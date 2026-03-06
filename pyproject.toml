@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vpml"
+version = "0.1.0"
+description = "JAX Fourier–Hermite Vlasov–Poisson"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "jax",
+  "jaxlib",
+  "numpy",
+  "matplotlib",
+  "scipy",
+]
+
+[project.scripts]
+fh-nonlinear-sim = "benchmarks.fh_nonlinear_sim_jax:main"
+fh-benchmarks-2412-07073 = "benchmarks.fh_benchmarks_2412_07073_jax:main"
+
+[tool.setuptools.packages.find]
+include = ["vpml", "vpml.*", "benchmarks", "benchmarks.*"]

@@ -1,6 +1,6 @@
 """
 Nonlinear 1D1V Vlasov–Poisson simulations in **JAX** using the core Fourier–Hermite IMEX
-integrator in fh_core_jax.py.
+integrator in ``vpml.core``.
 
 This script ports the provided numpy "two-stream + bump-on-tail" solver to JAX and keeps
 the same mathematical formulation (perturbation form, Hermite truncation, CNAB2, optional
@@ -25,7 +25,11 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 # Matplotlib cache directory fix for sandboxed environments (optional)
-os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig"))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MPLCONFIG = _REPO_ROOT / ".mplconfig"
+if _MPLCONFIG.exists():
+    os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import matplotlib.pyplot as plt
 
@@ -33,7 +37,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 
-from fh_core_jax import (
+from vpml.core import (
     Array,
     FourierHermiteIMEX,
     HermiteExponentialFilter,

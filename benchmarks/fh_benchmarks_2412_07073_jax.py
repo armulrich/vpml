@@ -5,7 +5,7 @@ Benchmark suite in **JAX** to reproduce the *key linear tests* from:
   on Hermite-based Vlasov-Poisson Simulations", arXiv:2412.07073 (v3).
 
 This script is designed to run side-by-side with the nonlinear solver script
-fh_nonlinear_sim_jax.py, sharing the same core numerics via fh_core_jax.py.
+``benchmarks/fh_nonlinear_sim_jax.py``, sharing the same core numerics via ``vpml.core``.
 
 What this benchmark script covers
 ---------------------------------
@@ -17,11 +17,11 @@ What this benchmark script covers
     * hypercollisions (tuned ν for each Nv)
     * nonlocal closure (Nm=1 and Nm=3)
     * filtering (tuned χ/Δt for each Nv)
-- Fig. 4/5-style eigenvalue (discrete Landau root) scans using the approximate response function:
+- Fig. 4/5-style eigenvalue scans using the discrete linearized Vlasov–Poisson matrix:
     * nonlocal closure parameter μ_{Nv-1} sweep
     * hypercollision ν sweep
     * filtering χ/Δt sweep
-- Optional: linear Landau damping time simulation using the shared IMEX integrator (Section 4.1 style)
+- Optional: linear Landau damping time simulation using implicit midpoint/JFNK (Section 4.1 style)
 
 Everything numerical is in JAX. Plotting uses matplotlib (CPU).
 
@@ -35,27 +35,37 @@ from __future__ import annotations
 
 import os
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
+try:
+    import scipy.linalg as la
+except Exception:  # pragma: no cover
+    la = None
 
 # Matplotlib cache directory fix for sandboxed environments (optional)
-os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig"))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MPLCONFIG = _REPO_ROOT / ".mplconfig"
+if _MPLCONFIG.exists():
+    os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
+# Silence noisy XLA/JAX C++ warnings on macOS benchmark runs unless the user overrides it.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 
-from fh_core_jax import (
+from vpml.core import (
     Array,
     FourierHermiteIMEX,
     HyperCollisions,
     HouLiFilter,
     NonlocalClosure,
     HermiteExponentialFilter,
+    implicit_midpoint_jfnk_step,
     rfft_x,
     irfft_x,
 )
@@ -115,7 +125,7 @@ def solve_landau_root_xi(
     Returns
     -------
     xi : complex
-        ξ = ω / sqrt(2|k|)
+        ξ = ω / (sqrt(2) |k|)
 
     Notes
     -----
@@ -129,7 +139,7 @@ def solve_landau_root_xi(
     if xi0 is None:
         # Heuristic start: warm plasma frequency with modest damping.
         wr = math.sqrt(1.0 + 3.0 * k2)
-        xi = complex(wr / math.sqrt(2.0 * abs(k)), -0.5)
+        xi = complex(wr / (math.sqrt(2.0) * abs(k)), -0.5)
     else:
         xi = complex(xi0)
 
@@ -165,13 +175,93 @@ def solve_landau_root_xi(
 
 
 def landau_omega(k: float, xi: complex) -> complex:
-    """ω = ξ * sqrt(2|k|)."""
-    return xi * math.sqrt(2.0 * abs(k))
+    """ω = ξ * sqrt(2) * |k|."""
+    return xi * math.sqrt(2.0) * abs(k)
 
 
 def landau_gamma(k: float, xi: complex) -> float:
     """Damping rate γ = Im(ω) (typically negative)."""
     return float(np.imag(landau_omega(k, xi)))
+
+
+def landau_gamma_mag(k: float, xi: complex) -> float:
+    """Positive damping magnitude γ = -Im(ω)."""
+    return -float(np.imag(landau_omega(k, xi)))
+
+
+def build_linear_Q(
+    Nv: int,
+    k: float,
+    gamma: Optional[np.ndarray] = None,
+    mu_nm1: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Discrete linearized Vlasov–Poisson matrix Q used in the paper's Fig. 4/5 benchmark.
+
+    The least-damped discrete mode is extracted from the eigenvalue of Q with the
+    smallest positive real part.
+    """
+    if k == 0.0:
+        raise ValueError("k must be nonzero")
+    if Nv < 2:
+        raise ValueError("Nv must be at least 2")
+
+    Q = np.zeros((Nv, Nv), dtype=np.complex128)
+    gamma_vec = np.zeros(Nv, dtype=float) if gamma is None else np.asarray(gamma, dtype=float)
+    if gamma_vec.shape != (Nv,):
+        raise ValueError(f"gamma must have shape ({Nv},), got {gamma_vec.shape}")
+
+    np.fill_diagonal(Q, gamma_vec)
+
+    # Streaming + Poisson coupling in the Hermite basis.
+    Q[0, 1] = 1j * k
+    Q[1, 0] = 1j * k * (1.0 + 1.0 / (k * k))
+
+    for n in range(1, Nv - 1):
+        if n >= 2:
+            Q[n, n - 1] = 1j * k * math.sqrt(n)
+        Q[n, n + 1] = 1j * k * math.sqrt(n + 1)
+
+    Q[Nv - 1, Nv - 2] = 1j * k * math.sqrt(Nv - 1)
+
+    # Nm = 1 closure: C_Nv = i * mu * sign(k) * C_{Nv-1}
+    if mu_nm1 is not None:
+        Q[Nv - 1, Nv - 1] += -abs(k) * math.sqrt(Nv) * float(mu_nm1)
+
+    return Q
+
+
+def least_damped_gamma_star(
+    Nv: int,
+    k: float,
+    gamma: Optional[np.ndarray] = None,
+    mu_nm1: Optional[float] = None,
+    tol: float = 1e-12,
+) -> float:
+    """Return the smallest positive real part among the discrete eigenvalues of Q."""
+    Q = build_linear_Q(Nv, k, gamma=gamma, mu_nm1=mu_nm1)
+    vals = la.eigvals(Q) if la is not None else np.linalg.eigvals(Q)
+    re = np.real(vals)
+    pos = re[re > tol]
+    return 0.0 if pos.size == 0 else float(np.min(pos))
+
+
+def select_paper_optimal_parameter(
+    x: np.ndarray,
+    rel_err: np.ndarray,
+    near_zero_tol: float = 1e-2,
+) -> float:
+    """
+    Heuristic for the dashed vertical lines in Fig. 4.
+
+    We use the first parameter value whose relative error is within `near_zero_tol`
+    of zero; if that never happens, fall back to the minimum-|error| point.
+    """
+    abs_err = np.abs(rel_err)
+    near_zero = np.flatnonzero(abs_err <= near_zero_tol)
+    if near_zero.size:
+        return float(x[int(near_zero[0])])
+    return float(x[int(np.argmin(abs_err))])
 
 
 # =============================================================================
@@ -469,7 +559,7 @@ class Fig3ResponseFunction(Benchmark):
     k: float = 1.0
     xi_min: float = 1e-2
     xi_max: float = 1e2
-    n_xi: int = 50_000  # paper uses 1e5
+    n_xi: int = 100_000
 
     p: int = 36
 
@@ -507,11 +597,9 @@ class Fig3ResponseFunction(Benchmark):
 
         R_true = np.array(response_function_R(xi_j))  # complex
 
-        def L2_rel_err(R_approx: np.ndarray) -> float:
+        def L2_err(R_approx: np.ndarray) -> float:
             diff = R_approx - R_true
-            num = np.sqrt(np.mean(np.abs(diff) ** 2))
-            den = np.sqrt(np.mean(np.abs(R_true) ** 2))
-            return float(num / den)
+            return float(np.sqrt(np.sum(np.abs(diff) ** 2)))
 
         Nv_list = [4, 6, 8, 10, 12]
         errs: Dict[str, list] = {
@@ -526,7 +614,7 @@ class Fig3ResponseFunction(Benchmark):
         for Nv in Nv_list:
             # truncation
             R_tr = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k))(xi_j))
-            errs["truncation"].append(L2_rel_err(R_tr))
+            errs["truncation"].append(L2_err(R_tr))
 
             # hypercollisions
             for a in [1, 2, 3, 4]:
@@ -534,7 +622,7 @@ class Fig3ResponseFunction(Benchmark):
                     nu = self.table1_collisions_nu[Nv][a]
                     diss = HyperCollisions(alpha=a, nu=nu, Nv=Nv)
                     R_h = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, dissipation=diss))(xi_j))
-                    errs[f"hyper_a{a}"].append(L2_rel_err(R_h))
+                    errs[f"hyper_a{a}"].append(L2_err(R_h))
                 else:
                     errs[f"hyper_a{a}"].append(np.nan)
 
@@ -542,19 +630,19 @@ class Fig3ResponseFunction(Benchmark):
             mu1 = self.table1_nonlocal_nm1_mu[Nv]
             clo1 = NonlocalClosure(mu_tail=jnp.array([mu1], dtype=jnp.float64))
             R_nl1 = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, closure=clo1))(xi_j))
-            errs["nonlocal_nm1"].append(L2_rel_err(R_nl1))
+            errs["nonlocal_nm1"].append(L2_err(R_nl1))
 
             # nonlocal Nm=3
             muNv1, muNv2, muNv3 = self.table1_nonlocal_nm3_mu[Nv]
             clo3 = NonlocalClosure(mu_tail=jnp.array([muNv3, muNv2, muNv1], dtype=jnp.float64))
             R_nl3 = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, closure=clo3))(xi_j))
-            errs["nonlocal_nm3"].append(L2_rel_err(R_nl3))
+            errs["nonlocal_nm3"].append(L2_err(R_nl3))
 
             # filtering
             chi = self.table1_filter_chi_over_dt[Nv]
             filt = HouLiFilter(chi_over_dt=chi, Nv=Nv, p=self.p)
             R_f = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, dissipation=filt))(xi_j))
-            errs["filter"].append(L2_rel_err(R_f))
+            errs["filter"].append(L2_err(R_f))
 
         # Error curves at Nv=12
         Nv = 12
@@ -610,7 +698,7 @@ class Fig3ResponseFunction(Benchmark):
         ax.semilogy(Nv_list, result.payload["err_nonlocal_nm3"], "o-", label=r"nonlocal $N_m=3$")
         ax.semilogy(Nv_list, result.payload["err_filter"], "o-", label="filter")
         ax.set_xlabel(r"$N_v$")
-        ax.set_ylabel(r"$\|R_{N_v}^{aw}-R\|_2/\|R\|_2$")
+        ax.set_ylabel(r"$\|R_{N_v}^{aw}-R\|_2$")
         ax.set_title("Fig. 3(a) — response-function convergence (k=1)")
         ax.grid(True, alpha=0.3)
         ax.legend(ncol=2, fontsize=8)
@@ -633,87 +721,100 @@ class Fig3ResponseFunction(Benchmark):
 
 
 # =============================================================================
-# Fig. 4/5: eigenvalue scans via discrete Landau root
+# Fig. 4/5: eigenvalue scans via the discrete linearized VP matrix
 # =============================================================================
 
 @dataclass
 class Fig4EigenvalueScan(Benchmark):
     name: str = "fig4_eigenvalue_scan"
     Nv: int = 20
-    k_list: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+    k_list: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
     p: int = 36
 
     mu_range: Tuple[float, float] = (-3.0, 0.0)
-    n_mu: int = 250
-
-    nu_range: Tuple[float, float] = (0.0, 100.0)
-    n_nu: int = 250
-
-    chi_over_dt_range: Tuple[float, float] = (0.0, 25.0)
-    n_chi: int = 250
+    n_mu: int = 601
+    hyper_nu_ranges: Dict[int, Tuple[float, float]] = field(default_factory=lambda: {
+        1: (0.0, 10.0),
+        2: (0.0, 25.0),
+        3: (0.0, 25.0),
+        4: (0.0, 20.0),
+    })
+    n_nu: int = 1001
+    chi_over_dt_range: Tuple[float, float] = (0.0, 15.0)
+    n_chi: int = 601
 
     def run(self) -> BenchmarkResult:
         Nv = int(self.Nv)
+        k_list = tuple(float(k) for k in self.k_list)
 
-        # True collisionless gammas
-        xi_true = {k: solve_landau_root_xi(float(k)) for k in self.k_list}
-        gamma_true = {k: landau_gamma(float(k), xi_true[k]) for k in self.k_list}
+        def rel_err(g_true: float, g_star: float) -> float:
+            return 0.0 if abs(g_true) < 1e-14 else (g_true - g_star) / g_true
+
+        # True collisionless Landau damping magnitudes.
+        xi_true = {k: solve_landau_root_xi(k) for k in k_list}
+        gamma_true = {k: landau_gamma_mag(k, xi_true[k]) for k in k_list}
 
         # (a) nonlocal mu sweep (Nm=1)
         mu_vals = np.linspace(self.mu_range[0], self.mu_range[1], self.n_mu)
-        err_nonlocal = {k: np.zeros_like(mu_vals) for k in self.k_list}
-        for k in self.k_list:
+        err_nonlocal = {k: np.zeros_like(mu_vals) for k in k_list}
+        for k in k_list:
             g_true = gamma_true[k]
-            xi_guess = xi_true[k]
             for i, mu in enumerate(mu_vals):
-                clo = NonlocalClosure(mu_tail=jnp.array([mu], dtype=jnp.float64))
-                xi_star = discrete_root_from_response(k=float(k), Nv=Nv, closure=clo, xi0=xi_guess)
-                xi_guess = xi_star
-                g_star = landau_gamma(float(k), xi_star)
-                err_nonlocal[k][i] = (g_true - g_star) / g_true
+                g_star = least_damped_gamma_star(Nv=Nv, k=k, mu_nm1=float(mu))
+                err_nonlocal[k][i] = rel_err(g_true, g_star)
+        mu_opt = float(np.median([
+            select_paper_optimal_parameter(mu_vals, err_nonlocal[k]) for k in k_list
+        ]))
 
         # (b-e) hypercollision nu sweeps
-        nu_vals = np.linspace(self.nu_range[0], self.nu_range[1], self.n_nu)
         err_hyper = {}  # (alpha,k)->curve
+        nu_axes = {}
+        opt_hyper = {}
         for a in [1, 2, 3, 4]:
-            for k in self.k_list:
+            nu_min, nu_max = self.hyper_nu_ranges[a]
+            nu_vals = np.linspace(nu_min, nu_max, self.n_nu)
+            nu_axes[a] = nu_vals
+            for k in k_list:
                 g_true = gamma_true[k]
                 curve = np.zeros_like(nu_vals)
-                xi_guess = xi_true[k]
                 for i, nu in enumerate(nu_vals):
                     diss = HyperCollisions(alpha=a, nu=float(nu), Nv=Nv)
-                    xi_star = discrete_root_from_response(k=float(k), Nv=Nv, dissipation=diss, xi0=xi_guess)
-                    xi_guess = xi_star
-                    g_star = landau_gamma(float(k), xi_star)
-                    curve[i] = (g_true - g_star) / g_true
+                    gamma = np.asarray(diss.damping_rates(), dtype=float)
+                    g_star = least_damped_gamma_star(Nv=Nv, k=k, gamma=gamma)
+                    curve[i] = rel_err(g_true, g_star)
                 err_hyper[(a, k)] = curve
+                opt_hyper[(a, k)] = select_paper_optimal_parameter(nu_vals, curve)
 
         # (f) filter chi sweep
         chi_vals = np.linspace(self.chi_over_dt_range[0], self.chi_over_dt_range[1], self.n_chi)
-        err_filter = {k: np.zeros_like(chi_vals) for k in self.k_list}
-        for k in self.k_list:
+        err_filter = {k: np.zeros_like(chi_vals) for k in k_list}
+        opt_filter = {}
+        for k in k_list:
             g_true = gamma_true[k]
-            xi_guess = xi_true[k]
             for i, chi in enumerate(chi_vals):
                 filt = HouLiFilter(chi_over_dt=float(chi), Nv=Nv, p=self.p)
-                xi_star = discrete_root_from_response(k=float(k), Nv=Nv, dissipation=filt, xi0=xi_guess)
-                xi_guess = xi_star
-                g_star = landau_gamma(float(k), xi_star)
-                err_filter[k][i] = (g_true - g_star) / g_true
+                gamma = np.asarray(filt.damping_rates(), dtype=float)
+                g_star = least_damped_gamma_star(Nv=Nv, k=k, gamma=gamma)
+                err_filter[k][i] = rel_err(g_true, g_star)
+            opt_filter[k] = select_paper_optimal_parameter(chi_vals, err_filter[k])
 
         payload: Dict[str, np.ndarray] = {
             "Nv": np.array([Nv]),
-            "k_list": np.array(self.k_list),
+            "k_list": np.array(k_list, dtype=float),
             "mu_vals": mu_vals,
-            "nu_vals": nu_vals,
             "chi_vals": chi_vals,
+            "mu_opt": np.array([mu_opt], dtype=float),
         }
-        for k in self.k_list:
+        for k in k_list:
             payload[f"err_nonlocal_k{k}"] = err_nonlocal[k]
             payload[f"err_filter_k{k}"] = err_filter[k]
             payload[f"gamma_true_k{k}"] = np.array([gamma_true[k]])
+            payload[f"opt_filter_k{k}"] = np.array([opt_filter[k]], dtype=float)
+        for a, nu_vals in nu_axes.items():
+            payload[f"nu_vals_a{a}"] = nu_vals
         for (a, k), curve in err_hyper.items():
             payload[f"err_hyper_a{a}_k{k}"] = curve
+            payload[f"opt_hyper_a{a}_k{k}"] = np.array([opt_hyper[(a, k)]], dtype=float)
 
         return BenchmarkResult(self.name, payload)
 
@@ -721,48 +822,100 @@ class Fig4EigenvalueScan(Benchmark):
         outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
         k_list = result.payload["k_list"].tolist()
         mu_vals = result.payload["mu_vals"]
-        nu_vals = result.payload["nu_vals"]
         chi_vals = result.payload["chi_vals"]
         Nv = int(result.payload["Nv"][0])
+        y_label = r"$(\gamma-\gamma^*)/\gamma$"
+        y_ticks = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        colors = {
+            0.5: "#1f77b4",
+            1.0: "#2ca02c",
+            1.5: "#d62728",
+            2.0: "#ff7f0e",
+        }
+        titles = {
+            "a": r"(a) Nonlocal closure with $N_m = 1$" + "\nSmith [38]",
+            "b": r"(b) Artificial collisions $\alpha = 1$" + "\nLenard and Bernstein [29]",
+            "c": r"(c) Artificial collisions $\alpha = 2$" + "\nCamporeale et al. [23]",
+            "d": r"(d) Artificial collisions $\alpha = 3$",
+            "e": r"(e) Artificial collisions $\alpha = 4$",
+            "f": r"(f) Hou and Li [31] filter",
+        }
 
-        # (a) nonlocal closure
+        def style_axis(ax: plt.Axes, *, xlabel: str, xlim: Tuple[float, float], xticks: Sequence[float]) -> None:
+            ax.axhline(0.0, color="0.45", lw=0.9, ls="--")
+            ax.set_xlim(*xlim)
+            ax.set_ylim(-1.2, 1.2)
+            ax.set_xticks(list(xticks))
+            ax.set_yticks(y_ticks)
+            ax.set_yticklabels([f"{tick:g}" for tick in y_ticks])
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(y_label)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        def draw_curves(ax: plt.Axes, x: np.ndarray, key_template: str, opt_template: str) -> None:
+            for k in k_list:
+                color = colors[float(k)]
+                ax.plot(x, result.payload[key_template.format(k=k)], color=color, lw=2.0, label=fr"$k={k:g}$")
+                ax.axvline(float(result.payload[opt_template.format(k=k)][0]), color=color, lw=1.2, ls="--", alpha=0.55)
+
         fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
         for k in k_list:
-            ax.plot(mu_vals, result.payload[f"err_nonlocal_k{k}"], label=fr"$k={k}$")
-        ax.axhline(0.0, color="k", lw=1, alpha=0.5)
-        ax.set_xlabel(r"$\mu_{N_v-1}$")
-        ax.set_ylabel(r"$(\gamma-\gamma^*)/\gamma$")
-        ax.set_title(fr"Nonlocal closure (Nm=1), $N_v={Nv}$")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+            ax.plot(mu_vals, result.payload[f"err_nonlocal_k{k}"], color=colors[float(k)], lw=2.0, label=fr"$k={k:g}$")
+        ax.axvline(float(result.payload["mu_opt"][0]), color=colors[2.0], lw=1.2, ls="--", alpha=0.55)
+        style_axis(ax, xlabel=r"$\mu_{N_v-1}$", xlim=(-3.0, 0.0), xticks=[-3, -2, -1, 0])
+        ax.set_title(titles["a"], fontsize=12, pad=12)
+        ax.legend(loc="lower left")
         fig.savefig(outdir / f"fig4a_nonlocal_scan_Nv{Nv}.png", dpi=200)
         plt.close(fig)
 
-        # (b-e) hypercollisions
-        for a in [1, 2, 3, 4]:
+        for a, xlim, xticks, panel in [
+            (1, (0.0, 10.0), [0, 5, 10], "b"),
+            (2, (0.0, 25.0), [5, 10, 15, 20, 25], "c"),
+            (3, (0.0, 25.0), [5, 10, 15, 20, 25], "d"),
+            (4, (0.0, 20.0), [5, 10, 15, 20], "e"),
+        ]:
+            nu_vals = result.payload[f"nu_vals_a{a}"]
             fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
-            for k in k_list:
-                ax.plot(nu_vals, result.payload[f"err_hyper_a{a}_k{k}"], label=fr"$k={k}$")
-            ax.axhline(0.0, color="k", lw=1, alpha=0.5)
-            ax.set_xlabel(r"$\nu$")
-            ax.set_ylabel(r"$(\gamma-\gamma^*)/\gamma$")
-            ax.set_title(fr"Hypercollisions $\alpha={a}$, $N_v={Nv}$")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
+            draw_curves(ax, nu_vals, f"err_hyper_a{a}_k{{k}}", f"opt_hyper_a{a}_k{{k}}")
+            style_axis(ax, xlabel=r"$\nu$", xlim=xlim, xticks=xticks)
+            ax.set_title(titles[panel], fontsize=12, pad=12)
             fig.savefig(outdir / f"fig4_hyper_a{a}_scan_Nv{Nv}.png", dpi=200)
             plt.close(fig)
 
-        # (f) filter
         fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
-        for k in k_list:
-            ax.plot(chi_vals, result.payload[f"err_filter_k{k}"], label=fr"$k={k}$")
-        ax.axhline(0.0, color="k", lw=1, alpha=0.5)
-        ax.set_xlabel(r"$\chi/\Delta t$")
-        ax.set_ylabel(r"$(\gamma-\gamma^*)/\gamma$")
-        ax.set_title(fr"Hou–Li filter (p={self.p}), $N_v={Nv}$")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        draw_curves(ax, chi_vals, "err_filter_k{k}", "opt_filter_k{k}")
+        style_axis(ax, xlabel=r"$\chi/\Delta t$", xlim=(0.0, 15.0), xticks=[5, 10, 15])
+        ax.set_title(titles["f"], fontsize=12, pad=12)
         fig.savefig(outdir / f"fig4f_filter_scan_Nv{Nv}.png", dpi=200)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(2, 3, figsize=(14, 10), constrained_layout=True)
+        axa, axb, axc, axd, axe, axf = axes.ravel()
+
+        for k in k_list:
+            axa.plot(mu_vals, result.payload[f"err_nonlocal_k{k}"], color=colors[float(k)], lw=2.0, label=fr"$k={k:g}$")
+        axa.axvline(float(result.payload["mu_opt"][0]), color=colors[2.0], lw=1.2, ls="--", alpha=0.55)
+        style_axis(axa, xlabel=r"$\mu_{N_v-1}$", xlim=(-3.0, 0.0), xticks=[-3, -2, -1, 0])
+        axa.set_title(titles["a"], fontsize=12, pad=12)
+        axa.legend(loc="lower left")
+
+        for ax, a, xlim, xticks, panel in [
+            (axb, 1, (0.0, 10.0), [0, 5, 10], "b"),
+            (axc, 2, (0.0, 25.0), [5, 10, 15, 20, 25], "c"),
+            (axd, 3, (0.0, 25.0), [5, 10, 15, 20, 25], "d"),
+            (axe, 4, (0.0, 20.0), [5, 10, 15, 20], "e"),
+        ]:
+            nu_vals = result.payload[f"nu_vals_a{a}"]
+            draw_curves(ax, nu_vals, f"err_hyper_a{a}_k{{k}}", f"opt_hyper_a{a}_k{{k}}")
+            style_axis(ax, xlabel=r"$\nu$", xlim=xlim, xticks=xticks)
+            ax.set_title(titles[panel], fontsize=12, pad=12)
+
+        draw_curves(axf, chi_vals, "err_filter_k{k}", "opt_filter_k{k}")
+        style_axis(axf, xlabel=r"$\chi/\Delta t$", xlim=(0.0, 15.0), xticks=[5, 10, 15])
+        axf.set_title(titles["f"], fontsize=12, pad=12)
+
+        fig.savefig(outdir / f"fig4_paper_style_Nv{Nv}.png", dpi=220)
         plt.close(fig)
 
 
@@ -773,7 +926,8 @@ class Fig4EigenvalueScan(Benchmark):
 @dataclass
 class LinearLandauTimeBenchmark(Benchmark):
     """
-    A minimal Section 4.1-style time simulation in the AW Hermite basis using the shared IMEX integrator.
+    A Section 4.1-style time simulation in the AW Hermite basis using implicit midpoint
+    with a Jacobian-free Newton-Krylov solve.
 
     Setup
     -----
@@ -791,12 +945,14 @@ class LinearLandauTimeBenchmark(Benchmark):
     Important
     ---------
     This benchmark is for comparing *time-domain* damping curves, not eigenvalue scans.
+    Unlike the nonlinear demos, it advances the linearized system with the paper-style
+    implicit-midpoint/JFNK method.
     """
     name: str = "linear_landau_time"
     method: str = "truncation"
     alpha: int = 2
     nu: float = 16.76
-    chi_over_dt: float = 6.94
+    chi_over_dt: float = 7.56
     mu: float = -1.01
     p: int = 36
 
@@ -807,6 +963,11 @@ class LinearLandauTimeBenchmark(Benchmark):
     T: float = 40.0
     eps: float = 1e-2
     modes: Tuple[float, ...] = (0.5, 1.5)
+    newton_tol: float = 1e-8
+    gmres_tol: float = 1e-8
+    max_newton_iter: int = 10
+    gmres_restart: Optional[int] = None
+    gmres_maxiter: Optional[int] = None
 
     poisson_sign: float = -1.0  # often used in Landau damping conventions
 
@@ -861,28 +1022,48 @@ class LinearLandauTimeBenchmark(Benchmark):
 
             return integ.apply_mask_hat(rfft_x(N_phys))
 
-        N0 = explicit_N_hat(a_hat0)
         E0 = integ.E_phys_from_a_hat(a_hat0, poisson_sign=self.poisson_sign)
         Ehat0 = jnp.fft.rfft(E0)
 
         nsteps = int(round(float(self.T) / float(self.dt)))
         times = np.linspace(0.0, nsteps * float(self.dt), nsteps + 1)
 
-        def step(carry, i):
-            a_hat, N_prev = carry
-            N_hat = explicit_N_hat(a_hat)
-            a_new = integ.step_cnab2(a_hat, N_hat, N_prev, hermite_filter=herm_filter)
-            E = integ.E_phys_from_a_hat(a_new, poisson_sign=self.poisson_sign)
-            Ehat = jnp.fft.rfft(E)
-            return (a_new, N_hat), Ehat
+        def full_rhs_hat(a_hat: Array) -> Array:
+            return integ.streaming_hat(a_hat) + explicit_N_hat(a_hat)
+        full_rhs_hat = jax.jit(full_rhs_hat)
 
-        (_, _), Ehat_hist = jax.lax.scan(step, (a_hat0, N0), jnp.arange(1, nsteps + 1, dtype=jnp.int32))
-        Ehat_hist = jnp.concatenate([Ehat0[None, :], Ehat_hist], axis=0)
+        a_curr = jnp.asarray(a_hat0, dtype=jnp.complex128)
+        Ehat_hist = [np.array(Ehat0)]
+        newton_hist = np.zeros(nsteps, dtype=float)
+        gmres_hist = np.zeros(nsteps, dtype=float)
+        residual_hist = np.zeros(nsteps, dtype=float)
+
+        for step_idx in range(nsteps):
+            predictor = a_curr + float(self.dt) * full_rhs_hat(a_curr)
+            a_next, solver_info = implicit_midpoint_jfnk_step(
+                a_curr,
+                full_rhs_hat,
+                self.dt,
+                initial_guess=predictor,
+                newton_tol=self.newton_tol,
+                gmres_tol=self.gmres_tol,
+                max_newton_iter=self.max_newton_iter,
+                gmres_restart=self.gmres_restart,
+                gmres_maxiter=self.gmres_maxiter,
+                post_step_filter=herm_filter,
+            )
+            E = integ.E_phys_from_a_hat(a_next, poisson_sign=self.poisson_sign)
+            Ehat_hist.append(np.array(jnp.fft.rfft(E)))
+            newton_hist[step_idx] = solver_info["newton_iters"]
+            gmres_hist[step_idx] = solver_info["gmres_iters"]
+            residual_hist[step_idx] = solver_info["residual_norm"]
+            a_curr = a_next
+
+        Ehat_hist = np.asarray(Ehat_hist)
 
         # Extract |E_k| for k=0.5 and 1.5 (indices 1 and 3 for Nx=10, L=4π)
-        Ehat_np = np.array(Ehat_hist)
-        E05 = np.abs(Ehat_np[:, 1])
-        E15 = np.abs(Ehat_np[:, 3])
+        E05 = np.abs(Ehat_hist[:, 1])
+        E15 = np.abs(Ehat_hist[:, 3])
 
         # Analytic damping rates (collisionless)
         xi05 = solve_landau_root_xi(0.5)
@@ -896,6 +1077,9 @@ class LinearLandauTimeBenchmark(Benchmark):
             "E_abs_k1p5": E15,
             "gamma_k0p5": np.array([g05]),
             "gamma_k1p5": np.array([g15]),
+            "newton_iters": newton_hist,
+            "gmres_iters": gmres_hist,
+            "solver_residual_norm": residual_hist,
         }
         return BenchmarkResult(self.name + "_" + self.method, payload)
 
@@ -917,7 +1101,7 @@ class LinearLandauTimeBenchmark(Benchmark):
 
         ax.set_xlabel("t")
         ax.set_ylabel(r"$|E_k(t)|$")
-        ax.set_title(f"Linear Landau damping — method={self.method}")
+        ax.set_title(f"Linear Landau damping — implicit midpoint/JFNK, method={self.method}")
         ax.grid(True, alpha=0.3)
         ax.legend()
         fig.savefig(outdir / f"linear_landau_{self.method}.png", dpi=200)
@@ -939,18 +1123,18 @@ def main():
 
     p3 = sub.add_parser("fig3", help="Response-function benchmarks (Fig. 3 style)")
     p3.add_argument("--outdir", type=str, default="out_bench")
-    p3.add_argument("--n_xi", type=int, default=50_000)
+    p3.add_argument("--n_xi", type=int, default=100_000)
 
-    p4 = sub.add_parser("fig4", help="Eigenvalue scan via discrete root (Fig. 4/5 style)")
+    p4 = sub.add_parser("fig4", help="Eigenvalue scan via discrete VP eigenvalues (Fig. 4/5 style)")
     p4.add_argument("--outdir", type=str, default="out_bench")
     p4.add_argument("--Nv", type=int, default=20)
 
-    pl = sub.add_parser("linear_landau", help="Linear Landau damping time simulation (optional)")
+    pl = sub.add_parser("linear_landau", help="Linear Landau damping time simulation via implicit midpoint/JFNK")
     pl.add_argument("--outdir", type=str, default="out_bench")
     pl.add_argument("--method", choices=["truncation", "hyper", "filter", "nonlocal"], default="truncation")
     pl.add_argument("--alpha", type=int, default=2)
     pl.add_argument("--nu", type=float, default=16.76)
-    pl.add_argument("--chi_over_dt", type=float, default=6.94)
+    pl.add_argument("--chi_over_dt", type=float, default=7.56)
     pl.add_argument("--mu", type=float, default=-1.01)
     pl.add_argument("--T", type=float, default=40.0)
 
