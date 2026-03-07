@@ -50,7 +50,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MPLCONFIG = _REPO_ROOT / ".mplconfig"
 if _MPLCONFIG.exists():
     os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
-# Silence noisy XLA/JAX C++ warnings on macOS benchmark runs unless the user overrides it.
+# Silence noisy XLA/JAX C++ warnings on macOS benchmark runs
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import matplotlib.pyplot as plt
 

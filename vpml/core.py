@@ -51,8 +51,6 @@ try:
 except Exception:  # pragma: no cover
     spla = None
 
-
-# Prefer float64/complex128 if the user enabled it (recommended for eigenvalues/roots).
 try:
     jax.config.update("jax_enable_x64", True)
 except Exception:
