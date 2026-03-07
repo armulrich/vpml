@@ -62,13 +62,6 @@ python benchmarks/fh_benchmarks_2412_07073_jax.py linear_landau --method truncat
 
 Outputs go to `out_bench/` (PNGs + `.npz` data dumps).
 
-The console scripts installed by `pip install -e .` still work:
-
-```bash
-fh-nonlinear-sim two_stream --outdir out_nl
-fh-benchmarks-2412-07073 fig2 --outdir out_bench
-```
-
 ## Package map
 
 - `vpml`: public package namespace
