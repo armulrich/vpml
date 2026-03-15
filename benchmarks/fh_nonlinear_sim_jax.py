@@ -307,9 +307,13 @@ def simulate_two_stream(p: TwoStreamParams):
 
         return (a_new, N_hat, snaps), en
 
-    (a_last, N_last, snaps_out), energy_hist = jax.lax.scan(
-        step, (a_hat0, N0, snaps0), jnp.arange(1, nsteps + 1, dtype=jnp.int32)
-    )
+    # JIT-compile the entire time loop for speed (one compilation per (Nx, Nv, nsteps))
+    def run_scan(init_carry):
+        return jax.lax.scan(
+            step, init_carry, jnp.arange(1, nsteps + 1, dtype=jnp.int32)
+        )
+
+    (a_last, N_last, snaps_out), energy_hist = jax.jit(run_scan)((a_hat0, N0, snaps0))
 
     energy = jnp.concatenate([jnp.array([energy0], dtype=jnp.float64), energy_hist], axis=0)
 
@@ -436,9 +440,13 @@ def simulate_bump_on_tail(p: BumpOnTailParams, system: str = "A"):
         snaps = maybe_update_snaps(snaps, i, a_new)
         return (a_new, N_hat, snaps), en
 
-    (a_last, N_last, snaps_out), energy_hist = jax.lax.scan(
-        step, (a_hat0, N0, snaps0), jnp.arange(1, nsteps + 1, dtype=jnp.int32)
-    )
+    # JIT-compile the entire time loop for speed
+    def run_scan(init_carry):
+        return jax.lax.scan(
+            step, init_carry, jnp.arange(1, nsteps + 1, dtype=jnp.int32)
+        )
+
+    (a_last, N_last, snaps_out), energy_hist = jax.jit(run_scan)((a_hat0, N0, snaps0))
     energy = jnp.concatenate([jnp.array([energy0], dtype=jnp.float64), energy_hist], axis=0)
 
     x_np = np.array(integrator.x)
