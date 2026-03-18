@@ -25,10 +25,13 @@ We evolve *Hermite coefficients of the perturbation* a_n(x,t) such that
 where φ_n are normalized probabilists' Hermite functions with Gaussian weight.
 Density is ρ(x,t) = a_0(x,t).
 
-Poisson in 1D periodic domain is handled in Fourier space:
-    i k E_k = poisson_sign * ρ_k   (k != 0),  E_0 = 0
-with poisson_sign = +1 matching the convention used in the provided numpy two-stream/bump-on-tail script.
-Some papers use the opposite sign; you can just flip it by passing poisson_sign=-1.
+Poisson in 1D periodic domain is handled in Fourier space via
+    E_k = poisson_sign * i * ρ_k / k   (k != 0),  E_0 = 0.
+Hence
+    i k E_k = -poisson_sign * ρ_k.
+With poisson_sign = +1 this matches the perturbation-form convention used in the
+provided nonlinear two-stream/bump-on-tail script and in Eq. (2.3) of the control paper.
+Some papers use the opposite sign; you can flip it by passing poisson_sign=-1.
 
 """
 
@@ -567,9 +570,10 @@ class FourierHermiteIMEX:
 
     def E_hat_from_rho_hat(self, rho_hat: Array, poisson_sign: float = +1.0) -> Array:
         """
-        Compute E_hat from rho_hat using:
-            i k E_k = poisson_sign * rho_k,   k!=0
-            E_0 = 0
+        Compute E_hat from rho_hat using
+            E_k = poisson_sign * i * rho_k / k,   k!=0
+            E_0 = 0,
+        so that i k E_k = -poisson_sign * rho_k.
         """
         E_hat = jnp.zeros_like(rho_hat)
         E_hat = E_hat.at[1:].set((poisson_sign * 1j) * rho_hat[1:] / self.k_arr[1:])
