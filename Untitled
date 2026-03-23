@@ -1,0 +1,120 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+
+\title{Benefits of Stochastic Noise in MRX Magnetic Relaxation}
+\author{[Notes for Julianne]}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Motivation}
+
+MRX relaxes a magnetic field $\mathbf{B}$ toward an MHD equilibrium by evolving a fictitious--time dynamics
+\[
+  \partial_t \mathbf{B} = - \nabla \times (\mathbf{v} \times \mathbf{B}),
+\]
+where the velocity $\mathbf{v}$ is chosen to reduce a magnetic energy functional subject to constraints such as $\nabla\!\cdot\mathbf{B}=0$ and (optionally) force--free conditions.
+In the simplest implementation, the update direction at each step is a deterministic function of the current state (a projected Lorentz force or a quasi--Newton step).
+
+However, the discrete energy landscape in a high--dimensional configuration space can exhibit multiple local minima, flat directions, or nearly marginal barriers associated with island formation and onset of stochastic field lines.
+To better explore this landscape and to probe the robustness of equilibria, MRX includes an option to add \emph{stochastic, divergence--free noise} to the update direction.
+
+\section{Noise model in the time stepper}
+
+Let $\mathbf{u}$ denote the deterministic update direction at a given pseudo--time step (for example, a projected Lorentz force or a quasi--Newton direction). The MRX time stepper defines an energy--weighted norm using the mass matrix $M_2$ on the 2--form space:
+\[
+  \|\mathbf{u}\|_2 = \bigl(\mathbf{u}^T M_2\,\mathbf{u}\bigr)^{1/2}.
+\]
+
+When the \verb|stochastic| flag is enabled, the actual update direction is modified to
+\[
+  \mathbf{u}_{\text{stoch}} = \mathbf{u} + \alpha\,\boldsymbol{\xi}_{\mathrm{df}},
+\]
+where:
+\begin{itemize}
+  \item $\boldsymbol{\xi}_{\mathrm{df}}$ is a divergence--free Gaussian random field constructed from i.i.d.~samples $\boldsymbol{\xi} \sim \mathcal{N}(0, I)$ by solving
+  \[
+    \tilde{\boldsymbol{\xi}} = M_2^{-1} \boldsymbol{\xi}, \qquad
+    \boldsymbol{\xi}_{\mathrm{df}} = P_{\mathrm{Leray}}\,\tilde{\boldsymbol{\xi}},
+  \]
+  with $P_{\mathrm{Leray}}$ the discrete Leray projector enforcing $\nabla\!\cdot\mathbf{B}=0$;
+  \item the scalar amplitude $\alpha$ is set by a \emph{noise level}
+  \[
+    \alpha = \texttt{noise\_level} \times \|\mathbf{u}\|_2,
+  \]
+  where \verb|noise_level| is stored in the relaxation state and updated each outer iteration by a user--supplied schedule.
+\end{itemize}
+The resulting step
+\[
+  \mathbf{B}_{n+1} = \mathbf{B}_n - \Delta t\,\mathbf{u}_{\text{stoch}}
+\]
+remains divergence--free by construction while introducing controlled random perturbations to the direction of downhill motion.
+
+\section{Benefits for equilibrium searches}
+
+\subsection{Escaping shallow local minima}
+
+In a purely deterministic scheme, the relaxation may become trapped in a shallow local minimum or stall in a nearly flat valley of the discrete energy functional.
+The stochastic term effectively turns the gradient--based search into a \emph{noisy} descent, analogous to simulated annealing:
+\begin{itemize}
+  \item The deterministic part moves downhill in energy.
+  \item The divergence--free noise perturbs the direction within the admissible subspace without violating $\nabla\!\cdot\mathbf{B}=0$.
+\end{itemize}
+With a moderate initial noise level and a decaying schedule, one can:
+\begin{itemize}
+  \item explore multiple nearby basins of attraction early in the run,
+  \item then gradually reduce the noise so that the solution settles into a \emph{deeper} or more robust equilibrium than would be obtained by deterministic relaxation alone.
+\end{itemize}
+
+\subsection{Sampling a family of nearby equilibria}
+
+For configurations with marginal modes or weakly broken symmetries, there may be a family of nearby equilibria related by small changes in island structures or stochastic layers.
+Running the relaxation multiple times with different random seeds and a fixed noise schedule generates an ensemble of slightly different final states:
+\begin{itemize}
+  \item This ensemble can be used to estimate the \emph{spread} in quantities such as rotational transform, Shafranov shift, or island widths.
+  \item It provides a more realistic view of equilibrium sensitivity than a single deterministic run.
+\end{itemize}
+
+\section{Benefits for stability and stochasticity diagnostics}
+
+The impact of stochastic noise is particularly informative when combined with field--line tracing and stability proxies:
+\begin{itemize}
+  \item \textbf{Field-line stochasticity:} Small divergence--free perturbations to $\mathbf{B}$ can seed or enhance stochastic layers. Comparing Poincar\'e plots from deterministic and stochastic runs highlights how easily field lines become chaotic, which is relevant for transport.
+  \item \textbf{Robustness to perturbations:} If an equilibrium remains qualitatively unchanged (e.g.\ similar island structure, comparable force residuals) under multiple noisy relaxations, this suggests a robust basin of attraction. Large variability indicates sensitivity to perturbations that may correlate with poor stability margins.
+  \item \textbf{Current density structure:} Stochastic relaxations can reveal how localized current channels or edge currents respond to small perturbations, indicating whether sharp features are physically meaningful or artefacts of a particular deterministic path.
+\end{itemize}
+
+\section{Demonstrating improvements in practice}
+
+To \emph{show} the benefits of stochastic noise in MRX, one can perform paired experiments:
+\begin{enumerate}
+  \item Choose a configuration script (e.g.\ a stellarator relaxation from NFS data) and a base resolution.
+  \item Run a \textbf{deterministic} relaxation with \verb|noise.max = 0| and record:
+  \begin{itemize}
+    \item force norm vs iteration,
+    \item magnetic energy vs iteration,
+    \item final Poincar\'e plots and axis trajectories,
+    \item current density profiles.
+  \end{itemize}
+  \item Run a \textbf{stochastic} relaxation with a moderate initial noise level, e.g.\ \verb|noise.max = 0.05| and a \verb|tanh| or linear schedule that decays to zero over the outer iterations.
+  \item Repeat the stochastic run with several different random keys to obtain an ensemble of final states.
+\end{enumerate}
+The improvements and qualitative differences can then be documented as:
+\begin{itemize}
+  \item \textbf{Convergence behavior:} in some cases the stochastic runs continue to reduce the force norm after the deterministic run has stalled, or reach a lower final energy.
+  \item \textbf{Equilibrium quality:} Poincar\'e sections may exhibit cleaner island chains or better-preserved symmetry in the stochastic runs, indicating that the deterministic path had become trapped in a less regular configuration.
+  \item \textbf{Sensitivity analysis:} the spread across stochastic realizations provides error bars on equilibrium quantities, illustrating stability or fragility of a given configuration.
+\end{itemize}
+
+\section{Recommendations}
+
+\begin{itemize}
+  \item Use \textbf{small} noise levels (e.g.\ $10^{-3}$--$10^{-1}$ relative to $\|\mathbf{u}\|_2$) and decaying schedules to avoid overwhelming the deterministic descent.
+  \item Enable stochastic noise primarily in phases where exploration is desired (early in the relaxation), and reduce it as the force residual approaches the desired tolerance.
+  \item For quantitative comparisons to other equilibrium codes, always report whether stochastic noise was used and, if so, summarize the noise schedule and the spread across multiple realizations.
+\end{itemize}
+
+\end{document}
+
