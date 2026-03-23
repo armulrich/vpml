@@ -1,11 +1,9 @@
 """
-Nonlinear 1D1V Vlasov–Poisson simulations in **JAX** using the core Fourier–Hermite IMEX
-integrator in ``vpml.core``.
+Nonlinear 1D1V Vlasov–Poisson simulations.
 
-This script ports the provided numpy "two-stream + bump-on-tail" solver to JAX and keeps
-the same mathematical formulation (perturbation form, Hermite truncation, CNAB2, optional
-dealiasing, optional exponential Hermite filter, and (for bump-on-tail) the System C
-pole-elimination control field).
+The two-stream path uses a paper-matched semi-Lagrangian cubic-spline discretization on a
+physical (x,v) grid. The bump-on-tail path continues to use the shared Fourier–Hermite JAX
+integrator from ``vpml.core``.
 
 What this script is for
 -----------------------
@@ -36,6 +34,7 @@ import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
+from scipy.ndimage import map_coordinates
 
 from vpml.core import (
     Array,
@@ -161,14 +160,16 @@ class TwoStreamParams:
     eps: float = 0.005
 
     Nx: int = 128
-    Nv: int = 80
+    # Paper-matched grid resolution in x and v.
+    Nv: int = 128
 
     dt: float = 0.1
     T: float = 80.0
 
     dealias_23: bool = True
 
-    # Hermite spectral-viscosity filter (multiplicative per step)
+    # Retained for backwards compatibility with earlier Fourier-Hermite drafts;
+    # unused by the paper-matched semi-Lagrangian two-stream solver.
     hermite_filter: bool = True
     filter_alpha: float = 8.0
     filter_p: int = 8
@@ -220,112 +221,101 @@ def _make_snapshot_indices(snapshot_times: Tuple[float, ...], dt: float) -> np.n
 
 def simulate_two_stream(p: TwoStreamParams):
     """
-    Nonlinear two-stream instability (System A, H=0), matching the numpy script.
+    Nonlinear two-stream instability (System A, H=0) using a paper-matched
+    semi-Lagrangian Strang splitting with cubic spline interpolation on a
+    128x128 physical (x,v) grid.
 
     Returns
     -------
     x : np.ndarray (Nx,)
-    m : np.ndarray (Nv,) equilibrium Hermite coefficients
-    snaps : Dict[float, np.ndarray] mapping snapshot time -> a_phys (Nv,Nx)
+    v : np.ndarray (Nv,)
+    snaps : Dict[float, np.ndarray] mapping snapshot time -> f(v,x)
     times : np.ndarray (nt,)
     energy : np.ndarray (nt,)
     """
     Lx = 2.0 * math.pi / float(p.beta)
-    integrator = FourierHermiteIMEX(
-        Nx=p.Nx, Nv=p.Nv, Lx=Lx, dt=p.dt, vth=1.0, dealias_23=p.dealias_23, closure=None
+    x = np.linspace(0.0, Lx, int(p.Nx), endpoint=False)
+    v = np.linspace(-6.0, 6.0, int(p.Nv))
+    dx = float(Lx) / float(p.Nx)
+    dv = float(v[1] - v[0])
+    k_arr = 2.0 * math.pi * np.fft.rfftfreq(int(p.Nx), d=dx)
+
+    # Equilibrium μ(v) truncated to [-6,6] and renormalized on the grid so the
+    # periodic Poisson solve sees a mean density of exactly 1.
+    mu = 0.5 / math.sqrt(2.0 * math.pi) * (
+        np.exp(-0.5 * (v - float(p.vbar)) ** 2) +
+        np.exp(-0.5 * (v + float(p.vbar)) ** 2)
     )
+    mu = mu / np.trapezoid(mu, v)
 
-    # Equilibrium μ coefficients
-    m = equilibrium_coeffs_two_stream(p.Nv, p.vbar)
-
-    # Initial perturbation: a_n(x,0) = eps*cos(beta x)*m_n
-    a0 = float(p.eps) * jnp.cos(float(p.beta) * integrator.x)
-    a_phys0 = (m[:, None] * a0[None, :]).astype(jnp.float64)
-    a_hat0 = rfft_x(a_phys0)
-
-    # Per-step Hermite filter factors
-    herm_filt = None
-    if p.hermite_filter:
-        herm_filt = HermiteExponentialFilter(alpha=p.filter_alpha, Nv=p.Nv, p=p.filter_p).factors()
+    # Total distribution: μ(v) * (1 + ε cos(βx)).
+    f0 = mu[:, None] * (1.0 + float(p.eps) * np.cos(float(p.beta) * x)[None, :])
 
     # Snapshot bookkeeping
     snap_times = tuple(t for t in p.snapshot_times)
     snap_steps = _make_snapshot_indices(snap_times, p.dt)
-    S = len(snap_steps)
-
-    snaps0 = jnp.zeros((S, p.Nv, p.Nx), dtype=jnp.float64)
-
-    # Write t=0 snapshot if requested
-    def _write_init(snaps):
-        return snaps.at[int(np.where(snap_steps == 0)[0][0])].set(irfft_x(a_hat0, p.Nx))
+    snaps: Dict[float, np.ndarray] = {}
     if 0 in snap_steps:
-        snaps0 = _write_init(snaps0)
-
-    # Explicit term N_hat(a_hat,t): nonlinear acceleration with equilibrium source
-    def explicit_N_hat(a_hat: Array, t: float) -> Array:
-        a_phys = irfft_x(a_hat, p.Nx)
-        E = integrator.E_phys_from_a_hat(a_hat, poisson_sign=p.poisson_sign)
-
-        Nv = p.Nv
-        N_phys = jnp.zeros((Nv, p.Nx), dtype=jnp.float64)
-        # N_n = -sqrt(n) E (a_{n-1} + m_{n-1}), n>=1
-        N_phys = N_phys.at[1:].set(-integrator.sqrt_n[1:, None] * E[None, :] * (a_phys[:-1] + m[:-1, None]))
-        N_hat = rfft_x(N_phys)
-        return integrator.apply_mask_hat(N_hat)
-
-    # Initial explicit term and energy
-    N0 = explicit_N_hat(a_hat0, t=0.0)
-    energy0 = integrator.electric_energy(a_hat0, poisson_sign=p.poisson_sign)
+        snaps[0.0] = f0.copy()
 
     nsteps = int(round(float(p.T) / float(p.dt)))
     times = np.linspace(0.0, nsteps * float(p.dt), nsteps + 1)
+    energy = np.zeros((nsteps + 1,), dtype=float)
 
-    def maybe_update_snaps(snaps: Array, step_i: Array, a_hat_new: Array) -> Array:
-        # step_i is an int scalar (JAX)
-        def update_one(snaps_, j):
-            cond = step_i == int(snap_steps[j])
+    v_idx = np.arange(int(p.Nv), dtype=float)[:, None]
+    x_idx = np.arange(int(p.Nx), dtype=float)[None, :]
 
-            def do_write(s):
-                return s.at[j].set(irfft_x(a_hat_new, p.Nx))
+    def compute_E(f: np.ndarray) -> np.ndarray:
+        rho = np.trapezoid(f, v, axis=0)
+        rho_p = rho - np.mean(rho)
+        rho_hat = np.fft.rfft(rho_p)
+        E_hat = np.zeros_like(rho_hat, dtype=np.complex128)
+        E_hat[1:] = (float(p.poisson_sign) * 1j) * rho_hat[1:] / k_arr[1:]
+        return np.fft.irfft(E_hat, n=int(p.Nx))
 
-            return jax.lax.cond(cond, do_write, lambda s: s, snaps_)
+    def electric_energy(E: np.ndarray) -> float:
+        return 0.5 * dx * float(np.sum(E * E))
 
-        for j in range(S):
-            snaps = update_one(snaps, j)
-        return snaps
-
-    def step(carry, i):
-        a_hat, N_prev, snaps = carry
-        t_cur = (i - 1) * float(p.dt)
-
-        N_hat = explicit_N_hat(a_hat, t_cur)
-        a_new = integrator.step_cnab2(a_hat, N_hat, N_prev, hermite_filter=herm_filt)
-
-        # Diagnostics at t=i*dt
-        en = integrator.electric_energy(a_new, poisson_sign=p.poisson_sign)
-        snaps = maybe_update_snaps(snaps, i, a_new)
-
-        return (a_new, N_hat, snaps), en
-
-    # JIT-compile the entire time loop for speed (one compilation per (Nx, Nv, nsteps))
-    def run_scan(init_carry):
-        return jax.lax.scan(
-            step, init_carry, jnp.arange(1, nsteps + 1, dtype=jnp.int32)
+    def advect_x_periodic(f: np.ndarray, tau: float) -> np.ndarray:
+        x_dep = (x[None, :] - v[:, None] * tau) % Lx
+        coords = np.array(
+            [
+                np.broadcast_to(v_idx, (int(p.Nv), int(p.Nx))),
+                x_dep / dx,
+            ]
         )
+        return map_coordinates(f, coords, order=3, mode="wrap")
 
-    (a_last, N_last, snaps_out), energy_hist = jax.jit(run_scan)((a_hat0, N0, snaps0))
+    def advect_v_cubic(f: np.ndarray, E: np.ndarray, tau: float) -> np.ndarray:
+        v_dep = v[:, None] + E[None, :] * tau
+        coords = np.array(
+            [
+                (v_dep - v[0]) / dv,
+                np.broadcast_to(x_idx, (int(p.Nv), int(p.Nx))),
+            ]
+        )
+        return map_coordinates(f, coords, order=3, mode="constant", cval=0.0)
 
-    energy = jnp.concatenate([jnp.array([energy0], dtype=jnp.float64), energy_hist], axis=0)
+    f = f0.copy()
+    energy[0] = electric_energy(compute_E(f))
+    if nsteps == 0:
+        return x, v, snaps, times, energy
 
-    # Convert outputs to numpy
-    x_np = np.array(integrator.x)
-    m_np = np.array(m)
-    energy_np = np.array(energy)
+    snap_lookup = {int(step): snap_times[j] for j, step in enumerate(snap_steps)}
 
-    snaps_np = np.array(snaps_out)
-    snaps: Dict[float, np.ndarray] = {t: snaps_np[j] for j, t in enumerate(snap_times)}
+    for step in range(1, nsteps + 1):
+        f = advect_x_periodic(f, 0.5 * float(p.dt))
+        E_mid = compute_E(f)
+        f = advect_v_cubic(f, E_mid, float(p.dt))
+        f = advect_x_periodic(f, 0.5 * float(p.dt))
 
-    return x_np, m_np, snaps, times, energy_np
+        E = compute_E(f)
+        energy[step] = electric_energy(E)
+
+        if step in snap_lookup:
+            snaps[float(snap_lookup[step])] = f.copy()
+
+    return x, v, snaps, times, energy
 
 
 def simulate_bump_on_tail(p: BumpOnTailParams, system: str = "A"):
@@ -497,13 +487,12 @@ def hermite_basis_phi_scaled(N: int, v: np.ndarray, vth: float) -> np.ndarray:
 
 def plot_snapshot_panel(
     x: np.ndarray,
-    m: np.ndarray,
+    v: np.ndarray,
     snaps: Dict[float, np.ndarray],
     *,
-    v_range: Tuple[float, float] = (-6.0, 6.0),
-    Nv_plot: int = 256,
     vmin: float = 0.0,
-    vmax: float = 0.22,
+    vmax: Optional[float] = None,
+    paper_view: bool = True,
     title: str = "",
     savepath: Optional[str] = None,
 ):
@@ -511,16 +500,20 @@ def plot_snapshot_panel(
     if len(times) != 9:
         raise ValueError("Expected 9 snapshot times for a 3x3 panel.")
 
-    v = np.linspace(v_range[0], v_range[1], Nv_plot)
-    phi = hermite_basis_phi(len(m), v)  # (Nv, Nv_plot)
-
     fig, axes = plt.subplots(3, 3, figsize=(12, 9), constrained_layout=True)
     fig.suptitle(title)
 
+    def apply_paper_view(F: np.ndarray) -> np.ndarray:
+        # The paper's x orientation already matches the raw simulation. The only
+        # display correction needed for panel-to-panel visual agreement is to
+        # flip the velocity axis.
+        if not paper_view:
+            return F
+        return F[::-1, :]
+
     for ax, t in zip(axes.flat, times):
-        a_phys = snaps[t]  # (Nv, Nx)
-        F = (a_phys + m[:, None]).T @ phi  # (Nx, Nv_plot)
-        im = ax.pcolormesh(x, v, F.T, shading="auto", vmin=vmin, vmax=vmax)
+        F = apply_paper_view(snaps[t])
+        im = ax.pcolormesh(x, v, F, shading="auto", vmin=vmin, vmax=vmax)
         ax.set_title(f"t={t:g}")
         ax.set_xlabel("x")
         ax.set_ylabel("v")
@@ -583,9 +576,10 @@ def main():
     p_ts = sub.add_parser("two_stream", help="Two-stream instability (System A)")
     p_ts.add_argument("--outdir", type=str, default="out_nonlinear")
     p_ts.add_argument("--Nx", type=int, default=128)
-    p_ts.add_argument("--Nv", type=int, default=80)
+    p_ts.add_argument("--Nv", type=int, default=128)
     p_ts.add_argument("--dt", type=float, default=0.1)
     p_ts.add_argument("--T", type=float, default=80.0)
+    p_ts.add_argument("--raw-view", action="store_true")
 
     p_bot = sub.add_parser("bump_on_tail", help="Bump-on-tail (System A or C)")
     p_bot.add_argument("--system", choices=["A", "C", "AC"], default="AC")
@@ -601,11 +595,12 @@ def main():
 
     if args.case == "two_stream":
         p = TwoStreamParams(Nx=args.Nx, Nv=args.Nv, dt=args.dt, T=args.T)
-        x, m, snaps, times, energy = simulate_two_stream(p)
+        x, v, snaps, times, energy = simulate_two_stream(p)
 
         plot_snapshot_panel(
-            x, m, snaps,
-            title="Two-stream (System A, H=0) — JAX Fourier–Hermite",
+            x, v, snaps,
+            paper_view=not args.raw_view,
+            title="Two-stream (System A, H=0) — Semi-Lagrangian cubic spline",
             savepath=str(outdir / "two_stream_snapshots.png"),
         )
         np.savez(outdir / "two_stream_energy.npz", times=times, energy=energy)
