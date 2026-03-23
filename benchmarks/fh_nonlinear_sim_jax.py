@@ -22,6 +22,9 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+# NumPy < 1.22 uses trapz; numpy.trapezoid is the modern alias
+_trapezoid = getattr(np, "trapezoid", np.trapz)
+
 # Matplotlib cache directory fix for sandboxed environments (optional)
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MPLCONFIG = _REPO_ROOT / ".mplconfig"
@@ -246,7 +249,7 @@ def simulate_two_stream(p: TwoStreamParams):
         np.exp(-0.5 * (v - float(p.vbar)) ** 2) +
         np.exp(-0.5 * (v + float(p.vbar)) ** 2)
     )
-    mu = mu / np.trapezoid(mu, v)
+    mu = mu / _trapezoid(mu, v)
 
     # Total distribution: μ(v) * (1 + ε cos(βx)).
     f0 = mu[:, None] * (1.0 + float(p.eps) * np.cos(float(p.beta) * x)[None, :])
@@ -266,7 +269,7 @@ def simulate_two_stream(p: TwoStreamParams):
     x_idx = np.arange(int(p.Nx), dtype=float)[None, :]
 
     def compute_E(f: np.ndarray) -> np.ndarray:
-        rho = np.trapezoid(f, v, axis=0)
+        rho = _trapezoid(f, v, axis=0)
         rho_p = rho - np.mean(rho)
         rho_hat = np.fft.rfft(rho_p)
         E_hat = np.zeros_like(rho_hat, dtype=np.complex128)
