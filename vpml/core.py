@@ -12,6 +12,7 @@ This module is intentionally "physics-agnostic": it provides
         * Hou–Li filter interpreted as damping
   - Optional Hermite exponential filter (spectral viscosity) as a per-step multiplier
   - Optional Nm=1 Hammett–Perkins nonlocal closure (time-stepping support)
+  - Optional learned interface-closure helpers for solver-embedded ML boundaries
 
 The nonlinear physics (equilibrium coefficients, acceleration term, external control fields, etc.)
 live in separate scripts that import this module.
@@ -40,9 +41,13 @@ from __future__ import annotations
 import os
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+from .jax_runtime import bootstrap_jax_runtime
+
+bootstrap_jax_runtime()
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +65,40 @@ except Exception:
     pass
 
 Array = jnp.ndarray
+
+
+def init_real_mlp(key: Array, layer_sizes: Sequence[int]) -> Dict[str, Array]:
+    """
+    Initialize a real-valued MLP with Xavier-style Gaussian weights.
+    """
+    if len(layer_sizes) < 2:
+        raise ValueError("layer_sizes must contain at least an input and output size")
+
+    params: Dict[str, Array] = {}
+    keys = jax.random.split(key, len(layer_sizes) - 1)
+    for i, (m, n) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+        if m <= 0 or n <= 0:
+            raise ValueError("All layer sizes must be positive")
+        scale = jnp.sqrt(2.0 / float(m + n))
+        params[f"W{i}"] = scale * jax.random.normal(keys[i], (m, n), dtype=jnp.float64)
+        params[f"b{i}"] = jnp.zeros((n,), dtype=jnp.float64)
+    return params
+
+
+def mlp_apply(
+    params: Dict[str, Array],
+    x: Array,
+    *,
+    activation: Callable[[Array], Array] = jnp.tanh,
+) -> Array:
+    """Apply a real-valued MLP to a single feature vector."""
+    h = jnp.asarray(x, dtype=jnp.float64)
+    num_layers = len(params) // 2
+    for i in range(num_layers):
+        h = h @ params[f"W{i}"] + params[f"b{i}"]
+        if i < num_layers - 1:
+            h = activation(h)
+    return h
 
 
 # =============================================================================
@@ -180,7 +219,7 @@ class NonlocalClosure:
     """
     Hammett–Perkins / nonlocal closure "tail" coefficients.
 
-    The paper's Eq. (21) is typically written as a closure for the ghost coefficient C_{Nv}:
+    The paper's Eq. (21) is typically written as a closure for the unresolved tail coefficient C_{Nv}:
 
         C_{Nv} = sum_{j=0..Nm-1} i * mu_{Nv-Nm+j} * sign(k) * C_{Nv-Nm+j}
 
@@ -200,9 +239,442 @@ class NonlocalClosure:
         return int(self.mu_tail.shape[0])
 
 
+@dataclass(frozen=True)
+class LearnedInterfaceClosure:
+    """
+    Solver-embedded learned interface closure for the unresolved Hermite tail.
+
+    The model predicts the complex interface term q_k directly from the top resolved
+    Hermite window at each retained Fourier mode:
+
+        x_k = Std(Re z_k, Im z_k, |k|/k_scale, Nv/nv_scale, E, H_low) in R^(2*Nm+4)
+        q_k = UnStd(C_theta(x_k)) in C
+
+    Legacy checkpoints without the global indicators remain supported and use the
+    smaller feature vector Re z_k, Im z_k, |k|/k_scale, Nv/nv_scale.
+
+    The network is a linear shortcut branch plus a nonlinear residual MLP branch.
+    """
+    params: Dict[str, Array]
+    Nm: int
+    k_scale: float
+    nv_scale: float
+    input_mean: Array
+    input_std: Array
+    target_mean: Array
+    target_std: Array
+    hidden_width: int = 128
+    res_blocks: int = 2
+    Nv_targets: Optional[Tuple[int, ...]] = None
+    train_regimes: Optional[Tuple[str, ...]] = None
+    teacher_backend: Optional[str] = None
+    teacher_Lx: Optional[float] = None
+    teacher_Nx: Optional[int] = None
+    teacher_Nv: Optional[int] = None
+    teacher_vmin: Optional[float] = None
+    teacher_vmax: Optional[float] = None
+    teacher_dt: Optional[float] = None
+    teacher_proj_Nv: Optional[int] = None
+    include_global_indicators: bool = True
+    n_low: int = 2
+
+    def __post_init__(self) -> None:
+        if int(self.Nm) <= 0:
+            raise ValueError("Nm must be positive")
+        if int(self.hidden_width) <= 0:
+            raise ValueError("hidden_width must be positive")
+        if int(self.res_blocks) < 0:
+            raise ValueError("res_blocks must be nonnegative")
+        if float(self.k_scale) <= 0.0:
+            raise ValueError("k_scale must be positive")
+        if float(self.nv_scale) <= 0.0:
+            raise ValueError("nv_scale must be positive")
+        if int(self.n_low) < 0:
+            raise ValueError("n_low must be nonnegative")
+
+        input_dim = self.input_dim
+        input_mean = jnp.asarray(self.input_mean, dtype=jnp.float64)
+        input_std = jnp.asarray(self.input_std, dtype=jnp.float64)
+        target_mean = jnp.asarray(self.target_mean, dtype=jnp.float64)
+        target_std = jnp.asarray(self.target_std, dtype=jnp.float64)
+
+        if input_mean.shape != (input_dim,):
+            raise ValueError(f"input_mean must have shape ({input_dim},), got {input_mean.shape}")
+        if input_std.shape != (input_dim,):
+            raise ValueError(f"input_std must have shape ({input_dim},), got {input_std.shape}")
+        if target_mean.shape != (2,):
+            raise ValueError(f"target_mean must have shape (2,), got {target_mean.shape}")
+        if target_std.shape != (2,):
+            raise ValueError(f"target_std must have shape (2,), got {target_std.shape}")
+
+    @property
+    def input_dim(self) -> int:
+        base_dim = 2 * int(self.Nm) + 2
+        return base_dim + (2 if bool(self.include_global_indicators) else 0)
+
+    def standardized_inputs(self, x: Array) -> Array:
+        x = jnp.asarray(x, dtype=jnp.float64)
+        std = jnp.maximum(jnp.asarray(self.input_std, dtype=jnp.float64), 1e-12)
+        return (x - jnp.asarray(self.input_mean, dtype=jnp.float64)) / std
+
+    def unstandardized_targets(self, y: Array) -> Array:
+        y = jnp.asarray(y, dtype=jnp.float64)
+        std = jnp.maximum(jnp.asarray(self.target_std, dtype=jnp.float64), 1e-12)
+        return y * std + jnp.asarray(self.target_mean, dtype=jnp.float64)
+
+    def predict_standardized_components(self, raw_features: Array) -> Array:
+        feats = self.standardized_inputs(raw_features)
+        return jax.vmap(
+            lambda z: interface_closure_apply(
+                self.params,
+                z,
+                hidden_width=int(self.hidden_width),
+                res_blocks=int(self.res_blocks),
+            )
+        )(feats)
+
+    def predict_q_components(self, raw_features: Array) -> Array:
+        return self.unstandardized_targets(
+            self.predict_standardized_components(raw_features)
+        )
+
+
+def _xavier_normal(key: Array, shape: Tuple[int, int]) -> Array:
+    fan_in, fan_out = shape
+    scale = jnp.sqrt(2.0 / float(fan_in + fan_out))
+    return scale * jax.random.normal(key, shape, dtype=jnp.float64)
+
+
+def init_interface_closure_params(
+    key: Array,
+    *,
+    input_dim: int,
+    hidden_width: int = 128,
+    res_blocks: int = 2,
+) -> Dict[str, Array]:
+    """Initialize the linear-plus-residual interface-closure network."""
+    if int(input_dim) <= 0:
+        raise ValueError("input_dim must be positive")
+    if int(hidden_width) <= 0:
+        raise ValueError("hidden_width must be positive")
+    if int(res_blocks) < 0:
+        raise ValueError("res_blocks must be nonnegative")
+
+    keys = jax.random.split(key, 2 + (2 * int(res_blocks)) + 1)
+    idx = 0
+    params: Dict[str, Array] = {}
+    params["W_lin"] = _xavier_normal(keys[idx], (int(input_dim), 2)); idx += 1
+    params["b_lin"] = jnp.zeros((2,), dtype=jnp.float64)
+    params["W_in"] = _xavier_normal(keys[idx], (int(input_dim), int(hidden_width))); idx += 1
+    params["b_in"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
+    for block_idx in range(int(res_blocks)):
+        params[f"W1_{block_idx}"] = _xavier_normal(keys[idx], (int(hidden_width), int(hidden_width))); idx += 1
+        params[f"b1_{block_idx}"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
+        params[f"W2_{block_idx}"] = _xavier_normal(keys[idx], (int(hidden_width), int(hidden_width))); idx += 1
+        params[f"b2_{block_idx}"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
+    params["W_out"] = _xavier_normal(keys[idx], (int(hidden_width), 2))
+    params["b_out"] = jnp.zeros((2,), dtype=jnp.float64)
+    return params
+
+
+def interface_closure_apply(
+    params: Dict[str, Array],
+    x: Array,
+    *,
+    hidden_width: int = 128,
+    res_blocks: int = 2,
+) -> Array:
+    """Apply the shared residual interface-closure network to one standardized feature vector."""
+    del hidden_width  # encoded in parameter shapes
+    x = jnp.asarray(x, dtype=jnp.float64)
+    y_lin = x @ params["W_lin"] + params["b_lin"]
+    h = jax.nn.silu(x @ params["W_in"] + params["b_in"])
+    for block_idx in range(int(res_blocks)):
+        residual = jax.nn.silu(h @ params[f"W1_{block_idx}"] + params[f"b1_{block_idx}"])
+        residual = residual @ params[f"W2_{block_idx}"] + params[f"b2_{block_idx}"]
+        h = h + residual
+    y_nl = h @ params["W_out"] + params["b_out"]
+    return (y_lin + y_nl).astype(jnp.float64)
+
+
+def save_learned_interface_closure_npz(
+    path: str | os.PathLike[str],
+    learned: LearnedInterfaceClosure,
+) -> None:
+    """Save a learned interface-closure checkpoint in NPZ format."""
+    payload: Dict[str, np.ndarray] = {
+        "closure_kind": np.array(["interface_closure"], dtype=np.str_),
+        "Nm": np.array([int(learned.Nm)], dtype=np.int32),
+        "k_scale": np.array([float(learned.k_scale)], dtype=np.float64),
+        "nv_scale": np.array([float(learned.nv_scale)], dtype=np.float64),
+        "input_mean": np.asarray(learned.input_mean, dtype=np.float64),
+        "input_std": np.asarray(learned.input_std, dtype=np.float64),
+        "target_mean": np.asarray(learned.target_mean, dtype=np.float64),
+        "target_std": np.asarray(learned.target_std, dtype=np.float64),
+        "hidden_width": np.array([int(learned.hidden_width)], dtype=np.int32),
+        "res_blocks": np.array([int(learned.res_blocks)], dtype=np.int32),
+        "Nv_targets": np.array(
+            [] if learned.Nv_targets is None else learned.Nv_targets,
+            dtype=np.int32,
+        ),
+        "train_regimes": np.array(
+            [] if learned.train_regimes is None else learned.train_regimes,
+            dtype=np.str_,
+        ),
+        "teacher_backend": np.array(
+            [] if learned.teacher_backend is None else [learned.teacher_backend],
+            dtype=np.str_,
+        ),
+        "include_global_indicators": np.array([int(bool(learned.include_global_indicators))], dtype=np.int32),
+        "n_low": np.array([int(learned.n_low)], dtype=np.int32),
+    }
+    if learned.teacher_Lx is not None:
+        payload["teacher_Lx"] = np.array([float(learned.teacher_Lx)], dtype=np.float64)
+    if learned.teacher_Nx is not None:
+        payload["teacher_Nx"] = np.array([int(learned.teacher_Nx)], dtype=np.int32)
+    if learned.teacher_Nv is not None:
+        payload["teacher_Nv"] = np.array([int(learned.teacher_Nv)], dtype=np.int32)
+    if learned.teacher_vmin is not None:
+        payload["teacher_vmin"] = np.array([float(learned.teacher_vmin)], dtype=np.float64)
+    if learned.teacher_vmax is not None:
+        payload["teacher_vmax"] = np.array([float(learned.teacher_vmax)], dtype=np.float64)
+    if learned.teacher_dt is not None:
+        payload["teacher_dt"] = np.array([float(learned.teacher_dt)], dtype=np.float64)
+    if learned.teacher_proj_Nv is not None:
+        payload["teacher_proj_Nv"] = np.array([int(learned.teacher_proj_Nv)], dtype=np.int32)
+    for name, value in learned.params.items():
+        payload[name] = np.asarray(value, dtype=np.float64)
+    np.savez(path, **payload)
+
+
+def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedInterfaceClosure:
+    """Load a learned interface-closure checkpoint saved by `save_learned_interface_closure_npz`."""
+    with np.load(path) as data:
+        closure_kind = None
+        if "closure_kind" in data.files and data["closure_kind"].size:
+            closure_kind = str(np.asarray(data["closure_kind"]).reshape(-1)[0])
+        if closure_kind != "interface_closure":
+            raise ValueError(
+                f"Incompatible learned-closure checkpoint at {path}: expected interface_closure. "
+                "Legacy mu-tail checkpoints are no longer supported and must be retrained."
+            )
+
+        params = {
+            name: jnp.asarray(data[name], dtype=jnp.float64)
+            for name in data.files
+            if (
+                name.startswith("W")
+                or name.startswith("b")
+                or name in {"W_lin", "b_lin", "W_in", "b_in", "W_out", "b_out"}
+            )
+        }
+        if not params:
+            raise ValueError(f"No learned-closure parameters found in checkpoint: {path}")
+
+        Nm = int(np.asarray(data["Nm"]).reshape(-1)[0])
+        k_scale = float(np.asarray(data["k_scale"]).reshape(-1)[0])
+        nv_scale = float(np.asarray(data["nv_scale"]).reshape(-1)[0])
+        input_mean = jnp.asarray(data["input_mean"], dtype=jnp.float64)
+        input_std = jnp.asarray(data["input_std"], dtype=jnp.float64)
+        target_mean = jnp.asarray(data["target_mean"], dtype=jnp.float64)
+        target_std = jnp.asarray(data["target_std"], dtype=jnp.float64)
+        hidden_width = int(np.asarray(data["hidden_width"]).reshape(-1)[0])
+        res_blocks = int(np.asarray(data["res_blocks"]).reshape(-1)[0])
+
+        Nv_targets = None
+        if "Nv_targets" in data.files and data["Nv_targets"].size:
+            Nv_targets = tuple(int(v) for v in np.asarray(data["Nv_targets"], dtype=np.int32).tolist())
+
+        train_regimes = None
+        if "train_regimes" in data.files and data["train_regimes"].size:
+            train_regimes = tuple(str(v) for v in np.asarray(data["train_regimes"], dtype=np.str_).tolist())
+
+        teacher_backend = None
+        if "teacher_backend" in data.files and data["teacher_backend"].size:
+            teacher_backend = str(np.asarray(data["teacher_backend"], dtype=np.str_).reshape(-1)[0])
+
+        teacher_Lx = None if "teacher_Lx" not in data.files or not data["teacher_Lx"].size else float(np.asarray(data["teacher_Lx"]).reshape(-1)[0])
+        teacher_Nx = None if "teacher_Nx" not in data.files or not data["teacher_Nx"].size else int(np.asarray(data["teacher_Nx"]).reshape(-1)[0])
+        teacher_Nv = None if "teacher_Nv" not in data.files or not data["teacher_Nv"].size else int(np.asarray(data["teacher_Nv"]).reshape(-1)[0])
+        teacher_vmin = None if "teacher_vmin" not in data.files or not data["teacher_vmin"].size else float(np.asarray(data["teacher_vmin"]).reshape(-1)[0])
+        teacher_vmax = None if "teacher_vmax" not in data.files or not data["teacher_vmax"].size else float(np.asarray(data["teacher_vmax"]).reshape(-1)[0])
+        teacher_dt = None if "teacher_dt" not in data.files or not data["teacher_dt"].size else float(np.asarray(data["teacher_dt"]).reshape(-1)[0])
+        teacher_proj_Nv = None if "teacher_proj_Nv" not in data.files or not data["teacher_proj_Nv"].size else int(np.asarray(data["teacher_proj_Nv"]).reshape(-1)[0])
+        include_global_indicators = (
+            bool(np.asarray(data["include_global_indicators"]).reshape(-1)[0])
+            if "include_global_indicators" in data.files and data["include_global_indicators"].size
+            else input_mean.shape[0] == (2 * Nm + 4)
+        )
+        n_low = (
+            int(np.asarray(data["n_low"]).reshape(-1)[0])
+            if "n_low" in data.files and data["n_low"].size
+            else 2
+        )
+
+    return LearnedInterfaceClosure(
+        params=params,
+        Nm=Nm,
+        k_scale=k_scale,
+        nv_scale=nv_scale,
+        input_mean=input_mean,
+        input_std=input_std,
+        target_mean=target_mean,
+        target_std=target_std,
+        hidden_width=hidden_width,
+        res_blocks=res_blocks,
+        Nv_targets=Nv_targets,
+        train_regimes=train_regimes,
+        teacher_backend=teacher_backend,
+        teacher_Lx=teacher_Lx,
+        teacher_Nx=teacher_Nx,
+        teacher_Nv=teacher_Nv,
+        teacher_vmin=teacher_vmin,
+        teacher_vmax=teacher_vmax,
+        teacher_dt=teacher_dt,
+        teacher_proj_Nv=teacher_proj_Nv,
+        include_global_indicators=include_global_indicators,
+        n_low=n_low,
+    )
+
+
+def _hermitian_rfft_weights(nk: int) -> Array:
+    if int(nk) <= 0:
+        raise ValueError("nk must be positive")
+    weights = jnp.ones((int(nk),), dtype=jnp.float64)
+    if int(nk) > 2:
+        weights = weights.at[1:-1].set(2.0)
+    return weights
+
+
+def learned_closure_global_indicators(
+    a_hat: Array,
+    k_arr: Array,
+    *,
+    n_low: int,
+) -> Tuple[Array, Array]:
+    """
+    Return the low-cost global state summaries used by the learned interface closure:
+
+        E = sum_{k != 0} |E_k|^2
+        H_low = sum_k sum_{n=0}^{n_low} |C_{n,k}|^2
+
+    The sums are evaluated on the stored rFFT half-spectrum with Hermitian weights so
+    they remain comparable to the full-spectrum quantities for real-valued states.
+    """
+    a_hat = jnp.asarray(a_hat, dtype=jnp.complex128)
+    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    if a_hat.ndim != 2:
+        raise ValueError(f"a_hat must have shape (Nv, Nk), got {a_hat.shape}")
+    if k_arr.ndim != 1 or k_arr.shape[0] != a_hat.shape[1]:
+        raise ValueError(f"k_arr must have shape ({a_hat.shape[1]},), got {k_arr.shape}")
+    if int(n_low) < 0:
+        raise ValueError("n_low must be nonnegative")
+
+    weights = _hermitian_rfft_weights(a_hat.shape[1])
+
+    e_hat = jnp.zeros((a_hat.shape[1],), dtype=jnp.complex128)
+    if a_hat.shape[1] > 1:
+        e_hat = e_hat.at[1:].set(1j * a_hat[0, 1:] / k_arr[1:])
+    field_activity = jnp.sum(weights[1:] * (jnp.abs(e_hat[1:]) ** 2))
+
+    n_hi = min(int(n_low), int(a_hat.shape[0]) - 1)
+    low_energy = jnp.sum(weights[None, :] * (jnp.abs(a_hat[: n_hi + 1, :]) ** 2))
+    return field_activity.astype(jnp.float64), low_energy.astype(jnp.float64)
+
+
+def learned_interface_q_hat(
+    a_hat: Array,
+    k_arr: Array,
+    Nv: int,
+    learned: LearnedInterfaceClosure,
+) -> Array:
+    """
+    Return the learned interface term q_k on the rFFT half-spectrum.
+
+    In a real-valued simulation, the negative-k values are the conjugates of the
+    stored positive modes, so only the nonnegative rFFT entries need to be modeled
+    explicitly here.
+    """
+    Nv = int(Nv)
+    Nm = int(learned.Nm)
+    if Nm > Nv:
+        raise ValueError(f"Learned closure Nm={Nm} exceeds Nv={Nv}")
+
+    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    q_hat = jnp.zeros((k_arr.shape[0],), dtype=jnp.complex128)
+    if k_arr.shape[0] <= 1:
+        return q_hat
+
+    z = jnp.swapaxes(a_hat[Nv - Nm : Nv, 1:], 0, 1)
+    kappa = (jnp.abs(k_arr[1:]) / float(learned.k_scale))[:, None]
+    eta = jnp.full((z.shape[0], 1), float(Nv) / float(learned.nv_scale), dtype=jnp.float64)
+    feature_cols = [jnp.real(z), jnp.imag(z), kappa, eta]
+    if learned.include_global_indicators:
+        field_activity, low_energy = learned_closure_global_indicators(
+            a_hat,
+            k_arr,
+            n_low=int(learned.n_low),
+        )
+        globals_mat = jnp.broadcast_to(
+            jnp.array([field_activity, low_energy], dtype=jnp.float64)[None, :],
+            (z.shape[0], 2),
+        )
+        feature_cols.append(globals_mat)
+    raw_features = jnp.concatenate(feature_cols, axis=1)
+    pred = learned.predict_q_components(raw_features)
+    q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(jnp.complex128)
+    return q_hat.at[1:].set(q_nonzero)
+
+
+def learned_boundary_flux_hat(
+    a_hat: Array,
+    k_arr: Array,
+    Nv: int,
+    vth: float,
+    learned: LearnedInterfaceClosure,
+) -> Array:
+    """Return the learned Hermite-boundary interface contribution, nonzero only on the last row."""
+    del vth  # q_k is learned directly in physical units.
+    q_hat = learned_interface_q_hat(a_hat, k_arr, Nv, learned)
+    B_hat = jnp.zeros_like(a_hat, dtype=jnp.complex128)
+    return B_hat.at[int(Nv) - 1].set(q_hat)
+
+
 # =============================================================================
 # Core numerical building blocks
 # =============================================================================
+
+def e_hat_from_rho_hat(
+    rho_hat: Array,
+    k_arr: Array,
+    *,
+    poisson_sign: float = +1.0,
+) -> Array:
+    """Compute electric-field Fourier coefficients from density coefficients."""
+    rho_hat = jnp.asarray(rho_hat, dtype=jnp.complex128)
+    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    if rho_hat.ndim != 1:
+        raise ValueError(f"rho_hat must have shape (Nk,), got {rho_hat.shape}")
+    if k_arr.ndim != 1 or k_arr.shape[0] != rho_hat.shape[0]:
+        raise ValueError(f"k_arr must have shape ({rho_hat.shape[0]},), got {k_arr.shape}")
+
+    E_hat = jnp.zeros_like(rho_hat, dtype=jnp.complex128)
+    return E_hat.at[1:].set((float(poisson_sign) * 1j) * rho_hat[1:] / k_arr[1:])
+
+
+def e_hat_history_from_a_hat_history(
+    a_hat_hist: Array,
+    k_arr: Array,
+    *,
+    poisson_sign: float = +1.0,
+) -> Array:
+    """Convert an ``a_hat`` history of shape ``(Nt, Nv, Nk)`` into ``E_hat(t,k)``."""
+    a_hat_hist = jnp.asarray(a_hat_hist, dtype=jnp.complex128)
+    if a_hat_hist.ndim != 3:
+        raise ValueError(f"a_hat_hist must have shape (Nt, Nv, Nk), got {a_hat_hist.shape}")
+    return jax.vmap(
+        lambda a_hat: e_hat_from_rho_hat(a_hat[0], k_arr, poisson_sign=poisson_sign)
+    )(a_hat_hist)
 
 def rfft_x(u_phys: Array) -> Array:
     """Real FFT over x axis=1, returning complex128."""
@@ -215,6 +687,42 @@ def irfft_x(u_hat: Array, Nx: int) -> Array:
 # Backwards-compatible aliases (older drafts used leading underscores)
 _rfft_x = rfft_x
 _irfft_x = irfft_x
+
+
+def hermite_basis_phi_scaled(N: int, v: np.ndarray, vth: float = 1.0) -> np.ndarray:
+    """
+    Build the scaled AW Hermite basis φ_n^{(vth)}(v) on a velocity grid.
+
+    The recurrence matches the visualization helper used by the nonlinear JAX demos:
+
+        φ_n^{(vth)}(v) = (1 / vth) φ_n(v / vth)
+
+    where φ_0 is the unit-mass Gaussian.
+    """
+    if N < 0:
+        raise ValueError("N must be nonnegative")
+    if vth <= 0.0:
+        raise ValueError("vth must be positive")
+
+    v = np.asarray(v, dtype=float)
+    if N == 0:
+        return np.zeros((0, v.size), dtype=float)
+
+    xi = v / float(vth)
+    w = np.exp(-0.5 * xi ** 2) / (math.sqrt(2.0 * math.pi) * float(vth))
+
+    h = np.zeros((N, v.size), dtype=float)
+    h[0] = 1.0
+    if N > 1:
+        h[1] = xi
+    for n in range(1, N - 1):
+        h[n + 1] = (xi / math.sqrt(n + 1)) * h[n] - math.sqrt(n / (n + 1)) * h[n - 1]
+    return w * h
+
+
+def hermite_basis_phi(N: int, v: np.ndarray) -> np.ndarray:
+    """Build the unscaled AW Hermite basis φ_n(v) on a velocity grid."""
+    return hermite_basis_phi_scaled(N, v, vth=1.0)
 
 
 
@@ -252,7 +760,7 @@ def tridiag_solve(sub: Array, diag: Array, sup: Array, rhs: Array) -> Array:
         Solution of Ax=rhs.
     """
     N = rhs.shape[0]
-    z = jnp.array(0.0 + 0.0j, dtype=rhs.dtype)
+    z = jnp.zeros((), dtype=rhs.dtype)
 
     # Pad to length N for scan-friendly indexing.
     sub_p = jnp.concatenate([jnp.array([z], dtype=rhs.dtype), sub])      # (N,)
@@ -609,6 +1117,8 @@ class FourierHermiteIMEX:
         N_hat: Array,
         N_hat_prev: Array,
         *,
+        extra_hat: Optional[Array] = None,
+        extra_hat_prev: Optional[Array] = None,
         hermite_filter: Optional[Array] = None,
     ) -> Array:
         """
@@ -622,6 +1132,10 @@ class FourierHermiteIMEX:
             Explicit term at the current time.
         N_hat_prev : (Nv, Nk) complex
             Explicit term at the previous time.
+        extra_hat : Optional[(Nv, Nk)] complex
+            Additional explicit term, typically a learned Hermite-boundary flux.
+        extra_hat_prev : Optional[(Nv, Nk)] complex
+            Previous-step value of `extra_hat`.
         hermite_filter : Optional[(Nv,)]
             If provided, multiplies the updated a_hat by this per-mode factor.
 
@@ -632,8 +1146,15 @@ class FourierHermiteIMEX:
         dt = float(self.dt)
         dt_half = 0.5 * dt
 
+        if extra_hat is None:
+            extra_hat = jnp.zeros_like(a_hat)
+        if extra_hat_prev is None:
+            extra_hat_prev = jnp.zeros_like(a_hat)
+
         La = self.streaming_hat(a_hat)
-        rhs = a_hat + dt_half * La + dt * (1.5 * N_hat - 0.5 * N_hat_prev)
+        rhs = a_hat + dt_half * La + dt * (
+            1.5 * (N_hat + extra_hat) - 0.5 * (N_hat_prev + extra_hat_prev)
+        )
         rhs = self.apply_mask_hat(rhs)
 
         a_new = self.implicit_solve(rhs)
