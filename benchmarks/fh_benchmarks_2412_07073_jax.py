@@ -22,6 +22,7 @@ What this benchmark script covers
     * hypercollision ν sweep
     * filtering χ/Δt sweep
 - Optional: linear Landau damping time simulation using implicit midpoint/JFNK (Section 4.1 style)
+- Fig. 10-style nonlinear Landau damping phase-space snapshots for the classical closures
 
 Everything numerical is in JAX. Plotting uses matplotlib (CPU).
 
@@ -40,6 +41,10 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from vpml.jax_runtime import bootstrap_jax_runtime, print_jax_runtime_summary
+
+bootstrap_jax_runtime()
+
 try:
     import scipy.linalg as la
 except Exception:  # pragma: no cover
@@ -52,7 +57,6 @@ if _MPLCONFIG.exists():
     os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
 # Silence noisy XLA/JAX C++ warnings on macOS benchmark runs
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
@@ -60,14 +64,28 @@ import jax.scipy as jsp
 
 from vpml.core import (
     Array,
-    FourierHermiteIMEX,
-    HyperCollisions,
-    HouLiFilter,
-    NonlocalClosure,
     HermiteExponentialFilter,
-    implicit_midpoint_jfnk_step,
-    rfft_x,
+    HouLiFilter,
+    HyperCollisions,
+    LearnedInterfaceClosure,
+    NonlocalClosure,
+    hermite_basis_phi,
+    hermite_damping_term,
     irfft_x,
+    learned_boundary_flux_hat,
+    load_learned_interface_closure_npz,
+    rfft_x,
+    FourierHermiteIMEX,
+)
+from vpml.linear_landau import LinearLandauConfig, run_linear_landau_rollout
+from vpml.visualization.benchmarks import (
+    save_fig2_damping_profiles,
+    save_fig3_response_function,
+    save_fig4_eigenvalue_scan,
+    save_fig10_learned_comparison_phase_space,
+    save_fig10_nonlinear_landau_phase_space,
+    save_linear_landau_comparison as save_linear_landau_comparison_figure,
+    save_linear_landau_time,
 )
 
 try:
@@ -194,6 +212,7 @@ def build_linear_Q(
     k: float,
     gamma: Optional[np.ndarray] = None,
     mu_nm1: Optional[float] = None,
+    mu_tail: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Discrete linearized Vlasov–Poisson matrix Q used in the paper's Fig. 4/5 benchmark.
@@ -224,9 +243,19 @@ def build_linear_Q(
 
     Q[Nv - 1, Nv - 2] = 1j * k * math.sqrt(Nv - 1)
 
-    # Nm = 1 closure: C_Nv = i * mu * sign(k) * C_{Nv-1}
-    if mu_nm1 is not None:
-        Q[Nv - 1, Nv - 1] += -abs(k) * math.sqrt(Nv) * float(mu_nm1)
+    if mu_nm1 is not None and mu_tail is not None:
+        raise ValueError("Pass only one of mu_nm1 or mu_tail")
+
+    if mu_tail is None and mu_nm1 is not None:
+        mu_tail = np.array([mu_nm1], dtype=np.complex128)
+
+    if mu_tail is not None:
+        mu_tail = np.asarray(mu_tail, dtype=np.complex128)
+        Nm = int(mu_tail.shape[0])
+        if Nm > Nv:
+            raise ValueError(f"mu_tail length {Nm} exceeds Nv={Nv}")
+        cols = np.arange(Nv - Nm, Nv)
+        Q[Nv - 1, cols] += -abs(k) * math.sqrt(Nv) * mu_tail
 
     return Q
 
@@ -236,10 +265,11 @@ def least_damped_gamma_star(
     k: float,
     gamma: Optional[np.ndarray] = None,
     mu_nm1: Optional[float] = None,
+    mu_tail: Optional[np.ndarray] = None,
     tol: float = 1e-12,
 ) -> float:
     """Return the smallest positive real part among the discrete eigenvalues of Q."""
-    Q = build_linear_Q(Nv, k, gamma=gamma, mu_nm1=mu_nm1)
+    Q = build_linear_Q(Nv, k, gamma=gamma, mu_nm1=mu_nm1, mu_tail=mu_tail)
     vals = la.eigvals(Q) if la is not None else np.linalg.eigvals(Q)
     re = np.real(vals)
     pos = re[re > tol]
@@ -290,7 +320,7 @@ def modify_A_for_method(
     """
     Apply paper-style modifications:
       - dissipation: add i η_n to diagonal, with η_n = -gamma_n/k
-      - nonlocal closure: modify last row by substituting ghost C_{Nv}
+      - nonlocal closure: modify last row by substituting the unresolved tail coefficient C_{Nv}
     """
     Nv = A.shape[0]
     A2 = A
@@ -303,8 +333,10 @@ def modify_A_for_method(
 
     # Nonlocal closure -> last row modification (can make A dense in last row)
     if closure is not None:
-        Nm = closure.Nm
-        mu = closure.mu_tail.astype(jnp.float64)  # length Nm, corresponds to mu_{Nv-Nm..Nv-1}
+        mu = jnp.asarray(closure.mu_tail, dtype=jnp.complex128)
+        Nm = int(closure.Nm)
+        if Nm > Nv:
+            raise ValueError(f"Tail length {Nm} exceeds Nv={Nv}")
         signk = float(np.sign(k)) if k != 0.0 else 0.0
 
         row = A2[Nv - 1].copy()
@@ -337,7 +369,12 @@ def response_function_aw_Nv(
     c = float(np.sign(k)) / math.sqrt(2.0)
 
     A = advection_matrix_Abarbar(int(Nv))
-    A = modify_A_for_method(A, k=k, dissipation=dissipation, closure=closure)
+    A = modify_A_for_method(
+        A,
+        k=k,
+        dissipation=dissipation,
+        closure=closure,
+    )
 
     I = jnp.eye(int(Nv), dtype=jnp.complex128)
     M = (xi.astype(jnp.complex128) * I) - (c * A)
@@ -367,7 +404,12 @@ def response_function_aw_Nv_and_deriv(
     c = float(np.sign(k)) / math.sqrt(2.0)
 
     A = advection_matrix_Abarbar(int(Nv))
-    A = modify_A_for_method(A, k=k, dissipation=dissipation, closure=closure)
+    A = modify_A_for_method(
+        A,
+        k=k,
+        dissipation=dissipation,
+        closure=closure,
+    )
 
     I = jnp.eye(int(Nv), dtype=jnp.complex128)
     M = (xi.astype(jnp.complex128) * I) - (c * A)
@@ -403,7 +445,10 @@ def discrete_root_from_response(
     for _ in range(maxiter):
         Rv_j, dRv_j = response_function_aw_Nv_and_deriv(
             jnp.array(xi, dtype=jnp.complex128),
-            Nv=Nv, k=k, dissipation=dissipation, closure=closure,
+            Nv=Nv,
+            k=k,
+            dissipation=dissipation,
+            closure=closure,
         )
         Rv = complex(jax.device_get(Rv_j))
         dRv = complex(jax.device_get(dRv_j))
@@ -421,14 +466,16 @@ def discrete_root_from_response(
         xi_new = xi - step
         Rv_new = complex(jax.device_get(response_function_aw_Nv(jnp.array(xi_new, jnp.complex128),
                                                               Nv=Nv, k=k,
-                                                              dissipation=dissipation, closure=closure)))
+                                                              dissipation=dissipation,
+                                                              closure=closure)))
         F_new = Rv_new + k2
         while abs(F_new) > abs(F) and lam > 1e-3:
             lam *= 0.5
             xi_new = xi - lam * step
             Rv_new = complex(jax.device_get(response_function_aw_Nv(jnp.array(xi_new, jnp.complex128),
                                                                   Nv=Nv, k=k,
-                                                                  dissipation=dissipation, closure=closure)))
+                                                                  dissipation=dissipation,
+                                                                  closure=closure)))
             F_new = Rv_new + k2
 
         xi = xi_new
@@ -505,43 +552,7 @@ class Fig2DampingProfiles(Benchmark):
         return BenchmarkResult(self.name, payload)
 
     def plot(self, result: BenchmarkResult, outdir: Union[str, Path]) -> None:
-        outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
-
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
-
-        # (a) Nv=20
-        ax = axes[0]
-        n = result.payload["n_Nv20"]
-        keys = sorted([k for k in result.payload if k.startswith("hyper_Nv20_alpha")],
-                      key=lambda s: int(s.split("alpha")[1]))
-        for key in keys:
-            a = int(key.split("alpha")[1])
-            ax.semilogy(n, result.payload[key], label=fr"$\alpha={a}$")
-        ax.semilogy(n, result.payload["filt_Nv20"], "k--", lw=2, label=fr"$p={self.p}$")
-        ax.set_title(r"(a) Damping rate $N_v=20$")
-        ax.set_xlabel("nth Hermite moment")
-        ax.set_ylabel("damping rate")
-        ax.set_ylim(1e-7, 1.2)
-        ax.grid(True, alpha=0.3)
-        ax.legend(ncol=2, fontsize=9)
-
-        # (b) Nv=1000
-        ax = axes[1]
-        n = result.payload["n_Nv1000"]
-        keys = sorted([k for k in result.payload if k.startswith("hyper_Nv1000_alpha")],
-                      key=lambda s: int(s.split("alpha")[1]))
-        for key in keys:
-            a = int(key.split("alpha")[1])
-            ax.semilogy(n, result.payload[key], label=fr"$\alpha={a}$")
-        ax.semilogy(n, result.payload["filt_Nv1000"], "k--", lw=2, label=fr"$p={self.p}$")
-        ax.set_title(r"(b) Damping rate $N_v=10^3$")
-        ax.set_xlabel("nth Hermite moment")
-        ax.set_ylim(1e-16, 1.2)
-        ax.grid(True, alpha=0.3)
-        ax.legend(ncol=2, fontsize=9)
-
-        fig.savefig(outdir / "fig2_damping_profiles.png", dpi=200)
-        plt.close(fig)
+        save_fig2_damping_profiles(result.payload, p=self.p, outdir=outdir)
 
 
 # =============================================================================
@@ -560,6 +571,10 @@ class Fig3ResponseFunction(Benchmark):
     xi_min: float = 1e-2
     xi_max: float = 1e2
     n_xi: int = 100_000
+    n_xi_plot: int = 4_001
+    learned_checkpoint: Optional[str] = None
+    plot_floor: float = 1e-8
+    plot_ymax: float = 5e-1
 
     p: int = 36
 
@@ -593,9 +608,17 @@ class Fig3ResponseFunction(Benchmark):
 
     def run(self) -> BenchmarkResult:
         xi = np.logspace(np.log10(self.xi_min), np.log10(self.xi_max), self.n_xi)
+        xi_plot = np.logspace(np.log10(self.xi_min), np.log10(self.xi_max), self.n_xi_plot)
         xi_j = jnp.array(xi, dtype=jnp.float64)
+        xi_plot_j = jnp.array(xi_plot, dtype=jnp.float64)
+        if self.learned_checkpoint is not None:
+            raise ValueError(
+                "The learned interface closure is state-dependent and is not supported in fig3 "
+                "response-function benchmarks. Remove --learned-checkpoint and use time-domain rollouts instead."
+            )
 
         R_true = np.array(response_function_R(xi_j))  # complex
+        R_true_plot = np.array(response_function_R(xi_plot_j))  # complex
 
         def L2_err(R_approx: np.ndarray) -> float:
             diff = R_approx - R_true
@@ -648,33 +671,34 @@ class Fig3ResponseFunction(Benchmark):
         Nv = 12
         abs_err_curves: Dict[str, np.ndarray] = {}
 
-        R_tr = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k))(xi_j))
-        abs_err_curves["truncation"] = np.abs(R_tr - R_true)
+        R_tr = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k))(xi_plot_j))
+        abs_err_curves["truncation"] = np.abs(R_tr - R_true_plot)
 
         for a in [1, 2, 3, 4]:
             nu = self.table1_collisions_nu[Nv][a]
             diss = HyperCollisions(alpha=a, nu=nu, Nv=Nv)
-            R_h = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, dissipation=diss))(xi_j))
-            abs_err_curves[f"hyper_a{a}"] = np.abs(R_h - R_true)
+            R_h = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, dissipation=diss))(xi_plot_j))
+            abs_err_curves[f"hyper_a{a}"] = np.abs(R_h - R_true_plot)
 
         mu1 = self.table1_nonlocal_nm1_mu[Nv]
         clo1 = NonlocalClosure(mu_tail=jnp.array([mu1], dtype=jnp.float64))
-        R_nl1 = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, closure=clo1))(xi_j))
-        abs_err_curves["nonlocal_nm1"] = np.abs(R_nl1 - R_true)
+        R_nl1 = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, closure=clo1))(xi_plot_j))
+        abs_err_curves["nonlocal_nm1"] = np.abs(R_nl1 - R_true_plot)
 
         muNv1, muNv2, muNv3 = self.table1_nonlocal_nm3_mu[Nv]
         clo3 = NonlocalClosure(mu_tail=jnp.array([muNv3, muNv2, muNv1], dtype=jnp.float64))
-        R_nl3 = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, closure=clo3))(xi_j))
-        abs_err_curves["nonlocal_nm3"] = np.abs(R_nl3 - R_true)
+        R_nl3 = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, closure=clo3))(xi_plot_j))
+        abs_err_curves["nonlocal_nm3"] = np.abs(R_nl3 - R_true_plot)
 
         chi = self.table1_filter_chi_over_dt[Nv]
         filt = HouLiFilter(chi_over_dt=chi, Nv=Nv, p=self.p)
-        R_f = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, dissipation=filt))(xi_j))
-        abs_err_curves["filter"] = np.abs(R_f - R_true)
+        R_f = np.array(jax.vmap(lambda z: response_function_aw_Nv(z, Nv=Nv, k=self.k, dissipation=filt))(xi_plot_j))
+        abs_err_curves["filter"] = np.abs(R_f - R_true_plot)
 
         payload: Dict[str, np.ndarray] = {
             "Nv_list": np.array(Nv_list),
             "xi": xi,
+            "xi_plot": xi_plot,
             "R_true_real": np.real(R_true),
             "R_true_imag": np.imag(R_true),
         }
@@ -687,37 +711,17 @@ class Fig3ResponseFunction(Benchmark):
 
     def plot(self, result: BenchmarkResult, outdir: Union[str, Path]) -> None:
         outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
-        Nv_list = result.payload["Nv_list"]
-
-        # (a) convergence
-        fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
-        ax.semilogy(Nv_list, result.payload["err_truncation"], "o-", label="truncation")
-        for a in [1, 2, 3, 4]:
-            ax.semilogy(Nv_list, result.payload[f"err_hyper_a{a}"], "o-", label=fr"hyper $\alpha={a}$")
-        ax.semilogy(Nv_list, result.payload["err_nonlocal_nm1"], "o-", label=r"nonlocal $N_m=1$")
-        ax.semilogy(Nv_list, result.payload["err_nonlocal_nm3"], "o-", label=r"nonlocal $N_m=3$")
-        ax.semilogy(Nv_list, result.payload["err_filter"], "o-", label="filter")
-        ax.set_xlabel(r"$N_v$")
-        ax.set_ylabel(r"$\|R_{N_v}^{aw}-R\|_2$")
-        ax.set_title("Fig. 3(a) — response-function convergence (k=1)")
-        ax.grid(True, alpha=0.3)
-        ax.legend(ncol=2, fontsize=8)
-        fig.savefig(outdir / "fig3a_response_function_convergence.png", dpi=200)
-        plt.close(fig)
-
-        # (b) absolute error at Nv=12
-        xi = result.payload["xi"]
-        fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
-        for key in [k for k in result.payload if k.startswith("abs_err_")]:
-            label = key.replace("abs_err_", "")
-            ax.loglog(xi, result.payload[key], label=label)
-        ax.set_xlabel(r"$\xi$")
-        ax.set_ylabel(r"$|R_{12}^{aw}(\xi)-R(\xi)|$")
-        ax.set_title("Fig. 3(b) — absolute response-function error (Nv=12, k=1)")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
-        fig.savefig(outdir / "fig3b_response_function_abs_error_Nv12.png", dpi=200)
-        plt.close(fig)
+        save_fig3_response_function(
+            result.payload,
+            Nv_list=np.asarray(result.payload["Nv_list"], dtype=int),
+            xi_plot=np.asarray(result.payload["xi_plot"], dtype=float),
+            xi_min=self.xi_min,
+            xi_max=self.xi_max,
+            plot_floor=self.plot_floor,
+            plot_ymax=self.plot_ymax,
+            has_learned="err_learned" in result.payload,
+            outdir=outdir,
+        )
 
 
 # =============================================================================
@@ -729,6 +733,7 @@ class Fig4EigenvalueScan(Benchmark):
     name: str = "fig4_eigenvalue_scan"
     Nv: int = 20
     k_list: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
+    learned_checkpoint: Optional[str] = None
     p: int = 36
 
     mu_range: Tuple[float, float] = (-3.0, 0.0)
@@ -746,6 +751,11 @@ class Fig4EigenvalueScan(Benchmark):
     def run(self) -> BenchmarkResult:
         Nv = int(self.Nv)
         k_list = tuple(float(k) for k in self.k_list)
+        if self.learned_checkpoint is not None:
+            raise ValueError(
+                "The learned interface closure is state-dependent and is not supported in fig4 "
+                "eigenvalue benchmarks. Remove --learned-checkpoint and use time-domain rollouts instead."
+            )
 
         def rel_err(g_true: float, g_star: float) -> float:
             return 0.0 if abs(g_true) < 1e-14 else (g_true - g_star) / g_true
@@ -820,104 +830,349 @@ class Fig4EigenvalueScan(Benchmark):
 
     def plot(self, result: BenchmarkResult, outdir: Union[str, Path]) -> None:
         outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
-        k_list = result.payload["k_list"].tolist()
-        mu_vals = result.payload["mu_vals"]
-        chi_vals = result.payload["chi_vals"]
-        Nv = int(result.payload["Nv"][0])
-        y_label = r"$(\gamma-\gamma^*)/\gamma$"
-        y_ticks = [-1.0, -0.5, 0.0, 0.5, 1.0]
-        colors = {
-            0.5: "#1f77b4",
-            1.0: "#2ca02c",
-            1.5: "#d62728",
-            2.0: "#ff7f0e",
+        save_fig4_eigenvalue_scan(
+            result.payload,
+            Nv=int(result.payload["Nv"][0]),
+            k_list=tuple(float(k) for k in result.payload["k_list"].tolist()),
+            outdir=outdir,
+        )
+
+
+# =============================================================================
+# Fig. 10: nonlinear Landau damping phase-space snapshots
+# =============================================================================
+
+@dataclass(frozen=True)
+class NonlinearLandauParams:
+    Nx: int = 200
+    Nv: int = 300
+    L: float = 4.0 * math.pi
+    dt: float = 1e-2
+    T: float = 40.0
+    eps: float = 0.5
+    k0: float = 0.5
+    vth: float = 1.0
+    dealias_23: bool = False
+    poisson_sign: float = +1.0
+    snapshot_times: Tuple[float, ...] = (20.0, 40.0)
+    v_range: Tuple[float, float] = (-4.0, 4.0)
+    Nv_plot: int = 1000
+    vmin: float = 0.0
+    vmax: float = 0.5
+
+
+def _snapshot_indices(snapshot_times: Sequence[float], dt: float) -> np.ndarray:
+    return np.asarray([int(round(float(t) / float(dt))) for t in snapshot_times], dtype=np.int32)
+
+
+def _time_key(t: float) -> str:
+    t_str = f"{float(t):g}".replace("-", "m").replace(".", "p")
+    return f"t{t_str}"
+
+
+def run_nonlinear_landau_rollout_raw(
+    params: NonlinearLandauParams,
+    method: str,
+    *,
+    alpha: Optional[int] = None,
+    nu: Optional[float] = None,
+    chi_over_dt: Optional[float] = None,
+    mu: Optional[float] = None,
+    learned_closure: Optional[LearnedInterfaceClosure] = None,
+    return_state_history: bool = False,
+    history_stride: int = 1,
+) -> Dict[str, np.ndarray | Array]:
+    """
+    Advance nonlinear Landau damping with the shared Fourier-Hermite CNAB2 solver.
+
+    When `return_state_history=True`, this stores strided raw `a_hat` states for training.
+    """
+    closure = None
+    damping = None
+    if method == "hyper":
+        if alpha is None or nu is None:
+            raise ValueError("hyper method requires alpha and nu")
+        damping = HyperCollisions(alpha=int(alpha), nu=float(nu), Nv=int(params.Nv))
+    elif method == "filter":
+        if chi_over_dt is None:
+            raise ValueError("filter method requires chi_over_dt")
+        damping = HouLiFilter(chi_over_dt=float(chi_over_dt), Nv=int(params.Nv), p=36)
+    elif method == "nonlocal":
+        if mu is None:
+            raise ValueError("nonlocal method requires mu")
+        closure = NonlocalClosure(mu_tail=jnp.array([float(mu)], dtype=jnp.float64))
+    elif method == "learned":
+        if learned_closure is None:
+            raise ValueError("learned method requires learned_closure")
+    elif method != "truncation":
+        raise ValueError(f"Unknown nonlinear Landau method: {method}")
+
+    history_stride = max(int(history_stride), 1)
+
+    integ = FourierHermiteIMEX(
+        Nx=int(params.Nx),
+        Nv=int(params.Nv),
+        Lx=float(params.L),
+        dt=float(params.dt),
+        vth=float(params.vth),
+        dealias_23=bool(params.dealias_23),
+        closure=closure,
+    )
+    m_eq = jnp.zeros((int(params.Nv),), dtype=jnp.float64).at[0].set(1.0)
+    a_phys0 = jnp.zeros((int(params.Nv), int(params.Nx)), dtype=jnp.float64)
+    a_phys0 = a_phys0.at[0].set(float(params.eps) * jnp.cos(float(params.k0) * integ.x))
+    a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
+
+    damping_rates = None
+    if damping is not None:
+        damping_rates = damping.damping_rates().astype(jnp.float64)
+
+    def explicit_n_hat(a_hat: Array) -> Array:
+        a_phys = irfft_x(a_hat, int(params.Nx))
+        e_phys = integ.E_phys_from_a_hat(a_hat, poisson_sign=float(params.poisson_sign))
+        n_phys = jnp.zeros_like(a_phys)
+        n_phys = n_phys.at[1:].set(
+            -(integ.sqrt_n[1:, None] / float(params.vth))
+            * e_phys[None, :]
+            * (a_phys[:-1] + m_eq[:-1, None])
+        )
+        if damping_rates is not None:
+            n_phys = n_phys + hermite_damping_term(a_phys, damping_rates)
+        return integ.apply_mask_hat(rfft_x(n_phys))
+
+    n0 = explicit_n_hat(a_hat0)
+    b0 = (
+        learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned_closure)
+        if learned_closure is not None
+        else jnp.zeros_like(a_hat0)
+    )
+    nsteps = int(round(float(params.T) / float(params.dt)))
+    snap_steps = _snapshot_indices(params.snapshot_times, params.dt)
+    snaps0 = jnp.zeros((len(snap_steps), int(params.Nv), int(params.Nx)), dtype=jnp.float64)
+    if 0 in snap_steps:
+        snap0_idx = int(np.where(snap_steps == 0)[0][0])
+        snaps0 = snaps0.at[snap0_idx].set(irfft_x(a_hat0, int(params.Nx)))
+
+    hist_steps = np.arange(0, nsteps + 1, history_stride, dtype=np.int32)
+    if hist_steps[-1] != nsteps:
+        hist_steps = np.concatenate([hist_steps, np.array([nsteps], dtype=np.int32)])
+    hist0 = None
+    if return_state_history:
+        hist0 = jnp.zeros((len(hist_steps), int(params.Nv), int(integ.Nk)), dtype=jnp.complex128)
+        hist0 = hist0.at[0].set(a_hat0)
+
+    def maybe_store(snaps: Array, step_i: Array, a_hat_new: Array) -> Array:
+        a_phys_new = irfft_x(a_hat_new, int(params.Nx))
+        for j, snap_step in enumerate(snap_steps):
+            snaps = jax.lax.cond(
+                step_i == int(snap_step),
+                lambda s, arr=a_phys_new, idx=j: s.at[idx].set(arr),
+                lambda s: s,
+                snaps,
+            )
+        return snaps
+
+    def maybe_store_history(history: Array, step_i: Array, a_hat_new: Array) -> Array:
+        if not return_state_history:
+            return history
+        history = jax.lax.cond(
+            (step_i % history_stride) == 0,
+            lambda h: h.at[step_i // history_stride].set(a_hat_new),
+            lambda h: h,
+            history,
+        )
+        if int(hist_steps[-1]) != nsteps:
+            history = jax.lax.cond(
+                step_i == int(nsteps),
+                lambda h: h.at[len(hist_steps) - 1].set(a_hat_new),
+                lambda h: h,
+                history,
+            )
+        return history
+
+    def step(carry, i):
+        a_hat, n_prev, b_prev, snaps, history = carry
+        n_hat = explicit_n_hat(a_hat)
+        b_hat = (
+            learned_boundary_flux_hat(a_hat, integ.k_arr, integ.Nv, integ.vth, learned_closure)
+            if learned_closure is not None
+            else jnp.zeros_like(a_hat)
+        )
+        a_new = integ.step_cnab2(
+            a_hat,
+            n_hat,
+            n_prev,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev,
+        )
+        snaps = maybe_store(snaps, i, a_new)
+        history = maybe_store_history(history, i, a_new)
+        return (a_new, n_hat, b_hat, snaps, history), 0.0
+
+    (a_last, n_last, b_last, snaps_out, hist_out), _ = jax.lax.scan(
+        step,
+        (a_hat0, n0, b0, snaps0, hist0),
+        jnp.arange(1, nsteps + 1, dtype=jnp.int32),
+    )
+
+    raw: Dict[str, np.ndarray | Array] = {
+        "x": np.asarray(integ.x),
+        "snapshot_times": np.asarray(params.snapshot_times, dtype=float),
+        "snapshot_a_phys": np.asarray(snaps_out),
+        "m_eq": np.asarray(m_eq),
+        "k_arr": np.asarray(integ.k_arr, dtype=float),
+    }
+    if return_state_history and hist_out is not None:
+        raw["a_hat_hist"] = hist_out
+        raw["a_hat_hist_times"] = hist_steps.astype(float) * float(params.dt)
+    return raw
+
+
+def simulate_nonlinear_landau_method(
+    params: NonlinearLandauParams,
+    method: str,
+    *,
+    alpha: Optional[int] = None,
+    nu: Optional[float] = None,
+    chi_over_dt: Optional[float] = None,
+    mu: Optional[float] = None,
+    learned_closure: Optional[LearnedInterfaceClosure] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Nonlinear Landau damping in the shared Fourier-Hermite perturbation formulation.
+    """
+    raw = run_nonlinear_landau_rollout_raw(
+        params,
+        method,
+        alpha=alpha,
+        nu=nu,
+        chi_over_dt=chi_over_dt,
+        mu=mu,
+        learned_closure=learned_closure,
+        return_state_history=False,
+    )
+
+    x = np.asarray(raw["x"], dtype=float)
+    v = np.linspace(params.v_range[0], params.v_range[1], int(params.Nv_plot))
+    phi = hermite_basis_phi(int(params.Nv), v)
+    snaps_phys = np.asarray(raw["snapshot_a_phys"], dtype=float)
+    m_eq = np.asarray(raw["m_eq"], dtype=float)
+
+    out: Dict[str, np.ndarray] = {
+        "x": x,
+        "v": v,
+        "times": np.asarray(params.snapshot_times, dtype=float),
+    }
+    for idx, t in enumerate(params.snapshot_times):
+        full_f = (snaps_phys[idx] + m_eq[:, None]).T @ phi
+        out[f"f_{_time_key(float(t))}"] = full_f.T.astype(float)
+    return out
+
+
+@dataclass
+class Fig10NonlinearLandauPhaseSpace(Benchmark):
+    """
+    Paper-style Figure 10 layout without the unavailable reference-solution panel.
+    """
+    name: str = "fig10_nonlinear_landau_phase_space"
+    params: NonlinearLandauParams = field(default_factory=NonlinearLandauParams)
+    hyper_nu_a1: float = 0.55
+    hyper_nu_a2: float = 1.312
+    hyper_nu_a3: float = 2.013
+    filter_chi_over_dt: float = 12.228
+    nonlocal_mu_nm1: float = -1.017234
+
+    def run(self) -> BenchmarkResult:
+        params = self.params
+        method_specs = {
+            "truncation": dict(method="truncation"),
+            "nonlocal_nm1": dict(method="nonlocal", mu=self.nonlocal_mu_nm1),
+            "hyper_a1": dict(method="hyper", alpha=1, nu=self.hyper_nu_a1),
+            "hyper_a2": dict(method="hyper", alpha=2, nu=self.hyper_nu_a2),
+            "hyper_a3": dict(method="hyper", alpha=3, nu=self.hyper_nu_a3),
+            "filter": dict(method="filter", chi_over_dt=self.filter_chi_over_dt),
         }
-        titles = {
-            "a": r"(a) Nonlocal closure with $N_m = 1$" + "\nSmith [38]",
-            "b": r"(b) Artificial collisions $\alpha = 1$" + "\nLenard and Bernstein [29]",
-            "c": r"(c) Artificial collisions $\alpha = 2$" + "\nCamporeale et al. [23]",
-            "d": r"(d) Artificial collisions $\alpha = 3$",
-            "e": r"(e) Artificial collisions $\alpha = 4$",
-            "f": r"(f) Hou and Li [31] filter",
+
+        payload: Dict[str, np.ndarray] = {
+            "x": np.empty((0,), dtype=float),
+            "v": np.empty((0,), dtype=float),
+            "times": np.asarray(params.snapshot_times, dtype=float),
+        }
+        for name, spec in method_specs.items():
+            data = simulate_nonlinear_landau_method(params, **spec)
+            if payload["x"].size == 0:
+                payload["x"] = data["x"]
+                payload["v"] = data["v"]
+            for key, value in data.items():
+                if key in {"x", "v", "times"}:
+                    continue
+                payload[f"{name}_{key}"] = value
+        return BenchmarkResult(self.name, payload)
+
+    def plot(self, result: BenchmarkResult, outdir: Union[str, Path]) -> None:
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        save_fig10_nonlinear_landau_phase_space(
+            result.payload,
+            times=tuple(float(t) for t in np.asarray(result.payload["times"], dtype=float)),
+            vmin=float(self.params.vmin),
+            vmax=float(self.params.vmax),
+            time_key_fn=_time_key,
+            outdir=outdir,
+        )
+
+
+@dataclass
+class Fig10LearnedComparisonPhaseSpace(Benchmark):
+    """
+    Learned-vs-baseline nonlinear Landau phase-space comparison with four panels.
+    """
+    name: str = "fig10_learned_comparison_phase_space"
+    params: NonlinearLandauParams = field(default_factory=NonlinearLandauParams)
+    nonlocal_mu_nm1: float = -1.017234
+    learned_checkpoint: Optional[str] = None
+
+    def run(self) -> BenchmarkResult:
+        if self.learned_checkpoint is None:
+            raise ValueError("learned_checkpoint must be provided for fig10_learned_comparison")
+
+        params = self.params
+        learned_closure = load_learned_interface_closure_npz(self.learned_checkpoint)
+        method_specs = {
+            "nonlocal_nm1": dict(method="nonlocal", mu=self.nonlocal_mu_nm1),
+            "learned": dict(method="learned", learned_closure=learned_closure),
         }
 
-        def style_axis(ax: plt.Axes, *, xlabel: str, xlim: Tuple[float, float], xticks: Sequence[float]) -> None:
-            ax.axhline(0.0, color="0.45", lw=0.9, ls="--")
-            ax.set_xlim(*xlim)
-            ax.set_ylim(-1.2, 1.2)
-            ax.set_xticks(list(xticks))
-            ax.set_yticks(y_ticks)
-            ax.set_yticklabels([f"{tick:g}" for tick in y_ticks])
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(y_label)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
+        payload: Dict[str, np.ndarray] = {
+            "x": np.empty((0,), dtype=float),
+            "v": np.empty((0,), dtype=float),
+            "times": np.asarray(params.snapshot_times, dtype=float),
+        }
+        for name, spec in method_specs.items():
+            data = simulate_nonlinear_landau_method(params, **spec)
+            if payload["x"].size == 0:
+                payload["x"] = data["x"]
+                payload["v"] = data["v"]
+            for key, value in data.items():
+                if key in {"x", "v", "times"}:
+                    continue
+                payload[f"{name}_{key}"] = value
+        return BenchmarkResult(self.name, payload)
 
-        def draw_curves(ax: plt.Axes, x: np.ndarray, key_template: str, opt_template: str) -> None:
-            for k in k_list:
-                color = colors[float(k)]
-                ax.plot(x, result.payload[key_template.format(k=k)], color=color, lw=2.0, label=fr"$k={k:g}$")
-                ax.axvline(float(result.payload[opt_template.format(k=k)][0]), color=color, lw=1.2, ls="--", alpha=0.55)
-
-        fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
-        for k in k_list:
-            ax.plot(mu_vals, result.payload[f"err_nonlocal_k{k}"], color=colors[float(k)], lw=2.0, label=fr"$k={k:g}$")
-        ax.axvline(float(result.payload["mu_opt"][0]), color=colors[2.0], lw=1.2, ls="--", alpha=0.55)
-        style_axis(ax, xlabel=r"$\mu_{N_v-1}$", xlim=(-3.0, 0.0), xticks=[-3, -2, -1, 0])
-        ax.set_title(titles["a"], fontsize=12, pad=12)
-        ax.legend(loc="lower left")
-        fig.savefig(outdir / f"fig4a_nonlocal_scan_Nv{Nv}.png", dpi=200)
-        plt.close(fig)
-
-        for a, xlim, xticks, panel in [
-            (1, (0.0, 10.0), [0, 5, 10], "b"),
-            (2, (0.0, 25.0), [5, 10, 15, 20, 25], "c"),
-            (3, (0.0, 25.0), [5, 10, 15, 20, 25], "d"),
-            (4, (0.0, 20.0), [5, 10, 15, 20], "e"),
-        ]:
-            nu_vals = result.payload[f"nu_vals_a{a}"]
-            fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
-            draw_curves(ax, nu_vals, f"err_hyper_a{a}_k{{k}}", f"opt_hyper_a{a}_k{{k}}")
-            style_axis(ax, xlabel=r"$\nu$", xlim=xlim, xticks=xticks)
-            ax.set_title(titles[panel], fontsize=12, pad=12)
-            fig.savefig(outdir / f"fig4_hyper_a{a}_scan_Nv{Nv}.png", dpi=200)
-            plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
-        draw_curves(ax, chi_vals, "err_filter_k{k}", "opt_filter_k{k}")
-        style_axis(ax, xlabel=r"$\chi/\Delta t$", xlim=(0.0, 15.0), xticks=[5, 10, 15])
-        ax.set_title(titles["f"], fontsize=12, pad=12)
-        fig.savefig(outdir / f"fig4f_filter_scan_Nv{Nv}.png", dpi=200)
-        plt.close(fig)
-
-        fig, axes = plt.subplots(2, 3, figsize=(14, 10), constrained_layout=True)
-        axa, axb, axc, axd, axe, axf = axes.ravel()
-
-        for k in k_list:
-            axa.plot(mu_vals, result.payload[f"err_nonlocal_k{k}"], color=colors[float(k)], lw=2.0, label=fr"$k={k:g}$")
-        axa.axvline(float(result.payload["mu_opt"][0]), color=colors[2.0], lw=1.2, ls="--", alpha=0.55)
-        style_axis(axa, xlabel=r"$\mu_{N_v-1}$", xlim=(-3.0, 0.0), xticks=[-3, -2, -1, 0])
-        axa.set_title(titles["a"], fontsize=12, pad=12)
-        axa.legend(loc="lower left")
-
-        for ax, a, xlim, xticks, panel in [
-            (axb, 1, (0.0, 10.0), [0, 5, 10], "b"),
-            (axc, 2, (0.0, 25.0), [5, 10, 15, 20, 25], "c"),
-            (axd, 3, (0.0, 25.0), [5, 10, 15, 20, 25], "d"),
-            (axe, 4, (0.0, 20.0), [5, 10, 15, 20], "e"),
-        ]:
-            nu_vals = result.payload[f"nu_vals_a{a}"]
-            draw_curves(ax, nu_vals, f"err_hyper_a{a}_k{{k}}", f"opt_hyper_a{a}_k{{k}}")
-            style_axis(ax, xlabel=r"$\nu$", xlim=xlim, xticks=xticks)
-            ax.set_title(titles[panel], fontsize=12, pad=12)
-
-        draw_curves(axf, chi_vals, "err_filter_k{k}", "opt_filter_k{k}")
-        style_axis(axf, xlabel=r"$\chi/\Delta t$", xlim=(0.0, 15.0), xticks=[5, 10, 15])
-        axf.set_title(titles["f"], fontsize=12, pad=12)
-
-        fig.savefig(outdir / f"fig4_paper_style_Nv{Nv}.png", dpi=220)
-        plt.close(fig)
-
+    def plot(self, result: BenchmarkResult, outdir: Union[str, Path]) -> None:
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        save_fig10_learned_comparison_phase_space(
+            result.payload,
+            times=tuple(float(t) for t in np.asarray(result.payload["times"], dtype=float)),
+            vmin=float(self.params.vmin),
+            vmax=float(self.params.vmax),
+            time_key_fn=_time_key,
+            outdir=outdir,
+            baseline_name="nonlocal_nm1",
+            baseline_title=r"Nonlocal closure ($N_m=1$)",
+            learned_title="Learned interface closure",
+        )
 
 # =============================================================================
 # Optional: linear Landau damping time simulation using the shared IMEX integrator
@@ -941,12 +1196,14 @@ class LinearLandauTimeBenchmark(Benchmark):
     - "hyper": hypercollisions (alpha, nu)
     - "filter": Hou–Li filter (chi_over_dt, p)
     - "nonlocal": Nm=1 closure (mu)
+    - "learned": learned interface closure from a checkpoint
 
     Important
     ---------
     This benchmark is for comparing *time-domain* damping curves, not eigenvalue scans.
-    Unlike the nonlinear demos, it advances the linearized system with the paper-style
-    implicit-midpoint/JFNK method.
+    Classical methods use the paper-style implicit-midpoint/JFNK path. The learned
+    interface closure is advanced with the shared CNAB2 solver so the closure enters
+    through the same explicit interface-term insertion used in the nonlinear runs.
     """
     name: str = "linear_landau_time"
     method: str = "truncation"
@@ -955,6 +1212,7 @@ class LinearLandauTimeBenchmark(Benchmark):
     chi_over_dt: float = 7.56
     mu: float = -1.01
     p: int = 36
+    learned_checkpoint: Optional[str] = None
 
     Nv: int = 20
     Nx: int = 10
@@ -969,143 +1227,51 @@ class LinearLandauTimeBenchmark(Benchmark):
     gmres_restart: Optional[int] = None
     gmres_maxiter: Optional[int] = None
 
-    poisson_sign: float = -1.0  # often used in Landau damping conventions
+    poisson_sign: float = +1.0
 
     def run(self) -> BenchmarkResult:
-        dissipation = None
-        herm_filter = None
-        closure = None
-
-        if self.method == "hyper":
-            dissipation = HyperCollisions(alpha=self.alpha, nu=self.nu, Nv=self.Nv)
-        elif self.method == "filter":
-            dissipation = HouLiFilter(chi_over_dt=self.chi_over_dt, Nv=self.Nv, p=self.p)
-        elif self.method == "nonlocal":
-            closure = NonlocalClosure(mu_tail=jnp.array([self.mu], dtype=jnp.float64))
-        elif self.method == "truncation":
-            pass
-        else:
-            raise ValueError("Unknown method")
-
-        integ = FourierHermiteIMEX(Nx=self.Nx, Nv=self.Nv, Lx=self.L, dt=self.dt,
-                                   vth=1.0, dealias_23=False, closure=closure)
-
-        # Maxwellian equilibrium in this normalized basis: m0=1, others 0.
-        m = jnp.zeros((self.Nv,), dtype=jnp.float64).at[0].set(1.0)
-
-        # Initial condition: only a0 excited
-        a0 = jnp.zeros((self.Nx,), dtype=jnp.float64)
-        for k in self.modes:
-            a0 = a0 + jnp.cos(float(k) * integ.x)
-        a0 = float(self.eps) * a0
-
-        a_phys0 = jnp.zeros((self.Nv, self.Nx), dtype=jnp.float64).at[0].set(a0)
-        a_hat0 = rfft_x(a_phys0)
-
-        # Optional Hou–Li per-step factor (if we use filter as explicit multiplication instead of damping in N)
-        # For the paper's filter-as-damping interpretation, we keep it in dissipation (diagonal in N).
-        if isinstance(dissipation, HouLiFilter):
-            herm_filter = None
-
-        # Explicit term for *linear* Landau damping:
-        #   N_n = -sqrt(n) E * m_{n-1}   (drop E * a_{n-1} term as O(eps^2))
-        def explicit_N_hat(a_hat: Array) -> Array:
-            a_phys = irfft_x(a_hat, self.Nx)
-            E = integ.E_phys_from_a_hat(a_hat, poisson_sign=self.poisson_sign)
-
-            N_phys = jnp.zeros_like(a_phys)
-            N_phys = N_phys.at[1:].set(-integ.sqrt_n[1:, None] * E[None, :] * m[:-1, None])
-
-            if dissipation is not None:
-                gamma = dissipation.damping_rates().astype(jnp.float64)
-                N_phys = N_phys - gamma[:, None] * a_phys
-
-            return integ.apply_mask_hat(rfft_x(N_phys))
-
-        E0 = integ.E_phys_from_a_hat(a_hat0, poisson_sign=self.poisson_sign)
-        Ehat0 = jnp.fft.rfft(E0)
-
-        nsteps = int(round(float(self.T) / float(self.dt)))
-        times = np.linspace(0.0, nsteps * float(self.dt), nsteps + 1)
-
-        def full_rhs_hat(a_hat: Array) -> Array:
-            return integ.streaming_hat(a_hat) + explicit_N_hat(a_hat)
-        full_rhs_hat = jax.jit(full_rhs_hat)
-
-        a_curr = jnp.asarray(a_hat0, dtype=jnp.complex128)
-        Ehat_hist = [np.array(Ehat0)]
-        newton_hist = np.zeros(nsteps, dtype=float)
-        gmres_hist = np.zeros(nsteps, dtype=float)
-        residual_hist = np.zeros(nsteps, dtype=float)
-
-        for step_idx in range(nsteps):
-            predictor = a_curr + float(self.dt) * full_rhs_hat(a_curr)
-            a_next, solver_info = implicit_midpoint_jfnk_step(
-                a_curr,
-                full_rhs_hat,
-                self.dt,
-                initial_guess=predictor,
-                newton_tol=self.newton_tol,
-                gmres_tol=self.gmres_tol,
-                max_newton_iter=self.max_newton_iter,
-                gmres_restart=self.gmres_restart,
-                gmres_maxiter=self.gmres_maxiter,
-                post_step_filter=herm_filter,
-            )
-            E = integ.E_phys_from_a_hat(a_next, poisson_sign=self.poisson_sign)
-            Ehat_hist.append(np.array(jnp.fft.rfft(E)))
-            newton_hist[step_idx] = solver_info["newton_iters"]
-            gmres_hist[step_idx] = solver_info["gmres_iters"]
-            residual_hist[step_idx] = solver_info["residual_norm"]
-            a_curr = a_next
-
-        Ehat_hist = np.asarray(Ehat_hist)
-
-        # Extract |E_k| for k=0.5 and 1.5 (indices 1 and 3 for Nx=10, L=4π)
-        E05 = np.abs(Ehat_hist[:, 1])
-        E15 = np.abs(Ehat_hist[:, 3])
-
-        # Analytic damping rates (collisionless)
-        xi05 = solve_landau_root_xi(0.5)
-        xi15 = solve_landau_root_xi(1.5)
-        g05 = landau_gamma(0.5, xi05)
-        g15 = landau_gamma(1.5, xi15)
-
-        payload = {
-            "times": times,
-            "E_abs_k0p5": E05,
-            "E_abs_k1p5": E15,
-            "gamma_k0p5": np.array([g05]),
-            "gamma_k1p5": np.array([g15]),
-            "newton_iters": newton_hist,
-            "gmres_iters": gmres_hist,
-            "solver_residual_norm": residual_hist,
-        }
+        learned_closure = None
+        if self.method == "learned":
+            if self.learned_checkpoint is None:
+                raise ValueError("learned_checkpoint must be provided when method='learned'")
+            learned_closure = load_learned_interface_closure_npz(self.learned_checkpoint)
+        config = LinearLandauConfig(
+            method=self.method,
+            alpha=self.alpha,
+            nu=self.nu,
+            chi_over_dt=self.chi_over_dt,
+            mu=self.mu,
+            p=self.p,
+            Nv=self.Nv,
+            Nx=self.Nx,
+            L=self.L,
+            dt=self.dt,
+            T=self.T,
+            eps=self.eps,
+            modes=tuple(float(k) for k in self.modes),
+            poisson_sign=self.poisson_sign,
+            newton_tol=self.newton_tol,
+            gmres_tol=self.gmres_tol,
+            max_newton_iter=self.max_newton_iter,
+            gmres_restart=self.gmres_restart,
+            gmres_maxiter=self.gmres_maxiter,
+        )
+        payload = run_linear_landau_rollout(
+            config,
+            learned_closure=learned_closure,
+            solver_backend="cnab2" if self.method == "learned" else "jfnk",
+        )
         return BenchmarkResult(self.name + "_" + self.method, payload)
 
     def plot(self, result: BenchmarkResult, outdir: Union[str, Path]) -> None:
-        outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+        save_linear_landau_time(result.payload, method=self.method, outdir=outdir)
 
-        t = result.payload["times"]
-        E05 = result.payload["E_abs_k0p5"]
-        E15 = result.payload["E_abs_k1p5"]
-        g05 = float(result.payload["gamma_k0p5"][0])
-        g15 = float(result.payload["gamma_k1p5"][0])
 
-        fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
-        ax.semilogy(t, E05, label=r"$|E_{k=0.5}(t)|$")
-        ax.semilogy(t, E15, label=r"$|E_{k=1.5}(t)|$")
-
-        ax.semilogy(t, E05[0] * np.exp(g05 * t), "k--", lw=1.5, label=r"analytic $k=0.5$")
-        ax.semilogy(t, E15[0] * np.exp(g15 * t), "k:", lw=1.5, label=r"analytic $k=1.5$")
-
-        ax.set_xlabel("t")
-        ax.set_ylabel(r"$|E_k(t)|$")
-        ax.set_title(f"Linear Landau damping — implicit midpoint/JFNK, method={self.method}")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        fig.savefig(outdir / f"linear_landau_{self.method}.png", dpi=200)
-        plt.close(fig)
+def plot_linear_landau_comparison(
+    results: Dict[str, BenchmarkResult],
+    outdir: Union[str, Path],
+) -> None:
+    save_linear_landau_comparison_figure(results, outdir)
 
 
 # =============================================================================
@@ -1115,6 +1281,7 @@ class LinearLandauTimeBenchmark(Benchmark):
 def main():
     import argparse
 
+    print_jax_runtime_summary(jax, context="benchmarks")
     parser = argparse.ArgumentParser(description="JAX benchmarks for arXiv:2412.07073")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -1124,19 +1291,37 @@ def main():
     p3 = sub.add_parser("fig3", help="Response-function benchmarks (Fig. 3 style)")
     p3.add_argument("--outdir", type=str, default="out_bench")
     p3.add_argument("--n_xi", type=int, default=100_000)
+    p3.add_argument("--learned-checkpoint", type=str, default=None)
 
     p4 = sub.add_parser("fig4", help="Eigenvalue scan via discrete VP eigenvalues (Fig. 4/5 style)")
     p4.add_argument("--outdir", type=str, default="out_bench")
     p4.add_argument("--Nv", type=int, default=20)
+    p4.add_argument("--learned-checkpoint", type=str, default=None)
+
+    p10 = sub.add_parser("fig10", help="Classical nonlinear Landau phase-space snapshots (Fig. 10 style, no learned panel)")
+    p10.add_argument("--outdir", type=str, default="out_bench")
+    p10.add_argument("--Nx", type=int, default=200)
+    p10.add_argument("--Nv", type=int, default=300)
+    p10.add_argument("--dt", type=float, default=1e-2)
+    p10.add_argument("--T", type=float, default=40.0)
+
+    p10l = sub.add_parser("fig10_learned_comparison", help="Four-panel nonlinear Landau comparison: nonlocal vs learned")
+    p10l.add_argument("--outdir", type=str, default="out_bench")
+    p10l.add_argument("--Nx", type=int, default=200)
+    p10l.add_argument("--Nv", type=int, default=300)
+    p10l.add_argument("--dt", type=float, default=1e-2)
+    p10l.add_argument("--T", type=float, default=40.0)
+    p10l.add_argument("--learned-checkpoint", type=str, required=True)
 
     pl = sub.add_parser("linear_landau", help="Linear Landau damping time simulation via implicit midpoint/JFNK")
     pl.add_argument("--outdir", type=str, default="out_bench")
-    pl.add_argument("--method", choices=["truncation", "hyper", "filter", "nonlocal"], default="truncation")
+    pl.add_argument("--method", choices=["truncation", "hyper", "filter", "nonlocal", "learned"], default="truncation")
     pl.add_argument("--alpha", type=int, default=2)
     pl.add_argument("--nu", type=float, default=16.76)
     pl.add_argument("--chi_over_dt", type=float, default=7.56)
     pl.add_argument("--mu", type=float, default=-1.01)
     pl.add_argument("--T", type=float, default=40.0)
+    pl.add_argument("--learned-checkpoint", type=str, default=None)
 
     args = parser.parse_args()
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
@@ -1148,23 +1333,54 @@ def main():
         b.plot(res, outdir)
 
     elif args.cmd == "fig3":
-        b = Fig3ResponseFunction(n_xi=args.n_xi)
+        b = Fig3ResponseFunction(n_xi=args.n_xi, learned_checkpoint=args.learned_checkpoint)
         res = b.run()
         res.save_npz(outdir / "fig3_response_function.npz")
         b.plot(res, outdir)
 
     elif args.cmd == "fig4":
-        b = Fig4EigenvalueScan(Nv=args.Nv)
+        b = Fig4EigenvalueScan(Nv=args.Nv, learned_checkpoint=args.learned_checkpoint)
         res = b.run()
         res.save_npz(outdir / f"fig4_eigen_scan_Nv{args.Nv}.npz")
         b.plot(res, outdir)
 
+    elif args.cmd == "fig10":
+        p = NonlinearLandauParams(Nx=args.Nx, Nv=args.Nv, dt=args.dt, T=args.T)
+        b = Fig10NonlinearLandauPhaseSpace(params=p)
+        res = b.run()
+        res.save_npz(outdir / "fig10_nonlinear_landau_phase_space.npz")
+        b.plot(res, outdir)
+
+    elif args.cmd == "fig10_learned_comparison":
+        p = NonlinearLandauParams(Nx=args.Nx, Nv=args.Nv, dt=args.dt, T=args.T)
+        b = Fig10LearnedComparisonPhaseSpace(params=p, learned_checkpoint=args.learned_checkpoint)
+        res = b.run()
+        res.save_npz(outdir / "fig10_learned_vs_nonlocal_phase_space.npz")
+        b.plot(res, outdir)
+
     elif args.cmd == "linear_landau":
         b = LinearLandauTimeBenchmark(method=args.method, alpha=args.alpha, nu=args.nu,
-                                      chi_over_dt=args.chi_over_dt, mu=args.mu, T=args.T)
+                                      chi_over_dt=args.chi_over_dt, mu=args.mu, T=args.T,
+                                      learned_checkpoint=args.learned_checkpoint)
         res = b.run()
         res.save_npz(outdir / f"linear_landau_{args.method}.npz")
         b.plot(res, outdir)
+        if args.learned_checkpoint is not None:
+            comparison_results: Dict[str, BenchmarkResult] = {args.method: res}
+            for method in ["truncation", "hyper", "filter", "nonlocal", "learned"]:
+                if method in comparison_results:
+                    continue
+                bench = LinearLandauTimeBenchmark(
+                    method=method,
+                    alpha=args.alpha,
+                    nu=args.nu,
+                    chi_over_dt=args.chi_over_dt,
+                    mu=args.mu,
+                    T=args.T,
+                    learned_checkpoint=args.learned_checkpoint,
+                )
+                comparison_results[method] = bench.run()
+            plot_linear_landau_comparison(comparison_results, outdir)
 
 
 if __name__ == "__main__":
