@@ -6,6 +6,10 @@ JAX cubic spline interpolation. Teacher snapshots are projected onto the Fourier
 basis, and the learned target is
 
     q_k^* = -i k v_th sqrt(Nv) C_{Nv,k}^{HR}.
+
+Previous versions trained only the one-step interface regression target q_k^*. The
+current trainer preserves that q-only path and also supports a stability-aware mode
+that augments the supervised loss with short-horizon field and excess-tail penalties.
 """
 
 from __future__ import annotations
@@ -31,13 +35,18 @@ if _MPLCONFIG.exists():
 
 from vpml.core import (
     Array,
+    FourierHermiteIMEX,
     LearnedInterfaceClosure,
+    e_hat_from_rho_hat,
     init_interface_closure_params,
+    learned_boundary_flux_hat,
+    scale_learned_closure_raw_features,
     save_learned_interface_closure_npz,
 )
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     extract_interface_supervised_pairs_from_coeff_history,
+    extract_interface_rollout_windows_from_coeff_history,
     gaussian_pdf,
     hermite_dual_basis_scaled,
     normalize_density_on_grid,
@@ -55,7 +64,8 @@ REGIME_LINEAR = "linear_landau"
 REGIME_WEAK = "nonlinear_landau_weak"
 REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
-CACHE_FORMAT = "landau_interface_dataset_physical_teacher_v4"
+CACHE_FORMAT = "landau_interface_dataset_physical_teacher_v5"
+STABILITY_LOSS_DEFINITION = "window_hybrid_v1"
 
 
 def parse_int_tuple(text: str) -> Tuple[int, ...]:
@@ -97,6 +107,8 @@ def build_dataset_cache_metadata(
     Nm: int,
     val_fraction: float,
     n_low: int,
+    context_mode: str = "none",
+    rollout_horizon: int = 0,
     projection_mode: str = "shared_max",
     teacher_proj_Nv_targets: Optional[Sequence[int]] = None,
 ) -> Dict[str, np.ndarray]:
@@ -106,6 +118,8 @@ def build_dataset_cache_metadata(
         "n_low": np.array([int(n_low)], dtype=np.int32),
         "Nm": np.array([int(Nm)], dtype=np.int32),
         "Nv_targets": np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32),
+        "context_mode": np.array([str(context_mode)], dtype=np.str_),
+        "rollout_horizon": np.array([int(rollout_horizon)], dtype=np.int32),
         "projection_mode": np.array([str(projection_mode)], dtype=np.str_),
         "teacher_Nx": np.array([int(teacher_Nx)], dtype=np.int32),
         "teacher_Nv": np.array([int(teacher_Nv)], dtype=np.int32),
@@ -217,16 +231,60 @@ def append_pairs(
         accum[regime][f"{split}_targets"].append(payload["targets"])
 
 
+def append_rollout_windows(
+    accum: Dict[str, Dict[str, object]],
+    regime: str,
+    split: str,
+    windows_by_nv: Dict[int, Dict[str, np.ndarray]],
+) -> None:
+    bucket = accum[regime][f"{split}_rollout"]
+    assert isinstance(bucket, dict)
+    for Nv, payload in windows_by_nv.items():
+        target = bucket.setdefault(
+            int(Nv),
+            {
+                "prev_state": [],
+                "curr_state": [],
+                "future_state": [],
+                "future_E_hat": [],
+            },
+        )
+        for key in ("prev_state", "curr_state", "future_state", "future_E_hat"):
+            target[key].append(np.asarray(payload[key]))
+
+
 def finalize_regime_arrays(accum: Dict[str, Dict[str, list]]) -> Dict[str, Dict[str, np.ndarray]]:
     dataset: Dict[str, Dict[str, np.ndarray]] = {}
     for regime, payload in accum.items():
         if not payload["train_inputs_base"]:
             continue
+        train_rollout = {}
+        val_rollout = {}
+        train_rollout_bucket = payload["train_rollout"]
+        val_rollout_bucket = payload["val_rollout"]
+        assert isinstance(train_rollout_bucket, dict)
+        assert isinstance(val_rollout_bucket, dict)
+        for Nv, arrays in train_rollout_bucket.items():
+            train_rollout[int(Nv)] = {
+                key: np.concatenate(arrays[key], axis=0).astype(np.complex128)
+                if arrays[key]
+                else np.zeros((0,), dtype=np.complex128)
+                for key in ("prev_state", "curr_state", "future_state", "future_E_hat")
+            }
+        for Nv, arrays in val_rollout_bucket.items():
+            val_rollout[int(Nv)] = {
+                key: np.concatenate(arrays[key], axis=0).astype(np.complex128)
+                if arrays[key]
+                else np.zeros((0,), dtype=np.complex128)
+                for key in ("prev_state", "curr_state", "future_state", "future_E_hat")
+            }
         dataset[regime] = {
             "train_inputs_base": np.concatenate(payload["train_inputs_base"], axis=0).astype(np.float64),
             "train_targets": np.concatenate(payload["train_targets"], axis=0).astype(np.float64),
             "val_inputs_base": np.concatenate(payload["val_inputs_base"], axis=0).astype(np.float64),
             "val_targets": np.concatenate(payload["val_targets"], axis=0).astype(np.float64),
+            "train_rollout": train_rollout,
+            "val_rollout": val_rollout,
         }
     return dataset
 
@@ -326,30 +384,22 @@ def _run_landau_teacher_projected_histories(
     orders = tuple(sorted(int(order) for order in projection_orders))
     if not orders:
         raise ValueError("projection_orders must be nonempty")
-
-    v = config.v
-    equilibrium = maxwellian_equilibrium(v)
-    f0 = equilibrium[:, None] * (1.0 + jnp.asarray(perturbation_x, dtype=jnp.float64)[None, :])
-    raw = run_semilagrangian_vlasov_poisson(
-        config,
-        f0,
-        history_stride=history_stride,
-        return_state_history=True,
-        history_projector=_multi_projected_history_projector(
-            v,
-            orders,
-            equilibrium=equilibrium,
-            vth=1.0,
-        ),
-    )
-    stacked = np.asarray(raw["state_history"], dtype=np.complex128)
     histories: Dict[int, np.ndarray] = {}
-    start = 0
+    k_arr = None
     for order in orders:
-        stop = start + int(order)
-        histories[int(order)] = stacked[:, start:stop, :]
-        start = stop
-    return histories, np.asarray(raw["k_arr"], dtype=np.float64)
+        coeff_hist, order_k_arr = _run_landau_teacher_projected_history(
+            config,
+            perturbation_x,
+            projection_order=int(order),
+            history_stride=history_stride,
+        )
+        histories[int(order)] = coeff_hist
+        if k_arr is None:
+            k_arr = order_k_arr
+        elif not np.array_equal(order_k_arr, k_arr):
+            raise ValueError("Projected teacher histories returned inconsistent Fourier grids")
+    assert k_arr is not None
+    return histories, np.asarray(k_arr, dtype=np.float64)
 
 
 def build_linear_landau_regime(
@@ -372,6 +422,8 @@ def build_linear_landau_regime(
     history_stride: int,
     val_fraction: float,
     n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
     per_target_projection_orders: bool = False,
 ) -> Dict[str, np.ndarray]:
     config = PhysicalGridVlasovPoissonConfig(
@@ -387,6 +439,7 @@ def build_linear_landau_regime(
     )
     rng = np.random.default_rng(seed)
     x = np.asarray(config.x, dtype=np.float64)
+    use_rollout_windows = int(rollout_horizon) > 0
 
     accum = {
         REGIME_LINEAR: {
@@ -394,6 +447,8 @@ def build_linear_landau_regime(
             "train_targets": [],
             "val_inputs_base": [],
             "val_targets": [],
+            "train_rollout": {},
+            "val_rollout": {},
         }
     }
 
@@ -422,8 +477,23 @@ def build_linear_landau_regime(
                         vth=1.0,
                         include_global_indicators=True,
                         n_low=int(n_low),
+                        context_mode=context_mode,
                     ),
                 )
+                if use_rollout_windows:
+                    append_rollout_windows(
+                        accum,
+                        REGIME_LINEAR,
+                        "train",
+                        extract_interface_rollout_windows_from_coeff_history(
+                            train_hist,
+                            Nv_targets=(int(Nv),),
+                            Nm=Nm,
+                            k_arr=k_arr,
+                            vth=1.0,
+                            rollout_horizon=rollout_horizon,
+                        ),
+                    )
                 append_pairs(
                     accum,
                     REGIME_LINEAR,
@@ -436,8 +506,23 @@ def build_linear_landau_regime(
                         vth=1.0,
                         include_global_indicators=True,
                         n_low=int(n_low),
+                        context_mode=context_mode,
                     ),
                 )
+                if use_rollout_windows:
+                    append_rollout_windows(
+                        accum,
+                        REGIME_LINEAR,
+                        "val",
+                        extract_interface_rollout_windows_from_coeff_history(
+                            val_hist,
+                            Nv_targets=(int(Nv),),
+                            Nm=Nm,
+                            k_arr=k_arr,
+                            vth=1.0,
+                            rollout_horizon=rollout_horizon,
+                        ),
+                    )
         else:
             coeff_hist, k_arr = _run_landau_teacher_projected_history(
                 config,
@@ -458,8 +543,23 @@ def build_linear_landau_regime(
                     vth=1.0,
                     include_global_indicators=True,
                     n_low=int(n_low),
+                    context_mode=context_mode,
                 ),
             )
+            if use_rollout_windows:
+                append_rollout_windows(
+                    accum,
+                    REGIME_LINEAR,
+                    "train",
+                    extract_interface_rollout_windows_from_coeff_history(
+                        train_hist,
+                        Nv_targets=Nv_targets,
+                        Nm=Nm,
+                        k_arr=k_arr,
+                        vth=1.0,
+                        rollout_horizon=rollout_horizon,
+                    ),
+                )
             append_pairs(
                 accum,
                 REGIME_LINEAR,
@@ -472,8 +572,23 @@ def build_linear_landau_regime(
                     vth=1.0,
                     include_global_indicators=True,
                     n_low=int(n_low),
+                    context_mode=context_mode,
                 ),
             )
+            if use_rollout_windows:
+                append_rollout_windows(
+                    accum,
+                    REGIME_LINEAR,
+                    "val",
+                    extract_interface_rollout_windows_from_coeff_history(
+                        val_hist,
+                        Nv_targets=Nv_targets,
+                        Nm=Nm,
+                        k_arr=k_arr,
+                        vth=1.0,
+                        rollout_horizon=rollout_horizon,
+                    ),
+                )
     return finalize_regime_arrays(accum)[REGIME_LINEAR]
 
 
@@ -496,6 +611,8 @@ def build_nonlinear_landau_regime(
     history_stride: int,
     val_fraction: float,
     n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
     per_target_projection_orders: bool = False,
 ) -> Dict[str, np.ndarray]:
     config = PhysicalGridVlasovPoissonConfig(
@@ -510,12 +627,15 @@ def build_nonlinear_landau_regime(
         snapshot_times=(),
     )
     perturb_template = np.cos(float(k0) * np.asarray(config.x, dtype=np.float64))
+    use_rollout_windows = int(rollout_horizon) > 0
     accum = {
         regime_name: {
             "train_inputs_base": [],
             "train_targets": [],
             "val_inputs_base": [],
             "val_targets": [],
+            "train_rollout": {},
+            "val_rollout": {},
         }
     }
 
@@ -543,8 +663,23 @@ def build_nonlinear_landau_regime(
                         vth=1.0,
                         include_global_indicators=True,
                         n_low=int(n_low),
+                        context_mode=context_mode,
                     ),
                 )
+                if use_rollout_windows:
+                    append_rollout_windows(
+                        accum,
+                        regime_name,
+                        "train",
+                        extract_interface_rollout_windows_from_coeff_history(
+                            train_hist,
+                            Nv_targets=(int(Nv),),
+                            Nm=Nm,
+                            k_arr=k_arr,
+                            vth=1.0,
+                            rollout_horizon=rollout_horizon,
+                        ),
+                    )
                 append_pairs(
                     accum,
                     regime_name,
@@ -557,8 +692,23 @@ def build_nonlinear_landau_regime(
                         vth=1.0,
                         include_global_indicators=True,
                         n_low=int(n_low),
+                        context_mode=context_mode,
                     ),
                 )
+                if use_rollout_windows:
+                    append_rollout_windows(
+                        accum,
+                        regime_name,
+                        "val",
+                        extract_interface_rollout_windows_from_coeff_history(
+                            val_hist,
+                            Nv_targets=(int(Nv),),
+                            Nm=Nm,
+                            k_arr=k_arr,
+                            vth=1.0,
+                            rollout_horizon=rollout_horizon,
+                        ),
+                    )
         else:
             coeff_hist, k_arr = _run_landau_teacher_projected_history(
                 config,
@@ -579,8 +729,23 @@ def build_nonlinear_landau_regime(
                     vth=1.0,
                     include_global_indicators=True,
                     n_low=int(n_low),
+                    context_mode=context_mode,
                 ),
             )
+            if use_rollout_windows:
+                append_rollout_windows(
+                    accum,
+                    regime_name,
+                    "train",
+                    extract_interface_rollout_windows_from_coeff_history(
+                        train_hist,
+                        Nv_targets=Nv_targets,
+                        Nm=Nm,
+                        k_arr=k_arr,
+                        vth=1.0,
+                        rollout_horizon=rollout_horizon,
+                    ),
+                )
             append_pairs(
                 accum,
                 regime_name,
@@ -593,8 +758,23 @@ def build_nonlinear_landau_regime(
                     vth=1.0,
                     include_global_indicators=True,
                     n_low=int(n_low),
+                    context_mode=context_mode,
                 ),
             )
+            if use_rollout_windows:
+                append_rollout_windows(
+                    accum,
+                    regime_name,
+                    "val",
+                    extract_interface_rollout_windows_from_coeff_history(
+                        val_hist,
+                        Nv_targets=Nv_targets,
+                        Nm=Nm,
+                        k_arr=k_arr,
+                        vth=1.0,
+                        rollout_horizon=rollout_horizon,
+                    ),
+                )
     return finalize_regime_arrays(accum)[regime_name]
 
 
@@ -663,11 +843,38 @@ def load_dataset_cache(
         regimes = tuple(str(v) for v in np.asarray(data["regimes"], dtype=np.str_).tolist())
         dataset: Dict[str, Dict[str, np.ndarray]] = {}
         for regime in regimes:
+            train_rollout: Dict[int, Dict[str, np.ndarray]] = {}
+            val_rollout: Dict[int, Dict[str, np.ndarray]] = {}
+            rollout_prefix = f"{regime}_rollout_nv"
+            nv_suffixes = []
+            for name in data.files:
+                if not name.startswith(rollout_prefix):
+                    continue
+                remainder = name[len(rollout_prefix):]
+                nv_text = remainder.split("_", 1)[0]
+                if nv_text:
+                    nv_suffixes.append(int(nv_text))
+            nv_suffixes = sorted(set(nv_suffixes))
+            for Nv in nv_suffixes:
+                train_rollout[Nv] = {
+                    "prev_state": np.asarray(data[f"{regime}_rollout_nv{Nv}_train_prev_state"], dtype=np.complex128),
+                    "curr_state": np.asarray(data[f"{regime}_rollout_nv{Nv}_train_curr_state"], dtype=np.complex128),
+                    "future_state": np.asarray(data[f"{regime}_rollout_nv{Nv}_train_future_state"], dtype=np.complex128),
+                    "future_E_hat": np.asarray(data[f"{regime}_rollout_nv{Nv}_train_future_E_hat"], dtype=np.complex128),
+                }
+                val_rollout[Nv] = {
+                    "prev_state": np.asarray(data[f"{regime}_rollout_nv{Nv}_val_prev_state"], dtype=np.complex128),
+                    "curr_state": np.asarray(data[f"{regime}_rollout_nv{Nv}_val_curr_state"], dtype=np.complex128),
+                    "future_state": np.asarray(data[f"{regime}_rollout_nv{Nv}_val_future_state"], dtype=np.complex128),
+                    "future_E_hat": np.asarray(data[f"{regime}_rollout_nv{Nv}_val_future_E_hat"], dtype=np.complex128),
+                }
             dataset[regime] = {
                 "train_inputs_base": np.asarray(data[f"{regime}_train_inputs_base"], dtype=np.float64),
                 "train_targets": np.asarray(data[f"{regime}_train_targets"], dtype=np.float64),
                 "val_inputs_base": np.asarray(data[f"{regime}_val_inputs_base"], dtype=np.float64),
                 "val_targets": np.asarray(data[f"{regime}_val_targets"], dtype=np.float64),
+                "train_rollout": train_rollout,
+                "val_rollout": val_rollout,
             }
         return dataset
 
@@ -684,6 +891,14 @@ def save_dataset_cache(
         payload[f"{regime}_train_targets"] = np.asarray(arrays["train_targets"], dtype=np.float64)
         payload[f"{regime}_val_inputs_base"] = np.asarray(arrays["val_inputs_base"], dtype=np.float64)
         payload[f"{regime}_val_targets"] = np.asarray(arrays["val_targets"], dtype=np.float64)
+        for split in ("train", "val"):
+            rollout = arrays.get(f"{split}_rollout", {})
+            for Nv, window_payload in rollout.items():
+                prefix = f"{regime}_rollout_nv{int(Nv)}_{split}"
+                payload[f"{prefix}_prev_state"] = np.asarray(window_payload["prev_state"], dtype=np.complex128)
+                payload[f"{prefix}_curr_state"] = np.asarray(window_payload["curr_state"], dtype=np.complex128)
+                payload[f"{prefix}_future_state"] = np.asarray(window_payload["future_state"], dtype=np.complex128)
+                payload[f"{prefix}_future_E_hat"] = np.asarray(window_payload["future_E_hat"], dtype=np.complex128)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **payload)
 
@@ -708,15 +923,27 @@ def select_nv_targets_from_dataset(
             raise ValueError(
                 f"Requested Nv-targets={tuple(int(v) for v in nv_targets)} do not exist in cached train split for regime '{regime}'."
             )
-        if not np.any(val_mask):
-            raise ValueError(
-                f"Requested Nv-targets={tuple(int(v) for v in nv_targets)} do not exist in cached val split for regime '{regime}'."
-            )
         subset[regime] = {
             "train_inputs_base": train_inputs[train_mask].astype(np.float64),
             "train_targets": np.asarray(arrays["train_targets"], dtype=np.float64)[train_mask].astype(np.float64),
             "val_inputs_base": val_inputs[val_mask].astype(np.float64),
             "val_targets": np.asarray(arrays["val_targets"], dtype=np.float64)[val_mask].astype(np.float64),
+            "train_rollout": {
+                int(Nv): {
+                    key: np.asarray(payload[key])
+                    for key in ("prev_state", "curr_state", "future_state", "future_E_hat")
+                }
+                for Nv, payload in arrays.get("train_rollout", {}).items()
+                if int(Nv) in set(int(v) for v in nv_targets.tolist())
+            },
+            "val_rollout": {
+                int(Nv): {
+                    key: np.asarray(payload[key])
+                    for key in ("prev_state", "curr_state", "future_state", "future_E_hat")
+                }
+                for Nv, payload in arrays.get("val_rollout", {}).items()
+                if int(Nv) in set(int(v) for v in nv_targets.tolist())
+            },
         }
     return subset
 
@@ -749,6 +976,8 @@ def build_mixed_landau_dataset(
     Nm: int,
     val_fraction: float,
     n_low: int,
+    context_mode: str = "none",
+    rollout_horizon: int = 0,
     allow_cached_nv_superset: bool = False,
     per_target_projection_orders: bool = False,
 ) -> Dict[str, Dict[str, np.ndarray]]:
@@ -783,6 +1012,8 @@ def build_mixed_landau_dataset(
         Nm=Nm,
         val_fraction=val_fraction,
         n_low=n_low,
+        context_mode=context_mode,
+        rollout_horizon=rollout_horizon,
         projection_mode="per_target" if bool(per_target_projection_orders) else "shared_max",
         teacher_proj_Nv_targets=teacher_proj_Nv_targets,
     )
@@ -822,6 +1053,8 @@ def build_mixed_landau_dataset(
             history_stride=linear_history_stride,
             val_fraction=val_fraction,
             n_low=int(n_low),
+            context_mode=context_mode,
+            rollout_horizon=rollout_horizon,
             per_target_projection_orders=bool(per_target_projection_orders),
         )
     if REGIME_WEAK in active:
@@ -843,6 +1076,8 @@ def build_mixed_landau_dataset(
             history_stride=nonlinear_history_stride,
             val_fraction=val_fraction,
             n_low=int(n_low),
+            context_mode=context_mode,
+            rollout_horizon=rollout_horizon,
             per_target_projection_orders=bool(per_target_projection_orders),
         )
     if REGIME_STRONG in active:
@@ -864,6 +1099,8 @@ def build_mixed_landau_dataset(
             history_stride=nonlinear_history_stride,
             val_fraction=val_fraction,
             n_low=int(n_low),
+            context_mode=context_mode,
+            rollout_horizon=rollout_horizon,
             per_target_projection_orders=bool(per_target_projection_orders),
         )
 
@@ -872,13 +1109,33 @@ def build_mixed_landau_dataset(
     return dataset
 
 
-def build_model_inputs(inputs_base: np.ndarray, *, Nm: int, k_scale: float, nv_scale: float) -> np.ndarray:
+def build_model_inputs(
+    inputs_base: np.ndarray,
+    *,
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    context_mode: str,
+    include_global_indicators: bool = True,
+) -> np.ndarray:
     inputs = np.asarray(inputs_base, dtype=np.float64).copy()
     k_col = 2 * int(Nm)
     nv_col = k_col + 1
-    inputs[:, k_col] = inputs[:, k_col] / float(k_scale)
-    inputs[:, nv_col] = inputs[:, nv_col] / float(nv_scale)
-    return inputs
+    base_dim = 2 * int(Nm) + (4 if bool(include_global_indicators) else 2)
+    if context_mode == "none":
+        inputs[:, k_col] = inputs[:, k_col] / float(k_scale)
+        inputs[:, nv_col] = inputs[:, nv_col] / float(nv_scale)
+        return inputs
+    if context_mode == "lag1_delta":
+        current = inputs[:, :base_dim]
+        previous = inputs[:, base_dim : 2 * base_dim]
+        current[:, k_col] = current[:, k_col] / float(k_scale)
+        current[:, nv_col] = current[:, nv_col] / float(nv_scale)
+        previous[:, k_col] = previous[:, k_col] / float(k_scale)
+        previous[:, nv_col] = previous[:, nv_col] / float(nv_scale)
+        delta = current - previous
+        return np.concatenate([current, previous, delta], axis=1)
+    raise ValueError(f"Unsupported context_mode={context_mode!r}")
 
 
 def safe_feature_std(values: np.ndarray) -> np.ndarray:
@@ -902,18 +1159,33 @@ def prepare_training_dataset(
     Nm: int,
     k_scale: float,
     nv_scale: float,
+    context_mode: str,
 ) -> Tuple[Dict[str, Dict[str, Array]], Dict[str, np.ndarray]]:
     scaled_dataset: Dict[str, Dict[str, np.ndarray]] = {}
     train_inputs_all = []
     train_targets_all = []
     for regime, arrays in dataset_base.items():
-        train_inputs = build_model_inputs(arrays["train_inputs_base"], Nm=Nm, k_scale=k_scale, nv_scale=nv_scale)
-        val_inputs = build_model_inputs(arrays["val_inputs_base"], Nm=Nm, k_scale=k_scale, nv_scale=nv_scale)
+        train_inputs = build_model_inputs(
+            arrays["train_inputs_base"],
+            Nm=Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            context_mode=context_mode,
+        )
+        val_inputs = build_model_inputs(
+            arrays["val_inputs_base"],
+            Nm=Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            context_mode=context_mode,
+        )
         scaled_dataset[regime] = {
             "train_inputs": train_inputs,
             "train_targets": np.asarray(arrays["train_targets"], dtype=np.float64),
             "val_inputs": val_inputs,
             "val_targets": np.asarray(arrays["val_targets"], dtype=np.float64),
+            "train_rollout": arrays.get("train_rollout", {}),
+            "val_rollout": arrays.get("val_rollout", {}),
         }
         train_inputs_all.append(train_inputs)
         train_targets_all.append(np.asarray(arrays["train_targets"], dtype=np.float64))
@@ -934,6 +1206,24 @@ def prepare_training_dataset(
             "val_inputs": jnp.asarray(arrays["val_inputs"], dtype=jnp.float64),
             "val_targets": jnp.asarray(arrays["val_targets"], dtype=jnp.float64),
             "val_targets_std": jnp.asarray((arrays["val_targets"] - target_mean_row) / target_std_safe, dtype=jnp.float64),
+            "train_rollout": {
+                int(Nv): {
+                    "prev_state": jnp.asarray(payload["prev_state"], dtype=jnp.complex128),
+                    "curr_state": jnp.asarray(payload["curr_state"], dtype=jnp.complex128),
+                    "future_state": jnp.asarray(payload["future_state"], dtype=jnp.complex128),
+                    "future_E_hat": jnp.asarray(payload["future_E_hat"], dtype=jnp.complex128),
+                }
+                for Nv, payload in arrays.get("train_rollout", {}).items()
+            },
+            "val_rollout": {
+                int(Nv): {
+                    "prev_state": jnp.asarray(payload["prev_state"], dtype=jnp.complex128),
+                    "curr_state": jnp.asarray(payload["curr_state"], dtype=jnp.complex128),
+                    "future_state": jnp.asarray(payload["future_state"], dtype=jnp.complex128),
+                    "future_E_hat": jnp.asarray(payload["future_E_hat"], dtype=jnp.complex128),
+                }
+                for Nv, payload in arrays.get("val_rollout", {}).items()
+            },
         }
 
     stats = {
@@ -969,6 +1259,15 @@ def build_learned_interface_closure(
     teacher_dt: float,
     teacher_proj_Nv: int,
     n_low: int,
+    train_objective: str = "q_only",
+    context_mode: str = "none",
+    rollout_horizon: int = 0,
+    tail_start_fraction: float = 2.0 / 3.0,
+    lambda_q: float = 1.0,
+    lambda_E: float = 0.0,
+    lambda_tail: float = 0.0,
+    lambda_reg: float = 0.0,
+    stability_loss_definition: Optional[str] = None,
 ) -> LearnedInterfaceClosure:
     return LearnedInterfaceClosure(
         params=params,
@@ -993,6 +1292,21 @@ def build_learned_interface_closure(
         teacher_proj_Nv=int(teacher_proj_Nv),
         include_global_indicators=True,
         n_low=int(n_low),
+        train_objective=str(train_objective),
+        context_mode=str(context_mode),
+        context_lags=1 if str(context_mode) == "lag1_delta" else 0,
+        base_input_dim=2 * int(Nm) + 4,
+        rollout_horizon=int(rollout_horizon),
+        tail_start_fraction=float(tail_start_fraction),
+        lambda_q=float(lambda_q),
+        lambda_E=float(lambda_E),
+        lambda_tail=float(lambda_tail),
+        lambda_reg=float(lambda_reg),
+        stability_loss_definition=(
+            None
+            if stability_loss_definition is None
+            else str(stability_loss_definition)
+        ),
     )
 
 
@@ -1017,6 +1331,7 @@ def make_regime_balanced_loss(
     teacher_dt: float,
     teacher_proj_Nv: int,
     n_low: int,
+    context_mode: str,
 ):
     active_regimes = tuple(regime for regime in train_regimes if regime in prepared)
     weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
@@ -1042,6 +1357,8 @@ def make_regime_balanced_loss(
             teacher_dt=teacher_dt,
             teacher_proj_Nv=teacher_proj_Nv,
             n_low=n_low,
+            train_objective="q_only",
+            context_mode=context_mode,
         )
         losses = []
         for weight, regime in zip(weights, active_regimes):
@@ -1111,6 +1428,7 @@ def make_regime_balanced_batch_loss(
     teacher_dt: float,
     teacher_proj_Nv: int,
     n_low: int,
+    context_mode: str,
 ):
     active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
     weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
@@ -1140,6 +1458,8 @@ def make_regime_balanced_batch_loss(
             teacher_dt=teacher_dt,
             teacher_proj_Nv=teacher_proj_Nv,
             n_low=n_low,
+            train_objective="q_only",
+            context_mode=context_mode,
         )
         losses = []
         for weight, regime in zip(weights, active_regimes):
@@ -1215,6 +1535,526 @@ def train_with_minibatch_loss(
     return params, history
 
 
+def l2_regularization(params: Dict[str, Array]) -> Array:
+    return jnp.sum(
+        jnp.stack([jnp.sum(jnp.abs(value) ** 2) for value in jax.tree_util.tree_leaves(params)])
+    )
+
+
+def build_rollout_weights(H: int) -> np.ndarray:
+    if int(H) <= 0:
+        raise ValueError("rollout_horizon must be positive")
+    return np.asarray([1.0 / (2 ** idx) for idx in range(int(H))], dtype=np.float64)
+
+
+def tail_mode_weights(Nv: int, tail_start_fraction: float) -> np.ndarray:
+    start = min(int(math.ceil(float(tail_start_fraction) * float(Nv))), int(Nv) - 1)
+    count = int(Nv) - start
+    if count <= 0:
+        start = int(Nv) - 1
+        count = 1
+    ramp = np.linspace(0.0, 1.0, count, dtype=np.float64) ** 2
+    if count == 1:
+        ramp[...] = 1.0
+    return ramp
+
+
+def _rollout_k_weights(nk: int) -> Array:
+    weights = jnp.ones((int(nk),), dtype=jnp.float64)
+    if int(nk) > 2:
+        weights = weights.at[1:-1].set(2.0)
+    return weights
+
+
+def rollout_window_teacher_scales(
+    future_state: Array,
+    future_E_hat: Array,
+    *,
+    rollout_weights: Array,
+    tail_start_fraction: float,
+) -> Tuple[Array, Array]:
+    future_state = jnp.asarray(future_state, dtype=jnp.complex128)
+    future_E_hat = jnp.asarray(future_E_hat, dtype=jnp.complex128)
+    H = int(future_state.shape[0])
+    Nv = int(future_state.shape[1])
+    k_weights = _rollout_k_weights(int(future_state.shape[2]))
+    tail_start = min(int(math.ceil(float(tail_start_fraction) * float(Nv))), int(Nv) - 1)
+    tail_weights = jnp.asarray(tail_mode_weights(Nv, tail_start_fraction), dtype=jnp.float64)
+    weights = jnp.asarray(rollout_weights, dtype=jnp.float64)[:H]
+
+    field_energy_by_step = jnp.sum(
+        k_weights[None, 1:] * (jnp.abs(future_E_hat[:, 1:]) ** 2),
+        axis=1,
+    )
+    field_true_total = jnp.sum(weights * field_energy_by_step)
+
+    true_tail = jnp.abs(future_state[:, tail_start:, :]) ** 2
+    alpha = tail_weights[:, None] * k_weights[None, :]
+    tail_energy_by_step = jnp.sum(alpha[None, :, :] * (true_tail ** 2), axis=(1, 2))
+    tail_true_total = jnp.sum(weights * tail_energy_by_step)
+    return field_true_total, tail_true_total
+
+
+def rollout_window_hybrid_loss_from_sequences(
+    pred_future_state: Array,
+    pred_future_E_hat: Array,
+    future_state: Array,
+    future_E_hat: Array,
+    *,
+    rollout_weights: Array,
+    tail_start_fraction: float,
+    field_ref_scale: Array,
+    tail_ref_scale: Array,
+) -> Tuple[Array, Array]:
+    pred_future_state = jnp.asarray(pred_future_state, dtype=jnp.complex128)
+    pred_future_E_hat = jnp.asarray(pred_future_E_hat, dtype=jnp.complex128)
+    future_state = jnp.asarray(future_state, dtype=jnp.complex128)
+    future_E_hat = jnp.asarray(future_E_hat, dtype=jnp.complex128)
+
+    H = int(future_state.shape[0])
+    Nv = int(future_state.shape[1])
+    k_weights = _rollout_k_weights(int(future_state.shape[2]))
+    tail_start = min(int(math.ceil(float(tail_start_fraction) * float(Nv))), int(Nv) - 1)
+    tail_weights = jnp.asarray(tail_mode_weights(Nv, tail_start_fraction), dtype=jnp.float64)
+    weights = jnp.asarray(rollout_weights, dtype=jnp.float64)[:H]
+
+    field_num_by_step = jnp.sum(
+        k_weights[None, 1:] * (jnp.abs(pred_future_E_hat[:, 1:] - future_E_hat[:, 1:]) ** 2),
+        axis=1,
+    )
+    field_num_total = jnp.sum(weights * field_num_by_step)
+    field_true_total, tail_true_total = rollout_window_teacher_scales(
+        future_state,
+        future_E_hat,
+        rollout_weights=weights,
+        tail_start_fraction=tail_start_fraction,
+    )
+
+    pred_tail = jnp.abs(pred_future_state[:, tail_start:, :]) ** 2
+    true_tail = jnp.abs(future_state[:, tail_start:, :]) ** 2
+    excess = jnp.maximum(pred_tail - true_tail, 0.0)
+    alpha = tail_weights[:, None] * k_weights[None, :]
+    tail_num_by_step = jnp.sum(alpha[None, :, :] * (excess ** 2), axis=(1, 2))
+    tail_num_total = jnp.sum(weights * tail_num_by_step)
+
+    field_loss = field_num_total / (
+        field_true_total + jnp.asarray(field_ref_scale, dtype=jnp.float64) + 1e-30
+    )
+    tail_loss = tail_num_total / (
+        tail_true_total + jnp.asarray(tail_ref_scale, dtype=jnp.float64) + 1e-30
+    )
+    return field_loss, tail_loss
+
+
+def build_stability_rollout_reference_scales(
+    prepared: Dict[str, Dict[str, Array]],
+    *,
+    active_regimes: Sequence[str],
+    regime_rollout_nvs: Dict[str, Sequence[int]],
+    rollout_weights: Array,
+    tail_start_fraction: float,
+) -> Dict[str, Dict[int, Dict[str, Array]]]:
+    scales: Dict[str, Dict[int, Dict[str, Array]]] = {}
+    for regime in active_regimes:
+        scales[regime] = {}
+        for Nv in regime_rollout_nvs[regime]:
+            payload = prepared[regime]["train_rollout"][int(Nv)]
+            future_state = payload["future_state"]
+            future_E_hat = payload["future_E_hat"]
+            if int(future_state.shape[0]) == 0:
+                field_ref = jnp.asarray(0.0, dtype=jnp.float64)
+                tail_ref = jnp.asarray(0.0, dtype=jnp.float64)
+            else:
+                field_scales, tail_scales = jax.vmap(
+                    lambda states, e_hat: rollout_window_teacher_scales(
+                        states,
+                        e_hat,
+                        rollout_weights=rollout_weights,
+                        tail_start_fraction=tail_start_fraction,
+                    )
+                )(future_state, future_E_hat)
+                field_ref = jnp.mean(field_scales)
+                tail_ref = jnp.mean(tail_scales)
+            scales[regime][int(Nv)] = {
+                "field": jnp.asarray(field_ref, dtype=jnp.float64),
+                "tail": jnp.asarray(tail_ref, dtype=jnp.float64),
+            }
+    return scales
+
+
+def landau_explicit_n_hat(
+    a_hat: Array,
+    *,
+    integ: FourierHermiteIMEX,
+    m_eq: Array,
+    poisson_sign: float,
+) -> Array:
+    a_phys = jnp.fft.irfft(a_hat, n=int(integ.Nx), axis=1).astype(jnp.float64)
+    e_phys = integ.E_phys_from_a_hat(a_hat, poisson_sign=float(poisson_sign))
+    n_phys = jnp.zeros_like(a_phys)
+    n_phys = n_phys.at[1:].set(
+        -(integ.sqrt_n[1:, None] / float(integ.vth))
+        * e_phys[None, :]
+        * (a_phys[:-1] + m_eq[:-1, None])
+    )
+    return integ.apply_mask_hat(jnp.fft.rfft(n_phys, axis=1).astype(jnp.complex128))
+
+
+def rollout_window_loss_terms(
+    learned: LearnedInterfaceClosure,
+    *,
+    prev_state: Array,
+    curr_state: Array,
+    future_state: Array,
+    future_E_hat: Array,
+    integ: FourierHermiteIMEX,
+    m_eq: Array,
+    poisson_sign: float,
+    rollout_weights: Array,
+    tail_start_fraction: float,
+    field_ref_scale: Array,
+    tail_ref_scale: Array,
+) -> Tuple[Array, Array]:
+    H = int(future_state.shape[0])
+
+    n_prev = landau_explicit_n_hat(prev_state, integ=integ, m_eq=m_eq, poisson_sign=poisson_sign)
+    n_curr = landau_explicit_n_hat(curr_state, integ=integ, m_eq=m_eq, poisson_sign=poisson_sign)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_state,
+    )
+    b_curr = learned_boundary_flux_hat(
+        curr_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_state,
+    )
+
+    def body(carry, _step_idx):
+        a_prev, a_curr, n_prev, n_curr, b_prev, b_curr = carry
+        a_next = integ.step_cnab2(
+            a_curr,
+            n_curr,
+            n_prev,
+            extra_hat=b_curr,
+            extra_hat_prev=b_prev,
+        )
+        e_pred = e_hat_from_rho_hat(a_next[0], integ.k_arr, poisson_sign=float(poisson_sign))
+
+        n_next = landau_explicit_n_hat(a_next, integ=integ, m_eq=m_eq, poisson_sign=poisson_sign)
+        b_next = learned_boundary_flux_hat(
+            a_next,
+            integ.k_arr,
+            integ.Nv,
+            integ.vth,
+            learned,
+            a_hat_prev=a_curr,
+        )
+        next_carry = (a_curr, a_next, n_curr, n_next, b_curr, b_next)
+        return next_carry, (a_next, e_pred)
+
+    _, (pred_future_state, pred_future_E_hat) = jax.lax.scan(
+        body,
+        (prev_state, curr_state, n_prev, n_curr, b_prev, b_curr),
+        jnp.arange(H, dtype=jnp.int32),
+    )
+    return rollout_window_hybrid_loss_from_sequences(
+        pred_future_state,
+        pred_future_E_hat,
+        future_state,
+        future_E_hat,
+        rollout_weights=rollout_weights,
+        tail_start_fraction=tail_start_fraction,
+        field_ref_scale=field_ref_scale,
+        tail_ref_scale=tail_ref_scale,
+    )
+
+
+def make_stability_aware_batch_loss(
+    *,
+    prepared: Dict[str, Dict[str, Array]],
+    regime_weights: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    teacher_proj_Nv: int,
+    n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
+    tail_start_fraction: float,
+    lambda_q: float,
+    lambda_E: float,
+    lambda_tail: float,
+    lambda_reg: float,
+    rollout_dealias_23: bool,
+    poisson_sign: float,
+):
+    active_regimes = tuple(regime for regime in train_regimes if regime in prepared and regime in regime_weights)
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    rollout_weights = jnp.asarray(build_rollout_weights(int(rollout_horizon)), dtype=jnp.float64)
+    regime_rollout_nvs = {
+        regime: tuple(sorted(int(v) for v in prepared[regime]["train_rollout"].keys()))
+        for regime in active_regimes
+    }
+    rollout_reference_scales = build_stability_rollout_reference_scales(
+        prepared,
+        active_regimes=active_regimes,
+        regime_rollout_nvs=regime_rollout_nvs,
+        rollout_weights=rollout_weights,
+        tail_start_fraction=tail_start_fraction,
+    )
+    integrators = {
+        (regime, Nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx),
+            Nv=int(Nv),
+            Lx=float(teacher_Lx),
+            dt=float(teacher_dt),
+            vth=1.0,
+            dealias_23=bool(rollout_dealias_23),
+            closure=None,
+        )
+        for regime in active_regimes
+        for Nv in regime_rollout_nvs[regime]
+    }
+    m_eq = {
+        int(Nv): jnp.zeros((int(Nv),), dtype=jnp.float64).at[0].set(1.0)
+        for regime in active_regimes
+        for Nv in regime_rollout_nvs[regime]
+    }
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    lambda_q_arr = jnp.asarray(float(lambda_q), dtype=jnp.float64)
+    lambda_E_arr = jnp.asarray(float(lambda_E), dtype=jnp.float64)
+    lambda_tail_arr = jnp.asarray(float(lambda_tail), dtype=jnp.float64)
+    lambda_reg_arr = jnp.asarray(float(lambda_reg), dtype=jnp.float64)
+
+    def loss_fn(
+        params: Dict[str, Array],
+        batch_inputs: Dict[str, Array],
+        batch_targets_std: Dict[str, Array],
+        rollout_batches: Dict[str, Dict[int, Dict[str, Array]]],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        learned = build_learned_interface_closure(
+            params=params,
+            Nm=Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            stats=stats,
+            hidden_width=hidden_width,
+            res_blocks=res_blocks,
+            Nv_targets=Nv_targets,
+            train_regimes=train_regimes,
+            teacher_backend=teacher_backend,
+            teacher_Lx=teacher_Lx,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            teacher_proj_Nv=teacher_proj_Nv,
+            n_low=n_low,
+            train_objective="stability_aware",
+            context_mode=context_mode,
+            rollout_horizon=rollout_horizon,
+            tail_start_fraction=tail_start_fraction,
+            lambda_q=lambda_q,
+            lambda_E=lambda_E,
+            lambda_tail=lambda_tail,
+            lambda_reg=lambda_reg,
+            stability_loss_definition=STABILITY_LOSS_DEFINITION,
+        )
+        total_q = jnp.asarray(0.0, dtype=jnp.float64)
+        total_field = jnp.asarray(0.0, dtype=jnp.float64)
+        total_tail = jnp.asarray(0.0, dtype=jnp.float64)
+        for weight, regime in zip(weight_arr, active_regimes):
+            pred_std = learned.predict_standardized_components(batch_inputs[regime])
+            target_std = batch_targets_std[regime]
+            regime_q = jnp.mean((pred_std - target_std) ** 2)
+
+            regime_field = jnp.asarray(0.0, dtype=jnp.float64)
+            regime_tail = jnp.asarray(0.0, dtype=jnp.float64)
+            rollout_groups = rollout_batches[regime]
+            if rollout_groups:
+                field_terms = []
+                tail_terms = []
+                for Nv in regime_rollout_nvs[regime]:
+                    batch = rollout_groups[int(Nv)]
+                    if batch["prev_state"].shape[0] == 0:
+                        continue
+                    field_term, tail_term = jax.vmap(
+                        lambda prev_state, curr_state, future_state, future_E_hat: rollout_window_loss_terms(
+                            learned,
+                            prev_state=prev_state,
+                            curr_state=curr_state,
+                            future_state=future_state,
+                            future_E_hat=future_E_hat,
+                            integ=integrators[(regime, int(Nv))],
+                            m_eq=m_eq[int(Nv)],
+                            poisson_sign=poisson_sign,
+                            rollout_weights=rollout_weights,
+                            tail_start_fraction=tail_start_fraction,
+                            field_ref_scale=rollout_reference_scales[regime][int(Nv)]["field"],
+                            tail_ref_scale=rollout_reference_scales[regime][int(Nv)]["tail"],
+                        )
+                    )(
+                        batch["prev_state"],
+                        batch["curr_state"],
+                        batch["future_state"],
+                        batch["future_E_hat"],
+                    )
+                    field_terms.append(jnp.mean(field_term))
+                    tail_terms.append(jnp.mean(tail_term))
+                if field_terms:
+                    regime_field = jnp.mean(jnp.stack(field_terms))
+                    regime_tail = jnp.mean(jnp.stack(tail_terms))
+            total_q = total_q + weight * (lambda_q_arr * regime_q)
+            total_field = total_field + weight * (lambda_E_arr * regime_field)
+            total_tail = total_tail + weight * (lambda_tail_arr * regime_tail)
+        reg_term = lambda_reg_arr * l2_regularization(params)
+        total_loss = total_q + total_field + total_tail + reg_term
+        return total_loss, {
+            "q": total_q,
+            "field": total_field,
+            "tail": total_tail,
+            "reg": reg_term,
+        }
+
+    return loss_fn, active_regimes, regime_rollout_nvs
+
+
+def train_with_stability_aware_minibatch_loss(
+    params: Dict[str, Array],
+    prepared: Dict[str, Dict[str, Array]],
+    batch_loss_fn,
+    *,
+    active_regimes: Sequence[str],
+    regime_rollout_nvs: Dict[str, Sequence[int]],
+    epochs: int,
+    learning_rate: float,
+    grad_clip: Optional[float],
+    log_every: int,
+    batch_size: int,
+    rollout_batch_size: int,
+    steps_per_epoch: int,
+    seed: int,
+) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive for stability-aware training")
+    if int(rollout_batch_size) <= 0:
+        raise ValueError("rollout_batch_size must be positive for stability-aware training")
+    if int(steps_per_epoch) <= 0:
+        raise ValueError("steps_per_epoch must be positive for stability-aware training")
+
+    q_train_sizes = {
+        regime: int(prepared[regime]["train_inputs"].shape[0])
+        for regime in active_regimes
+    }
+    rollout_train_sizes = {
+        regime: {
+            int(Nv): int(prepared[regime]["train_rollout"][int(Nv)]["prev_state"].shape[0])
+            for Nv in regime_rollout_nvs[regime]
+        }
+        for regime in active_regimes
+    }
+    state = adam_init(params)
+    history = {
+        key: np.zeros((int(epochs),), dtype=np.float64)
+        for key in ("total", "q", "field", "tail", "reg")
+    }
+
+    @jax.jit
+    def train_step(
+        current_params: Dict[str, Array],
+        current_state: Dict[str, object],
+        batch_inputs: Dict[str, Array],
+        batch_targets_std: Dict[str, Array],
+        rollout_batches: Dict[str, Dict[int, Dict[str, Array]]],
+    ) -> Tuple[Dict[str, Array], Dict[str, object], Dict[str, Array]]:
+        (loss, aux), grads = jax.value_and_grad(batch_loss_fn, has_aux=True)(
+            current_params,
+            batch_inputs,
+            batch_targets_std,
+            rollout_batches,
+        )
+        next_params, next_state = adam_step(
+            current_params,
+            grads,
+            current_state,
+            learning_rate,
+            grad_clip=grad_clip,
+        )
+        aux = dict(aux)
+        aux["total"] = loss
+        return next_params, next_state, aux
+
+    rng = np.random.default_rng(int(seed))
+    for epoch in range(int(epochs)):
+        running = {
+            key: jnp.asarray(0.0, dtype=jnp.float64)
+            for key in ("total", "q", "field", "tail", "reg")
+        }
+        for _ in range(int(steps_per_epoch)):
+            batch_inputs = {}
+            batch_targets_std = {}
+            rollout_batches: Dict[str, Dict[int, Dict[str, Array]]] = {}
+            for regime in active_regimes:
+                idx = rng.integers(0, q_train_sizes[regime], size=int(batch_size), endpoint=False)
+                batch_inputs[regime] = prepared[regime]["train_inputs"][idx]
+                batch_targets_std[regime] = prepared[regime]["train_targets_std"][idx]
+                rollout_batches[regime] = {}
+                for Nv in regime_rollout_nvs[regime]:
+                    group = prepared[regime]["train_rollout"][int(Nv)]
+                    size = rollout_train_sizes[regime][int(Nv)]
+                    if size == 0:
+                        rollout_batches[regime][int(Nv)] = {
+                            "prev_state": group["prev_state"],
+                            "curr_state": group["curr_state"],
+                            "future_state": group["future_state"],
+                            "future_E_hat": group["future_E_hat"],
+                        }
+                        continue
+                    idx_roll = rng.integers(0, size, size=int(min(rollout_batch_size, size)), endpoint=False)
+                    rollout_batches[regime][int(Nv)] = {
+                        "prev_state": group["prev_state"][idx_roll],
+                        "curr_state": group["curr_state"][idx_roll],
+                        "future_state": group["future_state"][idx_roll],
+                        "future_E_hat": group["future_E_hat"][idx_roll],
+                    }
+            params, state, aux = train_step(params, state, batch_inputs, batch_targets_std, rollout_batches)
+            for key in running:
+                running[key] = running[key] + aux[key]
+        for key, values in history.items():
+            values[epoch] = float(running[key] / float(steps_per_epoch))
+        if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
+            print(
+                f"[train] epoch {epoch + 1:04d}/{int(epochs):04d} "
+                f"loss={history['total'][epoch]:.6e} "
+                f"q={history['q'][epoch]:.6e} "
+                f"field={history['field'][epoch]:.6e} "
+                f"tail={history['tail'][epoch]:.6e} "
+                f"reg={history['reg'][epoch]:.6e}"
+            )
+    return params, history
+
+
 def evaluate_regime_metrics(
     learned: LearnedInterfaceClosure,
     prepared: Dict[str, Dict[str, Array]],
@@ -1223,9 +2063,13 @@ def evaluate_regime_metrics(
     for regime, arrays in prepared.items():
         pred = np.asarray(learned.predict_q_components(arrays["val_inputs"]), dtype=np.float64)
         target = np.asarray(arrays["val_targets"], dtype=np.float64)
-        mse = float(np.mean((pred - target) ** 2))
-        denom = max(float(np.linalg.norm(target)), 1e-30)
-        rel_l2 = float(np.linalg.norm(pred - target) / denom)
+        if target.shape[0] == 0:
+            mse = float("nan")
+            rel_l2 = float("nan")
+        else:
+            mse = float(np.mean((pred - target) ** 2))
+            denom = max(float(np.linalg.norm(target)), 1e-30)
+            rel_l2 = float(np.linalg.norm(pred - target) / denom)
         metrics[f"val_q_mse_{regime}"] = np.array([mse], dtype=np.float64)
         metrics[f"val_q_rel_l2_{regime}"] = np.array([rel_l2], dtype=np.float64)
         metrics[f"val_num_samples_{regime}"] = np.array([target.shape[0]], dtype=np.int32)
@@ -1250,11 +2094,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=0)
+    parser.add_argument("--rollout-batch-size", type=int, default=32)
     parser.add_argument("--steps-per-epoch", type=int, default=0)
     parser.add_argument("--k-scale", type=float, default=None)
     parser.add_argument("--nv-scale", type=float, default=None)
     parser.add_argument("--n-low", type=int, default=2)
     parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--train-objective", type=str, default="q_only", choices=("q_only", "stability_aware"))
+    parser.add_argument("--context-mode", type=str, default="none", choices=("none", "lag1_delta"))
+    parser.add_argument("--rollout-horizon", type=int, default=2)
+    parser.add_argument("--tail-start-fraction", type=float, default=2.0 / 3.0)
+    parser.add_argument("--lambda-q", type=float, default=1.0)
+    parser.add_argument("--lambda-E", type=float, default=0.5)
+    parser.add_argument("--lambda-tail", type=float, default=0.05)
+    parser.add_argument("--lambda-reg", type=float, default=1e-6)
+    parser.add_argument("--rollout-dealias-23", action="store_true")
     parser.add_argument("--regimes", type=str, default="linear_landau,nonlinear_landau_weak,nonlinear_landau_strong")
     parser.add_argument("--weight-linear", type=float, default=1.0)
     parser.add_argument("--weight-weak", type=float, default=1.0)
@@ -1307,10 +2161,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     regimes = tuple(regime for regime in parse_str_tuple(args.regimes) if regime in ALL_REGIMES)
     if not regimes:
         raise ValueError("At least one valid training regime must be selected")
+    if args.train_objective == "stability_aware" and int(args.batch_size) <= 0:
+        raise ValueError("stability_aware training requires --batch-size > 0")
+    if args.train_objective == "stability_aware" and (float(args.lambda_E) <= 0.0 and float(args.lambda_tail) <= 0.0):
+        raise ValueError("stability_aware training requires lambda_E > 0 or lambda_tail > 0")
 
     teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
     if teacher_proj_Nv <= max(Nv_targets):
         raise ValueError("teacher-proj-Nv must exceed every target Nv")
+
+    dataset_rollout_horizon = (
+        int(args.rollout_horizon)
+        if args.train_objective == "stability_aware"
+        else 0
+    )
 
     dataset_base = build_mixed_landau_dataset(
         dataset_cache=args.dataset_cache,
@@ -1339,6 +2203,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         Nm=args.Nm,
         val_fraction=args.val_fraction,
         n_low=args.n_low,
+        context_mode=args.context_mode,
+        rollout_horizon=dataset_rollout_horizon,
         allow_cached_nv_superset=bool(args.allow_dataset_cache_nv_superset),
         per_target_projection_orders=bool(args.per_target_projection_orders),
     )
@@ -1352,13 +2218,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     k_scale = float(args.k_scale) if args.k_scale is not None else choose_k_scale(dataset_base, Nm=args.Nm)
     nv_scale = float(args.nv_scale) if args.nv_scale is not None else choose_nv_scale(dataset_base, Nm=args.Nm)
 
-    prepared, stats = prepare_training_dataset(dataset_base, Nm=args.Nm, k_scale=k_scale, nv_scale=nv_scale)
+    prepared, stats = prepare_training_dataset(
+        dataset_base,
+        Nm=args.Nm,
+        k_scale=k_scale,
+        nv_scale=nv_scale,
+        context_mode=args.context_mode,
+    )
     for regime, count in summarize_dataset(prepared).items():
         print(f"[data] {regime}: {count} training samples")
 
+    input_dim = int(stats["input_mean"].shape[0])
     params = init_interface_closure_params(
         jax.random.PRNGKey(args.seed),
-        input_dim=2 * int(args.Nm) + 4,
+        input_dim=input_dim,
         hidden_width=int(args.hidden_width),
         res_blocks=int(args.res_blocks),
     )
@@ -1367,7 +2240,59 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         REGIME_WEAK: float(args.weight_weak),
         REGIME_STRONG: float(args.weight_strong),
     }
-    if int(args.batch_size) > 0:
+    stability_component_history: Optional[Dict[str, np.ndarray]] = None
+    if args.train_objective == "stability_aware":
+        batch_loss_fn, active_regimes, regime_rollout_nvs = make_stability_aware_batch_loss(
+            prepared=prepared,
+            regime_weights=regime_weights,
+            Nm=args.Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            stats=stats,
+            hidden_width=args.hidden_width,
+            res_blocks=args.res_blocks,
+            Nv_targets=Nv_targets,
+            train_regimes=regimes,
+            teacher_backend="physical_grid_cubic_v1",
+            teacher_Lx=args.teacher_L,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            teacher_proj_Nv=teacher_proj_Nv,
+            n_low=args.n_low,
+            context_mode=args.context_mode,
+            rollout_horizon=args.rollout_horizon,
+            tail_start_fraction=args.tail_start_fraction,
+            lambda_q=args.lambda_q,
+            lambda_E=args.lambda_E,
+            lambda_tail=args.lambda_tail,
+            lambda_reg=args.lambda_reg,
+            rollout_dealias_23=bool(args.rollout_dealias_23),
+            poisson_sign=args.teacher_poisson_sign,
+        )
+        q_train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
+        steps_per_epoch = int(args.steps_per_epoch)
+        if steps_per_epoch <= 0:
+            steps_per_epoch = max(1, math.ceil(max(q_train_sizes) / float(args.batch_size)))
+        params, stability_component_history = train_with_stability_aware_minibatch_loss(
+            params,
+            prepared,
+            batch_loss_fn,
+            active_regimes=active_regimes,
+            regime_rollout_nvs=regime_rollout_nvs,
+            epochs=args.epochs,
+            learning_rate=args.lr,
+            grad_clip=args.grad_clip,
+            log_every=args.log_every,
+            batch_size=args.batch_size,
+            rollout_batch_size=args.rollout_batch_size,
+            steps_per_epoch=steps_per_epoch,
+            seed=args.seed,
+        )
+        loss_history = stability_component_history["total"]
+    elif int(args.batch_size) > 0:
         batch_loss_fn, active_regimes = make_regime_balanced_batch_loss(
             regime_weights=regime_weights,
             Nm=args.Nm,
@@ -1387,6 +2312,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             teacher_dt=args.teacher_dt,
             teacher_proj_Nv=teacher_proj_Nv,
             n_low=args.n_low,
+            context_mode=args.context_mode,
         )
         train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
         steps_per_epoch = int(args.steps_per_epoch)
@@ -1426,6 +2352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             teacher_dt=args.teacher_dt,
             teacher_proj_Nv=teacher_proj_Nv,
             n_low=args.n_low,
+            context_mode=args.context_mode,
         )
         params, loss_history = train_with_loss(
             params,
@@ -1455,6 +2382,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         teacher_dt=args.teacher_dt,
         teacher_proj_Nv=teacher_proj_Nv,
         n_low=args.n_low,
+        train_objective=args.train_objective,
+        context_mode=args.context_mode,
+        rollout_horizon=args.rollout_horizon if args.train_objective == "stability_aware" else 0,
+        tail_start_fraction=args.tail_start_fraction,
+        lambda_q=args.lambda_q,
+        lambda_E=args.lambda_E if args.train_objective == "stability_aware" else 0.0,
+        lambda_tail=args.lambda_tail if args.train_objective == "stability_aware" else 0.0,
+        lambda_reg=args.lambda_reg if args.train_objective == "stability_aware" else 0.0,
+        stability_loss_definition=(
+            STABILITY_LOSS_DEFINITION if args.train_objective == "stability_aware" else None
+        ),
     )
     val_metrics = evaluate_regime_metrics(learned, prepared)
 
@@ -1462,6 +2400,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     save_learned_interface_closure_npz(args.checkpoint, learned)
 
     metrics_path = args.checkpoint.with_suffix(".metrics.npz")
+    used_lambda_E = args.lambda_E if args.train_objective == "stability_aware" else 0.0
+    used_lambda_tail = args.lambda_tail if args.train_objective == "stability_aware" else 0.0
+    used_lambda_reg = args.lambda_reg if args.train_objective == "stability_aware" else 0.0
     metrics_payload: Dict[str, np.ndarray] = {
         "train_loss": loss_history,
         "Nm": np.array([args.Nm], dtype=np.int32),
@@ -1487,12 +2428,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "teacher_dt": np.array([args.teacher_dt], dtype=np.float64),
         "teacher_proj_Nv": np.array([teacher_proj_Nv], dtype=np.int32),
         "n_low": np.array([args.n_low], dtype=np.int32),
+        "train_objective": np.array([args.train_objective], dtype=np.str_),
+        "context_mode": np.array([args.context_mode], dtype=np.str_),
+        "rollout_horizon": np.array([args.rollout_horizon], dtype=np.int32),
+        "tail_start_fraction": np.array([args.tail_start_fraction], dtype=np.float64),
+        "lambda_q": np.array([args.lambda_q], dtype=np.float64),
+        "lambda_E": np.array([used_lambda_E], dtype=np.float64),
+        "lambda_tail": np.array([used_lambda_tail], dtype=np.float64),
+        "lambda_reg": np.array([used_lambda_reg], dtype=np.float64),
     }
+    if args.train_objective == "stability_aware":
+        assert stability_component_history is not None
+        metrics_payload["train_loss_q"] = np.asarray(stability_component_history["q"], dtype=np.float64)
+        metrics_payload["train_loss_field"] = np.asarray(stability_component_history["field"], dtype=np.float64)
+        metrics_payload["train_loss_tail"] = np.asarray(stability_component_history["tail"], dtype=np.float64)
+        metrics_payload["train_loss_reg"] = np.asarray(stability_component_history["reg"], dtype=np.float64)
+        metrics_payload["stability_loss_definition"] = np.array([STABILITY_LOSS_DEFINITION], dtype=np.str_)
     metrics_payload.update(val_metrics)
     np.savez(metrics_path, **metrics_payload)
 
     loss_plot_path = args.loss_plot if args.loss_plot is not None else args.checkpoint.with_suffix(".loss.png")
-    save_training_loss_plot(loss_history, loss_plot_path, val_metrics=val_metrics)
+    save_training_loss_plot(
+        loss_history,
+        loss_plot_path,
+        val_metrics=val_metrics,
+        train_objective=args.train_objective,
+    )
 
     print(f"Saved checkpoint to {args.checkpoint}")
     print(f"Saved metrics to {metrics_path}")

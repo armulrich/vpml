@@ -494,6 +494,7 @@ def extract_interface_supervised_pairs_from_coeff_history(
     vth: float,
     include_global_indicators: bool = True,
     n_low: int = 2,
+    context_mode: str = "none",
 ) -> Dict[int, Dict[str, np.ndarray]]:
     a_hat_hist = np.asarray(a_hat_hist, dtype=np.complex128)
     k_arr = np.asarray(k_arr, dtype=np.float64)
@@ -501,6 +502,8 @@ def extract_interface_supervised_pairs_from_coeff_history(
         raise ValueError(f"a_hat_hist must have shape (T, Nv_ref, Nk), got {a_hat_hist.shape}")
     if int(n_low) < 0:
         raise ValueError("n_low must be nonnegative")
+    if str(context_mode) not in {"none", "lag1_delta"}:
+        raise ValueError(f"Unsupported context_mode={context_mode!r}")
 
     out: Dict[int, Dict[str, np.ndarray]] = {}
     k_nonzero = k_arr[1:]
@@ -533,24 +536,107 @@ def extract_interface_supervised_pairs_from_coeff_history(
         tail = np.transpose(a_hat_hist[:, int(Nv) - int(Nm) : int(Nv), 1:], (0, 2, 1))
         q = (-1j * k_nonzero[None, :] * float(vth) * math.sqrt(float(Nv)) * a_hat_hist[:, int(Nv), 1:])
         nv_col = np.full((tail.shape[0], tail.shape[1], 1), float(Nv), dtype=np.float64)
-        pieces = [
+        base_pieces = [
             np.real(tail),
             np.imag(tail),
             np.broadcast_to(abs_k, (tail.shape[0], tail.shape[1], 1)),
             nv_col,
         ]
         if global_features is not None:
-            pieces.append(
+            base_pieces.append(
                 np.broadcast_to(
                     global_features[:, None, :],
                     (tail.shape[0], tail.shape[1], 2),
                 )
             )
-        inputs = np.concatenate(pieces, axis=-1)
+        base_inputs = np.concatenate(base_pieces, axis=-1)
         targets = np.stack([np.real(q), np.imag(q)], axis=-1)
-        input_dim = 2 * int(Nm) + (4 if include_global_indicators else 2)
+        base_dim = 2 * int(Nm) + (4 if include_global_indicators else 2)
+        if context_mode == "none":
+            inputs = base_inputs
+            targets_out = targets
+            input_dim = base_dim
+        else:
+            if base_inputs.shape[0] < 2:
+                inputs = np.zeros((0, base_inputs.shape[1], 3 * base_dim), dtype=np.float64)
+                targets_out = np.zeros((0, targets.shape[1], 2), dtype=np.float64)
+            else:
+                current = base_inputs[1:]
+                previous = base_inputs[:-1]
+                inputs = np.concatenate([current, previous, current - previous], axis=-1)
+                targets_out = targets[1:]
+            input_dim = 3 * base_dim
         out[int(Nv)] = {
             "inputs_base": inputs.reshape(-1, input_dim).astype(np.float64),
-            "targets": targets.reshape(-1, 2).astype(np.float64),
+            "targets": targets_out.reshape(-1, 2).astype(np.float64),
+        }
+    return out
+
+
+def extract_interface_rollout_windows_from_coeff_history(
+    a_hat_hist: np.ndarray,
+    *,
+    Nv_targets: Sequence[int],
+    Nm: int,
+    k_arr: np.ndarray,
+    vth: float,
+    rollout_horizon: int,
+) -> Dict[int, Dict[str, np.ndarray]]:
+    """
+    Extract short retained-state rollout windows for stability-aware closure training.
+
+    For each target Nv, windows are built from consecutive projected states
+
+        (a^{n-1}, a^n) -> {a^{n+1}, ..., a^{n+H}}
+
+    using the retained hierarchy only. Electric-field targets are stored explicitly
+    because they are used by the rollout-aware field penalty.
+    """
+    del Nm, vth  # retained-state windows depend only on projected coefficient history.
+    a_hat_hist = np.asarray(a_hat_hist, dtype=np.complex128)
+    k_arr = np.asarray(k_arr, dtype=np.float64)
+    H = int(rollout_horizon)
+    if a_hat_hist.ndim != 3:
+        raise ValueError(f"a_hat_hist must have shape (T, Nv_ref, Nk), got {a_hat_hist.shape}")
+    if H < 1:
+        raise ValueError("rollout_horizon must be positive")
+
+    out: Dict[int, Dict[str, np.ndarray]] = {}
+    for Nv in Nv_targets:
+        Nv = int(Nv)
+        if Nv >= a_hat_hist.shape[1]:
+            raise ValueError(
+                f"Target Nv={Nv} requires coefficient index {Nv}, but projection order={a_hat_hist.shape[1]}"
+            )
+        max_start = a_hat_hist.shape[0] - H
+        if max_start <= 1:
+            out[Nv] = {
+                "prev_state": np.zeros((0, Nv, a_hat_hist.shape[2]), dtype=np.complex128),
+                "curr_state": np.zeros((0, Nv, a_hat_hist.shape[2]), dtype=np.complex128),
+                "future_state": np.zeros((0, H, Nv, a_hat_hist.shape[2]), dtype=np.complex128),
+                "future_E_hat": np.zeros((0, H, a_hat_hist.shape[2]), dtype=np.complex128),
+            }
+            continue
+
+        prev_state = []
+        curr_state = []
+        future_state = []
+        future_E_hat = []
+        for n in range(1, max_start):
+            prev = a_hat_hist[n - 1, :Nv, :]
+            curr = a_hat_hist[n, :Nv, :]
+            future = a_hat_hist[n + 1 : n + 1 + H, :Nv, :]
+            e_hat_future = np.zeros((H, curr.shape[1]), dtype=np.complex128)
+            if curr.shape[1] > 1:
+                e_hat_future[:, 1:] = (1j * future[:, 0, 1:]) / k_arr[None, 1:]
+            prev_state.append(prev)
+            curr_state.append(curr)
+            future_state.append(future)
+            future_E_hat.append(e_hat_future)
+        out[Nv] = {
+            "prev_state": np.asarray(prev_state, dtype=np.complex128),
+            "curr_state": np.asarray(curr_state, dtype=np.complex128),
+            "future_state": np.asarray(future_state, dtype=np.complex128),
+            "future_E_hat": np.asarray(future_E_hat, dtype=np.complex128),
         }
     return out
