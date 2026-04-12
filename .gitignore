@@ -211,5 +211,9 @@ __marimo__/
 # Project outputs
 runs/
 figures/
+out_bench/
 *.npz
 *.png
+
+# Local scratch helpers
+scripts/train_and_benchmark_from_scratch.sh

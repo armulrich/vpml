@@ -19,6 +19,8 @@ dependencies = [
 [project.scripts]
 fh-nonlinear-sim = "benchmarks.fh_nonlinear_sim_jax:main"
 fh-benchmarks-2412-07073 = "benchmarks.fh_benchmarks_2412_07073_jax:main"
+fh-ml-tail-closure-train = "benchmarks.fh_ml_tail_closure_train_jax:main"
+fh-learned-closure-eval = "benchmarks.eval:main"
 
 [tool.setuptools.packages.find]
 include = ["vpml", "vpml.*", "benchmarks", "benchmarks.*"]
