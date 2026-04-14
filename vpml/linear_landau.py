@@ -95,10 +95,29 @@ def _resolve_method_components(
     raise ValueError(f"Unknown linear Landau method: {config.method}")
 
 
+def _linear_initial_perturbation(
+    config: LinearLandauConfig,
+    x: Array,
+    *,
+    perturbation_x: Optional[Array] = None,
+) -> Array:
+    if perturbation_x is not None:
+        arr = jnp.asarray(perturbation_x, dtype=jnp.float64)
+        if arr.shape != (int(config.Nx),):
+            raise ValueError(f"perturbation_x must have shape ({config.Nx},), got {arr.shape}")
+        return arr
+
+    a0 = jnp.zeros((config.Nx,), dtype=jnp.float64)
+    for k in config.modes:
+        a0 = a0 + jnp.cos(float(k) * x)
+    return float(config.eps) * a0
+
+
 def build_linear_landau_problem(
     config: LinearLandauConfig,
     *,
     learned_closure: Optional[LearnedInterfaceClosure] = None,
+    perturbation_x: Optional[Array] = None,
 ) -> Dict[str, object]:
     """Construct the common linear-Landau benchmark state and RHS."""
     dissipation, closure = _resolve_method_components(config, learned_closure)
@@ -113,11 +132,7 @@ def build_linear_landau_problem(
     )
 
     m_eq = jnp.zeros((config.Nv,), dtype=jnp.float64).at[0].set(1.0)
-    a0 = jnp.zeros((config.Nx,), dtype=jnp.float64)
-    for k in config.modes:
-        a0 = a0 + jnp.cos(float(k) * integ.x)
-    a0 = float(config.eps) * a0
-
+    a0 = _linear_initial_perturbation(config, integ.x, perturbation_x=perturbation_x)
     a_phys0 = jnp.zeros((config.Nv, config.Nx), dtype=jnp.float64).at[0].set(a0)
     a_hat0 = rfft_x(a_phys0)
 
@@ -197,6 +212,7 @@ def run_linear_landau_cnab2_raw(
     *,
     learned_closure: Optional[LearnedInterfaceClosure] = None,
     return_state_history: bool = False,
+    perturbation_x: Optional[Array] = None,
 ) -> Dict[str, np.ndarray | Array]:
     """Advance the linear Landau problem with the shared IMEX CNAB2 solver."""
     dissipation, closure = _resolve_method_components(config, learned_closure)
@@ -211,10 +227,7 @@ def run_linear_landau_cnab2_raw(
     )
 
     m_eq = jnp.zeros((config.Nv,), dtype=jnp.float64).at[0].set(1.0)
-    a0 = jnp.zeros((config.Nx,), dtype=jnp.float64)
-    for k in config.modes:
-        a0 = a0 + jnp.cos(float(k) * integ.x)
-    a0 = float(config.eps) * a0
+    a0 = _linear_initial_perturbation(config, integ.x, perturbation_x=perturbation_x)
     a_phys0 = jnp.zeros((config.Nv, config.Nx), dtype=jnp.float64).at[0].set(a0)
     a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
 

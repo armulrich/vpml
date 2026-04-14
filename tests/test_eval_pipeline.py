@@ -73,7 +73,7 @@ def _make_closure(
         res_blocks=res_blocks,
         Nv_targets=(4,),
         train_regimes=("linear_landau",),
-        teacher_backend="physical_grid_cubic_v1",
+        teacher_backend="grid_cubic_spline",
         teacher_Lx=4.0 * math.pi,
         teacher_Nx=16,
         teacher_Nv=32,

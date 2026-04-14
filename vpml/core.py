@@ -66,6 +66,18 @@ except Exception:
 
 Array = jnp.ndarray
 
+LEGACY_GRID_CUBIC_TEACHER_BACKEND = "physical_grid_cubic_v1"
+GRID_CUBIC_SPLINE_TEACHER_BACKEND = "grid_cubic_spline"
+HIGHER_ORDER_HERMITE_TEACHER_BACKEND = "higher_order_hermite"
+
+
+def normalize_teacher_backend_name(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    if str(name) == LEGACY_GRID_CUBIC_TEACHER_BACKEND:
+        return GRID_CUBIC_SPLINE_TEACHER_BACKEND
+    return str(name)
+
 
 def init_real_mlp(key: Array, layer_sizes: Sequence[int]) -> Dict[str, Array]:
     """
@@ -459,7 +471,9 @@ def save_learned_interface_closure_npz(
             dtype=np.str_,
         ),
         "teacher_backend": np.array(
-            [] if learned.teacher_backend is None else [learned.teacher_backend],
+            []
+            if learned.teacher_backend is None
+            else [normalize_teacher_backend_name(learned.teacher_backend)],
             dtype=np.str_,
         ),
         "include_global_indicators": np.array([int(bool(learned.include_global_indicators))], dtype=np.int32),
@@ -540,7 +554,9 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
 
         teacher_backend = None
         if "teacher_backend" in data.files and data["teacher_backend"].size:
-            teacher_backend = str(np.asarray(data["teacher_backend"], dtype=np.str_).reshape(-1)[0])
+            teacher_backend = normalize_teacher_backend_name(
+                str(np.asarray(data["teacher_backend"], dtype=np.str_).reshape(-1)[0])
+            )
 
         teacher_Lx = None if "teacher_Lx" not in data.files or not data["teacher_Lx"].size else float(np.asarray(data["teacher_Lx"]).reshape(-1)[0])
         teacher_Nx = None if "teacher_Nx" not in data.files or not data["teacher_Nx"].size else int(np.asarray(data["teacher_Nx"]).reshape(-1)[0])

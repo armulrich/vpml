@@ -1,11 +1,11 @@
 # JAX Fourier–Hermite Vlasov–Poisson 
 
-This repo exposes the reusable Fourier–Hermite implementation and the shared physical-grid semi-Lagrangian solver as an importable `vpml` package and keeps the runnable scripts under `benchmarks/`.
+This repo exposes the reusable Fourier–Hermite implementation and the shared grid-cubic-spline semi-Lagrangian solver as an importable `vpml` package and keeps the runnable scripts under `benchmarks/`.
 
-- `vpml/`: importable Fourier–Hermite core operators plus the shared physical-grid semi-Lagrangian solver
-- `benchmarks/fh_nonlinear_sim_jax.py`: nonlinear two-stream and bump-on-tail runs on the shared physical-grid solver
+- `vpml/`: importable Fourier–Hermite core operators plus the shared grid-cubic-spline semi-Lagrangian solver
+- `benchmarks/fh_nonlinear_sim_jax.py`: nonlinear two-stream and bump-on-tail runs on the shared grid-cubic-spline solver
 - `benchmarks/fh_benchmarks_2412_07073_jax.py`: linear benchmarks reproducing key figures from Palisso et al. (arXiv:2412.07073)
-- `benchmarks/fh_ml_tail_closure_train_jax.py`: training entrypoint for the learned interface closure using a physical-grid Landau teacher
+- `benchmarks/fh_ml_tail_closure_train_jax.py`: training entrypoint for the learned interface closure using either a `grid_cubic_spline` or `higher_order_hermite` Landau teacher
 - `benchmarks/eval.py`: post-train a posteriori metric evaluation for learned closures
 - `benchmarks/run_all_benchmarks.sh`: shell entry point for the full benchmark suite
 
@@ -152,7 +152,7 @@ This writes:
 
 - `interface_closure.npz`: learned interface-closure weights, normalization stats, and metadata
 - `interface_closure.metrics.npz`: single-stage training loss plus split validation metrics
-- `interface_closure_dataset.npz`: optional cached mixed Landau-family supervised pairs generated from the physical-grid teacher
+- `interface_closure_dataset.npz`: optional cached mixed Landau-family supervised pairs generated from the selected training teacher
 
 To run the post-train a posteriori evaluation directly:
 
@@ -191,7 +191,7 @@ from the shared extracted cache. That keeps the experiment aligned with the ques
 "how does the learned closure improve as `N_v` changes?" rather than mixing all
 deployment resolutions into one shared checkpoint.
 
-The first training pass uses only Landau-family data from the shared physical-grid teacher:
+The first training pass uses only Landau-family data from the shared `grid_cubic_spline` teacher:
 
 - linear Landau damping
 - weakly nonlinear Landau damping
@@ -205,6 +205,21 @@ The teacher defaults are:
 - `teacher-vmax = 8`
 - `teacher-dt = 0.01`
 - `teacher-proj-Nv = max(Nv-targets) + 1` unless overridden
+
+To run the higher-order-Hermite teacher sweep with the matched fixed-ratio curriculum used by
+`run_nv_sweep_single_qloss_fixed_ratio.sh`:
+
+```bash
+./benchmarks/run_nv_sweep_higher_order_hermite_fixed_ratio.sh out_bench/nv_sweep_higher_order_hermite_fixed_ratio
+```
+
+This trains one `q_only` checkpoint per deployment `N_v` using
+`teacher_backend=higher_order_hermite`, the same fixed-ratio per-target `N_v` ladders as the
+grid-teacher fixed-ratio sweep, and a per-target teacher size
+`teacher_Nv = ceil(HR_TEACHER_RATIO * target_Nv)` with `HR_TEACHER_RATIO=2.0` by default.
+
+That keeps the training ladder construction, cache layout, and evaluation pipeline aligned so
+the side-by-side comparison changes only the teacher data source.
 
 The runtime closure API can be reused elsewhere, but a checkpoint should only be trusted
 for regimes represented in its training data.

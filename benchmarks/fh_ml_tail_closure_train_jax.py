@@ -1,15 +1,16 @@
 """
-Train a shared learned interface closure for Landau-family runs using a physical-grid teacher.
+Train a shared learned interface closure for Landau-family runs using a selectable teacher.
 
-The teacher is a full Vlasov-Poisson semi-Lagrangian solve on a fine (x, v) grid with
-JAX cubic spline interpolation. Teacher snapshots are projected onto the Fourier-Hermite
-basis, and the learned target is
+The grid-cubic-spline teacher is a full Vlasov-Poisson semi-Lagrangian solve on a fine
+(x, v) grid with JAX cubic spline interpolation. Teacher snapshots are projected onto
+the Fourier-Hermite basis, and the learned target is
 
     q_k^* = -i k v_th sqrt(Nv) C_{Nv,k}^{HR}.
 
-Previous versions trained only the one-step interface regression target q_k^*. The
-current trainer preserves that q-only path and also supports a stability-aware mode
-that augments the supervised loss with short-horizon field and excess-tail penalties.
+The higher-order-Hermite teacher uses direct Hermite-space rollouts to produce the same
+coefficient histories without a projection step. The current trainer preserves the q-only
+path and also supports a stability-aware mode that augments the supervised loss with
+short-horizon field and excess-tail penalties.
 """
 
 from __future__ import annotations
@@ -33,16 +34,24 @@ _MPLCONFIG = _REPO_ROOT / ".mplconfig"
 if _MPLCONFIG.exists():
     os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
 
+from benchmarks.fh_benchmarks_2412_07073_jax import (
+    NonlinearLandauParams,
+    run_nonlinear_landau_rollout_raw,
+)
 from vpml.core import (
     Array,
     FourierHermiteIMEX,
+    GRID_CUBIC_SPLINE_TEACHER_BACKEND,
+    HIGHER_ORDER_HERMITE_TEACHER_BACKEND,
     LearnedInterfaceClosure,
     e_hat_from_rho_hat,
     init_interface_closure_params,
     learned_boundary_flux_hat,
+    normalize_teacher_backend_name,
     scale_learned_closure_raw_features,
     save_learned_interface_closure_npz,
 )
+from vpml.linear_landau import LinearLandauConfig, run_linear_landau_cnab2_raw
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     extract_interface_supervised_pairs_from_coeff_history,
@@ -64,8 +73,12 @@ REGIME_LINEAR = "linear_landau"
 REGIME_WEAK = "nonlinear_landau_weak"
 REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
-CACHE_FORMAT = "landau_interface_dataset_physical_teacher_v5"
+CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
 STABILITY_LOSS_DEFINITION = "window_hybrid_v1"
+ALL_TEACHER_BACKENDS = (
+    GRID_CUBIC_SPLINE_TEACHER_BACKEND,
+    HIGHER_ORDER_HERMITE_TEACHER_BACKEND,
+)
 
 
 def parse_int_tuple(text: str) -> Tuple[int, ...]:
@@ -83,13 +96,14 @@ def parse_str_tuple(text: str) -> Tuple[str, ...]:
 def build_dataset_cache_metadata(
     *,
     regimes: Sequence[str],
+    teacher_backend: str,
     teacher_Nx: int,
     teacher_Nv: int,
     teacher_L: float,
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     linear_T: float,
     linear_eps: float,
     linear_modes: Sequence[float],
@@ -118,6 +132,7 @@ def build_dataset_cache_metadata(
         "n_low": np.array([int(n_low)], dtype=np.int32),
         "Nm": np.array([int(Nm)], dtype=np.int32),
         "Nv_targets": np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32),
+        "teacher_backend": np.array([str(teacher_backend)], dtype=np.str_),
         "context_mode": np.array([str(context_mode)], dtype=np.str_),
         "rollout_horizon": np.array([int(rollout_horizon)], dtype=np.int32),
         "projection_mode": np.array([str(projection_mode)], dtype=np.str_),
@@ -127,7 +142,6 @@ def build_dataset_cache_metadata(
         "teacher_vmin": np.array([float(teacher_vmin)], dtype=np.float64),
         "teacher_vmax": np.array([float(teacher_vmax)], dtype=np.float64),
         "teacher_dt": np.array([float(teacher_dt)], dtype=np.float64),
-        "teacher_proj_Nv": np.array([int(teacher_proj_Nv)], dtype=np.int32),
         "linear_T": np.array([float(linear_T)], dtype=np.float64),
         "linear_eps": np.array([float(linear_eps)], dtype=np.float64),
         "linear_modes": np.asarray(tuple(float(v) for v in linear_modes), dtype=np.float64),
@@ -143,6 +157,8 @@ def build_dataset_cache_metadata(
         "strong_eps": np.asarray(tuple(float(v) for v in strong_eps), dtype=np.float64),
         "val_fraction": np.array([float(val_fraction)], dtype=np.float64),
     }
+    if teacher_proj_Nv is not None:
+        payload["teacher_proj_Nv"] = np.array([int(teacher_proj_Nv)], dtype=np.int32)
     if teacher_proj_Nv_targets is not None:
         payload["teacher_proj_Nv_targets"] = np.asarray(
             tuple(int(v) for v in teacher_proj_Nv_targets),
@@ -402,15 +418,109 @@ def _run_landau_teacher_projected_histories(
     return histories, np.asarray(k_arr, dtype=np.float64)
 
 
+def _run_linear_landau_higher_order_history(
+    config: LinearLandauConfig,
+    perturbation_x: Array,
+    *,
+    history_stride: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    raw = run_linear_landau_cnab2_raw(
+        config,
+        return_state_history=True,
+        perturbation_x=perturbation_x,
+    )
+    a_hat_hist = np.asarray(raw["a_hat_hist"], dtype=np.complex128)
+    nsteps = a_hat_hist.shape[0] - 1
+    stride = max(int(history_stride), 1)
+    hist_steps = np.arange(0, nsteps + 1, stride, dtype=np.int32)
+    if hist_steps[-1] != nsteps:
+        hist_steps = np.concatenate([hist_steps, np.array([nsteps], dtype=np.int32)])
+    integ = FourierHermiteIMEX(
+        Nx=int(config.Nx),
+        Nv=int(config.Nv),
+        Lx=float(config.L),
+        dt=float(config.dt),
+        vth=1.0,
+        dealias_23=False,
+        closure=None,
+    )
+    return a_hat_hist[hist_steps], np.asarray(integ.k_arr, dtype=np.float64)
+
+
+def _run_nonlinear_landau_higher_order_history(
+    params: NonlinearLandauParams,
+    *,
+    history_stride: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    raw = run_nonlinear_landau_rollout_raw(
+        params,
+        "truncation",
+        return_state_history=True,
+        history_stride=history_stride,
+    )
+    return (
+        np.asarray(raw["a_hat_hist"], dtype=np.complex128),
+        np.asarray(raw["k_arr"], dtype=np.float64),
+    )
+
+
+def _append_coeff_history_to_accum(
+    accum: Dict[str, Dict[str, object]],
+    regime_name: str,
+    coeff_hist: np.ndarray,
+    *,
+    k_arr: np.ndarray,
+    Nv_targets: Sequence[int],
+    Nm: int,
+    val_fraction: float,
+    n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
+) -> None:
+    train_hist, val_hist = split_history_train_val(coeff_hist, val_fraction)
+    use_rollout_windows = int(rollout_horizon) > 0
+    for split, hist in (("train", train_hist), ("val", val_hist)):
+        append_pairs(
+            accum,
+            regime_name,
+            split,
+            extract_interface_supervised_pairs_from_coeff_history(
+                hist,
+                Nv_targets=Nv_targets,
+                Nm=Nm,
+                k_arr=k_arr,
+                vth=1.0,
+                include_global_indicators=True,
+                n_low=int(n_low),
+                context_mode=context_mode,
+            ),
+        )
+        if use_rollout_windows:
+            append_rollout_windows(
+                accum,
+                regime_name,
+                split,
+                extract_interface_rollout_windows_from_coeff_history(
+                    hist,
+                    Nv_targets=Nv_targets,
+                    Nm=Nm,
+                    k_arr=k_arr,
+                    vth=1.0,
+                    rollout_horizon=rollout_horizon,
+                ),
+            )
+
+
 def build_linear_landau_regime(
     *,
+    teacher_backend: str,
     teacher_Nx: int,
     teacher_Nv: int,
     teacher_L: float,
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     Nv_targets: Sequence[int],
     Nm: int,
     T: float,
@@ -426,19 +536,44 @@ def build_linear_landau_regime(
     rollout_horizon: int,
     per_target_projection_orders: bool = False,
 ) -> Dict[str, np.ndarray]:
-    config = PhysicalGridVlasovPoissonConfig(
-        Nx=int(teacher_Nx),
-        Nv=int(teacher_Nv),
-        Lx=float(teacher_L),
-        vmin=float(teacher_vmin),
-        vmax=float(teacher_vmax),
-        dt=float(teacher_dt),
-        T=float(T),
-        poisson_sign=float(poisson_sign),
-        snapshot_times=(),
-    )
+    teacher_backend = normalize_teacher_backend_name(teacher_backend)
     rng = np.random.default_rng(seed)
-    x = np.asarray(config.x, dtype=np.float64)
+    if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(teacher_Nx),
+            Nv=int(teacher_Nv),
+            Lx=float(teacher_L),
+            vmin=float(teacher_vmin),
+            vmax=float(teacher_vmax),
+            dt=float(teacher_dt),
+            T=float(T),
+            poisson_sign=float(poisson_sign),
+            snapshot_times=(),
+        )
+        x = np.asarray(config.x, dtype=np.float64)
+    elif teacher_backend == HIGHER_ORDER_HERMITE_TEACHER_BACKEND:
+        config = LinearLandauConfig(
+            Nv=int(teacher_Nv),
+            Nx=int(teacher_Nx),
+            L=float(teacher_L),
+            dt=float(teacher_dt),
+            T=float(T),
+            eps=float(eps),
+            modes=tuple(float(v) for v in modes),
+            poisson_sign=float(poisson_sign),
+        )
+        integ = FourierHermiteIMEX(
+            Nx=int(config.Nx),
+            Nv=int(config.Nv),
+            Lx=float(config.L),
+            dt=float(config.dt),
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        x = np.asarray(integ.x, dtype=np.float64)
+    else:
+        raise ValueError(f"Unsupported teacher_backend={teacher_backend!r}")
     use_rollout_windows = int(rollout_horizon) > 0
 
     accum = {
@@ -454,7 +589,8 @@ def build_linear_landau_regime(
 
     for _ in range(int(num_samples)):
         perturb = sample_initial_condition(rng, x, modes, eps)
-        if bool(per_target_projection_orders):
+        if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND and bool(per_target_projection_orders):
+            assert teacher_proj_Nv is not None
             projection_orders = tuple(sorted({int(Nv) + 1 for Nv in Nv_targets}))
             coeff_histories, k_arr = _run_landau_teacher_projected_histories(
                 config,
@@ -464,131 +600,47 @@ def build_linear_landau_regime(
             )
             for Nv in Nv_targets:
                 coeff_hist = coeff_histories[int(Nv) + 1]
-                train_hist, val_hist = split_history_train_val(coeff_hist, val_fraction)
-                append_pairs(
+                _append_coeff_history_to_accum(
                     accum,
                     REGIME_LINEAR,
-                    "train",
-                    extract_interface_supervised_pairs_from_coeff_history(
-                        train_hist,
-                        Nv_targets=(int(Nv),),
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        include_global_indicators=True,
-                        n_low=int(n_low),
-                        context_mode=context_mode,
-                    ),
+                    coeff_hist,
+                    k_arr=k_arr,
+                    Nv_targets=(int(Nv),),
+                    Nm=Nm,
+                    val_fraction=val_fraction,
+                    n_low=n_low,
+                    context_mode=context_mode,
+                    rollout_horizon=rollout_horizon,
                 )
-                if use_rollout_windows:
-                    append_rollout_windows(
-                        accum,
-                        REGIME_LINEAR,
-                        "train",
-                        extract_interface_rollout_windows_from_coeff_history(
-                            train_hist,
-                            Nv_targets=(int(Nv),),
-                            Nm=Nm,
-                            k_arr=k_arr,
-                            vth=1.0,
-                            rollout_horizon=rollout_horizon,
-                        ),
-                    )
-                append_pairs(
-                    accum,
-                    REGIME_LINEAR,
-                    "val",
-                    extract_interface_supervised_pairs_from_coeff_history(
-                        val_hist,
-                        Nv_targets=(int(Nv),),
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        include_global_indicators=True,
-                        n_low=int(n_low),
-                        context_mode=context_mode,
-                    ),
-                )
-                if use_rollout_windows:
-                    append_rollout_windows(
-                        accum,
-                        REGIME_LINEAR,
-                        "val",
-                        extract_interface_rollout_windows_from_coeff_history(
-                            val_hist,
-                            Nv_targets=(int(Nv),),
-                            Nm=Nm,
-                            k_arr=k_arr,
-                            vth=1.0,
-                            rollout_horizon=rollout_horizon,
-                        ),
-                    )
-        else:
+            continue
+
+        if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+            assert teacher_proj_Nv is not None
             coeff_hist, k_arr = _run_landau_teacher_projected_history(
                 config,
                 perturb,
                 projection_order=int(teacher_proj_Nv),
                 history_stride=history_stride,
             )
-            train_hist, val_hist = split_history_train_val(coeff_hist, val_fraction)
-            append_pairs(
-                accum,
-                REGIME_LINEAR,
-                "train",
-                extract_interface_supervised_pairs_from_coeff_history(
-                    train_hist,
-                    Nv_targets=Nv_targets,
-                    Nm=Nm,
-                    k_arr=k_arr,
-                    vth=1.0,
-                    include_global_indicators=True,
-                    n_low=int(n_low),
-                    context_mode=context_mode,
-                ),
+        else:
+            coeff_hist, k_arr = _run_linear_landau_higher_order_history(
+                config,
+                perturb,
+                history_stride=history_stride,
             )
-            if use_rollout_windows:
-                append_rollout_windows(
-                    accum,
-                    REGIME_LINEAR,
-                    "train",
-                    extract_interface_rollout_windows_from_coeff_history(
-                        train_hist,
-                        Nv_targets=Nv_targets,
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        rollout_horizon=rollout_horizon,
-                    ),
-                )
-            append_pairs(
-                accum,
-                REGIME_LINEAR,
-                "val",
-                extract_interface_supervised_pairs_from_coeff_history(
-                    val_hist,
-                    Nv_targets=Nv_targets,
-                    Nm=Nm,
-                    k_arr=k_arr,
-                    vth=1.0,
-                    include_global_indicators=True,
-                    n_low=int(n_low),
-                    context_mode=context_mode,
-                ),
-            )
-            if use_rollout_windows:
-                append_rollout_windows(
-                    accum,
-                    REGIME_LINEAR,
-                    "val",
-                    extract_interface_rollout_windows_from_coeff_history(
-                        val_hist,
-                        Nv_targets=Nv_targets,
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        rollout_horizon=rollout_horizon,
-                    ),
-                )
+
+        _append_coeff_history_to_accum(
+            accum,
+            REGIME_LINEAR,
+            coeff_hist,
+            k_arr=k_arr,
+            Nv_targets=Nv_targets,
+            Nm=Nm,
+            val_fraction=val_fraction,
+            n_low=n_low,
+            context_mode=context_mode,
+            rollout_horizon=rollout_horizon,
+        )
     return finalize_regime_arrays(accum)[REGIME_LINEAR]
 
 
@@ -596,13 +648,14 @@ def build_nonlinear_landau_regime(
     regime_name: str,
     eps_values: Sequence[float],
     *,
+    teacher_backend: str,
     teacher_Nx: int,
     teacher_Nv: int,
     teacher_L: float,
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     Nv_targets: Sequence[int],
     Nm: int,
     T: float,
@@ -615,19 +668,34 @@ def build_nonlinear_landau_regime(
     rollout_horizon: int,
     per_target_projection_orders: bool = False,
 ) -> Dict[str, np.ndarray]:
-    config = PhysicalGridVlasovPoissonConfig(
-        Nx=int(teacher_Nx),
-        Nv=int(teacher_Nv),
-        Lx=float(teacher_L),
-        vmin=float(teacher_vmin),
-        vmax=float(teacher_vmax),
-        dt=float(teacher_dt),
-        T=float(T),
-        poisson_sign=float(poisson_sign),
-        snapshot_times=(),
-    )
-    perturb_template = np.cos(float(k0) * np.asarray(config.x, dtype=np.float64))
-    use_rollout_windows = int(rollout_horizon) > 0
+    teacher_backend = normalize_teacher_backend_name(teacher_backend)
+    if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(teacher_Nx),
+            Nv=int(teacher_Nv),
+            Lx=float(teacher_L),
+            vmin=float(teacher_vmin),
+            vmax=float(teacher_vmax),
+            dt=float(teacher_dt),
+            T=float(T),
+            poisson_sign=float(poisson_sign),
+            snapshot_times=(),
+        )
+        perturb_template = np.cos(float(k0) * np.asarray(config.x, dtype=np.float64))
+    elif teacher_backend == HIGHER_ORDER_HERMITE_TEACHER_BACKEND:
+        config = NonlinearLandauParams(
+            Nx=int(teacher_Nx),
+            Nv=int(teacher_Nv),
+            L=float(teacher_L),
+            dt=float(teacher_dt),
+            T=float(T),
+            k0=float(k0),
+            dealias_23=False,
+            poisson_sign=float(poisson_sign),
+            snapshot_times=(),
+        )
+    else:
+        raise ValueError(f"Unsupported teacher_backend={teacher_backend!r}")
     accum = {
         regime_name: {
             "train_inputs_base": [],
@@ -640,7 +708,8 @@ def build_nonlinear_landau_regime(
     }
 
     for eps in eps_values:
-        if bool(per_target_projection_orders):
+        if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND and bool(per_target_projection_orders):
+            assert teacher_proj_Nv is not None
             projection_orders = tuple(sorted({int(Nv) + 1 for Nv in Nv_targets}))
             coeff_histories, k_arr = _run_landau_teacher_projected_histories(
                 config,
@@ -650,131 +719,62 @@ def build_nonlinear_landau_regime(
             )
             for Nv in Nv_targets:
                 coeff_hist = coeff_histories[int(Nv) + 1]
-                train_hist, val_hist = split_history_train_val(coeff_hist, val_fraction)
-                append_pairs(
+                _append_coeff_history_to_accum(
                     accum,
                     regime_name,
-                    "train",
-                    extract_interface_supervised_pairs_from_coeff_history(
-                        train_hist,
-                        Nv_targets=(int(Nv),),
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        include_global_indicators=True,
-                        n_low=int(n_low),
-                        context_mode=context_mode,
-                    ),
+                    coeff_hist,
+                    k_arr=k_arr,
+                    Nv_targets=(int(Nv),),
+                    Nm=Nm,
+                    val_fraction=val_fraction,
+                    n_low=n_low,
+                    context_mode=context_mode,
+                    rollout_horizon=rollout_horizon,
                 )
-                if use_rollout_windows:
-                    append_rollout_windows(
-                        accum,
-                        regime_name,
-                        "train",
-                        extract_interface_rollout_windows_from_coeff_history(
-                            train_hist,
-                            Nv_targets=(int(Nv),),
-                            Nm=Nm,
-                            k_arr=k_arr,
-                            vth=1.0,
-                            rollout_horizon=rollout_horizon,
-                        ),
-                    )
-                append_pairs(
-                    accum,
-                    regime_name,
-                    "val",
-                    extract_interface_supervised_pairs_from_coeff_history(
-                        val_hist,
-                        Nv_targets=(int(Nv),),
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        include_global_indicators=True,
-                        n_low=int(n_low),
-                        context_mode=context_mode,
-                    ),
-                )
-                if use_rollout_windows:
-                    append_rollout_windows(
-                        accum,
-                        regime_name,
-                        "val",
-                        extract_interface_rollout_windows_from_coeff_history(
-                            val_hist,
-                            Nv_targets=(int(Nv),),
-                            Nm=Nm,
-                            k_arr=k_arr,
-                            vth=1.0,
-                            rollout_horizon=rollout_horizon,
-                        ),
-                    )
-        else:
+            continue
+
+        if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+            assert teacher_proj_Nv is not None
             coeff_hist, k_arr = _run_landau_teacher_projected_history(
                 config,
                 float(eps) * perturb_template,
                 projection_order=int(teacher_proj_Nv),
                 history_stride=history_stride,
             )
-            train_hist, val_hist = split_history_train_val(coeff_hist, val_fraction)
-            append_pairs(
-                accum,
-                regime_name,
-                "train",
-                extract_interface_supervised_pairs_from_coeff_history(
-                    train_hist,
-                    Nv_targets=Nv_targets,
-                    Nm=Nm,
-                    k_arr=k_arr,
-                    vth=1.0,
-                    include_global_indicators=True,
-                    n_low=int(n_low),
-                    context_mode=context_mode,
+        else:
+            coeff_hist, k_arr = _run_nonlinear_landau_higher_order_history(
+                NonlinearLandauParams(
+                    Nx=int(config.Nx),
+                    Nv=int(config.Nv),
+                    L=float(config.L),
+                    dt=float(config.dt),
+                    T=float(config.T),
+                    eps=float(eps),
+                    k0=float(config.k0),
+                    vth=float(config.vth),
+                    dealias_23=bool(config.dealias_23),
+                    poisson_sign=float(config.poisson_sign),
+                    snapshot_times=tuple(config.snapshot_times),
+                    v_range=tuple(config.v_range),
+                    Nv_plot=int(config.Nv_plot),
+                    vmin=float(config.vmin),
+                    vmax=float(config.vmax),
                 ),
+                history_stride=history_stride,
             )
-            if use_rollout_windows:
-                append_rollout_windows(
-                    accum,
-                    regime_name,
-                    "train",
-                    extract_interface_rollout_windows_from_coeff_history(
-                        train_hist,
-                        Nv_targets=Nv_targets,
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        rollout_horizon=rollout_horizon,
-                    ),
-                )
-            append_pairs(
-                accum,
-                regime_name,
-                "val",
-                extract_interface_supervised_pairs_from_coeff_history(
-                    val_hist,
-                    Nv_targets=Nv_targets,
-                    Nm=Nm,
-                    k_arr=k_arr,
-                    vth=1.0,
-                    include_global_indicators=True,
-                    n_low=int(n_low),
-                    context_mode=context_mode,
-                ),
-            )
-            if use_rollout_windows:
-                append_rollout_windows(
-                    accum,
-                    regime_name,
-                    "val",
-                    extract_interface_rollout_windows_from_coeff_history(
-                        val_hist,
-                        Nv_targets=Nv_targets,
-                        Nm=Nm,
-                        k_arr=k_arr,
-                        vth=1.0,
-                        rollout_horizon=rollout_horizon,
-                    ),
-                )
+
+        _append_coeff_history_to_accum(
+            accum,
+            regime_name,
+            coeff_hist,
+            k_arr=k_arr,
+            Nv_targets=Nv_targets,
+            Nm=Nm,
+            val_fraction=val_fraction,
+            n_low=n_low,
+            context_mode=context_mode,
+            rollout_horizon=rollout_horizon,
+        )
     return finalize_regime_arrays(accum)[regime_name]
 
 
@@ -838,7 +838,7 @@ def load_dataset_cache(
             if _cache_value_mismatch(actual, np.asarray(expected)):
                 raise ValueError(
                     f"Dataset cache {path} metadata mismatch for '{key}'. "
-                    "Rebuilding with the current physical-grid teacher configuration is required."
+                    "Rebuilding with the current teacher configuration is required."
                 )
         regimes = tuple(str(v) for v in np.asarray(data["regimes"], dtype=np.str_).tolist())
         dataset: Dict[str, Dict[str, np.ndarray]] = {}
@@ -952,13 +952,14 @@ def build_mixed_landau_dataset(
     *,
     dataset_cache: Optional[Path],
     regimes: Sequence[str],
+    teacher_backend: str,
     teacher_Nx: int,
     teacher_Nv: int,
     teacher_L: float,
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     linear_T: float,
     linear_eps: float,
     linear_modes: Sequence[float],
@@ -981,13 +982,15 @@ def build_mixed_landau_dataset(
     allow_cached_nv_superset: bool = False,
     per_target_projection_orders: bool = False,
 ) -> Dict[str, Dict[str, np.ndarray]]:
+    teacher_backend = normalize_teacher_backend_name(teacher_backend)
     teacher_proj_Nv_targets = (
         tuple(int(v) + 1 for v in Nv_targets)
-        if bool(per_target_projection_orders)
+        if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND and bool(per_target_projection_orders)
         else None
     )
     cache_metadata = build_dataset_cache_metadata(
         regimes=regimes,
+        teacher_backend=teacher_backend,
         teacher_Nx=teacher_Nx,
         teacher_Nv=teacher_Nv,
         teacher_L=teacher_L,
@@ -1014,7 +1017,11 @@ def build_mixed_landau_dataset(
         n_low=n_low,
         context_mode=context_mode,
         rollout_horizon=rollout_horizon,
-        projection_mode="per_target" if bool(per_target_projection_orders) else "shared_max",
+        projection_mode=(
+            "per_target"
+            if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND and bool(per_target_projection_orders)
+            else ("shared_max" if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND else "none")
+        ),
         teacher_proj_Nv_targets=teacher_proj_Nv_targets,
     )
     if dataset_cache is not None and dataset_cache.exists():
@@ -1035,6 +1042,7 @@ def build_mixed_landau_dataset(
     active = tuple(regimes)
     if REGIME_LINEAR in active:
         dataset[REGIME_LINEAR] = build_linear_landau_regime(
+            teacher_backend=teacher_backend,
             teacher_Nx=teacher_Nx,
             teacher_Nv=teacher_Nv,
             teacher_L=teacher_L,
@@ -1061,6 +1069,7 @@ def build_mixed_landau_dataset(
         dataset[REGIME_WEAK] = build_nonlinear_landau_regime(
             REGIME_WEAK,
             weak_eps,
+            teacher_backend=teacher_backend,
             teacher_Nx=teacher_Nx,
             teacher_Nv=teacher_Nv,
             teacher_L=teacher_L,
@@ -1084,6 +1093,7 @@ def build_mixed_landau_dataset(
         dataset[REGIME_STRONG] = build_nonlinear_landau_regime(
             REGIME_STRONG,
             strong_eps,
+            teacher_backend=teacher_backend,
             teacher_Nx=teacher_Nx,
             teacher_Nv=teacher_Nv,
             teacher_L=teacher_L,
@@ -1257,7 +1267,7 @@ def build_learned_interface_closure(
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     n_low: int,
     train_objective: str = "q_only",
     context_mode: str = "none",
@@ -1282,14 +1292,14 @@ def build_learned_interface_closure(
         res_blocks=int(res_blocks),
         Nv_targets=tuple(int(v) for v in Nv_targets),
         train_regimes=tuple(str(v) for v in train_regimes),
-        teacher_backend=str(teacher_backend),
+        teacher_backend=str(normalize_teacher_backend_name(teacher_backend)),
         teacher_Lx=float(teacher_Lx),
         teacher_Nx=int(teacher_Nx),
         teacher_Nv=int(teacher_Nv),
         teacher_vmin=float(teacher_vmin),
         teacher_vmax=float(teacher_vmax),
         teacher_dt=float(teacher_dt),
-        teacher_proj_Nv=int(teacher_proj_Nv),
+        teacher_proj_Nv=None if teacher_proj_Nv is None else int(teacher_proj_Nv),
         include_global_indicators=True,
         n_low=int(n_low),
         train_objective=str(train_objective),
@@ -1329,7 +1339,7 @@ def make_regime_balanced_loss(
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     n_low: int,
     context_mode: str,
 ):
@@ -1426,7 +1436,7 @@ def make_regime_balanced_batch_loss(
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     n_low: int,
     context_mode: str,
 ):
@@ -1795,7 +1805,7 @@ def make_stability_aware_batch_loss(
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    teacher_proj_Nv: int,
+    teacher_proj_Nv: Optional[int],
     n_low: int,
     context_mode: str,
     rollout_horizon: int,
@@ -2077,7 +2087,7 @@ def evaluate_regime_metrics(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a shared learned interface closure from a physical-grid Landau teacher")
+    parser = argparse.ArgumentParser(description="Train a shared learned interface closure from a selectable Landau teacher")
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-cache", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
@@ -2114,6 +2124,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-weak", type=float, default=1.0)
     parser.add_argument("--weight-strong", type=float, default=1.0)
 
+    parser.add_argument("--teacher-backend", type=str, default=GRID_CUBIC_SPLINE_TEACHER_BACKEND, choices=ALL_TEACHER_BACKENDS)
     parser.add_argument("--teacher-Nx", type=int, default=256)
     parser.add_argument("--teacher-Nv", type=int, default=512)
     parser.add_argument("--teacher-L", type=float, default=4.0 * math.pi)
@@ -2165,10 +2176,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("stability_aware training requires --batch-size > 0")
     if args.train_objective == "stability_aware" and (float(args.lambda_E) <= 0.0 and float(args.lambda_tail) <= 0.0):
         raise ValueError("stability_aware training requires lambda_E > 0 or lambda_tail > 0")
-
-    teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
-    if teacher_proj_Nv <= max(Nv_targets):
-        raise ValueError("teacher-proj-Nv must exceed every target Nv")
+    teacher_backend = normalize_teacher_backend_name(args.teacher_backend)
+    teacher_proj_Nv: Optional[int]
+    if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+        teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
+        if teacher_proj_Nv <= max(Nv_targets):
+            raise ValueError("teacher-proj-Nv must exceed every target Nv")
+    elif teacher_backend == HIGHER_ORDER_HERMITE_TEACHER_BACKEND:
+        if bool(args.per_target_projection_orders):
+            raise ValueError("higher_order_hermite does not support --per-target-projection-orders")
+        if args.teacher_proj_Nv is not None:
+            raise ValueError("higher_order_hermite does not use --teacher-proj-Nv")
+        if int(args.teacher_Nv) <= max(Nv_targets):
+            raise ValueError("higher_order_hermite requires teacher-Nv to exceed every target Nv")
+        teacher_proj_Nv = None
+    else:
+        raise ValueError(f"Unsupported teacher backend: {teacher_backend!r}")
 
     dataset_rollout_horizon = (
         int(args.rollout_horizon)
@@ -2179,6 +2202,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     dataset_base = build_mixed_landau_dataset(
         dataset_cache=args.dataset_cache,
         regimes=regimes,
+        teacher_backend=teacher_backend,
         teacher_Nx=args.teacher_Nx,
         teacher_Nv=args.teacher_Nv,
         teacher_L=args.teacher_L,
@@ -2206,7 +2230,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         context_mode=args.context_mode,
         rollout_horizon=dataset_rollout_horizon,
         allow_cached_nv_superset=bool(args.allow_dataset_cache_nv_superset),
-        per_target_projection_orders=bool(args.per_target_projection_orders),
+        per_target_projection_orders=bool(args.per_target_projection_orders) if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND else False,
     )
     if bool(args.build_dataset_only):
         cache_msg = f"Saved shared dataset cache to {args.dataset_cache}" if args.dataset_cache is not None else "Built dataset in memory"
@@ -2253,7 +2277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             res_blocks=args.res_blocks,
             Nv_targets=Nv_targets,
             train_regimes=regimes,
-            teacher_backend="physical_grid_cubic_v1",
+            teacher_backend=teacher_backend,
             teacher_Lx=args.teacher_L,
             teacher_Nx=args.teacher_Nx,
             teacher_Nv=args.teacher_Nv,
@@ -2303,7 +2327,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             res_blocks=args.res_blocks,
             Nv_targets=Nv_targets,
             train_regimes=regimes,
-            teacher_backend="physical_grid_cubic_v1",
+            teacher_backend=teacher_backend,
             teacher_Lx=args.teacher_L,
             teacher_Nx=args.teacher_Nx,
             teacher_Nv=args.teacher_Nv,
@@ -2343,7 +2367,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             res_blocks=args.res_blocks,
             Nv_targets=Nv_targets,
             train_regimes=regimes,
-            teacher_backend="physical_grid_cubic_v1",
+            teacher_backend=teacher_backend,
             teacher_Lx=args.teacher_L,
             teacher_Nx=args.teacher_Nx,
             teacher_Nv=args.teacher_Nv,
@@ -2373,7 +2397,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         res_blocks=args.res_blocks,
         Nv_targets=Nv_targets,
         train_regimes=regimes,
-        teacher_backend="physical_grid_cubic_v1",
+        teacher_backend=teacher_backend,
         teacher_Lx=args.teacher_L,
         teacher_Nx=args.teacher_Nx,
         teacher_Nv=args.teacher_Nv,
@@ -2419,14 +2443,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "input_std": np.asarray(stats["input_std"], dtype=np.float64),
         "target_mean": np.asarray(stats["target_mean"], dtype=np.float64),
         "target_std": np.asarray(stats["target_std"], dtype=np.float64),
-        "teacher_backend": np.array(["physical_grid_cubic_v1"], dtype=np.str_),
+        "teacher_backend": np.array([str(teacher_backend)], dtype=np.str_),
         "teacher_Lx": np.array([args.teacher_L], dtype=np.float64),
         "teacher_Nx": np.array([args.teacher_Nx], dtype=np.int32),
         "teacher_Nv": np.array([args.teacher_Nv], dtype=np.int32),
         "teacher_vmin": np.array([args.teacher_vmin], dtype=np.float64),
         "teacher_vmax": np.array([args.teacher_vmax], dtype=np.float64),
         "teacher_dt": np.array([args.teacher_dt], dtype=np.float64),
-        "teacher_proj_Nv": np.array([teacher_proj_Nv], dtype=np.int32),
         "n_low": np.array([args.n_low], dtype=np.int32),
         "train_objective": np.array([args.train_objective], dtype=np.str_),
         "context_mode": np.array([args.context_mode], dtype=np.str_),
@@ -2437,6 +2460,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "lambda_tail": np.array([used_lambda_tail], dtype=np.float64),
         "lambda_reg": np.array([used_lambda_reg], dtype=np.float64),
     }
+    if teacher_proj_Nv is not None:
+        metrics_payload["teacher_proj_Nv"] = np.array([teacher_proj_Nv], dtype=np.int32)
     if args.train_objective == "stability_aware":
         assert stability_component_history is not None
         metrics_payload["train_loss_q"] = np.asarray(stability_component_history["q"], dtype=np.float64)

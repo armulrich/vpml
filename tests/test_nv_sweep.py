@@ -51,7 +51,7 @@ def _make_closure(*, Nm: int = 1, hidden_width: int = 8, res_blocks: int = 1) ->
         res_blocks=res_blocks,
         Nv_targets=(6, 8),
         train_regimes=("linear_landau", "nonlinear_landau_weak", "nonlinear_landau_strong"),
-        teacher_backend="physical_grid_cubic_v1",
+        teacher_backend="grid_cubic_spline",
         teacher_Lx=4.0 * math.pi,
         teacher_Nx=8,
         teacher_Nv=16,
@@ -435,6 +435,87 @@ class NvSweepTests(unittest.TestCase):
                 self.assertTrue(ckpt.exists())
                 learned = load_learned_interface_closure_npz(ckpt)
                 self.assertEqual(tuple(int(v) for v in learned.Nv_targets), expected_targets)
+
+            summary = json.loads((outdir / "summary.json").read_text())
+            self.assertEqual(summary["nv_list"], [6, 8])
+            case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
+            self.assertEqual(case_targets, expected)
+
+    def test_run_nv_sweep_higher_order_hermite_fixed_ratio_wrapper_uses_fixed_ratio_ladders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            outdir = tmp / "nv_sweep_higher_order_hermite_fixed_ratio"
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON": sys.executable,
+                    "NV_LIST": "6,8",
+                    "NX": "8",
+                    "DT": "0.05",
+                    "T_FINAL": "0.10",
+                    "EPS": "0.05",
+                    "K0": "0.5",
+                    "SNAPSHOT_TIMES": "0.05,0.10",
+                    "NV_PLOT": "32",
+                    "TEACHER_NX": "8",
+                    "TEACHER_NV": "16",
+                    "TEACHER_DT": "0.05",
+                    "TEACHER_VMIN": "-6",
+                    "TEACHER_VMAX": "6",
+                    "HR_TEACHER_RATIO": "2.0",
+                    "TRAIN_NM": "6",
+                    "TRAIN_FIXED_RATIO": "1.8",
+                    "TRAIN_HIDDEN_WIDTH": "8",
+                    "TRAIN_RES_BLOCKS": "1",
+                    "TRAIN_EPOCHS": "1",
+                    "TRAIN_LOG_EVERY": "1",
+                    "TRAIN_BATCH_SIZE": "32",
+                    "TRAIN_STEPS_PER_EPOCH": "1",
+                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak",
+                    "TRAIN_LINEAR_T": "0.10",
+                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
+                    "TRAIN_LINEAR_HISTORY_STRIDE": "1",
+                    "TRAIN_NONLINEAR_T": "0.10",
+                    "TRAIN_NONLINEAR_HISTORY_STRIDE": "1",
+                    "TRAIN_WEAK_EPS": "0.05",
+                    "TRAIN_STRONG_EPS": "0.10",
+                    "TRAIN_TEACHER_NX": "8",
+                    "TRAIN_TEACHER_DT": "0.05",
+                    "TRAIN_TEACHER_VMIN": "-6",
+                    "TRAIN_TEACHER_VMAX": "6",
+                }
+            )
+            subprocess.run(
+                ["bash", "benchmarks/run_nv_sweep_higher_order_hermite_fixed_ratio.sh", str(outdir)],
+                cwd="/Users/armin/Documents/NYU/vpml",
+                env=env,
+                check=True,
+            )
+
+            self.assertTrue((outdir / "summary.json").exists())
+            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
+            self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
+            self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
+            self.assertTrue((outdir / "models" / "nv6" / "interface_closure_dataset.npz").exists())
+            self.assertTrue((outdir / "models" / "nv8" / "interface_closure_dataset.npz").exists())
+
+            expected = {
+                6: _fixed_ratio_ladder(6, nm=6, ratio=1.8),
+                8: _fixed_ratio_ladder(8, nm=6, ratio=1.8),
+            }
+            expected_teacher_nv = {
+                6: 12,
+                8: 16,
+            }
+            for nv, expected_targets in expected.items():
+                ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
+                self.assertTrue(ckpt.exists())
+                learned = load_learned_interface_closure_npz(ckpt)
+                self.assertEqual(learned.teacher_backend, "higher_order_hermite")
+                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), expected_targets)
+                self.assertEqual(int(learned.teacher_Nv), expected_teacher_nv[nv])
+                self.assertIsNone(learned.teacher_proj_Nv)
 
             summary = json.loads((outdir / "summary.json").read_text())
             self.assertEqual(summary["nv_list"], [6, 8])

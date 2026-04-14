@@ -112,7 +112,7 @@ def _make_closure(
         res_blocks=res_blocks,
         Nv_targets=(4,),
         train_regimes=("linear_landau",),
-        teacher_backend="physical_grid_cubic_v1",
+        teacher_backend="grid_cubic_spline",
         teacher_Lx=4.0 * math.pi,
         teacher_Nx=32,
         teacher_Nv=64,
@@ -162,13 +162,25 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertEqual(loaded.Nm, closure.Nm)
         self.assertEqual(loaded.hidden_width, closure.hidden_width)
         self.assertEqual(loaded.res_blocks, closure.res_blocks)
-        self.assertEqual(loaded.teacher_backend, "physical_grid_cubic_v1")
+        self.assertEqual(loaded.teacher_backend, "grid_cubic_spline")
         self.assertEqual(loaded.teacher_proj_Nv, 5)
         self.assertTrue(loaded.include_global_indicators)
         self.assertEqual(loaded.n_low, 2)
         np.testing.assert_allclose(np.asarray(loaded.input_mean), np.asarray(closure.input_mean))
         np.testing.assert_allclose(np.asarray(loaded.target_mean), np.asarray(closure.target_mean))
         np.testing.assert_allclose(np.asarray(loaded.params["W_lin"]), np.asarray(closure.params["W_lin"]))
+
+    def test_checkpoint_loader_normalizes_legacy_teacher_backend_name(self) -> None:
+        closure = _make_closure(target_bias=(1.5, -0.25))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "interface_closure.npz"
+            save_learned_interface_closure_npz(path, closure)
+            with np.load(path) as data:
+                payload = {name: np.asarray(data[name]) for name in data.files}
+            payload["teacher_backend"] = np.array(["physical_grid_cubic_v1"], dtype=np.str_)
+            np.savez(path, **payload)
+            loaded = load_learned_interface_closure_npz(path)
+        self.assertEqual(loaded.teacher_backend, "grid_cubic_spline")
 
     def test_checkpoint_round_trip_preserves_stability_metadata(self) -> None:
         closure = _make_closure(
@@ -587,7 +599,7 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             self.assertTrue(ckpt.with_suffix(".metrics.npz").exists())
             self.assertTrue(ckpt.with_suffix(".loss.png").exists())
             loaded = load_learned_interface_closure_npz(ckpt)
-            self.assertEqual(loaded.teacher_backend, "physical_grid_cubic_v1")
+            self.assertEqual(loaded.teacher_backend, "grid_cubic_spline")
             self.assertTrue(loaded.include_global_indicators)
             self.assertEqual(loaded.input_dim, 6)
 
@@ -686,6 +698,7 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                 dataset = train_mod.build_mixed_landau_dataset(
                     dataset_cache=cache,
                     regimes=(train_mod.REGIME_LINEAR,),
+                    teacher_backend="grid_cubic_spline",
                     teacher_Nx=8,
                     teacher_Nv=16,
                     teacher_L=4.0 * math.pi,
@@ -746,6 +759,7 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         }
         metadata = train_mod.build_dataset_cache_metadata(
             regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
             teacher_Nx=8,
             teacher_Nv=16,
             teacher_L=4.0 * math.pi,
@@ -777,6 +791,7 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             filtered = train_mod.build_mixed_landau_dataset(
                 dataset_cache=cache,
                 regimes=(train_mod.REGIME_LINEAR,),
+                teacher_backend="grid_cubic_spline",
                 teacher_Nx=8,
                 teacher_Nv=16,
                 teacher_L=4.0 * math.pi,
@@ -873,6 +888,117 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                         "stability_aware",
                     ]
                 )
+
+    def test_grid_teacher_accepts_projection_options(self) -> None:
+        captured = {}
+
+        def fake_build_mixed_landau_dataset(**kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop after dataset build")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            with mock.patch.object(
+                train_mod,
+                "build_mixed_landau_dataset",
+                side_effect=fake_build_mixed_landau_dataset,
+            ):
+                with self.assertRaisesRegex(RuntimeError, r"stop after dataset build"):
+                    train_main(
+                        [
+                            "--checkpoint",
+                            str(ckpt),
+                            "--teacher-backend",
+                            "grid_cubic_spline",
+                            "--Nv-targets",
+                            "4",
+                            "--Nm",
+                            "1",
+                            "--teacher-proj-Nv",
+                            "5",
+                            "--per-target-projection-orders",
+                        ]
+                    )
+
+        self.assertEqual(captured["teacher_backend"], "grid_cubic_spline")
+        self.assertEqual(captured["teacher_proj_Nv"], 5)
+        self.assertTrue(captured["per_target_projection_orders"])
+
+    def test_higher_order_hermite_rejects_projection_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            with self.assertRaisesRegex(ValueError, r"does not use --teacher-proj-Nv"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--teacher-backend",
+                        "higher_order_hermite",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--teacher-Nv",
+                        "8",
+                        "--teacher-proj-Nv",
+                        "5",
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, r"does not support --per-target-projection-orders"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--teacher-backend",
+                        "higher_order_hermite",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--teacher-Nv",
+                        "8",
+                        "--per-target-projection-orders",
+                    ]
+                )
+
+    def test_higher_order_hermite_dataset_builds_landau_regimes(self) -> None:
+        dataset = train_mod.build_mixed_landau_dataset(
+            dataset_cache=None,
+            regimes=(
+                train_mod.REGIME_LINEAR,
+                train_mod.REGIME_WEAK,
+                train_mod.REGIME_STRONG,
+            ),
+            teacher_backend="higher_order_hermite",
+            teacher_Nx=8,
+            teacher_Nv=6,
+            teacher_L=4.0 * math.pi,
+            teacher_vmin=-6.0,
+            teacher_vmax=6.0,
+            teacher_dt=0.05,
+            teacher_proj_Nv=None,
+            linear_T=0.1,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            linear_history_stride=1,
+            nonlinear_T=0.1,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            nonlinear_history_stride=1,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            Nv_targets=(4,),
+            Nm=1,
+            val_fraction=0.2,
+            n_low=2,
+        )
+        for regime in (train_mod.REGIME_LINEAR, train_mod.REGIME_WEAK, train_mod.REGIME_STRONG):
+            self.assertIn(regime, dataset)
+            self.assertGreater(dataset[regime]["train_inputs_base"].shape[0], 0, msg=regime)
+            self.assertGreater(dataset[regime]["val_inputs_base"].shape[0], 0, msg=regime)
 
     def test_q_only_dataset_build_ignores_rollout_horizon(self) -> None:
         captured = {}
