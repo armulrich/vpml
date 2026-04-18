@@ -1,47 +1,66 @@
-# JAX Fourier–Hermite Vlasov–Poisson 
+# JAX Fourier-Hermite Vlasov-Poisson
 
-This repo exposes the reusable Fourier–Hermite implementation and the shared grid-cubic-spline semi-Lagrangian solver as an importable `vpml` package and keeps the runnable scripts under `benchmarks/`.
+This repo is split into three layers:
 
-- `vpml/`: importable Fourier–Hermite core operators plus the shared grid-cubic-spline semi-Lagrangian solver
-- `benchmarks/fh_nonlinear_sim_jax.py`: nonlinear two-stream and bump-on-tail runs on the shared grid-cubic-spline solver
-- `benchmarks/fh_benchmarks_2412_07073_jax.py`: linear benchmarks reproducing key figures from Palisso et al. (arXiv:2412.07073)
-- `benchmarks/fh_ml_tail_closure_train_jax.py`: training entrypoint for the learned interface closure using either a `grid_cubic_spline` or `higher_order_hermite` Landau teacher
-- `benchmarks/eval.py`: post-train a posteriori metric evaluation for learned closures
-- `benchmarks/run_all_benchmarks.sh`: shell entry point for the full benchmark suite
+- `vpml/`: reusable package code
+- `benchmarks/`: paper-result regeneration scripts
+- `model/`: learned-closure training and learned-model evaluation
+
+That means the benchmark app and the model app both depend on `vpml`, but they do not depend on each other.
+
+## Repo Map
+
+- `vpml/core.py`: Fourier-Hermite operators, closures, implicit/CNAB2 solvers, learned-closure runtime
+- `vpml/linear_landau.py`: shared linear-Landau rollout helpers and dispersion/root-finding utilities
+- `vpml/nonlinear_landau.py`: shared nonlinear-Landau rollout runtime for benchmarks and learned-model eval
+- `vpml/physical_grid.py`: physical-grid semi-Lagrangian teacher solver and projection helpers
+- `vpml/metrics/`: reusable rollout metrics
+- `vpml/visualization/`: reusable plotting helpers
+- `benchmarks/fh_benchmarks_2412_07073_jax.py`: paper benchmark regeneration for Palisso et al. (arXiv:2412.07073)
+- `benchmarks/run_all_benchmarks.sh`: full benchmark shell entrypoint
+- `benchmarks/run_linear_landau_suite.sh`: linear Landau benchmark shell entrypoint
+- `benchmarks/fh_nonlinear_sim_jax.py`: standalone nonlinear physical-grid simulations
+- `model/model.py`: thin learned-model surface built on top of `vpml`
+- `model/train/train.py`: learned interface-closure training entrypoint
+- `model/train/data.py`: dataset/cache/reference-building surface for learned-closure workflows
+- `model/eval.py`: post-train learned-model evaluation
+- `model/eval_nv_sweep.py`: learned-model nonlinear `N_v` sweep evaluation
+- `model/train/run_nv_sweep_single_qloss.sh`: per-`N_v` offline `q_only` sweep wrapper
+- `model/train/run_nv_sweep_single_qloss_fixed_ratio.sh`: per-`N_v` fixed-ratio offline `q_only` sweep wrapper
+- `model/train/run_nv_sweep_online_rollout.sh`: per-`N_v` pure `online_rollout` sweep wrapper
+- `model/train/run_nv_sweep_higher_order_hermite_fixed_ratio.sh`: per-`N_v` higher-order-Hermite teacher sweep wrapper
 
 ## Requirements
 
-- Python 3.10+ (this repo is currently using Python 3.12)
-- `jax`, `jaxlib`, `numpy`, `matplotlib`
-- `scipy` (required for the benchmark script’s plasma-dispersion function and spline-regression tests in this environment)
+- Python 3.10+
+- `jax`
+- `jaxlib`
+- `numpy`
+- `matplotlib`
+- `scipy`
 
-For better eigenvalue/root-finding accuracy, enable 64-bit:
+For better eigenvalue/root-finding accuracy:
 
 ```bash
 export JAX_ENABLE_X64=True
 ```
 
-## Backend selection
+## Backend Selection
 
-`vpml` now bootstraps JAX before import and prints the active backend when the main
-training or benchmark scripts start.
+`vpml` bootstraps JAX before import and prints the active backend when the main
+benchmark or model scripts start.
 
-- On Linux, the default `VPML_JAX_BACKEND=auto` leaves backend selection to JAX. Per the
-  JAX docs, that means JAX defaults to GPU or TPU if available and falls back to CPU
-  otherwise.
-- On macOS, `vpml` forces `JAX_PLATFORMS=cpu` by default instead of using `jax-metal`.
-  This repo relies heavily on `float64` and complex dtypes, while the current Apple
-  `jax-metal` docs still list `np.float64`, `np.complex64`, and `np.complex128` as
-  unsupported.
+- On Linux, `VPML_JAX_BACKEND=auto` leaves backend selection to JAX.
+- On macOS, `vpml` defaults to CPU rather than `jax-metal` because this repo relies heavily on `float64` and complex dtypes.
 
-You can override the policy with:
+Overrides:
 
 ```bash
-export VPML_JAX_BACKEND=cpu   # force CPU
-export VPML_JAX_BACKEND=gpu   # prefer a CUDA/ROCm-style backend; vpml will warn if JAX still lands on CPU
+export VPML_JAX_BACKEND=cpu
+export VPML_JAX_BACKEND=gpu
 ```
 
-To actually use NVIDIA CUDA, install a CUDA-enabled JAX build in your environment, e.g.
+If you actually want CUDA, install a CUDA-enabled JAX build:
 
 ```bash
 pip install -U "jax[cuda13]"
@@ -55,179 +74,146 @@ source venv/bin/activate
 python -m pip install -e .
 ```
 
-If you only want to install the dependencies (without an editable install), you can do:
+Or just install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-After the editable install, this should work:
+Editable install sanity check:
 
 ```bash
 python -c "import vpml; print(vpml.__version__)"
 ```
 
-## How to run
+## Running The Benchmark App
 
-### Nonlinear simulations
+### Nonlinear Simulations
 
 ```bash
-python benchmarks/fh_nonlinear_sim_jax.py two_stream --outdir out_nl
-python benchmarks/fh_nonlinear_sim_jax.py bump_on_tail --system AC --outdir out_nl --vmin -12 --vmax 12
+python -m benchmarks.fh_nonlinear_sim_jax two_stream --outdir out_nl
+python -m benchmarks.fh_nonlinear_sim_jax bump_on_tail --system AC --outdir out_nl --vmin -12 --vmax 12
 ```
 
-Outputs go to `out_nl/` (PNGs + `.npz` energy time series).
+Outputs go to `out_nl/`.
 
-### Benchmarks (arXiv:2412.07073)
+### Paper Benchmarks
 
 ```bash
-python benchmarks/fh_benchmarks_2412_07073_jax.py fig2 --outdir out_bench
-python benchmarks/fh_benchmarks_2412_07073_jax.py fig3 --outdir out_bench
-python benchmarks/fh_benchmarks_2412_07073_jax.py fig4 --outdir out_bench --Nv 20
-python benchmarks/fh_benchmarks_2412_07073_jax.py linear_landau --method truncation --outdir out_bench
+python -m benchmarks.fh_benchmarks_2412_07073_jax fig2 --outdir out_bench
+python -m benchmarks.fh_benchmarks_2412_07073_jax fig3 --outdir out_bench
+python -m benchmarks.fh_benchmarks_2412_07073_jax fig4 --outdir out_bench --Nv 20
+python -m benchmarks.fh_benchmarks_2412_07073_jax linear_landau --method truncation --outdir out_bench
 ./benchmarks/run_all_benchmarks.sh out_bench
 ```
 
-Outputs go to `out_bench/` (PNGs + `.npz` data dumps).
-
-When a learned interface-closure checkpoint is available, pass it explicitly to rollout-style benchmarks:
+When a learned checkpoint is available:
 
 ```bash
-python benchmarks/fh_benchmarks_2412_07073_jax.py linear_landau --method learned --outdir out_bench --learned-checkpoint out_bench/interface_closure.npz
-python benchmarks/fh_benchmarks_2412_07073_jax.py fig10 --outdir out_bench
-python benchmarks/fh_benchmarks_2412_07073_jax.py fig10_learned_comparison --outdir out_bench --learned-checkpoint out_bench/interface_closure.npz
-LEARNED_CHECKPOINT=out_bench/interface_closure.npz ./benchmarks/run_all_benchmarks.sh out_bench
+python -m benchmarks.fh_benchmarks_2412_07073_jax linear_landau --method learned --outdir out_bench --learned-checkpoint out_model/interface_closure.npz
+python -m benchmarks.fh_benchmarks_2412_07073_jax fig10_learned_comparison --outdir out_bench --learned-checkpoint out_model/interface_closure.npz
+LEARNED_CHECKPOINT=out_model/interface_closure.npz ./benchmarks/run_all_benchmarks.sh out_bench
 ```
 
 The learned closure is intentionally not supported in `fig3` response-function or `fig4`
-eigenvalue benchmarks because it is state-dependent rather than a fixed modified Hermite
-matrix.
+eigenvalue benchmarks because it is state-dependent rather than a fixed modified Hermite matrix.
 
-### Learned Interface-Closure Training
+## Running The Model App
 
-If you want the whole workflow in one command, use the wrapper script:
-
-```bash
-cd /Users/armin/Documents/NYU/vpml
-./benchmarks/train.sh out_bench
-```
-
-That single script will:
-
-- generate or reuse the cached mixed Landau-family training dataset
-- train the shared interface-closure model with the repo defaults
-- run `benchmarks/eval.py` to compute post-train rollout metrics and metric figures
-- save the checkpoint, metrics, and training-loss plot
-- rerun the benchmark suite
-- render the classical nonlinear Landau phase-space figure plus a separate learned-vs-nonlocal comparison figure
-
-You can override the defaults with environment variables, for example:
+### Train A Learned Closure
 
 ```bash
-EPOCHS=100 NM=4 HIDDEN_WIDTH=128 ./benchmarks/train.sh out_bench
-```
-
-The current wrapper defaults train a less-local learned closure by using:
-
-- `NM=6`
-- `NV_TARGETS=6,8,10,12,20,40,80,160,300`
-
-`train.sh` also now rebuilds an incompatible cached dataset automatically, so rerunning it after these default changes is enough even if `out_bench/interface_closure_dataset.npz` was created by an older low-`N_v` configuration.
-
-The most useful outputs after the script finishes are:
-
-- `out_bench/interface_closure.loss.png`
-- `out_bench/eval/summary.json`
-- `out_bench/linear_landau_comparison.png`
-- `out_bench/fig10_nonlinear_landau_phase_space.png`
-- `out_bench/fig10_learned_vs_nonlocal_phase_space.png`
-
-```bash
-python benchmarks/fh_ml_tail_closure_train_jax.py \
-  --checkpoint out_bench/interface_closure.npz \
-  --dataset-cache out_bench/interface_closure_dataset.npz
+python -m model.train.train \
+  --checkpoint out_model/interface_closure.npz \
+  --dataset-cache out_model/interface_closure_dataset.npz
 ```
 
 This writes:
 
-- `interface_closure.npz`: learned interface-closure weights, normalization stats, and metadata
-- `interface_closure.metrics.npz`: single-stage training loss plus split validation metrics
-- `interface_closure_dataset.npz`: optional cached mixed Landau-family supervised pairs generated from the selected training teacher
+- `out_model/interface_closure.npz`
+- `out_model/interface_closure.metrics.npz`
+- `out_model/interface_closure_dataset.npz`
+- optionally `out_model/interface_closure.loss.png` if `--loss-plot` is passed
 
-To run the post-train a posteriori evaluation directly:
+The main offline training lane is `q_only`. The pure online lane is still kept separate as `online_rollout`.
+
+### Evaluate A Learned Closure
 
 ```bash
-python benchmarks/eval.py \
-  --checkpoint out_bench/interface_closure.npz \
-  --outdir out_bench/eval
+python -m model.eval \
+  --checkpoint out_model/interface_closure.npz \
+  --outdir out_model/eval
 ```
 
 This writes:
 
-- `eval/summary.json`: aggregate scalar metric summary across bundles
-- `eval/heldout_landau/*.npz`: per-case times, energies, field histories, and scalar metrics
-- `eval/heldout_landau/*_summary.png`: combined Metric 1 + Metric 2 figures
-- `eval/benchmark_rollouts/*.npz`: per-case benchmark-style learned-rollout metric payloads
-- `eval/benchmark_rollouts/*_summary.png`: benchmark-style metric figures
+- `out_model/eval/summary.json`
+- `out_model/eval/heldout_landau/*.npz`
+- `out_model/eval/heldout_landau/*_summary.png`
+- `out_model/eval/benchmark_rollouts/*.npz`
+- `out_model/eval/benchmark_rollouts/*_summary.png`
 
-To sweep the nonlinear learned closure across deployment `N_v` values without rerunning the full benchmark suite:
+### Sweep Learned Closures Across Deployment `N_v`
 
-```bash
-./benchmarks/run_nv_sweep.sh out_bench/nv_sweep
-```
-
-The sweep defaults to `NV_LIST=8,64,256,300,512` and writes:
-
-- `nv_sweep/shared_interface_closure_dataset.npz`: one shared extracted dataset cache built once for the full `N_v` list
-- `nv_sweep/models/nv*/interface_closure.npz`: separately trained learned-closure checkpoints, one per `N_v`
-- `nv_sweep/summary.json`: scalar metric summary per `N_v`
-- `nv_sweep/nv_sweep_metric1.png`: all nonlinear energy traces plus fitted early-time lines on one figure
-- `nv_sweep/nv_sweep_metric2.png`: `\varepsilon_E` summary plus stacked HR/learned field panels across `N_v`
-- `nv_sweep/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png`: stacked nonlocal-vs-learned nonlinear phase-space panels across `N_v`
-- `nv_sweep/cases/*.npz`: per-`N_v` saved metric payloads
-
-By default this sweep now trains a separate learned closure for each deployment `N_v`
-from the shared extracted cache. That keeps the experiment aligned with the question
-"how does the learned closure improve as `N_v` changes?" rather than mixing all
-deployment resolutions into one shared checkpoint.
-
-The first training pass uses only Landau-family data from the shared `grid_cubic_spline` teacher:
-
-- linear Landau damping
-- weakly nonlinear Landau damping
-- strongly nonlinear Landau damping
-
-The teacher defaults are:
-
-- `teacher-Nx = 256`
-- `teacher-Nv = 512`
-- `teacher-vmin = -8`
-- `teacher-vmax = 8`
-- `teacher-dt = 0.01`
-- `teacher-proj-Nv = max(Nv-targets) + 1` unless overridden
-
-To run the higher-order-Hermite teacher sweep with the matched fixed-ratio curriculum used by
-`run_nv_sweep_single_qloss_fixed_ratio.sh`:
+Offline target-specific `q_only` sweep:
 
 ```bash
-./benchmarks/run_nv_sweep_higher_order_hermite_fixed_ratio.sh out_bench/nv_sweep_higher_order_hermite_fixed_ratio
+./model/train/run_nv_sweep_single_qloss.sh out_bench/nv_sweep_single_qloss
 ```
 
-This trains one `q_only` checkpoint per deployment `N_v` using
-`teacher_backend=higher_order_hermite`, the same fixed-ratio per-target `N_v` ladders as the
-grid-teacher fixed-ratio sweep, and a per-target teacher size
-`teacher_Nv = ceil(HR_TEACHER_RATIO * target_Nv)` with `HR_TEACHER_RATIO=2.0` by default.
+Offline fixed-ratio `q_only` sweep:
 
-That keeps the training ladder construction, cache layout, and evaluation pipeline aligned so
-the side-by-side comparison changes only the teacher data source.
+```bash
+./model/train/run_nv_sweep_single_qloss_fixed_ratio.sh out_bench/nv_sweep_single_qloss_fixed_ratio
+```
 
-The runtime closure API can be reused elsewhere, but a checkpoint should only be trusted
-for regimes represented in its training data.
+Pure online rollout sweep:
 
-## Package map
+```bash
+./model/train/run_nv_sweep_online_rollout.sh out_bench/nv_sweep_online_rollout
+```
 
-- `vpml`: public package namespace
-- `vpml.core`: Fourier/Hermite utilities, CNAB2 integrator, implicit-midpoint/JFNK stepper, damping, and closure operators
-- `vpml.physical_grid`: shared JAX semi-Lagrangian cubic-spline Vlasov-Poisson solver and Fourier-Hermite projection helpers
-- `vpml.visualization`: shared plotting/output helpers for training, benchmarks, nonlinear runs, and post-train metrics
-- `benchmarks/`: runnable scripts and shell helpers that import `vpml`
+Higher-order-Hermite teacher fixed-ratio sweep:
+
+```bash
+./model/train/run_nv_sweep_higher_order_hermite_fixed_ratio.sh out_bench/nv_sweep_higher_order_hermite_fixed_ratio
+```
+
+All of these wrappers train one checkpoint per deployment `N_v` and then run:
+
+```bash
+python -m model.eval_nv_sweep ...
+```
+
+The sweep outputs include:
+
+- `summary.json`
+- `nv_sweep_metric1.png`
+- `nv_sweep_metric2.png`
+- `fig10_learned_vs_nonlocal_nv_sweep_phase_space.png`
+- `cases/*.npz`
+
+For the offline wrappers, dataset caches live under each per-`N_v` model directory:
+
+- `models/nv*/interface_closure_dataset.npz`
+
+For the pure online wrapper, no dataset cache is written.
+
+## Design Boundary
+
+The intended dependency direction is:
+
+```text
+benchmarks  -> vpml
+model       -> vpml
+```
+
+Not:
+
+```text
+vpml -> benchmarks
+vpml -> model
+```
+
+So shared math, solver code, rollout runtimes, checkpoint I/O, metrics, and plotting primitives belong in `vpml`.
+Training-program choices such as dataset construction, curriculum ladders, and offline-vs-online objectives belong in `model/`.
