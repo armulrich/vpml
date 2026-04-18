@@ -37,21 +37,7 @@ TEACHER_VMAX="${TEACHER_VMAX:-8.0}"
 FIELD_NUM_LOW_MODES="${FIELD_NUM_LOW_MODES:-}"
 FIELD_K_MAX="${FIELD_K_MAX:-}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
-TOTAL_CPU_COUNT="$(
-  if command -v getconf >/dev/null 2>&1; then
-    getconf _NPROCESSORS_ONLN 2>/dev/null || true
-  elif command -v sysctl >/dev/null 2>&1; then
-    sysctl -n hw.logicalcpu 2>/dev/null || true
-  fi
-)"
-if [[ -z "${TOTAL_CPU_COUNT}" ]]; then
-  TOTAL_CPU_COUNT="1"
-fi
-DEFAULT_TRAIN_PARALLEL_JOBS="1"
-if [[ "${TOTAL_CPU_COUNT}" =~ ^[0-9]+$ ]] && [[ "${TOTAL_CPU_COUNT}" -ge 8 ]]; then
-  DEFAULT_TRAIN_PARALLEL_JOBS="2"
-fi
-TRAIN_PARALLEL_JOBS="${TRAIN_PARALLEL_JOBS:-${DEFAULT_TRAIN_PARALLEL_JOBS}}"
+TRAIN_PARALLEL_JOBS="${TRAIN_PARALLEL_JOBS:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
 TRAIN_NM="${TRAIN_NM:-6}"
