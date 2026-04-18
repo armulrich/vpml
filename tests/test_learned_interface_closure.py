@@ -1209,32 +1209,13 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
 
         self.assertEqual(captured["rollout_horizon"], 0)
 
-    def test_online_rollout_rejects_offline_cache_and_projection_options(self) -> None:
+    def test_online_rollout_supports_reference_cache_but_rejects_offline_cache_flags_and_projection_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt = Path(tmpdir) / "shared_interface.npz"
             cache = Path(tmpdir) / "shared_dataset.npz"
-            with self.assertRaisesRegex(ValueError, r"does not support --dataset-cache"):
+            with self.assertRaisesRegex(ValueError, r"--build-dataset-only requires --dataset-cache"):
                 train_main(
                     [
-                        "--checkpoint",
-                        str(ckpt),
-                        "--training-mode",
-                        "online_rollout",
-                        "--train-objective",
-                        "trajectory",
-                        "--Nv-targets",
-                        "4",
-                        "--Nm",
-                        "1",
-                        "--dataset-cache",
-                        str(cache),
-                    ]
-                )
-            with self.assertRaisesRegex(ValueError, r"does not support --build-dataset-only"):
-                train_main(
-                    [
-                        "--checkpoint",
-                        str(ckpt),
                         "--training-mode",
                         "online_rollout",
                         "--train-objective",
@@ -1246,6 +1227,35 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                         "--build-dataset-only",
                     ]
                 )
+            with mock.patch.object(
+                train_mod,
+                "build_online_reference_dataset",
+                return_value=(
+                    {
+                        train_mod.REGIME_LINEAR: {
+                            "train": {"E_hat_ref": np.zeros((1, 2, 2), dtype=np.complex128)},
+                            "val": {"E_hat_ref": np.zeros((1, 2, 2), dtype=np.complex128)},
+                        }
+                    },
+                    jnp.linspace(-6.0, 6.0, 4, dtype=jnp.float64),
+                ),
+            ) as patched:
+                train_main(
+                    [
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--Nv-targets",
+                        "4,8",
+                        "--Nm",
+                        "1",
+                        "--dataset-cache",
+                        str(cache),
+                        "--build-dataset-only",
+                    ]
+                )
+            patched.assert_called_once()
             with self.assertRaisesRegex(ValueError, r"does not support --allow-dataset-cache-nv-superset"):
                 train_main(
                     [
@@ -1278,6 +1288,92 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                         "--per-target-projection-orders",
                     ]
                 )
+
+    def test_cached_online_reference_dataset_is_reused(self) -> None:
+        v_probe = np.linspace(-6.0, 6.0, 8, dtype=np.float64)
+        shared_dataset = {
+            train_mod.REGIME_LINEAR: {
+                "train": {
+                    "times": np.array([[0.0, 0.05, 0.10]], dtype=np.float64),
+                    "E_hat_ref": np.zeros((1, 3, 5), dtype=np.complex128),
+                    "delta_f_ref": np.zeros((1, 3, 8, 4), dtype=np.float64),
+                    "perturbation_x": np.array([[0.1, 0.2, 0.3, 0.4]], dtype=np.float64),
+                },
+                "val": {
+                    "times": np.array([[0.0, 0.05, 0.10]], dtype=np.float64),
+                    "E_hat_ref": np.ones((1, 3, 5), dtype=np.complex128),
+                    "delta_f_ref": np.ones((1, 3, 8, 4), dtype=np.float64),
+                    "perturbation_x": np.array([[0.5, 0.6, 0.7, 0.8]], dtype=np.float64),
+                },
+            }
+        }
+        metadata = train_mod.build_online_reference_cache_metadata(
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_Nx=8,
+            teacher_Nv=16,
+            teacher_L=4.0 * math.pi,
+            teacher_vmin=-6.0,
+            teacher_vmax=6.0,
+            teacher_dt=0.05,
+            linear_T=0.10,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            val_fraction=0.2,
+            online_v_probes=8,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir) / "online_reference_dataset.npz"
+            train_mod.save_online_reference_cache(
+                cache,
+                shared_dataset,
+                v_probe=v_probe,
+                metadata=metadata,
+            )
+            with mock.patch.object(
+                train_mod,
+                "build_physical_reference_episode",
+                side_effect=RuntimeError("should reuse cached online dataset"),
+            ):
+                cached_dataset, cached_v_probe = train_mod.build_online_reference_dataset(
+                    dataset_cache=cache,
+                    regimes=(train_mod.REGIME_LINEAR,),
+                    teacher_Nx=8,
+                    teacher_Nv=16,
+                    teacher_L=4.0 * math.pi,
+                    teacher_vmin=-6.0,
+                    teacher_vmax=6.0,
+                    teacher_dt=0.05,
+                    linear_T=0.10,
+                    linear_eps=1e-2,
+                    linear_modes=(0.5,),
+                    linear_num_samples=1,
+                    linear_seed=0,
+                    linear_poisson_sign=1.0,
+                    nonlinear_T=0.10,
+                    nonlinear_k0=0.5,
+                    nonlinear_poisson_sign=1.0,
+                    weak_eps=(0.05,),
+                    strong_eps=(0.25,),
+                    val_fraction=0.2,
+                    online_v_probes=8,
+                )
+            np.testing.assert_allclose(np.asarray(cached_v_probe, dtype=np.float64), v_probe)
+            np.testing.assert_allclose(
+                np.asarray(cached_dataset[train_mod.REGIME_LINEAR]["train"]["times"], dtype=np.float64),
+                shared_dataset[train_mod.REGIME_LINEAR]["train"]["times"],
+            )
+            np.testing.assert_allclose(
+                np.asarray(cached_dataset[train_mod.REGIME_LINEAR]["val"]["perturbation_x"], dtype=np.float64),
+                shared_dataset[train_mod.REGIME_LINEAR]["val"]["perturbation_x"],
+            )
 
     def test_online_rollout_rejects_higher_order_hermite_teacher(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

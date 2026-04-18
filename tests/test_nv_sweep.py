@@ -630,6 +630,7 @@ class NvSweepTests(unittest.TestCase):
                     "TRAIN_TEACHER_VMAX": "6",
                     "TRAIN_ONLINE_V_PROBES": "8",
                     "TRAIN_ONLINE_CASE_BATCH_SIZE": "1",
+                    "TRAIN_PARALLEL_JOBS": "1",
                 }
             )
             subprocess.run(
@@ -643,6 +644,7 @@ class NvSweepTests(unittest.TestCase):
             self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
             self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
             self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
+            self.assertTrue((outdir / "online_reference_dataset.npz").exists())
             self.assertFalse((outdir / "shared_interface_closure_dataset.npz").exists())
             self.assertEqual(list(outdir.rglob("interface_closure_dataset.npz")), [])
 

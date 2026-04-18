@@ -80,6 +80,7 @@ REGIME_WEAK = "nonlinear_landau_weak"
 REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
+ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v1"
 STABILITY_LOSS_DEFINITION = "window_hybrid_v1"
 ONLINE_TRAINING_MODE = "online_rollout"
 OFFLINE_TRAINING_MODE = "offline_rollout"
@@ -174,6 +175,55 @@ def build_dataset_cache_metadata(
             dtype=np.int32,
         )
     return payload
+
+
+def build_online_reference_cache_metadata(
+    *,
+    regimes: Sequence[str],
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_L: float,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    linear_T: float,
+    linear_eps: float,
+    linear_modes: Sequence[float],
+    linear_num_samples: int,
+    linear_seed: int,
+    linear_poisson_sign: float,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    nonlinear_poisson_sign: float,
+    weak_eps: Sequence[float],
+    strong_eps: Sequence[float],
+    val_fraction: float,
+    online_v_probes: int,
+) -> Dict[str, np.ndarray]:
+    return {
+        "dataset_format": np.array([ONLINE_REFERENCE_CACHE_FORMAT], dtype=np.str_),
+        "regimes": np.asarray(tuple(regimes), dtype=np.str_),
+        "teacher_backend": np.array([GRID_CUBIC_SPLINE_TEACHER_BACKEND], dtype=np.str_),
+        "teacher_Nx": np.array([int(teacher_Nx)], dtype=np.int32),
+        "teacher_Nv": np.array([int(teacher_Nv)], dtype=np.int32),
+        "teacher_L": np.array([float(teacher_L)], dtype=np.float64),
+        "teacher_vmin": np.array([float(teacher_vmin)], dtype=np.float64),
+        "teacher_vmax": np.array([float(teacher_vmax)], dtype=np.float64),
+        "teacher_dt": np.array([float(teacher_dt)], dtype=np.float64),
+        "linear_T": np.array([float(linear_T)], dtype=np.float64),
+        "linear_eps": np.array([float(linear_eps)], dtype=np.float64),
+        "linear_modes": np.asarray(tuple(float(v) for v in linear_modes), dtype=np.float64),
+        "linear_num_samples": np.array([int(linear_num_samples)], dtype=np.int32),
+        "linear_seed": np.array([int(linear_seed)], dtype=np.int32),
+        "linear_poisson_sign": np.array([float(linear_poisson_sign)], dtype=np.float64),
+        "nonlinear_T": np.array([float(nonlinear_T)], dtype=np.float64),
+        "nonlinear_k0": np.array([float(nonlinear_k0)], dtype=np.float64),
+        "nonlinear_poisson_sign": np.array([float(nonlinear_poisson_sign)], dtype=np.float64),
+        "weak_eps": np.asarray(tuple(float(v) for v in weak_eps), dtype=np.float64),
+        "strong_eps": np.asarray(tuple(float(v) for v in strong_eps), dtype=np.float64),
+        "val_fraction": np.array([float(val_fraction)], dtype=np.float64),
+        "online_v_probes": np.array([int(online_v_probes)], dtype=np.int32),
+    }
 
 
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
@@ -888,6 +938,38 @@ def load_dataset_cache(
         return dataset
 
 
+def load_online_reference_cache(
+    path: Path,
+    *,
+    expected_metadata: Dict[str, np.ndarray],
+) -> Tuple[Dict[str, Dict[str, Dict[str, np.ndarray]]], np.ndarray]:
+    with np.load(path) as data:
+        for key, expected in expected_metadata.items():
+            if key not in data.files:
+                raise ValueError(f"Online reference cache {path} is missing metadata field '{key}'.")
+            actual = np.asarray(data[key])
+            if _cache_value_mismatch(actual, np.asarray(expected)):
+                raise ValueError(
+                    f"Online reference cache {path} metadata mismatch for '{key}'. "
+                    "Rebuilding with the current teacher configuration is required."
+                )
+        if "v_probe" not in data.files:
+            raise ValueError(f"Online reference cache {path} is missing 'v_probe'.")
+        regimes = tuple(str(v) for v in np.asarray(data["regimes"], dtype=np.str_).tolist())
+        dataset: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        for regime in regimes:
+            dataset[regime] = {}
+            for split in ("train", "val"):
+                prefix = f"{regime}_{split}_"
+                payload = {
+                    name[len(prefix):]: np.asarray(data[name])
+                    for name in data.files
+                    if name.startswith(prefix)
+                }
+                dataset[regime][split] = payload
+        return dataset, np.asarray(data["v_probe"], dtype=np.float64)
+
+
 def save_dataset_cache(
     path: Path,
     dataset: Dict[str, Dict[str, np.ndarray]],
@@ -908,6 +990,23 @@ def save_dataset_cache(
                 payload[f"{prefix}_curr_state"] = np.asarray(window_payload["curr_state"], dtype=np.complex128)
                 payload[f"{prefix}_future_state"] = np.asarray(window_payload["future_state"], dtype=np.complex128)
                 payload[f"{prefix}_future_E_hat"] = np.asarray(window_payload["future_E_hat"], dtype=np.complex128)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **payload)
+
+
+def save_online_reference_cache(
+    path: Path,
+    dataset: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    *,
+    v_probe: Array,
+    metadata: Dict[str, np.ndarray],
+) -> None:
+    payload: Dict[str, np.ndarray] = dict(metadata)
+    payload["v_probe"] = np.asarray(v_probe, dtype=np.float64)
+    for regime, splits in dataset.items():
+        for split in ("train", "val"):
+            for key, value in splits.get(split, {}).items():
+                payload[f"{regime}_{split}_{key}"] = np.asarray(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **payload)
 
@@ -1414,6 +1513,7 @@ def build_physical_reference_episode(
 
 def build_online_reference_dataset(
     *,
+    dataset_cache: Optional[Path],
     regimes: Sequence[str],
     teacher_Nx: int,
     teacher_Nv: int,
@@ -1435,6 +1535,39 @@ def build_online_reference_dataset(
     val_fraction: float,
     online_v_probes: int,
 ) -> Tuple[Dict[str, Dict[str, Dict[str, Array]]], Array]:
+    cache_metadata = build_online_reference_cache_metadata(
+        regimes=regimes,
+        teacher_Nx=teacher_Nx,
+        teacher_Nv=teacher_Nv,
+        teacher_L=teacher_L,
+        teacher_vmin=teacher_vmin,
+        teacher_vmax=teacher_vmax,
+        teacher_dt=teacher_dt,
+        linear_T=linear_T,
+        linear_eps=linear_eps,
+        linear_modes=linear_modes,
+        linear_num_samples=linear_num_samples,
+        linear_seed=linear_seed,
+        linear_poisson_sign=linear_poisson_sign,
+        nonlinear_T=nonlinear_T,
+        nonlinear_k0=nonlinear_k0,
+        nonlinear_poisson_sign=nonlinear_poisson_sign,
+        weak_eps=weak_eps,
+        strong_eps=strong_eps,
+        val_fraction=val_fraction,
+        online_v_probes=online_v_probes,
+    )
+    if dataset_cache is not None and dataset_cache.exists():
+        try:
+            cached_dataset, cached_v_probe = load_online_reference_cache(
+                dataset_cache,
+                expected_metadata=cache_metadata,
+            )
+            selected = {regime: cached_dataset[regime] for regime in regimes}
+            return selected, jnp.asarray(cached_v_probe, dtype=jnp.float64)
+        except ValueError as exc:
+            print(f"[data] ignoring incompatible online reference cache {dataset_cache}: {exc}")
+
     v_probe = jnp.linspace(float(teacher_vmin), float(teacher_vmax), int(online_v_probes), dtype=jnp.float64)
     dataset: Dict[str, Dict[str, Dict[str, Array]]] = {}
 
@@ -1495,6 +1628,13 @@ def build_online_reference_dataset(
             "val": _stack_episode_payloads(val_payloads),
         }
 
+    if dataset_cache is not None:
+        save_online_reference_cache(
+            dataset_cache,
+            dataset,
+            v_probe=v_probe,
+            metadata=cache_metadata,
+        )
     return dataset, v_probe
 
 
@@ -2870,17 +3010,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     teacher_backend = normalize_teacher_backend_name(args.teacher_backend)
     teacher_proj_Nv: Optional[int] = None
     if training_mode == ONLINE_TRAINING_MODE:
-        if bool(args.build_dataset_only):
-            raise ValueError("online_rollout does not support --build-dataset-only")
-        if args.dataset_cache is not None:
-            raise ValueError("online_rollout does not support --dataset-cache")
         if bool(args.allow_dataset_cache_nv_superset):
             raise ValueError("online_rollout does not support --allow-dataset-cache-nv-superset")
         if bool(args.per_target_projection_orders):
             raise ValueError("online_rollout does not support --per-target-projection-orders")
         if teacher_backend != GRID_CUBIC_SPLINE_TEACHER_BACKEND:
             raise ValueError("online_rollout only supports teacher_backend=grid_cubic_spline")
-        if len(Nv_targets) != 1:
+        if bool(args.build_dataset_only) and args.dataset_cache is None:
+            raise ValueError("online_rollout --build-dataset-only requires --dataset-cache")
+        if len(Nv_targets) != 1 and not bool(args.build_dataset_only):
             raise ValueError("online_rollout requires exactly one target Nv")
         if args.teacher_proj_Nv is not None:
             raise ValueError("online_rollout does not use --teacher-proj-Nv")
@@ -2893,9 +3031,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
         if int(args.online_v_probes) <= 0:
             raise ValueError("online_rollout requires --online-v-probes > 0")
-        if int(args.online_case_batch_size) <= 0:
+        if int(args.online_case_batch_size) <= 0 and not bool(args.build_dataset_only):
             raise ValueError("online_rollout requires --online-case-batch-size > 0")
-        if float(args.lambda_E) <= 0.0 and float(args.lambda_dist) <= 0.0:
+        if (
+            float(args.lambda_E) <= 0.0
+            and float(args.lambda_dist) <= 0.0
+            and not bool(args.build_dataset_only)
+        ):
             raise ValueError("online_rollout requires lambda_E > 0 or lambda_dist > 0")
     else:
         if args.train_objective == "trajectory":
@@ -3147,6 +3289,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         val_metrics = evaluate_regime_metrics(learned, prepared)
     else:
         online_dataset, _ = build_online_reference_dataset(
+            dataset_cache=args.dataset_cache,
             regimes=regimes,
             teacher_Nx=args.teacher_Nx,
             teacher_Nv=args.teacher_Nv,
@@ -3174,6 +3317,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             train_count = int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("train") else 0
             val_count = int(online_dataset[regime]["val"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("val") else 0
             print(f"[data] {regime}: train={train_count} episodes val={val_count} episodes")
+
+        if bool(args.build_dataset_only):
+            print(f"Prepared online reference dataset cache at {args.dataset_cache}")
+            return
 
         integ = FourierHermiteIMEX(
             Nx=int(args.teacher_Nx),

@@ -194,6 +194,6 @@ dataset cache.
 - `model/train/run_nv_sweep_single_qloss.sh` — per-`N_v` offline `q_only` sweep wrapper
 - `model/train/run_nv_sweep_single_qloss_fixed_ratio.sh` — per-`N_v` fixed-ratio offline `q_only` sweep wrapper
 - `model/train/run_nv_sweep_online_rollout.sh` — per-`N_v` pure `online_rollout` sweep wrapper
+  Default recipe: denser nonlinear amplitude coverage, `TEACHER_NX=256`, `TEACHER_DT=0.005`, and `TRAIN_ONLINE_V_PROBES=256` for the top-end `N_v` comparison lane
+  Runtime note: the wrapper prebuilds a shared `online_reference_dataset.npz`, reuses it across `N_v`, and enables bounded per-`N_v` parallel training on larger CPU boxes
 - `model/train/run_nv_sweep_higher_order_hermite_fixed_ratio.sh` — per-`N_v` higher-order-Hermite teacher sweep wrapper
-
-
