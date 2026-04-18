@@ -12,6 +12,7 @@ bootstrap_jax_runtime()
 
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 import numpy as np
 
 from .core import (
@@ -57,6 +58,87 @@ class LinearLandauConfig:
     max_newton_iter: int = 10
     gmres_restart: Optional[int] = None
     gmres_maxiter: Optional[int] = None
+
+
+def plasma_dispersion_Z(xi: Array) -> Array:
+    """Fried-Conte plasma dispersion function Z(xi)."""
+    try:
+        wofz = jsp.special.wofz  # type: ignore[attr-defined]
+        w = wofz(xi.astype(jnp.complex128))
+    except Exception:
+        try:
+            from scipy.special import wofz as sp_wofz  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                "plasma_dispersion_Z requires SciPy (`pip install scipy`) in this environment "
+                "because complex erfc/wofz are not available in jax.scipy."
+            ) from exc
+        w = jnp.asarray(sp_wofz(np.asarray(xi, dtype=np.complex128)))
+    return 1j * jnp.sqrt(jnp.pi) * w
+
+
+def response_function_R(xi: Array) -> Array:
+    """Collisionless response function R(xi) = 1 + xi Z(xi)."""
+    return 1.0 + xi * plasma_dispersion_Z(xi)
+
+
+def solve_landau_root_xi(
+    k: float,
+    xi0: Optional[complex] = None,
+    maxiter: int = 60,
+    tol: float = 1e-13,
+) -> complex:
+    """Solve the collisionless Landau dispersion relation for xi."""
+    k2 = float(k) * float(k)
+
+    if xi0 is None:
+        wr = math.sqrt(1.0 + 3.0 * k2)
+        xi = complex(wr / (math.sqrt(2.0) * abs(k)), -0.5)
+    else:
+        xi = complex(xi0)
+
+    for _ in range(maxiter):
+        xi_j = jnp.array(xi, dtype=jnp.complex128)
+        Z = plasma_dispersion_Z(xi_j)
+        R = 1.0 + xi_j * Z
+        dR = Z - (2.0 * xi_j * R)
+
+        F = complex(jax.device_get(R)) + k2
+        if abs(F) < tol:
+            return xi
+        Fp = complex(jax.device_get(dR))
+        if Fp == 0.0:
+            break
+
+        step = F / Fp
+        lam = 1.0
+        xi_new = xi - step
+        F_new = complex(jax.device_get(response_function_R(jnp.array(xi_new, jnp.complex128)))) + k2
+        while abs(F_new) > abs(F) and lam > 1e-3:
+            lam *= 0.5
+            xi_new = xi - lam * step
+            F_new = complex(jax.device_get(response_function_R(jnp.array(xi_new, jnp.complex128)))) + k2
+
+        xi = xi_new
+        if abs(lam * step) < tol:
+            return xi
+
+    return xi
+
+
+def landau_omega(k: float, xi: complex) -> complex:
+    """Return omega = xi * sqrt(2) * |k|."""
+    return xi * math.sqrt(2.0) * abs(k)
+
+
+def landau_gamma(k: float, xi: complex) -> float:
+    """Return the signed damping rate Im(omega)."""
+    return float(np.imag(landau_omega(k, xi)))
+
+
+def landau_gamma_mag(k: float, xi: complex) -> float:
+    """Return the positive damping magnitude -Im(omega)."""
+    return -float(np.imag(landau_omega(k, xi)))
 
 
 def _flatten_hat_real(a_hat: Array) -> Array:
@@ -306,7 +388,6 @@ def linear_landau_payload(
     residual_hist: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     """Build benchmark-style observables from a rollout history."""
-    from benchmarks.fh_benchmarks_2412_07073_jax import landau_gamma, solve_landau_root_xi
 
     integ = FourierHermiteIMEX(
         Nx=config.Nx,

@@ -62,6 +62,17 @@ from .physical_grid import (
     project_distribution_snapshot_to_fourier_hermite,
     run_semilagrangian_vlasov_poisson,
 )
+from .linear_landau import (
+    landau_gamma,
+    landau_gamma_mag,
+    plasma_dispersion_Z,
+    response_function_R,
+    solve_landau_root_xi,
+)
+from .nonlinear_landau import (
+    NonlinearLandauParams,
+    run_nonlinear_landau_rollout_raw,
+)
 
 __all__ = [
     "bootstrap_jax_runtime",
@@ -118,6 +129,13 @@ __all__ = [
     "project_distribution_history_to_fourier_hermite",
     "project_distribution_snapshot_to_fourier_hermite",
     "run_semilagrangian_vlasov_poisson",
+    "plasma_dispersion_Z",
+    "response_function_R",
+    "solve_landau_root_xi",
+    "landau_gamma",
+    "landau_gamma_mag",
+    "NonlinearLandauParams",
+    "run_nonlinear_landau_rollout_raw",
 ]
 
 __version__ = "0.1.0"

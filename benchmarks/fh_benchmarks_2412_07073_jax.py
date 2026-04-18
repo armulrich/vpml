@@ -60,7 +60,6 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import jax
 import jax.numpy as jnp
-import jax.scipy as jsp
 
 from vpml.core import (
     Array,
@@ -70,14 +69,20 @@ from vpml.core import (
     LearnedInterfaceClosure,
     NonlocalClosure,
     hermite_basis_phi,
-    hermite_damping_term,
-    irfft_x,
-    learned_boundary_flux_hat,
     load_learned_interface_closure_npz,
-    rfft_x,
-    FourierHermiteIMEX,
 )
-from vpml.linear_landau import LinearLandauConfig, run_linear_landau_rollout
+from vpml.linear_landau import (
+    LinearLandauConfig,
+    landau_gamma_mag,
+    response_function_R,
+    run_linear_landau_rollout,
+    solve_landau_root_xi,
+)
+from vpml.nonlinear_landau import (
+    NonlinearLandauParams,
+    _time_key,
+    run_nonlinear_landau_rollout_raw,
+)
 from vpml.visualization.benchmarks import (
     save_fig2_damping_profiles,
     save_fig3_response_function,
@@ -92,119 +97,6 @@ try:
     jax.config.update("jax_enable_x64", True)
 except Exception:
     pass
-
-
-# =============================================================================
-# Plasma dispersion function and response function
-# =============================================================================
-
-def plasma_dispersion_Z(xi: Array) -> Array:
-    """
-    Fried–Conte plasma dispersion function Z(ξ).
-
-    We use the exact relation:
-        Z(ξ) = i*sqrt(pi) * w(ξ),
-    where w is the Faddeeva function (wofz).
-
-    Note: JAX (in this environment) does not provide `jax.scipy.special.wofz`, and
-    `jax.scipy.special.erfc` is real-only, so we fall back to SciPy’s `wofz`.
-    """
-    try:
-        wofz = jsp.special.wofz  # type: ignore[attr-defined]
-        w = wofz(xi.astype(jnp.complex128))
-    except Exception:
-        try:
-            from scipy.special import wofz as sp_wofz  # type: ignore
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError(
-                "plasma_dispersion_Z requires SciPy (`pip install scipy`) in this environment "
-                "because complex erfc/wofz are not available in jax.scipy."
-            ) from exc
-        w = jnp.asarray(sp_wofz(np.asarray(xi, dtype=np.complex128)))
-    return 1j * jnp.sqrt(jnp.pi) * w
-
-
-def response_function_R(xi: Array) -> Array:
-    """Collisionless response function R(ξ) = 1 + ξ Z(ξ)."""
-    return 1.0 + xi * plasma_dispersion_Z(xi)
-
-
-def solve_landau_root_xi(
-    k: float,
-    xi0: Optional[complex] = None,
-    maxiter: int = 60,
-    tol: float = 1e-13,
-) -> complex:
-    """
-    Solve the collisionless dispersion relation used in the paper:
-        k^2 = - R(ξ)   <=>  F(ξ) = R(ξ) + k^2 = 0
-    with complex Newton + simple backtracking.
-
-    Returns
-    -------
-    xi : complex
-        ξ = ω / (sqrt(2) |k|)
-
-    Notes
-    -----
-    Uses the identity:
-        Z'(ξ) = -2 (1 + ξ Z(ξ)) = -2 R(ξ)
-    so:
-        dR/dξ = Z(ξ) + ξ Z'(ξ) = Z(ξ) - 2 ξ R(ξ)
-    """
-    k2 = float(k) * float(k)
-
-    if xi0 is None:
-        # Heuristic start: warm plasma frequency with modest damping.
-        wr = math.sqrt(1.0 + 3.0 * k2)
-        xi = complex(wr / (math.sqrt(2.0) * abs(k)), -0.5)
-    else:
-        xi = complex(xi0)
-
-    for _ in range(maxiter):
-        xi_j = jnp.array(xi, dtype=jnp.complex128)
-        Z = plasma_dispersion_Z(xi_j)
-        R = 1.0 + xi_j * Z
-        dR = Z - (2.0 * xi_j * R)
-
-        F = complex(jax.device_get(R)) + k2
-        if abs(F) < tol:
-            return xi
-        Fp = complex(jax.device_get(dR))
-        if Fp == 0.0:
-            break
-
-        step = F / Fp
-
-        # Backtracking line search
-        lam = 1.0
-        xi_new = xi - step
-        F_new = complex(jax.device_get(response_function_R(jnp.array(xi_new, jnp.complex128)))) + k2
-        while abs(F_new) > abs(F) and lam > 1e-3:
-            lam *= 0.5
-            xi_new = xi - lam * step
-            F_new = complex(jax.device_get(response_function_R(jnp.array(xi_new, jnp.complex128)))) + k2
-
-        xi = xi_new
-        if abs(lam * step) < tol:
-            return xi
-
-    return xi
-
-
-def landau_omega(k: float, xi: complex) -> complex:
-    """ω = ξ * sqrt(2) * |k|."""
-    return xi * math.sqrt(2.0) * abs(k)
-
-
-def landau_gamma(k: float, xi: complex) -> float:
-    """Damping rate γ = Im(ω) (typically negative)."""
-    return float(np.imag(landau_omega(k, xi)))
-
-
-def landau_gamma_mag(k: float, xi: complex) -> float:
-    """Positive damping magnitude γ = -Im(ω)."""
-    return -float(np.imag(landau_omega(k, xi)))
 
 
 def build_linear_Q(
@@ -841,192 +733,6 @@ class Fig4EigenvalueScan(Benchmark):
 # =============================================================================
 # Fig. 10: nonlinear Landau damping phase-space snapshots
 # =============================================================================
-
-@dataclass(frozen=True)
-class NonlinearLandauParams:
-    Nx: int = 200
-    Nv: int = 300
-    L: float = 4.0 * math.pi
-    dt: float = 1e-2
-    T: float = 40.0
-    eps: float = 0.5
-    k0: float = 0.5
-    vth: float = 1.0
-    dealias_23: bool = False
-    poisson_sign: float = +1.0
-    snapshot_times: Tuple[float, ...] = (20.0, 40.0)
-    v_range: Tuple[float, float] = (-4.0, 4.0)
-    Nv_plot: int = 1000
-    vmin: float = 0.0
-    vmax: float = 0.5
-
-
-def _snapshot_indices(snapshot_times: Sequence[float], dt: float) -> np.ndarray:
-    return np.asarray([int(round(float(t) / float(dt))) for t in snapshot_times], dtype=np.int32)
-
-
-def _time_key(t: float) -> str:
-    t_str = f"{float(t):g}".replace("-", "m").replace(".", "p")
-    return f"t{t_str}"
-
-
-def run_nonlinear_landau_rollout_raw(
-    params: NonlinearLandauParams,
-    method: str,
-    *,
-    alpha: Optional[int] = None,
-    nu: Optional[float] = None,
-    chi_over_dt: Optional[float] = None,
-    mu: Optional[float] = None,
-    learned_closure: Optional[LearnedInterfaceClosure] = None,
-    return_state_history: bool = False,
-    history_stride: int = 1,
-) -> Dict[str, np.ndarray | Array]:
-    """
-    Advance nonlinear Landau damping with the shared Fourier-Hermite CNAB2 solver.
-
-    When `return_state_history=True`, this stores strided raw `a_hat` states for training.
-    """
-    closure = None
-    damping = None
-    if method == "hyper":
-        if alpha is None or nu is None:
-            raise ValueError("hyper method requires alpha and nu")
-        damping = HyperCollisions(alpha=int(alpha), nu=float(nu), Nv=int(params.Nv))
-    elif method == "filter":
-        if chi_over_dt is None:
-            raise ValueError("filter method requires chi_over_dt")
-        damping = HouLiFilter(chi_over_dt=float(chi_over_dt), Nv=int(params.Nv), p=36)
-    elif method == "nonlocal":
-        if mu is None:
-            raise ValueError("nonlocal method requires mu")
-        closure = NonlocalClosure(mu_tail=jnp.array([float(mu)], dtype=jnp.float64))
-    elif method == "learned":
-        if learned_closure is None:
-            raise ValueError("learned method requires learned_closure")
-    elif method != "truncation":
-        raise ValueError(f"Unknown nonlinear Landau method: {method}")
-
-    history_stride = max(int(history_stride), 1)
-
-    integ = FourierHermiteIMEX(
-        Nx=int(params.Nx),
-        Nv=int(params.Nv),
-        Lx=float(params.L),
-        dt=float(params.dt),
-        vth=float(params.vth),
-        dealias_23=bool(params.dealias_23),
-        closure=closure,
-    )
-    m_eq = jnp.zeros((int(params.Nv),), dtype=jnp.float64).at[0].set(1.0)
-    a_phys0 = jnp.zeros((int(params.Nv), int(params.Nx)), dtype=jnp.float64)
-    a_phys0 = a_phys0.at[0].set(float(params.eps) * jnp.cos(float(params.k0) * integ.x))
-    a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
-
-    damping_rates = None
-    if damping is not None:
-        damping_rates = damping.damping_rates().astype(jnp.float64)
-
-    def explicit_n_hat(a_hat: Array) -> Array:
-        a_phys = irfft_x(a_hat, int(params.Nx))
-        e_phys = integ.E_phys_from_a_hat(a_hat, poisson_sign=float(params.poisson_sign))
-        n_phys = jnp.zeros_like(a_phys)
-        n_phys = n_phys.at[1:].set(
-            -(integ.sqrt_n[1:, None] / float(params.vth))
-            * e_phys[None, :]
-            * (a_phys[:-1] + m_eq[:-1, None])
-        )
-        if damping_rates is not None:
-            n_phys = n_phys + hermite_damping_term(a_phys, damping_rates)
-        return integ.apply_mask_hat(rfft_x(n_phys))
-
-    n0 = explicit_n_hat(a_hat0)
-    b0 = (
-        learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned_closure)
-        if learned_closure is not None
-        else jnp.zeros_like(a_hat0)
-    )
-    nsteps = int(round(float(params.T) / float(params.dt)))
-    snap_steps = _snapshot_indices(params.snapshot_times, params.dt)
-    snaps0 = jnp.zeros((len(snap_steps), int(params.Nv), int(params.Nx)), dtype=jnp.float64)
-    if 0 in snap_steps:
-        snap0_idx = int(np.where(snap_steps == 0)[0][0])
-        snaps0 = snaps0.at[snap0_idx].set(irfft_x(a_hat0, int(params.Nx)))
-
-    hist_steps = np.arange(0, nsteps + 1, history_stride, dtype=np.int32)
-    if hist_steps[-1] != nsteps:
-        hist_steps = np.concatenate([hist_steps, np.array([nsteps], dtype=np.int32)])
-    hist0 = None
-    if return_state_history:
-        hist0 = jnp.zeros((len(hist_steps), int(params.Nv), int(integ.Nk)), dtype=jnp.complex128)
-        hist0 = hist0.at[0].set(a_hat0)
-
-    def maybe_store(snaps: Array, step_i: Array, a_hat_new: Array) -> Array:
-        a_phys_new = irfft_x(a_hat_new, int(params.Nx))
-        for j, snap_step in enumerate(snap_steps):
-            snaps = jax.lax.cond(
-                step_i == int(snap_step),
-                lambda s, arr=a_phys_new, idx=j: s.at[idx].set(arr),
-                lambda s: s,
-                snaps,
-            )
-        return snaps
-
-    def maybe_store_history(history: Array, step_i: Array, a_hat_new: Array) -> Array:
-        if not return_state_history:
-            return history
-        history = jax.lax.cond(
-            (step_i % history_stride) == 0,
-            lambda h: h.at[step_i // history_stride].set(a_hat_new),
-            lambda h: h,
-            history,
-        )
-        if int(hist_steps[-1]) != nsteps:
-            history = jax.lax.cond(
-                step_i == int(nsteps),
-                lambda h: h.at[len(hist_steps) - 1].set(a_hat_new),
-                lambda h: h,
-                history,
-            )
-        return history
-
-    def step(carry, i):
-        a_hat, n_prev, b_prev, snaps, history = carry
-        n_hat = explicit_n_hat(a_hat)
-        b_hat = (
-            learned_boundary_flux_hat(a_hat, integ.k_arr, integ.Nv, integ.vth, learned_closure)
-            if learned_closure is not None
-            else jnp.zeros_like(a_hat)
-        )
-        a_new = integ.step_cnab2(
-            a_hat,
-            n_hat,
-            n_prev,
-            extra_hat=b_hat,
-            extra_hat_prev=b_prev,
-        )
-        snaps = maybe_store(snaps, i, a_new)
-        history = maybe_store_history(history, i, a_new)
-        return (a_new, n_hat, b_hat, snaps, history), 0.0
-
-    (a_last, n_last, b_last, snaps_out, hist_out), _ = jax.lax.scan(
-        step,
-        (a_hat0, n0, b0, snaps0, hist0),
-        jnp.arange(1, nsteps + 1, dtype=jnp.int32),
-    )
-
-    raw: Dict[str, np.ndarray | Array] = {
-        "x": np.asarray(integ.x),
-        "snapshot_times": np.asarray(params.snapshot_times, dtype=float),
-        "snapshot_a_phys": np.asarray(snaps_out),
-        "m_eq": np.asarray(m_eq),
-        "k_arr": np.asarray(integ.k_arr, dtype=float),
-    }
-    if return_state_history and hist_out is not None:
-        raw["a_hat_hist"] = hist_out
-        raw["a_hat_hist_times"] = hist_steps.astype(float) * float(params.dt)
-    return raw
-
 
 def simulate_nonlinear_landau_method(
     params: NonlinearLandauParams,
