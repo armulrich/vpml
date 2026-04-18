@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_OUTDIR="${REPO_ROOT}/out_bench/nv_sweep_online_rollout"
+DEFAULT_NV_LIST="8,64,256,300,512"  # match the legacy Nv sweep wrappers
 DEFAULT_PYTHON="${REPO_ROOT}/.venv/bin/python"
 if [[ -x "${DEFAULT_PYTHON}" ]]; then
   PYTHON_BIN="${PYTHON:-${DEFAULT_PYTHON}}"
@@ -10,8 +12,8 @@ else
   PYTHON_BIN="${PYTHON:-python}"
 fi
 
-OUTDIR="${1:-${REPO_ROOT}/out_bench/nv_sweep_higher_order_hermite_fixed_ratio}"
-NV_LIST="${NV_LIST:-64,256,300,512}"
+OUTDIR="${1:-${DEFAULT_OUTDIR}}"
+NV_LIST="${NV_LIST:-${DEFAULT_NV_LIST}}"
 NX="${NX:-200}"
 DT="${DT:-0.01}"
 T_FINAL="${T_FINAL:-40.0}"
@@ -25,7 +27,7 @@ PHASE_VRANGE="${PHASE_VRANGE:--4.0,4.0}"
 DEALIAS_23="${DEALIAS_23:-1}"
 NONLOCAL_MU="${NONLOCAL_MU:--1.017234}"
 
-TEACHER_NX="${TEACHER_NX:-256}"
+TEACHER_NX="${TEACHER_NX:-200}"
 TEACHER_NV="${TEACHER_NV:-512}"
 TEACHER_DT="${TEACHER_DT:-0.01}"
 TEACHER_VMIN="${TEACHER_VMIN:--8.0}"
@@ -36,26 +38,32 @@ FIELD_K_MAX="${FIELD_K_MAX:-}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
-TRAIN_FIXED_RATIO="${TRAIN_FIXED_RATIO:-1.8}"
-HR_TEACHER_RATIO="${HR_TEACHER_RATIO:-2.0}"
-TRAIN_NM="${TRAIN_NM:-16}"
+TRAIN_NM="${TRAIN_NM:-6}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-128}"
 TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
-TRAIN_LR="${TRAIN_LR:-1e-3}"
+TRAIN_LR="${TRAIN_LR:-1e-4}"
 TRAIN_GRAD_CLIP="${TRAIN_GRAD_CLIP:-1.0}"
 TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-10}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-0}"
 TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-0}"
 TRAIN_SEED="${TRAIN_SEED:-0}"
 TRAIN_N_LOW="${TRAIN_N_LOW:-2}"
 TRAIN_VAL_FRACTION="${TRAIN_VAL_FRACTION:-0.2}"
 TRAIN_REGIMES="${TRAIN_REGIMES:-linear_landau,nonlinear_landau_weak,nonlinear_landau_strong}"
-TRAIN_OBJECTIVE="${TRAIN_OBJECTIVE:-q_only}"
 TRAIN_CONTEXT_MODE="${TRAIN_CONTEXT_MODE:-none}"
-TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-0}"
+TRAIN_TAIL_START_FRACTION="${TRAIN_TAIL_START_FRACTION:-0.6666666666666666}"
+TRAIN_LAMBDA_E="${TRAIN_LAMBDA_E:-0.5}"
+TRAIN_LAMBDA_DIST="${TRAIN_LAMBDA_DIST:-1.0}"
+TRAIN_LAMBDA_TAIL="${TRAIN_LAMBDA_TAIL:-0.05}"
+TRAIN_LAMBDA_NEG="${TRAIN_LAMBDA_NEG:-0.05}"
+TRAIN_LAMBDA_REG="${TRAIN_LAMBDA_REG:-1e-6}"
+TRAIN_ROLLOUT_DEALIAS_23="${TRAIN_ROLLOUT_DEALIAS_23:-1}"
+TRAIN_ONLINE_LOSS_BACKEND="${TRAIN_ONLINE_LOSS_BACKEND:-field_distribution_v1}"
+TRAIN_ONLINE_V_PROBES="${TRAIN_ONLINE_V_PROBES:-64}"
+TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-1}"
 
 TRAIN_TEACHER_NX="${TRAIN_TEACHER_NX:-${TEACHER_NX}}"
+TRAIN_TEACHER_NV="${TRAIN_TEACHER_NV:-${TEACHER_NV}}"
 TRAIN_TEACHER_DT="${TRAIN_TEACHER_DT:-${TEACHER_DT}}"
 TRAIN_TEACHER_VMIN="${TRAIN_TEACHER_VMIN:-${TEACHER_VMIN}}"
 TRAIN_TEACHER_VMAX="${TRAIN_TEACHER_VMAX:-${TEACHER_VMAX}}"
@@ -64,71 +72,10 @@ TRAIN_LINEAR_EPS="${TRAIN_LINEAR_EPS:-0.01}"
 TRAIN_LINEAR_MODES="${TRAIN_LINEAR_MODES:-0.5,1.0,1.5,2.0}"
 TRAIN_LINEAR_NUM_SAMPLES="${TRAIN_LINEAR_NUM_SAMPLES:-8}"
 TRAIN_LINEAR_SEED="${TRAIN_LINEAR_SEED:-0}"
-TRAIN_LINEAR_HISTORY_STRIDE="${TRAIN_LINEAR_HISTORY_STRIDE:-2}"
 TRAIN_NONLINEAR_T="${TRAIN_NONLINEAR_T:-20.0}"
 TRAIN_NONLINEAR_K0="${TRAIN_NONLINEAR_K0:-${K0}}"
-TRAIN_NONLINEAR_HISTORY_STRIDE="${TRAIN_NONLINEAR_HISTORY_STRIDE:-20}"
 TRAIN_WEAK_EPS="${TRAIN_WEAK_EPS:-0.05,0.1}"
 TRAIN_STRONG_EPS="${TRAIN_STRONG_EPS:-0.25,0.5}"
-
-if [[ "${TRAIN_OBJECTIVE}" != "q_only" ]]; then
-  echo "run_nv_sweep_higher_order_hermite_fixed_ratio.sh only supports TRAIN_OBJECTIVE=q_only; got '${TRAIN_OBJECTIVE}'." >&2
-  exit 1
-fi
-if [[ "${TRAIN_CONTEXT_MODE}" != "none" ]]; then
-  echo "run_nv_sweep_higher_order_hermite_fixed_ratio.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
-  exit 1
-fi
-if [[ "${TRAIN_ROLLOUT_HORIZON}" != "0" ]]; then
-  echo "run_nv_sweep_higher_order_hermite_fixed_ratio.sh only supports TRAIN_ROLLOUT_HORIZON=0; got '${TRAIN_ROLLOUT_HORIZON}'." >&2
-  exit 1
-fi
-
-ladder_csv_for_target() {
-  local target="$1"
-  "${PYTHON_BIN}" - <<'PY' "${target}" "${TRAIN_NM}" "${TRAIN_FIXED_RATIO}"
-import math
-import sys
-
-target = int(sys.argv[1])
-nm = int(sys.argv[2])
-ratio = float(sys.argv[3])
-if target < nm:
-    raise SystemExit(f"target Nv={target} must be at least TRAIN_NM={nm}")
-if ratio <= 1.0:
-    raise SystemExit(f"TRAIN_FIXED_RATIO must be greater than 1; got {ratio}")
-if target == nm:
-    ladder = [nm]
-else:
-    ladder = [target]
-    current = target
-    while True:
-        next_value = int(math.ceil(float(current) / ratio))
-        if next_value <= nm:
-            ladder.append(nm)
-            break
-        ladder.append(next_value)
-        current = next_value
-    ladder = sorted(set(max(nm, min(target, int(value))) for value in ladder))
-print(",".join(str(value) for value in ladder))
-PY
-}
-
-teacher_nv_for_target() {
-  local target="$1"
-  "${PYTHON_BIN}" - <<'PY' "${target}" "${HR_TEACHER_RATIO}"
-import math
-import sys
-
-target = int(sys.argv[1])
-ratio = float(sys.argv[2])
-if ratio <= 1.0:
-    raise SystemExit(f"HR_TEACHER_RATIO must be greater than 1; got {ratio}")
-teacher_nv = int(math.ceil(ratio * float(target)))
-teacher_nv = max(teacher_nv, target + 1)
-print(teacher_nv)
-PY
-}
 
 mkdir -p "${OUTDIR}"
 cd "${REPO_ROOT}"
@@ -169,28 +116,28 @@ IFS=',' read -r -a NV_VALUES <<< "${NV_LIST}"
 TOTAL_NV="${#NV_VALUES[@]}"
 
 if [[ "${RUN_TRAIN}" != "0" ]]; then
-  echo "[nv-sweep-higher-order-hermite-fixed-ratio] [1/3] Using fixed-ratio q_only Nv ladders with higher_order_hermite teacher histories"
+  echo "[nv-sweep-online-rollout] [1/2] Training one online_rollout checkpoint per deployment Nv"
   for idx in "${!NV_VALUES[@]}"; do
     NV_RAW="${NV_VALUES[idx]}"
     NV="$(echo "${NV_RAW}" | tr -d '[:space:]')"
     if [[ -z "${NV}" ]]; then
       continue
     fi
-    TRAIN_LADDER_CSV="$(ladder_csv_for_target "${NV}")"
-    TEACHER_NV_TARGET="$(teacher_nv_for_target "${NV}")"
     MODEL_DIR="${CHECKPOINT_ROOT}/nv${NV}"
     CHECKPOINT_NV="${MODEL_DIR}/interface_closure.npz"
     LOSS_PLOT_NV="${MODEL_DIR}/interface_closure.loss.png"
-    DATASET_CACHE_NV="${MODEL_DIR}/interface_closure_dataset.npz"
     mkdir -p "${MODEL_DIR}"
 
     TRAIN_ARGS=(
       --checkpoint "${CHECKPOINT_NV}"
-      --dataset-cache "${DATASET_CACHE_NV}"
       --loss-plot "${LOSS_PLOT_NV}"
-      --training-mode offline_rollout
-      --teacher-backend higher_order_hermite
-      --Nv-targets "${TRAIN_LADDER_CSV}"
+      --training-mode online_rollout
+      --train-objective trajectory
+      --online-loss-backend "${TRAIN_ONLINE_LOSS_BACKEND}"
+      --online-v-probes "${TRAIN_ONLINE_V_PROBES}"
+      --online-case-batch-size "${TRAIN_ONLINE_CASE_BATCH_SIZE}"
+      --teacher-backend grid_cubic_spline
+      --Nv-targets "${NV}"
       --Nm "${TRAIN_NM}"
       --hidden-width "${TRAIN_HIDDEN_WIDTH}"
       --res-blocks "${TRAIN_RES_BLOCKS}"
@@ -198,17 +145,20 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --lr "${TRAIN_LR}"
       --grad-clip "${TRAIN_GRAD_CLIP}"
       --log-every "${TRAIN_LOG_EVERY}"
-      --batch-size "${TRAIN_BATCH_SIZE}"
       --steps-per-epoch "${TRAIN_STEPS_PER_EPOCH}"
       --seed "${TRAIN_SEED}"
       --n-low "${TRAIN_N_LOW}"
       --val-fraction "${TRAIN_VAL_FRACTION}"
-      --train-objective q_only
-      --context-mode none
-      --rollout-horizon 0
+      --context-mode "${TRAIN_CONTEXT_MODE}"
+      --tail-start-fraction "${TRAIN_TAIL_START_FRACTION}"
+      --lambda-E "${TRAIN_LAMBDA_E}"
+      --lambda-dist "${TRAIN_LAMBDA_DIST}"
+      --lambda-tail "${TRAIN_LAMBDA_TAIL}"
+      --lambda-neg "${TRAIN_LAMBDA_NEG}"
+      --lambda-reg "${TRAIN_LAMBDA_REG}"
       --regimes "${TRAIN_REGIMES}"
       --teacher-Nx "${TRAIN_TEACHER_NX}"
-      --teacher-Nv "${TEACHER_NV_TARGET}"
+      --teacher-Nv "${TRAIN_TEACHER_NV}"
       --teacher-dt "${TRAIN_TEACHER_DT}"
       --teacher-vmin "${TRAIN_TEACHER_VMIN}"
       --teacher-vmax "${TRAIN_TEACHER_VMAX}"
@@ -217,15 +167,16 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --linear-modes "${TRAIN_LINEAR_MODES}"
       --linear-num-samples "${TRAIN_LINEAR_NUM_SAMPLES}"
       --linear-seed "${TRAIN_LINEAR_SEED}"
-      --linear-history-stride "${TRAIN_LINEAR_HISTORY_STRIDE}"
       --nonlinear-T "${TRAIN_NONLINEAR_T}"
       --nonlinear-k0 "${TRAIN_NONLINEAR_K0}"
-      --nonlinear-history-stride "${TRAIN_NONLINEAR_HISTORY_STRIDE}"
       --weak-eps "${TRAIN_WEAK_EPS}"
       --strong-eps "${TRAIN_STRONG_EPS}"
     )
+    if [[ "${TRAIN_ROLLOUT_DEALIAS_23}" != "0" ]]; then
+      TRAIN_ARGS+=(--rollout-dealias-23)
+    fi
 
-    echo "[nv-sweep-higher-order-hermite-fixed-ratio] [2/3] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV} with Nv-targets=${TRAIN_LADDER_CSV} and teacher Nv=${TEACHER_NV_TARGET}"
+    echo "[nv-sweep-online-rollout] [1/2] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV}"
     "${PYTHON_BIN}" benchmarks/fh_ml_tail_closure_train_jax.py "${TRAIN_ARGS[@]}"
   done
 else
@@ -240,12 +191,11 @@ else
       exit 1
     fi
   done
-  echo "[nv-sweep-higher-order-hermite-fixed-ratio] [1/3] Skipping model training because RUN_TRAIN=${RUN_TRAIN}"
-  echo "[nv-sweep-higher-order-hermite-fixed-ratio] [2/3] Reusing existing checkpoints in ${CHECKPOINT_ROOT}"
+  echo "[nv-sweep-online-rollout] [1/2] Reusing existing online checkpoints in ${CHECKPOINT_ROOT}"
 fi
 
 ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
-echo "[nv-sweep-higher-order-hermite-fixed-ratio] [3/3] Running nonlinear Nv sweep"
+echo "[nv-sweep-online-rollout] [2/2] Running nonlinear Nv sweep"
 "${PYTHON_BIN}" benchmarks/eval_nv_sweep.py "${ARGS[@]}"
 
 cat <<EOF
@@ -253,9 +203,8 @@ cat <<EOF
 Done.
 
 Artifacts:
-  mode:           offline_rollout_q_only_fixed_ratio_higher_order_hermite
+  mode:           online_rollout_field_distribution_v1
   checkpoint dir: ${CHECKPOINT_ROOT}
-  dataset caches: ${CHECKPOINT_ROOT}/nv*/interface_closure_dataset.npz
   summary:        ${OUTDIR}/summary.json
   metric 1:       ${OUTDIR}/nv_sweep_metric1.png
   metric 2:       ${OUTDIR}/nv_sweep_metric2.png
@@ -263,14 +212,11 @@ Artifacts:
   phase payload:  ${OUTDIR}/nv_sweep_phase_space_payload.npz
 
 Defaults:
-  teacher mode:   higher_order_hermite
-  teacher Nv:     ceil(${HR_TEACHER_RATIO} * Nv)
-  train target:   fixed-ratio per-target q_only ladder
-  train ratio:    ${TRAIN_FIXED_RATIO}
+  objective:      trajectory
+  loss backend:   ${TRAIN_ONLINE_LOSS_BACKEND}
+  v probes:       ${TRAIN_ONLINE_V_PROBES}
+  case batch:     ${TRAIN_ONLINE_CASE_BATCH_SIZE}
   train Nm:       ${TRAIN_NM}
-  batch size:     ${TRAIN_BATCH_SIZE}
   steps/epoch:    ${TRAIN_STEPS_PER_EPOCH}
-  objective:      q_only
-  context:        none
   Nv list:        ${NV_LIST}
 EOF

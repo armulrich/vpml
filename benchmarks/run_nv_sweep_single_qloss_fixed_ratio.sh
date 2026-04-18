@@ -173,6 +173,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --checkpoint "${CHECKPOINT_NV}"
       --dataset-cache "${DATASET_CACHE_NV}"
       --loss-plot "${LOSS_PLOT_NV}"
+      --training-mode offline_rollout
       --Nv-targets "${TRAIN_LADDER_CSV}"
       --Nm "${TRAIN_NM}"
       --hidden-width "${TRAIN_HIDDEN_WIDTH}"
@@ -237,7 +238,7 @@ cat <<EOF
 Done.
 
 Artifacts:
-  mode:           target_aware_single_qloss_fixed_ratio
+  mode:           offline_rollout_q_only_fixed_ratio_grid_teacher
   checkpoint dir: ${CHECKPOINT_ROOT}
   dataset caches: ${CHECKPOINT_ROOT}/nv*/interface_closure_dataset.npz
   summary:        ${OUTDIR}/summary.json

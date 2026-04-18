@@ -219,6 +219,10 @@ class NvSweepTests(unittest.TestCase):
             self.assertTrue((outdir / "shared_interface_closure_dataset.npz").exists())
             self.assertTrue((outdir / "models" / "nv6" / "interface_closure.npz").exists())
             self.assertTrue((outdir / "models" / "nv8" / "interface_closure.npz").exists())
+            for nv in (6, 8):
+                learned = load_learned_interface_closure_npz(outdir / "models" / f"nv{nv}" / "interface_closure.npz")
+                self.assertEqual(learned.training_mode, "offline_rollout")
+                self.assertEqual(learned.train_objective, "q_only")
 
     def test_run_nv_sweep_wrapper_stability_aware_uses_per_nv_dataset_caches(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -282,6 +286,10 @@ class NvSweepTests(unittest.TestCase):
             self.assertTrue((outdir / "models" / "nv8" / "interface_closure_dataset.npz").exists())
             self.assertTrue((outdir / "models" / "nv6" / "interface_closure.npz").exists())
             self.assertTrue((outdir / "models" / "nv8" / "interface_closure.npz").exists())
+            for nv in (6, 8):
+                learned = load_learned_interface_closure_npz(outdir / "models" / f"nv{nv}" / "interface_closure.npz")
+                self.assertEqual(learned.training_mode, "offline_rollout")
+                self.assertEqual(learned.train_objective, "stability_aware")
 
     def test_fixed_ratio_ladder_matches_default_targets(self) -> None:
         expected = {
@@ -360,6 +368,8 @@ class NvSweepTests(unittest.TestCase):
                 ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
                 self.assertTrue(ckpt.exists())
                 learned = load_learned_interface_closure_npz(ckpt)
+                self.assertEqual(learned.training_mode, "offline_rollout")
+                self.assertEqual(learned.train_objective, "q_only")
                 self.assertEqual(tuple(int(v) for v in learned.Nv_targets), expected_targets)
 
             summary = json.loads((outdir / "summary.json").read_text())
@@ -434,6 +444,8 @@ class NvSweepTests(unittest.TestCase):
                 ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
                 self.assertTrue(ckpt.exists())
                 learned = load_learned_interface_closure_npz(ckpt)
+                self.assertEqual(learned.training_mode, "offline_rollout")
+                self.assertEqual(learned.train_objective, "q_only")
                 self.assertEqual(tuple(int(v) for v in learned.Nv_targets), expected_targets)
 
             summary = json.loads((outdir / "summary.json").read_text())
@@ -512,6 +524,8 @@ class NvSweepTests(unittest.TestCase):
                 ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
                 self.assertTrue(ckpt.exists())
                 learned = load_learned_interface_closure_npz(ckpt)
+                self.assertEqual(learned.training_mode, "offline_rollout")
+                self.assertEqual(learned.train_objective, "q_only")
                 self.assertEqual(learned.teacher_backend, "higher_order_hermite")
                 self.assertEqual(tuple(int(v) for v in learned.Nv_targets), expected_targets)
                 self.assertEqual(int(learned.teacher_Nv), expected_teacher_nv[nv])
@@ -521,6 +535,80 @@ class NvSweepTests(unittest.TestCase):
             self.assertEqual(summary["nv_list"], [6, 8])
             case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
             self.assertEqual(case_targets, expected)
+
+    def test_run_nv_sweep_online_rollout_wrapper_writes_target_only_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            outdir = tmp / "nv_sweep_online_rollout"
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON": sys.executable,
+                    "NV_LIST": "6,8",
+                    "NX": "8",
+                    "DT": "0.05",
+                    "T_FINAL": "0.10",
+                    "EPS": "0.05",
+                    "K0": "0.5",
+                    "SNAPSHOT_TIMES": "0.05,0.10",
+                    "NV_PLOT": "16",
+                    "TEACHER_NX": "8",
+                    "TEACHER_NV": "16",
+                    "TEACHER_DT": "0.05",
+                    "TEACHER_VMIN": "-6",
+                    "TEACHER_VMAX": "6",
+                    "TRAIN_NM": "6",
+                    "TRAIN_HIDDEN_WIDTH": "8",
+                    "TRAIN_RES_BLOCKS": "1",
+                    "TRAIN_EPOCHS": "1",
+                    "TRAIN_LR": "1e-3",
+                    "TRAIN_GRAD_CLIP": "1.0",
+                    "TRAIN_LOG_EVERY": "1",
+                    "TRAIN_STEPS_PER_EPOCH": "1",
+                    "TRAIN_SEED": "0",
+                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak,nonlinear_landau_strong",
+                    "TRAIN_VAL_FRACTION": "0.2",
+                    "TRAIN_LINEAR_T": "0.10",
+                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
+                    "TRAIN_LINEAR_MODES": "0.5",
+                    "TRAIN_LINEAR_SEED": "0",
+                    "TRAIN_NONLINEAR_T": "0.10",
+                    "TRAIN_NONLINEAR_K0": "0.5",
+                    "TRAIN_WEAK_EPS": "0.05",
+                    "TRAIN_STRONG_EPS": "0.25",
+                    "TRAIN_TEACHER_NX": "8",
+                    "TRAIN_TEACHER_NV": "16",
+                    "TRAIN_TEACHER_DT": "0.05",
+                    "TRAIN_TEACHER_VMIN": "-6",
+                    "TRAIN_TEACHER_VMAX": "6",
+                    "TRAIN_ONLINE_V_PROBES": "8",
+                    "TRAIN_ONLINE_CASE_BATCH_SIZE": "1",
+                }
+            )
+            subprocess.run(
+                ["bash", "benchmarks/run_nv_sweep_online_rollout.sh", str(outdir)],
+                cwd="/Users/armin/Documents/NYU/vpml",
+                env=env,
+                check=True,
+            )
+
+            self.assertTrue((outdir / "summary.json").exists())
+            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
+            self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
+            self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
+            self.assertFalse((outdir / "shared_interface_closure_dataset.npz").exists())
+            self.assertEqual(list(outdir.rglob("interface_closure_dataset.npz")), [])
+
+            for nv in (6, 8):
+                ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
+                self.assertTrue(ckpt.exists())
+                learned = load_learned_interface_closure_npz(ckpt)
+                self.assertEqual(learned.training_mode, "online_rollout")
+                self.assertEqual(learned.train_objective, "trajectory")
+                self.assertEqual(learned.loss_backend, "field_distribution_v1")
+                self.assertEqual(learned.online_v_probes, 8)
+                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), (nv,))
 
 
 if __name__ == "__main__":
