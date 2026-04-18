@@ -1,0 +1,61 @@
+"""Data-building helpers for learned interface-closure experiments.
+
+This module keeps the dataset/cache/reference-building surface under `model/train`
+without pushing research-workflow logic into `vpml`.
+"""
+
+from .train import (
+    CACHE_FORMAT,
+    OFFLINE_TRAINING_MODE,
+    ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+    ONLINE_TRAINING_MODE,
+    REGIME_LINEAR,
+    REGIME_STRONG,
+    REGIME_WEAK,
+    ALL_REGIMES,
+    build_dataset_cache_metadata,
+    build_identity_training_stats,
+    build_mixed_landau_dataset,
+    build_model_inputs,
+    build_online_reference_dataset,
+    choose_k_scale,
+    choose_nv_scale,
+    init_online_rollout_params,
+    load_dataset_cache,
+    maxwellian_equilibrium,
+    prepare_training_dataset,
+    reconstruct_delta_f_from_a_hat_history,
+    resample_distribution_history_to_probe_grid,
+    safe_feature_std,
+    save_dataset_cache,
+    select_nv_targets_from_dataset,
+    summarize_dataset,
+)
+
+__all__ = [
+    "CACHE_FORMAT",
+    "ONLINE_TRAINING_MODE",
+    "OFFLINE_TRAINING_MODE",
+    "ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1",
+    "REGIME_LINEAR",
+    "REGIME_WEAK",
+    "REGIME_STRONG",
+    "ALL_REGIMES",
+    "build_dataset_cache_metadata",
+    "build_identity_training_stats",
+    "build_mixed_landau_dataset",
+    "build_model_inputs",
+    "build_online_reference_dataset",
+    "choose_k_scale",
+    "choose_nv_scale",
+    "init_online_rollout_params",
+    "load_dataset_cache",
+    "maxwellian_equilibrium",
+    "prepare_training_dataset",
+    "reconstruct_delta_f_from_a_hat_history",
+    "resample_distribution_history_to_probe_grid",
+    "safe_feature_std",
+    "save_dataset_cache",
+    "select_nv_targets_from_dataset",
+    "summarize_dataset",
+]

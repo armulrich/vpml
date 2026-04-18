@@ -9,14 +9,12 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.ndimage import map_coordinates
 
-import benchmarks.fh_ml_tail_closure_train_jax as train_mod
+import model.train.train as train_mod
 from benchmarks.fh_benchmarks_2412_07073_jax import (
     Fig3ResponseFunction,
     Fig4EigenvalueScan,
-    NonlinearLandauParams,
-    run_nonlinear_landau_rollout_raw,
 )
-from benchmarks.fh_ml_tail_closure_train_jax import main as train_main
+from model.train.train import main as train_main
 from benchmarks.fh_nonlinear_sim_jax import (
     BumpOnTailParams,
     TwoStreamParams,
@@ -35,6 +33,10 @@ from vpml.linear_landau import (
     LinearLandauConfig,
     run_linear_landau_cnab2_raw,
     run_linear_landau_rollout_raw,
+)
+from vpml.nonlinear_landau import (
+    NonlinearLandauParams,
+    run_nonlinear_landau_rollout_raw,
 )
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,

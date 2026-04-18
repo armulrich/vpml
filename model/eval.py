@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from benchmarks.fh_benchmarks_2412_07073_jax import (
+from vpml.nonlinear_landau import (
     NonlinearLandauParams,
     run_nonlinear_landau_rollout_raw,
 )

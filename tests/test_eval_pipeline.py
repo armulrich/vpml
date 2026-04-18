@@ -11,7 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from benchmarks.eval import main as eval_main
+from model.eval import main as eval_main
+from model.train.train import main as train_main
 from vpml.core import (
     LearnedInterfaceClosure,
     e_hat_history_from_a_hat_history,
@@ -195,43 +196,92 @@ class EvalPipelineTests(unittest.TestCase):
             self.assertTrue(case_npz.exists())
             self.assertTrue(case_png.exists())
 
-    def test_train_sh_runs_eval_stage_when_benchmarks_are_disabled(self) -> None:
+    def test_train_then_eval_pipeline_runs_on_tiny_case(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outdir = Path(tmpdir) / "out"
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PYTHON": sys.executable,
-                    "RUN_STANDARD_BENCHMARKS": "0",
-                    "RUN_FIG10": "0",
-                    "EPOCHS": "1",
-                    "NV_TARGETS": "4",
-                    "NM": "1",
-                    "HIDDEN_WIDTH": "8",
-                    "RES_BLOCKS": "1",
-                    "TEACHER_NX": "8",
-                    "TEACHER_NV": "16",
-                    "TEACHER_DT": "0.05",
-                    "TEACHER_VMIN": "-6",
-                    "TEACHER_VMAX": "6",
-                    "LINEAR_T": "0.10",
-                    "LINEAR_NUM_SAMPLES": "1",
-                    "LINEAR_HISTORY_STRIDE": "1",
-                    "NONLINEAR_T": "0.10",
-                    "NONLINEAR_HISTORY_STRIDE": "1",
-                    "WEAK_EPS": "0.05",
-                    "STRONG_EPS": "0.25",
-                    "EVAL_BUNDLES": "heldout_landau",
-                    "EVAL_EXTRA_ARGS": "--teacher-Nx 8 --teacher-Nv 16 --teacher-dt 0.05 --teacher-vmin -6 --teacher-vmax 6 --heldout-linear-Nx 8 --heldout-linear-Nv 4 --heldout-linear-dt 0.05 --heldout-linear-T 0.10 --heldout-nonlinear-Nx 8 --heldout-nonlinear-Nv 4 --heldout-nonlinear-dt 0.05 --heldout-nonlinear-T 0.10",
-                }
+            checkpoint = outdir / "interface_closure.npz"
+            train_main(
+                [
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--dataset-cache",
+                    str(outdir / "interface_closure_dataset.npz"),
+                    "--loss-plot",
+                    str(outdir / "interface_closure.loss.png"),
+                    "--epochs",
+                    "1",
+                    "--Nv-targets",
+                    "4",
+                    "--Nm",
+                    "1",
+                    "--hidden-width",
+                    "8",
+                    "--res-blocks",
+                    "1",
+                    "--teacher-Nx",
+                    "8",
+                    "--teacher-Nv",
+                    "16",
+                    "--teacher-dt",
+                    "0.05",
+                    "--teacher-vmin",
+                    "-6",
+                    "--teacher-vmax",
+                    "6",
+                    "--linear-T",
+                    "0.10",
+                    "--linear-num-samples",
+                    "1",
+                    "--linear-history-stride",
+                    "1",
+                    "--nonlinear-T",
+                    "0.10",
+                    "--nonlinear-history-stride",
+                    "1",
+                    "--weak-eps",
+                    "0.05",
+                    "--strong-eps",
+                    "0.25",
+                ]
             )
-            subprocess.run(
-                ["bash", "benchmarks/train.sh", str(outdir)],
-                cwd="/Users/armin/Documents/NYU/vpml",
-                env=env,
-                check=True,
+
+            eval_main(
+                [
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--outdir",
+                    str(outdir / "eval"),
+                    "--bundles",
+                    "heldout_landau",
+                    "--teacher-Nx",
+                    "8",
+                    "--teacher-Nv",
+                    "16",
+                    "--teacher-dt",
+                    "0.05",
+                    "--teacher-vmin",
+                    "-6",
+                    "--teacher-vmax",
+                    "6",
+                    "--heldout-linear-Nx",
+                    "8",
+                    "--heldout-linear-Nv",
+                    "4",
+                    "--heldout-linear-dt",
+                    "0.05",
+                    "--heldout-linear-T",
+                    "0.10",
+                    "--heldout-nonlinear-Nx",
+                    "8",
+                    "--heldout-nonlinear-Nv",
+                    "4",
+                    "--heldout-nonlinear-dt",
+                    "0.05",
+                    "--heldout-nonlinear-T",
+                    "0.10",
+                ]
             )
-            self.assertTrue((outdir / "interface_closure.npz").exists())
+            self.assertTrue(checkpoint.exists())
             self.assertTrue((outdir / "eval" / "summary.json").exists())
 
 

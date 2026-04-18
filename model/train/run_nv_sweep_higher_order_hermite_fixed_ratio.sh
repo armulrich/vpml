@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 DEFAULT_PYTHON="${REPO_ROOT}/.venv/bin/python"
 if [[ -x "${DEFAULT_PYTHON}" ]]; then
   PYTHON_BIN="${PYTHON:-${DEFAULT_PYTHON}}"
@@ -226,7 +226,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     )
 
     echo "[nv-sweep-higher-order-hermite-fixed-ratio] [2/3] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV} with Nv-targets=${TRAIN_LADDER_CSV} and teacher Nv=${TEACHER_NV_TARGET}"
-    "${PYTHON_BIN}" benchmarks/fh_ml_tail_closure_train_jax.py "${TRAIN_ARGS[@]}"
+    "${PYTHON_BIN}" -m model.train.train "${TRAIN_ARGS[@]}"
   done
 else
   for NV_RAW in "${NV_VALUES[@]}"; do
@@ -246,7 +246,7 @@ fi
 
 ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
 echo "[nv-sweep-higher-order-hermite-fixed-ratio] [3/3] Running nonlinear Nv sweep"
-"${PYTHON_BIN}" benchmarks/eval_nv_sweep.py "${ARGS[@]}"
+"${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
 
 cat <<EOF
 

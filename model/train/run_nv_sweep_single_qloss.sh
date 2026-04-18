@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 DEFAULT_PYTHON="${REPO_ROOT}/.venv/bin/python"
 if [[ -x "${DEFAULT_PYTHON}" ]]; then
   PYTHON_BIN="${PYTHON:-${DEFAULT_PYTHON}}"
@@ -10,7 +10,7 @@ else
   PYTHON_BIN="${PYTHON:-python}"
 fi
 
-OUTDIR="${1:-${REPO_ROOT}/out_bench/nv_sweep_single_qloss_fixed_ratio}"
+OUTDIR="${1:-${REPO_ROOT}/out_bench/nv_sweep_single_qloss}"
 NV_LIST="${NV_LIST:-8,64,256,300,512}"
 NX="${NX:-200}"
 DT="${DT:-0.01}"
@@ -36,7 +36,7 @@ FIELD_K_MAX="${FIELD_K_MAX:-}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
-TRAIN_FIXED_RATIO="${TRAIN_FIXED_RATIO:-1.8}"
+TRAIN_LADDER_LEVELS=5
 TRAIN_NM="${TRAIN_NM:-6}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-128}"
 TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
@@ -73,44 +73,47 @@ TRAIN_WEAK_EPS="${TRAIN_WEAK_EPS:-0.05,0.1}"
 TRAIN_STRONG_EPS="${TRAIN_STRONG_EPS:-0.25,0.5}"
 
 if [[ "${TRAIN_OBJECTIVE}" != "q_only" ]]; then
-  echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_OBJECTIVE=q_only; got '${TRAIN_OBJECTIVE}'." >&2
+  echo "run_nv_sweep_single_qloss.sh only supports TRAIN_OBJECTIVE=q_only; got '${TRAIN_OBJECTIVE}'." >&2
   exit 1
 fi
 if [[ "${TRAIN_CONTEXT_MODE}" != "none" ]]; then
-  echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
+  echo "run_nv_sweep_single_qloss.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
   exit 1
 fi
 if [[ "${TRAIN_ROLLOUT_HORIZON}" != "0" ]]; then
-  echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_ROLLOUT_HORIZON=0; got '${TRAIN_ROLLOUT_HORIZON}'." >&2
+  echo "run_nv_sweep_single_qloss.sh only supports TRAIN_ROLLOUT_HORIZON=0; got '${TRAIN_ROLLOUT_HORIZON}'." >&2
   exit 1
 fi
 
 ladder_csv_for_target() {
   local target="$1"
-  "${PYTHON_BIN}" - <<'PY' "${target}" "${TRAIN_NM}" "${TRAIN_FIXED_RATIO}"
+  "${PYTHON_BIN}" - <<'PY' "${target}" "${TRAIN_NM}" "${TRAIN_LADDER_LEVELS}"
 import math
 import sys
 
 target = int(sys.argv[1])
 nm = int(sys.argv[2])
-ratio = float(sys.argv[3])
+levels = int(sys.argv[3])
+if levels <= 0:
+    raise SystemExit("TRAIN_LADDER_LEVELS must be positive")
 if target < nm:
     raise SystemExit(f"target Nv={target} must be at least TRAIN_NM={nm}")
-if ratio <= 1.0:
-    raise SystemExit(f"TRAIN_FIXED_RATIO must be greater than 1; got {ratio}")
 if target == nm:
     ladder = [nm]
 else:
-    ladder = [target]
-    current = target
-    while True:
-        next_value = int(math.ceil(float(current) / ratio))
-        if next_value <= nm:
-            ladder.append(nm)
-            break
-        ladder.append(next_value)
-        current = next_value
-    ladder = sorted(set(max(nm, min(target, int(value))) for value in ladder))
+    ladder = []
+    for idx in range(levels):
+        t = 0.0 if levels == 1 else idx / float(levels - 1)
+        value = math.exp(math.log(float(nm)) + t * (math.log(float(target)) - math.log(float(nm))))
+        ladder.append(int(round(value)))
+    ladder[0] = nm
+    ladder[-1] = target
+    dedup = []
+    for value in ladder:
+        value = max(nm, min(target, int(value)))
+        if not dedup or dedup[-1] != value:
+            dedup.append(value)
+    ladder = dedup
 print(",".join(str(value) for value in ladder))
 PY
 }
@@ -154,7 +157,7 @@ IFS=',' read -r -a NV_VALUES <<< "${NV_LIST}"
 TOTAL_NV="${#NV_VALUES[@]}"
 
 if [[ "${RUN_TRAIN}" != "0" ]]; then
-  echo "[nv-sweep-single-qloss-fixed-ratio] [1/3] Using target-specific fixed-ratio q_only Nv ladders and per-model dataset caches"
+  echo "[nv-sweep-single-qloss] [1/3] Using target-specific q_only Nv ladders and per-model dataset caches"
   for idx in "${!NV_VALUES[@]}"; do
     NV_RAW="${NV_VALUES[idx]}"
     NV="$(echo "${NV_RAW}" | tr -d '[:space:]')"
@@ -210,8 +213,8 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --strong-eps "${TRAIN_STRONG_EPS}"
     )
 
-    echo "[nv-sweep-single-qloss-fixed-ratio] [2/3] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV} with Nv-targets=${TRAIN_LADDER_CSV}"
-    "${PYTHON_BIN}" benchmarks/fh_ml_tail_closure_train_jax.py "${TRAIN_ARGS[@]}"
+    echo "[nv-sweep-single-qloss] [2/3] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV} with Nv-targets=${TRAIN_LADDER_CSV}"
+    "${PYTHON_BIN}" -m model.train.train "${TRAIN_ARGS[@]}"
   done
 else
   for NV_RAW in "${NV_VALUES[@]}"; do
@@ -225,20 +228,20 @@ else
       exit 1
     fi
   done
-  echo "[nv-sweep-single-qloss-fixed-ratio] [1/3] Skipping model training because RUN_TRAIN=${RUN_TRAIN}"
-  echo "[nv-sweep-single-qloss-fixed-ratio] [2/3] Reusing existing checkpoints in ${CHECKPOINT_ROOT}"
+  echo "[nv-sweep-single-qloss] [1/3] Skipping model training because RUN_TRAIN=${RUN_TRAIN}"
+  echo "[nv-sweep-single-qloss] [2/3] Reusing existing checkpoints in ${CHECKPOINT_ROOT}"
 fi
 
 ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
-echo "[nv-sweep-single-qloss-fixed-ratio] [3/3] Running nonlinear Nv sweep"
-"${PYTHON_BIN}" benchmarks/eval_nv_sweep.py "${ARGS[@]}"
+echo "[nv-sweep-single-qloss] [3/3] Running nonlinear Nv sweep"
+"${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
 
 cat <<EOF
 
 Done.
 
 Artifacts:
-  mode:           offline_rollout_q_only_fixed_ratio_grid_teacher
+  mode:           offline_rollout_target_aware_single_qloss
   checkpoint dir: ${CHECKPOINT_ROOT}
   dataset caches: ${CHECKPOINT_ROOT}/nv*/interface_closure_dataset.npz
   summary:        ${OUTDIR}/summary.json
@@ -248,12 +251,13 @@ Artifacts:
   phase payload:  ${OUTDIR}/nv_sweep_phase_space_payload.npz
 
 Defaults:
-  ladder mode:    target-specific fixed-ratio q_only
-  fixed ratio:    ${TRAIN_FIXED_RATIO}
+  ladder mode:    target-specific log-spaced q_only
+  ladder levels:  ${TRAIN_LADDER_LEVELS}
   train Nm:       ${TRAIN_NM}
   batch size:     ${TRAIN_BATCH_SIZE}
   steps/epoch:    ${TRAIN_STEPS_PER_EPOCH}
   objective:      q_only
   context:        none
   Nv list:        ${NV_LIST}
+  nonlinear case: Nx=${NX}, T=${T_FINAL}, dt=${DT}, eps=${EPS}, k0=${K0}
 EOF

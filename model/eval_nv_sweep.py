@@ -22,8 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from benchmarks.eval import run_physical_landau_reference
-from benchmarks.fh_benchmarks_2412_07073_jax import (
+from model.eval import run_physical_landau_reference
+from vpml.nonlinear_landau import (
     NonlinearLandauParams,
     _time_key,
     run_nonlinear_landau_rollout_raw,

@@ -29,12 +29,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _MPLCONFIG = _REPO_ROOT / ".mplconfig"
 if _MPLCONFIG.exists():
     os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
 
-from benchmarks.fh_benchmarks_2412_07073_jax import (
+from vpml.nonlinear_landau import (
     NonlinearLandauParams,
     run_nonlinear_landau_rollout_raw,
 )

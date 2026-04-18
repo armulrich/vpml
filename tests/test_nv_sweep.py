@@ -10,7 +10,8 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
-from benchmarks.eval_nv_sweep import main as nv_sweep_main
+from model.eval_nv_sweep import main as nv_sweep_main
+from model.train.train import main as train_main
 from vpml.core import LearnedInterfaceClosure, load_learned_interface_closure_npz, save_learned_interface_closure_npz
 
 try:
@@ -158,7 +159,7 @@ class NvSweepTests(unittest.TestCase):
             self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
             self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
 
-    def test_run_nv_sweep_wrapper_accepts_default_negative_phase_vrange(self) -> None:
+    def test_run_nv_sweep_single_qloss_wrapper_accepts_default_negative_phase_vrange(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             outdir = tmp / "nv_sweep_wrapper"
@@ -180,18 +181,14 @@ class NvSweepTests(unittest.TestCase):
                     "TEACHER_DT": "0.05",
                     "TEACHER_VMIN": "-6",
                     "TEACHER_VMAX": "6",
-                    "TRAIN_NV_TARGETS": "6,8",
-                    "TRAIN_NM": "1",
+                    "TRAIN_NM": "6",
                     "TRAIN_HIDDEN_WIDTH": "8",
                     "TRAIN_RES_BLOCKS": "1",
                     "TRAIN_EPOCHS": "1",
                     "TRAIN_LOG_EVERY": "1",
                     "TRAIN_BATCH_SIZE": "32",
-                    "TRAIN_ROLLOUT_BATCH_SIZE": "4",
                     "TRAIN_STEPS_PER_EPOCH": "1",
                     "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak",
-                    "TRAIN_OBJECTIVE": "q_only",
-                    "TRAIN_ROLLOUT_HORIZON": "0",
                     "TRAIN_LINEAR_T": "0.10",
                     "TRAIN_LINEAR_NUM_SAMPLES": "1",
                     "TRAIN_LINEAR_HISTORY_STRIDE": "1",
@@ -208,7 +205,7 @@ class NvSweepTests(unittest.TestCase):
                 }
             )
             subprocess.run(
-                ["bash", "benchmarks/run_nv_sweep.sh", str(outdir)],
+                ["bash", "model/train/run_nv_sweep_single_qloss.sh", str(outdir)],
                 cwd="/Users/armin/Documents/NYU/vpml",
                 env=env,
                 check=True,
@@ -216,7 +213,8 @@ class NvSweepTests(unittest.TestCase):
 
             self.assertTrue((outdir / "summary.json").exists())
             self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
-            self.assertTrue((outdir / "shared_interface_closure_dataset.npz").exists())
+            self.assertTrue((outdir / "models" / "nv6" / "interface_closure_dataset.npz").exists())
+            self.assertTrue((outdir / "models" / "nv8" / "interface_closure_dataset.npz").exists())
             self.assertTrue((outdir / "models" / "nv6" / "interface_closure.npz").exists())
             self.assertTrue((outdir / "models" / "nv8" / "interface_closure.npz").exists())
             for nv in (6, 8):
@@ -224,60 +222,108 @@ class NvSweepTests(unittest.TestCase):
                 self.assertEqual(learned.training_mode, "offline_rollout")
                 self.assertEqual(learned.train_objective, "q_only")
 
-    def test_run_nv_sweep_wrapper_stability_aware_uses_per_nv_dataset_caches(self) -> None:
+    def test_stability_aware_per_nv_training_uses_per_model_dataset_caches(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             outdir = tmp / "nv_sweep_wrapper_stability"
+            checkpoint_root = outdir / "models"
 
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PYTHON": sys.executable,
-                    "NV_LIST": "6,8",
-                    "NX": "8",
-                    "DT": "0.05",
-                    "T_FINAL": "0.10",
-                    "EPS": "0.05",
-                    "K0": "0.5",
-                    "SNAPSHOT_TIMES": "0.05,0.10",
-                    "NV_PLOT": "32",
-                    "TEACHER_NX": "8",
-                    "TEACHER_NV": "16",
-                    "TEACHER_DT": "0.05",
-                    "TEACHER_VMIN": "-6",
-                    "TEACHER_VMAX": "6",
-                    "TRAIN_NV_TARGETS": "6,8",
-                    "TRAIN_NM": "1",
-                    "TRAIN_HIDDEN_WIDTH": "8",
-                    "TRAIN_RES_BLOCKS": "1",
-                    "TRAIN_EPOCHS": "1",
-                    "TRAIN_LOG_EVERY": "1",
-                    "TRAIN_BATCH_SIZE": "32",
-                    "TRAIN_ROLLOUT_BATCH_SIZE": "4",
-                    "TRAIN_STEPS_PER_EPOCH": "1",
-                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak",
-                    "TRAIN_OBJECTIVE": "stability_aware",
-                    "TRAIN_ROLLOUT_HORIZON": "2",
-                    "TRAIN_LINEAR_T": "0.10",
-                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
-                    "TRAIN_LINEAR_HISTORY_STRIDE": "1",
-                    "TRAIN_NONLINEAR_T": "0.10",
-                    "TRAIN_NONLINEAR_HISTORY_STRIDE": "1",
-                    "TRAIN_WEAK_EPS": "0.05",
-                    "TRAIN_STRONG_EPS": "0.10",
-                    "TRAIN_TEACHER_NX": "8",
-                    "TRAIN_TEACHER_NV": "16",
-                    "TRAIN_TEACHER_DT": "0.05",
-                    "TRAIN_TEACHER_VMIN": "-6",
-                    "TRAIN_TEACHER_VMAX": "6",
-                    "TRAIN_TEACHER_PROJ_NV": "9",
-                }
-            )
-            subprocess.run(
-                ["bash", "benchmarks/run_nv_sweep.sh", str(outdir)],
-                cwd="/Users/armin/Documents/NYU/vpml",
-                env=env,
-                check=True,
+            for nv in (6, 8):
+                model_dir = checkpoint_root / f"nv{nv}"
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(model_dir / "interface_closure.npz"),
+                        "--dataset-cache",
+                        str(model_dir / "interface_closure_dataset.npz"),
+                        "--loss-plot",
+                        str(model_dir / "interface_closure.loss.png"),
+                        "--Nv-targets",
+                        str(nv),
+                        "--Nm",
+                        "1",
+                        "--hidden-width",
+                        "8",
+                        "--res-blocks",
+                        "1",
+                        "--epochs",
+                        "1",
+                        "--log-every",
+                        "1",
+                        "--batch-size",
+                        "4",
+                        "--rollout-batch-size",
+                        "2",
+                        "--steps-per-epoch",
+                        "1",
+                        "--regimes",
+                        "linear_landau,nonlinear_landau_weak",
+                        "--train-objective",
+                        "stability_aware",
+                        "--rollout-horizon",
+                        "2",
+                        "--teacher-Nx",
+                        "8",
+                        "--teacher-Nv",
+                        "16",
+                        "--teacher-dt",
+                        "0.05",
+                        "--teacher-vmin",
+                        "-6",
+                        "--teacher-vmax",
+                        "6",
+                        "--teacher-proj-Nv",
+                        "9",
+                        "--linear-T",
+                        "0.10",
+                        "--linear-num-samples",
+                        "1",
+                        "--linear-history-stride",
+                        "1",
+                        "--nonlinear-T",
+                        "0.10",
+                        "--nonlinear-history-stride",
+                        "1",
+                        "--weak-eps",
+                        "0.05",
+                        "--strong-eps",
+                        "0.10",
+                    ]
+                )
+
+            nv_sweep_main(
+                [
+                    "--checkpoint-dir",
+                    str(checkpoint_root),
+                    "--outdir",
+                    str(outdir),
+                    "--nv-list",
+                    "6,8",
+                    "--Nx",
+                    "8",
+                    "--dt",
+                    "0.05",
+                    "--T",
+                    "0.10",
+                    "--eps",
+                    "0.05",
+                    "--k0",
+                    "0.5",
+                    "--snapshot-times",
+                    "0.05,0.10",
+                    "--Nv-plot",
+                    "32",
+                    "--teacher-Nx",
+                    "8",
+                    "--teacher-Nv",
+                    "16",
+                    "--teacher-dt",
+                    "0.05",
+                    "--teacher-vmin",
+                    "-6",
+                    "--teacher-vmax",
+                    "6",
+                ]
             )
 
             self.assertTrue((outdir / "summary.json").exists())
@@ -347,7 +393,7 @@ class NvSweepTests(unittest.TestCase):
                 }
             )
             subprocess.run(
-                ["bash", "benchmarks/run_nv_sweep_single_qloss.sh", str(outdir)],
+                ["bash", "model/train/run_nv_sweep_single_qloss.sh", str(outdir)],
                 cwd="/Users/armin/Documents/NYU/vpml",
                 env=env,
                 check=True,
@@ -423,7 +469,7 @@ class NvSweepTests(unittest.TestCase):
                 }
             )
             subprocess.run(
-                ["bash", "benchmarks/run_nv_sweep_single_qloss_fixed_ratio.sh", str(outdir)],
+                ["bash", "model/train/run_nv_sweep_single_qloss_fixed_ratio.sh", str(outdir)],
                 cwd="/Users/armin/Documents/NYU/vpml",
                 env=env,
                 check=True,
@@ -499,7 +545,7 @@ class NvSweepTests(unittest.TestCase):
                 }
             )
             subprocess.run(
-                ["bash", "benchmarks/run_nv_sweep_higher_order_hermite_fixed_ratio.sh", str(outdir)],
+                ["bash", "model/train/run_nv_sweep_higher_order_hermite_fixed_ratio.sh", str(outdir)],
                 cwd="/Users/armin/Documents/NYU/vpml",
                 env=env,
                 check=True,
@@ -587,7 +633,7 @@ class NvSweepTests(unittest.TestCase):
                 }
             )
             subprocess.run(
-                ["bash", "benchmarks/run_nv_sweep_online_rollout.sh", str(outdir)],
+                ["bash", "model/train/run_nv_sweep_online_rollout.sh", str(outdir)],
                 cwd="/Users/armin/Documents/NYU/vpml",
                 env=env,
                 check=True,
