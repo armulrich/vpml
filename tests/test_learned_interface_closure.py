@@ -90,8 +90,13 @@ def _make_closure(
     rollout_horizon: int = 0,
     lambda_q: float = 1.0,
     lambda_E: float = 0.0,
+    lambda_dist: float = 0.0,
     lambda_tail: float = 0.0,
+    lambda_neg: float = 0.0,
     lambda_reg: float = 0.0,
+    training_mode: str = "offline_rollout",
+    loss_backend: str | None = None,
+    online_v_probes: int = 0,
     stability_loss_definition: str | None = None,
 ) -> LearnedInterfaceClosure:
     raw_base_dim = 2 * Nm + (4 if include_global_indicators else 2)
@@ -122,15 +127,20 @@ def _make_closure(
         teacher_proj_Nv=5,
         include_global_indicators=include_global_indicators,
         n_low=n_low,
+        training_mode=training_mode,
         train_objective=train_objective,
         context_mode=context_mode,
         context_lags=1 if context_mode == "lag1_delta" else 0,
         base_input_dim=raw_base_dim,
         rollout_horizon=rollout_horizon,
+        loss_backend=loss_backend,
         lambda_q=lambda_q,
         lambda_E=lambda_E,
+        lambda_dist=lambda_dist,
         lambda_tail=lambda_tail,
+        lambda_neg=lambda_neg,
         lambda_reg=lambda_reg,
+        online_v_probes=online_v_probes,
         stability_loss_definition=stability_loss_definition,
     )
 
@@ -204,6 +214,32 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertAlmostEqual(loaded.lambda_tail, 0.05)
         self.assertEqual(loaded.stability_loss_definition, train_mod.STABILITY_LOSS_DEFINITION)
         self.assertEqual(loaded.input_dim, 18)
+
+    def test_checkpoint_round_trip_preserves_online_metadata(self) -> None:
+        closure = _make_closure(
+            training_mode="online_rollout",
+            train_objective="trajectory",
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            lambda_E=0.5,
+            lambda_dist=1.0,
+            lambda_tail=0.05,
+            lambda_neg=0.025,
+            lambda_reg=1e-6,
+            online_v_probes=64,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "interface_closure.npz"
+            save_learned_interface_closure_npz(path, closure)
+            loaded = load_learned_interface_closure_npz(path)
+        self.assertEqual(loaded.training_mode, "online_rollout")
+        self.assertEqual(loaded.train_objective, "trajectory")
+        self.assertEqual(loaded.loss_backend, train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
+        self.assertAlmostEqual(loaded.lambda_E, 0.5)
+        self.assertAlmostEqual(loaded.lambda_dist, 1.0)
+        self.assertAlmostEqual(loaded.lambda_tail, 0.05)
+        self.assertAlmostEqual(loaded.lambda_neg, 0.025)
+        self.assertAlmostEqual(loaded.lambda_reg, 1e-6)
+        self.assertEqual(loaded.online_v_probes, 64)
 
     def test_boundary_flux_only_touches_last_row_and_zero_mode(self) -> None:
         params = _zero_interface_params(6)
@@ -678,6 +714,145 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                 for key in ("train_loss", "train_loss_q", "train_loss_field", "train_loss_tail", "train_loss_reg"):
                     self.assertTrue(np.isfinite(np.asarray(data[key], dtype=np.float64)).all(), msg=key)
 
+    def test_online_rollout_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
+        target_nv = 4
+        teacher_Nx = 8
+        teacher_Nv = 16
+        teacher_L = 4.0 * math.pi
+        teacher_dt = 0.05
+        teacher_vmin = -6.0
+        teacher_vmax = 6.0
+        online_v_probes = 8
+
+        online_dataset, _ = train_mod.build_online_reference_dataset(
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_L=teacher_L,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            linear_T=0.10,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            val_fraction=0.2,
+            online_v_probes=online_v_probes,
+        )
+        stats = train_mod.build_identity_training_stats(Nm=1, context_mode="none")
+        params = train_mod.init_interface_closure_params(
+            jax.random.PRNGKey(0),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=8,
+            res_blocks=1,
+        )
+        integ = FourierHermiteIMEX(
+            Nx=teacher_Nx,
+            Nv=target_nv,
+            Lx=teacher_L,
+            dt=teacher_dt,
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        loss_fn, active_regimes = train_mod.make_online_trajectory_batch_loss(
+            online_dataset=online_dataset,
+            regime_weights={train_mod.REGIME_LINEAR: 1.0},
+            Nm=1,
+            k_scale=float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64))),
+            nv_scale=float(target_nv),
+            stats=stats,
+            hidden_width=8,
+            res_blocks=1,
+            Nv_targets=(target_nv,),
+            train_regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
+            teacher_Lx=teacher_L,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            n_low=2,
+            context_mode="none",
+            tail_start_fraction=2.0 / 3.0,
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            lambda_E=0.5,
+            lambda_dist=1.0,
+            lambda_tail=0.05,
+            lambda_neg=0.01,
+            lambda_reg=1e-6,
+            online_v_probes=online_v_probes,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            poisson_sign=1.0,
+            rollout_dealias_23=False,
+        )
+        self.assertEqual(tuple(active_regimes), (train_mod.REGIME_LINEAR,))
+        regime_batches = {
+            regime: online_dataset[regime]["train"]
+            for regime in active_regimes
+        }
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, regime_batches)
+        self.assertTrue(np.isfinite(float(loss)))
+        for key, value in aux.items():
+            self.assertTrue(np.isfinite(np.asarray(value, dtype=np.float64)).all(), msg=key)
+        for leaf in jax.tree_util.tree_leaves(grads):
+            self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
+
+    def test_online_reconstruction_and_penalties_are_finite_and_nontrivial(self) -> None:
+        Nx = 4
+        Nv = 6
+        integ = FourierHermiteIMEX(
+            Nx=Nx,
+            Nv=Nv,
+            Lx=4.0 * math.pi,
+            dt=0.05,
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        v_probe = jnp.linspace(-4.0, 4.0, 9, dtype=jnp.float64)
+        eq_probe = train_mod.maxwellian_equilibrium(v_probe)
+        nk = int(integ.k_arr.shape[0])
+        a_hat_hist = jnp.zeros((2, Nv, nk), dtype=jnp.complex128)
+        a_hat_hist = a_hat_hist.at[:, 0, 0].set(complex(-4.0 * Nx, 0.0))
+        a_hat_hist = a_hat_hist.at[:, -1, 0].set(complex(1.0 * Nx, 0.0))
+        delta_f = train_mod.reconstruct_delta_f_from_a_hat_history(
+            a_hat_hist,
+            Nx=Nx,
+            v_probe=v_probe,
+            vth=1.0,
+        )
+        self.assertEqual(tuple(delta_f.shape), (2, int(v_probe.shape[0]), Nx))
+        self.assertTrue(np.isfinite(np.asarray(delta_f, dtype=np.float64)).all())
+
+        field_loss, dist_loss, tail_loss, neg_loss = train_mod.online_trajectory_loss_terms(
+            a_hat_hist,
+            k_arr=integ.k_arr,
+            ref_E_hat=jnp.zeros((2, nk), dtype=jnp.complex128),
+            ref_delta_f=0.5 * delta_f,
+            Nx=Nx,
+            v_probe=v_probe,
+            eq_probe=eq_probe,
+            tail_start_fraction=2.0 / 3.0,
+            poisson_sign=1.0,
+        )
+        self.assertAlmostEqual(float(field_loss), 0.0, places=12)
+        self.assertTrue(np.isfinite(float(dist_loss)))
+        self.assertTrue(np.isfinite(float(tail_loss)))
+        self.assertTrue(np.isfinite(float(neg_loss)))
+        self.assertGreater(float(dist_loss), 0.0)
+        self.assertGreater(float(tail_loss), 0.0)
+        self.assertGreater(float(neg_loss), 0.0)
+
     def test_incompatible_dataset_cache_is_rebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir) / "shared_dataset.npz"
@@ -1031,6 +1206,118 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                     )
 
         self.assertEqual(captured["rollout_horizon"], 0)
+
+    def test_online_rollout_rejects_offline_cache_and_projection_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            cache = Path(tmpdir) / "shared_dataset.npz"
+            with self.assertRaisesRegex(ValueError, r"does not support --dataset-cache"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--dataset-cache",
+                        str(cache),
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, r"does not support --build-dataset-only"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--build-dataset-only",
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, r"does not support --allow-dataset-cache-nv-superset"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--allow-dataset-cache-nv-superset",
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, r"does not support --per-target-projection-orders"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--per-target-projection-orders",
+                    ]
+                )
+
+    def test_online_rollout_rejects_higher_order_hermite_teacher(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            with self.assertRaisesRegex(ValueError, r"only supports teacher_backend=grid_cubic_spline"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--teacher-backend",
+                        "higher_order_hermite",
+                        "--teacher-Nv",
+                        "8",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                    ]
+                )
+
+    def test_online_rollout_requires_exactly_one_target_nv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            with self.assertRaisesRegex(ValueError, r"requires exactly one target Nv"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--Nv-targets",
+                        "4,6",
+                        "--Nm",
+                        "1",
+                    ]
+                )
 
     def test_learned_rollout_runs_for_linear_and_nonlinear_landau(self) -> None:
         closure = _make_closure()

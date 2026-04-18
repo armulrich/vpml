@@ -19,7 +19,7 @@ import argparse
 import math
 import os
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from vpml.jax_runtime import bootstrap_jax_runtime, print_jax_runtime_summary
 
@@ -45,15 +45,21 @@ from vpml.core import (
     HIGHER_ORDER_HERMITE_TEACHER_BACKEND,
     LearnedInterfaceClosure,
     e_hat_from_rho_hat,
+    e_hat_history_from_a_hat_history,
     init_interface_closure_params,
+    irfft_x,
     learned_boundary_flux_hat,
     normalize_teacher_backend_name,
+    rfft_x,
     scale_learned_closure_raw_features,
     save_learned_interface_closure_npz,
 )
-from vpml.linear_landau import LinearLandauConfig, run_linear_landau_cnab2_raw
+from vpml.linear_landau import LinearLandauConfig, linear_explicit_N_hat, run_linear_landau_cnab2_raw
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
+    compute_electric_field_from_distribution,
+    cubic_bspline_interp_constant,
+    cubic_bspline_prefilter_constant,
     extract_interface_supervised_pairs_from_coeff_history,
     extract_interface_rollout_windows_from_coeff_history,
     gaussian_pdf,
@@ -75,6 +81,9 @@ REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
 STABILITY_LOSS_DEFINITION = "window_hybrid_v1"
+ONLINE_TRAINING_MODE = "online_rollout"
+OFFLINE_TRAINING_MODE = "offline_rollout"
+ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
 ALL_TEACHER_BACKENDS = (
     GRID_CUBIC_SPLINE_TEACHER_BACKEND,
     HIGHER_ORDER_HERMITE_TEACHER_BACKEND,
@@ -1249,6 +1258,361 @@ def summarize_dataset(prepared: Dict[str, Dict[str, Array]]) -> Dict[str, int]:
     return {regime: int(arrays["train_inputs"].shape[0]) for regime, arrays in prepared.items()}
 
 
+def build_identity_training_stats(
+    *,
+    Nm: int,
+    context_mode: str,
+    include_global_indicators: bool = True,
+) -> Dict[str, np.ndarray]:
+    base_dim = 2 * int(Nm) + (4 if bool(include_global_indicators) else 2)
+    input_dim = base_dim if str(context_mode) == "none" else 3 * base_dim
+    return {
+        "input_mean": np.zeros((input_dim,), dtype=np.float64),
+        "input_std": np.ones((input_dim,), dtype=np.float64),
+        "target_mean": np.zeros((2,), dtype=np.float64),
+        "target_std": np.ones((2,), dtype=np.float64),
+    }
+
+
+def init_online_rollout_params(
+    key: Array,
+    *,
+    input_dim: int,
+    hidden_width: int,
+    res_blocks: int,
+) -> Dict[str, Array]:
+    """Initialize online training near the truncation baseline.
+
+    Long solver-in-the-loop rollouts are numerically fragile if the closure
+    starts from a random nonzero boundary flux. Keep the hidden stack random so
+    gradients can flow immediately, but zero the output heads so the initial
+    rollout matches the stable zero-closure baseline.
+    """
+    params = init_interface_closure_params(
+        key,
+        input_dim=int(input_dim),
+        hidden_width=int(hidden_width),
+        res_blocks=int(res_blocks),
+    )
+    for name in ("W_lin", "b_lin", "W_out", "b_out"):
+        params[name] = jnp.zeros_like(params[name])
+    return params
+
+
+def jax_hermite_basis_phi_scaled(N: int, v: Array, vth: float = 1.0) -> Array:
+    if int(N) < 0:
+        raise ValueError("N must be nonnegative")
+    if float(vth) <= 0.0:
+        raise ValueError("vth must be positive")
+    v = jnp.asarray(v, dtype=jnp.float64)
+    if int(N) == 0:
+        return jnp.zeros((0, v.size), dtype=jnp.float64)
+
+    xi = v / float(vth)
+    w = jnp.exp(-0.5 * xi ** 2) / (math.sqrt(2.0 * math.pi) * float(vth))
+    h = jnp.zeros((int(N), v.size), dtype=jnp.float64).at[0].set(1.0)
+    if int(N) > 1:
+        h = h.at[1].set(xi)
+
+    def body(i: int, arr: Array) -> Array:
+        i_f = jnp.asarray(i, dtype=jnp.float64)
+        next_row = (xi / jnp.sqrt(i_f + 1.0)) * arr[i] - jnp.sqrt(i_f / (i_f + 1.0)) * arr[i - 1]
+        return arr.at[i + 1].set(next_row)
+
+    if int(N) > 2:
+        h = jax.lax.fori_loop(1, int(N) - 1, body, h)
+    return (w[None, :] * h).astype(jnp.float64)
+
+
+def reconstruct_delta_f_from_a_hat_history(
+    a_hat_hist: Array,
+    *,
+    Nx: int,
+    v_probe: Array,
+    vth: float = 1.0,
+) -> Array:
+    a_hat_hist = jnp.asarray(a_hat_hist, dtype=jnp.complex128)
+    a_phys_hist = jax.vmap(lambda a_hat: irfft_x(a_hat, int(Nx)))(a_hat_hist)
+    phi = jax_hermite_basis_phi_scaled(int(a_phys_hist.shape[1]), v_probe, vth=vth)
+    return jnp.einsum("tnx,nv->tvx", a_phys_hist, phi).astype(jnp.float64)
+
+
+def resample_distribution_history_to_probe_grid(
+    f_hist: Array,
+    config: PhysicalGridVlasovPoissonConfig,
+    *,
+    v_probe: Array,
+) -> Array:
+    f_hist = jnp.asarray(f_hist, dtype=jnp.float64)
+    v_probe = jnp.asarray(v_probe, dtype=jnp.float64)
+    Nv = int(config.Nv)
+    Nx = int(config.Nx)
+    coords_1d = (v_probe - float(config.vmin)) / float(config.dv)
+    coords = jnp.broadcast_to(coords_1d[:, None], (int(v_probe.shape[0]), Nx))
+    sub = jnp.full((Nv - 1,), 1.0, dtype=jnp.float64)
+    diag = jnp.full((Nv,), 4.0, dtype=jnp.float64)
+    sup = jnp.full((Nv - 1,), 1.0, dtype=jnp.float64)
+
+    def sample_one(f_state: Array) -> Array:
+        coeffs = cubic_bspline_prefilter_constant(f_state, sub, diag, sup)
+        return cubic_bspline_interp_constant(coeffs, coords, cval=0.0)
+
+    return jax.vmap(sample_one)(f_hist).astype(jnp.float64)
+
+
+def _split_episode_payloads(
+    payloads: Sequence[Dict[str, Array]],
+    *,
+    val_fraction: float,
+) -> Tuple[Sequence[Dict[str, Array]], Sequence[Dict[str, Array]]]:
+    if len(payloads) <= 1:
+        return payloads, payloads
+    n_val = max(1, int(round(len(payloads) * float(val_fraction))))
+    n_val = min(n_val, len(payloads) - 1)
+    return payloads[:-n_val], payloads[-n_val:]
+
+
+def _stack_episode_payloads(payloads: Sequence[Dict[str, Array]]) -> Dict[str, Array]:
+    if not payloads:
+        return {}
+    keys = tuple(payloads[0].keys())
+    out: Dict[str, Array] = {}
+    for key in keys:
+        out[key] = jnp.stack([jnp.asarray(payload[key]) for payload in payloads], axis=0)
+    return out
+
+
+def build_physical_reference_episode(
+    config: PhysicalGridVlasovPoissonConfig,
+    perturbation_x: Array,
+    *,
+    v_probe: Array,
+) -> Dict[str, Array]:
+    equilibrium = maxwellian_equilibrium(config.v)
+    perturb = jnp.asarray(perturbation_x, dtype=jnp.float64)
+    f0 = equilibrium[:, None] * (1.0 + perturb[None, :])
+    raw = run_semilagrangian_vlasov_poisson(
+        config,
+        f0,
+        history_stride=1,
+        return_state_history=True,
+    )
+    f_hist = jnp.asarray(raw["state_history"], dtype=jnp.float64)
+    e_hat_hist = jax.vmap(
+        lambda f_state: jnp.fft.rfft(
+            compute_electric_field_from_distribution(f_state, config)
+        ).astype(jnp.complex128)
+    )(f_hist)
+    sampled_hist = resample_distribution_history_to_probe_grid(f_hist, config, v_probe=v_probe)
+    eq_probe = maxwellian_equilibrium(jnp.asarray(v_probe, dtype=jnp.float64))
+    return {
+        "times": jnp.asarray(raw["state_history_times"], dtype=jnp.float64),
+        "E_hat_ref": e_hat_hist,
+        "delta_f_ref": sampled_hist - eq_probe[None, :, None],
+    }
+
+
+def build_online_reference_dataset(
+    *,
+    regimes: Sequence[str],
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_L: float,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    linear_T: float,
+    linear_eps: float,
+    linear_modes: Sequence[float],
+    linear_num_samples: int,
+    linear_seed: int,
+    linear_poisson_sign: float,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    nonlinear_poisson_sign: float,
+    weak_eps: Sequence[float],
+    strong_eps: Sequence[float],
+    val_fraction: float,
+    online_v_probes: int,
+) -> Tuple[Dict[str, Dict[str, Dict[str, Array]]], Array]:
+    v_probe = jnp.linspace(float(teacher_vmin), float(teacher_vmax), int(online_v_probes), dtype=jnp.float64)
+    dataset: Dict[str, Dict[str, Dict[str, Array]]] = {}
+
+    if REGIME_LINEAR in regimes:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(teacher_Nx),
+            Nv=int(teacher_Nv),
+            Lx=float(teacher_L),
+            vmin=float(teacher_vmin),
+            vmax=float(teacher_vmax),
+            dt=float(teacher_dt),
+            T=float(linear_T),
+            poisson_sign=float(linear_poisson_sign),
+            snapshot_times=(),
+        )
+        rng = np.random.default_rng(int(linear_seed))
+        x = np.asarray(config.x, dtype=np.float64)
+        payloads: List[Dict[str, Array]] = []
+        for _ in range(int(linear_num_samples)):
+            perturb = sample_initial_condition(rng, x, linear_modes, linear_eps)
+            payload = build_physical_reference_episode(config, perturb, v_probe=v_probe)
+            payload["perturbation_x"] = jnp.asarray(perturb, dtype=jnp.float64)
+            payloads.append(payload)
+        train_payloads, val_payloads = _split_episode_payloads(payloads, val_fraction=val_fraction)
+        dataset[REGIME_LINEAR] = {
+            "train": _stack_episode_payloads(train_payloads),
+            "val": _stack_episode_payloads(val_payloads),
+        }
+
+    nonlinear_config = PhysicalGridVlasovPoissonConfig(
+        Nx=int(teacher_Nx),
+        Nv=int(teacher_Nv),
+        Lx=float(teacher_L),
+        vmin=float(teacher_vmin),
+        vmax=float(teacher_vmax),
+        dt=float(teacher_dt),
+        T=float(nonlinear_T),
+        poisson_sign=float(nonlinear_poisson_sign),
+        snapshot_times=(),
+    )
+    perturb_template = np.cos(float(nonlinear_k0) * np.asarray(nonlinear_config.x, dtype=np.float64))
+
+    for regime_name, eps_values in ((REGIME_WEAK, weak_eps), (REGIME_STRONG, strong_eps)):
+        if regime_name not in regimes:
+            continue
+        payloads = []
+        for eps in eps_values:
+            payload = build_physical_reference_episode(
+                nonlinear_config,
+                float(eps) * perturb_template,
+                v_probe=v_probe,
+            )
+            payload["eps"] = jnp.asarray(float(eps), dtype=jnp.float64)
+            payloads.append(payload)
+        train_payloads, val_payloads = _split_episode_payloads(payloads, val_fraction=val_fraction)
+        dataset[regime_name] = {
+            "train": _stack_episode_payloads(train_payloads),
+            "val": _stack_episode_payloads(val_payloads),
+        }
+
+    return dataset, v_probe
+
+
+def run_linear_landau_online_history(
+    learned: LearnedInterfaceClosure,
+    *,
+    config: LinearLandauConfig,
+    perturbation_x: Array,
+) -> Array:
+    integ = FourierHermiteIMEX(
+        Nx=int(config.Nx),
+        Nv=int(config.Nv),
+        Lx=float(config.L),
+        dt=float(config.dt),
+        vth=1.0,
+        dealias_23=False,
+        closure=None,
+    )
+    m_eq = jnp.zeros((int(config.Nv),), dtype=jnp.float64).at[0].set(1.0)
+    a_phys0 = jnp.zeros((int(config.Nv), int(config.Nx)), dtype=jnp.float64).at[0].set(
+        jnp.asarray(perturbation_x, dtype=jnp.float64)
+    )
+    a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
+    n0 = linear_explicit_N_hat(
+        a_hat0,
+        integ,
+        m_eq,
+        poisson_sign=float(config.poisson_sign),
+        dissipation=None,
+    )
+    b0 = learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned)
+    nsteps = int(round(float(config.T) / float(config.dt)))
+
+    def step(carry, _):
+        a_hat, n_prev, b_prev = carry
+        n_hat = linear_explicit_N_hat(
+            a_hat,
+            integ,
+            m_eq,
+            poisson_sign=float(config.poisson_sign),
+            dissipation=None,
+        )
+        b_hat = learned_boundary_flux_hat(a_hat, integ.k_arr, integ.Nv, integ.vth, learned)
+        a_new = integ.step_cnab2(
+            a_hat,
+            n_hat,
+            n_prev,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev,
+        )
+        return (a_new, n_hat, b_hat), a_new
+
+    step = jax.checkpoint(step)
+    (_, _, _), states = jax.lax.scan(step, (a_hat0, n0, b0), xs=None, length=nsteps)
+    return jnp.concatenate([a_hat0[None, :, :], states], axis=0)
+
+
+def run_nonlinear_landau_online_history(
+    learned: LearnedInterfaceClosure,
+    *,
+    Nx: int,
+    Nv: int,
+    L: float,
+    dt: float,
+    T: float,
+    eps: Array,
+    k0: float,
+    dealias_23: bool,
+    poisson_sign: float,
+    vth: float = 1.0,
+) -> Array:
+    integ = FourierHermiteIMEX(
+        Nx=int(Nx),
+        Nv=int(Nv),
+        Lx=float(L),
+        dt=float(dt),
+        vth=float(vth),
+        dealias_23=bool(dealias_23),
+        closure=None,
+    )
+    m_eq = jnp.zeros((int(Nv),), dtype=jnp.float64).at[0].set(1.0)
+    a_phys0 = jnp.zeros((int(Nv), int(Nx)), dtype=jnp.float64)
+    a_phys0 = a_phys0.at[0].set(jnp.asarray(eps, dtype=jnp.float64) * jnp.cos(float(k0) * integ.x))
+    a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
+
+    def explicit_n_hat(a_hat: Array) -> Array:
+        a_phys = irfft_x(a_hat, int(Nx))
+        e_phys = integ.E_phys_from_a_hat(a_hat, poisson_sign=float(poisson_sign))
+        n_phys = jnp.zeros_like(a_phys)
+        n_phys = n_phys.at[1:].set(
+            -(integ.sqrt_n[1:, None] / float(vth))
+            * e_phys[None, :]
+            * (a_phys[:-1] + m_eq[:-1, None])
+        )
+        return integ.apply_mask_hat(rfft_x(n_phys))
+
+    n0 = explicit_n_hat(a_hat0)
+    b0 = learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned)
+    nsteps = int(round(float(T) / float(dt)))
+
+    def step(carry, _):
+        a_hat, n_prev, b_prev = carry
+        n_hat = explicit_n_hat(a_hat)
+        b_hat = learned_boundary_flux_hat(a_hat, integ.k_arr, integ.Nv, integ.vth, learned)
+        a_new = integ.step_cnab2(
+            a_hat,
+            n_hat,
+            n_prev,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev,
+        )
+        return (a_new, n_hat, b_hat), a_new
+
+    step = jax.checkpoint(step)
+    (_, _, _), states = jax.lax.scan(step, (a_hat0, n0, b0), xs=None, length=nsteps)
+    return jnp.concatenate([a_hat0[None, :, :], states], axis=0)
+
+
 def build_learned_interface_closure(
     *,
     params: Dict[str, Array],
@@ -1269,14 +1633,19 @@ def build_learned_interface_closure(
     teacher_dt: float,
     teacher_proj_Nv: Optional[int],
     n_low: int,
+    training_mode: str = OFFLINE_TRAINING_MODE,
     train_objective: str = "q_only",
     context_mode: str = "none",
     rollout_horizon: int = 0,
     tail_start_fraction: float = 2.0 / 3.0,
+    loss_backend: Optional[str] = None,
     lambda_q: float = 1.0,
     lambda_E: float = 0.0,
+    lambda_dist: float = 0.0,
     lambda_tail: float = 0.0,
+    lambda_neg: float = 0.0,
     lambda_reg: float = 0.0,
+    online_v_probes: int = 0,
     stability_loss_definition: Optional[str] = None,
 ) -> LearnedInterfaceClosure:
     return LearnedInterfaceClosure(
@@ -1302,16 +1671,21 @@ def build_learned_interface_closure(
         teacher_proj_Nv=None if teacher_proj_Nv is None else int(teacher_proj_Nv),
         include_global_indicators=True,
         n_low=int(n_low),
+        training_mode=str(training_mode),
         train_objective=str(train_objective),
         context_mode=str(context_mode),
         context_lags=1 if str(context_mode) == "lag1_delta" else 0,
         base_input_dim=2 * int(Nm) + 4,
         rollout_horizon=int(rollout_horizon),
         tail_start_fraction=float(tail_start_fraction),
+        loss_backend=None if loss_backend is None else str(loss_backend),
         lambda_q=float(lambda_q),
         lambda_E=float(lambda_E),
+        lambda_dist=float(lambda_dist),
         lambda_tail=float(lambda_tail),
+        lambda_neg=float(lambda_neg),
         lambda_reg=float(lambda_reg),
+        online_v_probes=int(online_v_probes),
         stability_loss_definition=(
             None
             if stability_loss_definition is None
@@ -2065,6 +2439,319 @@ def train_with_stability_aware_minibatch_loss(
     return params, history
 
 
+def online_trajectory_loss_terms(
+    a_hat_hist: Array,
+    *,
+    k_arr: Array,
+    ref_E_hat: Array,
+    ref_delta_f: Array,
+    Nx: int,
+    v_probe: Array,
+    eq_probe: Array,
+    tail_start_fraction: float,
+    poisson_sign: float,
+) -> Tuple[Array, Array, Array, Array]:
+    pred_E_hat = e_hat_history_from_a_hat_history(
+        jnp.asarray(a_hat_hist, dtype=jnp.complex128),
+        jnp.asarray(k_arr, dtype=jnp.float64),
+        poisson_sign=float(poisson_sign),
+    )
+    pred_delta_f = reconstruct_delta_f_from_a_hat_history(
+        a_hat_hist,
+        Nx=int(Nx),
+        v_probe=v_probe,
+        vth=1.0,
+    )
+    k_weights = _rollout_k_weights(int(pred_E_hat.shape[1]))
+    field_num = jnp.sum(k_weights[None, 1:] * (jnp.abs(pred_E_hat[:, 1:] - ref_E_hat[:, 1:]) ** 2))
+    field_den = jnp.sum(k_weights[None, 1:] * (jnp.abs(ref_E_hat[:, 1:]) ** 2)) + 1e-30
+    field_loss = field_num / field_den
+
+    ref_delta_f = jnp.asarray(ref_delta_f, dtype=jnp.float64)
+    dist_num = jnp.mean((pred_delta_f - ref_delta_f) ** 2)
+    dist_den = jnp.mean(ref_delta_f ** 2) + 1e-30
+    dist_loss = dist_num / dist_den
+
+    Nv = int(a_hat_hist.shape[1])
+    tail_start = min(int(math.ceil(float(tail_start_fraction) * float(Nv))), int(Nv) - 1)
+    tail_weights = jnp.asarray(tail_mode_weights(Nv, tail_start_fraction), dtype=jnp.float64)
+    tail_energy = jnp.mean(
+        tail_weights[None, :, None] * k_weights[None, None, :] * (jnp.abs(a_hat_hist[:, tail_start:, :]) ** 2)
+    )
+    tail_loss = tail_energy / dist_den
+
+    full_f = eq_probe[None, :, None] + pred_delta_f
+    neg_num = jnp.mean(jax.nn.relu(-full_f) ** 2)
+    neg_den = jnp.mean(eq_probe ** 2) + 1e-30
+    neg_loss = neg_num / neg_den
+    return field_loss, dist_loss, tail_loss, neg_loss
+
+
+def make_online_trajectory_batch_loss(
+    *,
+    online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
+    regime_weights: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    n_low: int,
+    context_mode: str,
+    tail_start_fraction: float,
+    loss_backend: str,
+    lambda_E: float,
+    lambda_dist: float,
+    lambda_tail: float,
+    lambda_neg: float,
+    lambda_reg: float,
+    online_v_probes: int,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    poisson_sign: float,
+    rollout_dealias_23: bool,
+) -> Tuple[object, Sequence[str]]:
+    active_regimes = tuple(
+        regime
+        for regime in train_regimes
+        if regime in online_dataset
+        and bool(online_dataset[regime].get("train"))
+        and int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) > 0
+    )
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    target_nv = int(Nv_targets[0])
+    v_probe = jnp.linspace(float(teacher_vmin), float(teacher_vmax), int(online_v_probes), dtype=jnp.float64)
+    eq_probe = maxwellian_equilibrium(v_probe)
+    k_arr = FourierHermiteIMEX(
+        Nx=int(teacher_Nx),
+        Nv=int(target_nv),
+        Lx=float(teacher_Lx),
+        dt=float(teacher_dt),
+        vth=1.0,
+        dealias_23=bool(rollout_dealias_23),
+        closure=None,
+    ).k_arr
+    linear_config = LinearLandauConfig(
+        method="learned",
+        Nv=int(target_nv),
+        Nx=int(teacher_Nx),
+        L=float(teacher_Lx),
+        dt=float(teacher_dt),
+        T=float(online_dataset[REGIME_LINEAR]["train"]["times"].shape[1] - 1) * float(teacher_dt)
+        if REGIME_LINEAR in online_dataset and online_dataset[REGIME_LINEAR].get("train")
+        else float(nonlinear_T),
+        poisson_sign=float(poisson_sign),
+    )
+    lambda_E_arr = jnp.asarray(float(lambda_E), dtype=jnp.float64)
+    lambda_dist_arr = jnp.asarray(float(lambda_dist), dtype=jnp.float64)
+    lambda_tail_arr = jnp.asarray(float(lambda_tail), dtype=jnp.float64)
+    lambda_neg_arr = jnp.asarray(float(lambda_neg), dtype=jnp.float64)
+    lambda_reg_arr = jnp.asarray(float(lambda_reg), dtype=jnp.float64)
+
+    def loss_fn(
+        params: Dict[str, Array],
+        regime_batches: Dict[str, Dict[str, Array]],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        learned = build_learned_interface_closure(
+            params=params,
+            Nm=Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            stats=stats,
+            hidden_width=hidden_width,
+            res_blocks=res_blocks,
+            Nv_targets=Nv_targets,
+            train_regimes=train_regimes,
+            teacher_backend=teacher_backend,
+            teacher_Lx=teacher_Lx,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            teacher_proj_Nv=None,
+            n_low=n_low,
+            training_mode=ONLINE_TRAINING_MODE,
+            train_objective="trajectory",
+            context_mode=context_mode,
+            rollout_horizon=0,
+            tail_start_fraction=tail_start_fraction,
+            loss_backend=loss_backend,
+            lambda_q=0.0,
+            lambda_E=lambda_E,
+            lambda_dist=lambda_dist,
+            lambda_tail=lambda_tail,
+            lambda_neg=lambda_neg,
+            lambda_reg=lambda_reg,
+            online_v_probes=online_v_probes,
+        )
+        total_field = jnp.asarray(0.0, dtype=jnp.float64)
+        total_dist = jnp.asarray(0.0, dtype=jnp.float64)
+        total_tail = jnp.asarray(0.0, dtype=jnp.float64)
+        total_neg = jnp.asarray(0.0, dtype=jnp.float64)
+
+        for weight, regime in zip(weight_arr, active_regimes):
+            batch = regime_batches[regime]
+            if regime == REGIME_LINEAR:
+                field_terms, dist_terms, tail_terms, neg_terms = jax.vmap(
+                    lambda perturbation_x, ref_e_hat, ref_delta_f: online_trajectory_loss_terms(
+                        run_linear_landau_online_history(
+                            learned,
+                            config=linear_config,
+                            perturbation_x=perturbation_x,
+                        ),
+                        k_arr=k_arr,
+                        ref_E_hat=ref_e_hat,
+                        ref_delta_f=ref_delta_f,
+                        Nx=int(teacher_Nx),
+                        v_probe=v_probe,
+                        eq_probe=eq_probe,
+                        tail_start_fraction=tail_start_fraction,
+                        poisson_sign=float(poisson_sign),
+                    )
+                )(
+                    batch["perturbation_x"],
+                    batch["E_hat_ref"],
+                    batch["delta_f_ref"],
+                )
+            else:
+                field_terms, dist_terms, tail_terms, neg_terms = jax.vmap(
+                    lambda eps, ref_e_hat, ref_delta_f: online_trajectory_loss_terms(
+                        run_nonlinear_landau_online_history(
+                            learned,
+                            Nx=int(teacher_Nx),
+                            Nv=int(target_nv),
+                            L=float(teacher_Lx),
+                            dt=float(teacher_dt),
+                            T=float(nonlinear_T),
+                            eps=eps,
+                            k0=float(nonlinear_k0),
+                            dealias_23=bool(rollout_dealias_23),
+                            poisson_sign=float(poisson_sign),
+                        ),
+                        k_arr=k_arr,
+                        ref_E_hat=ref_e_hat,
+                        ref_delta_f=ref_delta_f,
+                        Nx=int(teacher_Nx),
+                        v_probe=v_probe,
+                        eq_probe=eq_probe,
+                        tail_start_fraction=tail_start_fraction,
+                        poisson_sign=float(poisson_sign),
+                    )
+                )(
+                    batch["eps"],
+                    batch["E_hat_ref"],
+                    batch["delta_f_ref"],
+                )
+            total_field = total_field + weight * (lambda_E_arr * jnp.mean(field_terms))
+            total_dist = total_dist + weight * (lambda_dist_arr * jnp.mean(dist_terms))
+            total_tail = total_tail + weight * (lambda_tail_arr * jnp.mean(tail_terms))
+            total_neg = total_neg + weight * (lambda_neg_arr * jnp.mean(neg_terms))
+
+        reg_term = lambda_reg_arr * l2_regularization(params)
+        total_loss = total_field + total_dist + total_tail + total_neg + reg_term
+        return total_loss, {
+            "field": total_field,
+            "dist": total_dist,
+            "tail": total_tail,
+            "neg": total_neg,
+            "reg": reg_term,
+        }
+
+    return loss_fn, active_regimes
+
+
+def train_with_online_trajectory_minibatch_loss(
+    params: Dict[str, Array],
+    online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
+    batch_loss_fn,
+    *,
+    active_regimes: Sequence[str],
+    epochs: int,
+    learning_rate: float,
+    grad_clip: Optional[float],
+    log_every: int,
+    online_case_batch_size: int,
+    steps_per_epoch: int,
+    seed: int,
+) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
+    if int(online_case_batch_size) <= 0:
+        raise ValueError("online_case_batch_size must be positive for online rollout training")
+    if int(steps_per_epoch) <= 0:
+        raise ValueError("steps_per_epoch must be positive for online rollout training")
+
+    train_sizes = {
+        regime: int(online_dataset[regime]["train"]["E_hat_ref"].shape[0])
+        for regime in active_regimes
+    }
+    state = adam_init(params)
+    history = {
+        key: np.zeros((int(epochs),), dtype=np.float64)
+        for key in ("total", "field", "dist", "tail", "neg", "reg")
+    }
+
+    @jax.jit
+    def train_step(
+        current_params: Dict[str, Array],
+        current_state: Dict[str, object],
+        regime_batches: Dict[str, Dict[str, Array]],
+    ) -> Tuple[Dict[str, Array], Dict[str, object], Dict[str, Array]]:
+        (loss, aux), grads = jax.value_and_grad(batch_loss_fn, has_aux=True)(current_params, regime_batches)
+        next_params, next_state = adam_step(
+            current_params,
+            grads,
+            current_state,
+            learning_rate,
+            grad_clip=grad_clip,
+        )
+        aux = dict(aux)
+        aux["total"] = loss
+        return next_params, next_state, aux
+
+    rng = np.random.default_rng(int(seed))
+    for epoch in range(int(epochs)):
+        running = {
+            key: jnp.asarray(0.0, dtype=jnp.float64)
+            for key in ("total", "field", "dist", "tail", "neg", "reg")
+        }
+        for _ in range(int(steps_per_epoch)):
+            regime_batches: Dict[str, Dict[str, Array]] = {}
+            for regime in active_regimes:
+                group = online_dataset[regime]["train"]
+                size = train_sizes[regime]
+                batch_n = int(min(online_case_batch_size, size))
+                idx = rng.integers(0, size, size=batch_n, endpoint=False)
+                regime_batches[regime] = {key: value[idx] for key, value in group.items()}
+            params, state, aux = train_step(params, state, regime_batches)
+            for key in running:
+                running[key] = running[key] + aux[key]
+        for key in history:
+            history[key][epoch] = float(running[key] / float(steps_per_epoch))
+        if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
+            print(
+                f"[train] epoch {epoch + 1:04d}/{int(epochs):04d} "
+                f"loss={history['total'][epoch]:.6e} "
+                f"field={history['field'][epoch]:.6e} "
+                f"dist={history['dist'][epoch]:.6e} "
+                f"tail={history['tail'][epoch]:.6e} "
+                f"neg={history['neg'][epoch]:.6e} "
+                f"reg={history['reg'][epoch]:.6e}"
+            )
+    return params, history
+
+
 def evaluate_regime_metrics(
     learned: LearnedInterfaceClosure,
     prepared: Dict[str, Dict[str, Array]],
@@ -2110,15 +2797,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nv-scale", type=float, default=None)
     parser.add_argument("--n-low", type=int, default=2)
     parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--train-objective", type=str, default="q_only", choices=("q_only", "stability_aware"))
+    parser.add_argument("--training-mode", type=str, default=OFFLINE_TRAINING_MODE, choices=(OFFLINE_TRAINING_MODE, ONLINE_TRAINING_MODE))
+    parser.add_argument("--train-objective", type=str, default="q_only", choices=("q_only", "stability_aware", "trajectory"))
     parser.add_argument("--context-mode", type=str, default="none", choices=("none", "lag1_delta"))
     parser.add_argument("--rollout-horizon", type=int, default=2)
     parser.add_argument("--tail-start-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--lambda-q", type=float, default=1.0)
     parser.add_argument("--lambda-E", type=float, default=0.5)
+    parser.add_argument("--lambda-dist", type=float, default=1.0)
     parser.add_argument("--lambda-tail", type=float, default=0.05)
+    parser.add_argument("--lambda-neg", type=float, default=0.05)
     parser.add_argument("--lambda-reg", type=float, default=1e-6)
     parser.add_argument("--rollout-dealias-23", action="store_true")
+    parser.add_argument("--online-loss-backend", type=str, default=ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
+    parser.add_argument("--online-v-probes", type=int, default=64)
+    parser.add_argument("--online-case-batch-size", type=int, default=1)
     parser.add_argument("--regimes", type=str, default="linear_landau,nonlinear_landau_weak,nonlinear_landau_strong")
     parser.add_argument("--weight-linear", type=float, default=1.0)
     parser.add_argument("--weight-weak", type=float, default=1.0)
@@ -2153,9 +2846,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print_jax_runtime_summary(jax, context="training")
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    training_mode = str(args.training_mode)
     if args.checkpoint is None and not bool(args.build_dataset_only):
         raise ValueError("--checkpoint is required unless --build-dataset-only is set")
-    if bool(args.build_dataset_only) and args.dataset_cache is None:
+    if training_mode == OFFLINE_TRAINING_MODE and bool(args.build_dataset_only) and args.dataset_cache is None:
         raise ValueError("--build-dataset-only requires --dataset-cache so the generated dataset can be reused")
 
     Nv_targets = parse_int_tuple(args.Nv_targets)
@@ -2172,103 +2866,254 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     regimes = tuple(regime for regime in parse_str_tuple(args.regimes) if regime in ALL_REGIMES)
     if not regimes:
         raise ValueError("At least one valid training regime must be selected")
-    if args.train_objective == "stability_aware" and int(args.batch_size) <= 0:
-        raise ValueError("stability_aware training requires --batch-size > 0")
-    if args.train_objective == "stability_aware" and (float(args.lambda_E) <= 0.0 and float(args.lambda_tail) <= 0.0):
-        raise ValueError("stability_aware training requires lambda_E > 0 or lambda_tail > 0")
+
     teacher_backend = normalize_teacher_backend_name(args.teacher_backend)
-    teacher_proj_Nv: Optional[int]
-    if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
-        teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
-        if teacher_proj_Nv <= max(Nv_targets):
-            raise ValueError("teacher-proj-Nv must exceed every target Nv")
-    elif teacher_backend == HIGHER_ORDER_HERMITE_TEACHER_BACKEND:
+    teacher_proj_Nv: Optional[int] = None
+    if training_mode == ONLINE_TRAINING_MODE:
+        if bool(args.build_dataset_only):
+            raise ValueError("online_rollout does not support --build-dataset-only")
+        if args.dataset_cache is not None:
+            raise ValueError("online_rollout does not support --dataset-cache")
+        if bool(args.allow_dataset_cache_nv_superset):
+            raise ValueError("online_rollout does not support --allow-dataset-cache-nv-superset")
         if bool(args.per_target_projection_orders):
-            raise ValueError("higher_order_hermite does not support --per-target-projection-orders")
+            raise ValueError("online_rollout does not support --per-target-projection-orders")
+        if teacher_backend != GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+            raise ValueError("online_rollout only supports teacher_backend=grid_cubic_spline")
+        if len(Nv_targets) != 1:
+            raise ValueError("online_rollout requires exactly one target Nv")
         if args.teacher_proj_Nv is not None:
-            raise ValueError("higher_order_hermite does not use --teacher-proj-Nv")
-        if int(args.teacher_Nv) <= max(Nv_targets):
-            raise ValueError("higher_order_hermite requires teacher-Nv to exceed every target Nv")
-        teacher_proj_Nv = None
+            raise ValueError("online_rollout does not use --teacher-proj-Nv")
+        if args.train_objective != "trajectory":
+            raise ValueError("online_rollout requires --train-objective trajectory")
+        if str(args.online_loss_backend) != ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1:
+            raise ValueError(
+                f"Unsupported online loss backend {args.online_loss_backend!r}; "
+                f"expected {ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1!r}"
+            )
+        if int(args.online_v_probes) <= 0:
+            raise ValueError("online_rollout requires --online-v-probes > 0")
+        if int(args.online_case_batch_size) <= 0:
+            raise ValueError("online_rollout requires --online-case-batch-size > 0")
+        if float(args.lambda_E) <= 0.0 and float(args.lambda_dist) <= 0.0:
+            raise ValueError("online_rollout requires lambda_E > 0 or lambda_dist > 0")
     else:
-        raise ValueError(f"Unsupported teacher backend: {teacher_backend!r}")
+        if args.train_objective == "trajectory":
+            raise ValueError("trajectory objective is only supported with --training-mode online_rollout")
+        if args.train_objective == "stability_aware" and int(args.batch_size) <= 0:
+            raise ValueError("stability_aware training requires --batch-size > 0")
+        if args.train_objective == "stability_aware" and (
+            float(args.lambda_E) <= 0.0 and float(args.lambda_tail) <= 0.0
+        ):
+            raise ValueError("stability_aware training requires lambda_E > 0 or lambda_tail > 0")
+        if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+            teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
+            if teacher_proj_Nv <= max(Nv_targets):
+                raise ValueError("teacher-proj-Nv must exceed every target Nv")
+        elif teacher_backend == HIGHER_ORDER_HERMITE_TEACHER_BACKEND:
+            if bool(args.per_target_projection_orders):
+                raise ValueError("higher_order_hermite does not support --per-target-projection-orders")
+            if args.teacher_proj_Nv is not None:
+                raise ValueError("higher_order_hermite does not use --teacher-proj-Nv")
+            if int(args.teacher_Nv) <= max(Nv_targets):
+                raise ValueError("higher_order_hermite requires teacher-Nv to exceed every target Nv")
+        else:
+            raise ValueError(f"Unsupported teacher backend: {teacher_backend!r}")
 
-    dataset_rollout_horizon = (
-        int(args.rollout_horizon)
-        if args.train_objective == "stability_aware"
-        else 0
-    )
-
-    dataset_base = build_mixed_landau_dataset(
-        dataset_cache=args.dataset_cache,
-        regimes=regimes,
-        teacher_backend=teacher_backend,
-        teacher_Nx=args.teacher_Nx,
-        teacher_Nv=args.teacher_Nv,
-        teacher_L=args.teacher_L,
-        teacher_vmin=args.teacher_vmin,
-        teacher_vmax=args.teacher_vmax,
-        teacher_dt=args.teacher_dt,
-        teacher_proj_Nv=teacher_proj_Nv,
-        linear_T=args.linear_T,
-        linear_eps=args.linear_eps,
-        linear_modes=linear_modes,
-        linear_num_samples=args.linear_num_samples,
-        linear_seed=args.linear_seed,
-        linear_poisson_sign=args.teacher_poisson_sign,
-        linear_history_stride=args.linear_history_stride,
-        nonlinear_T=args.nonlinear_T,
-        nonlinear_k0=args.nonlinear_k0,
-        nonlinear_poisson_sign=args.teacher_poisson_sign,
-        nonlinear_history_stride=args.nonlinear_history_stride,
-        weak_eps=weak_eps,
-        strong_eps=strong_eps,
-        Nv_targets=Nv_targets,
-        Nm=args.Nm,
-        val_fraction=args.val_fraction,
-        n_low=args.n_low,
-        context_mode=args.context_mode,
-        rollout_horizon=dataset_rollout_horizon,
-        allow_cached_nv_superset=bool(args.allow_dataset_cache_nv_superset),
-        per_target_projection_orders=bool(args.per_target_projection_orders) if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND else False,
-    )
-    if bool(args.build_dataset_only):
-        cache_msg = f"Saved shared dataset cache to {args.dataset_cache}" if args.dataset_cache is not None else "Built dataset in memory"
-        print(cache_msg)
-        for regime, arrays in dataset_base.items():
-            print(f"[data] {regime}: {arrays['train_inputs_base'].shape[0]} training samples cached")
-        return
-
-    k_scale = float(args.k_scale) if args.k_scale is not None else choose_k_scale(dataset_base, Nm=args.Nm)
-    nv_scale = float(args.nv_scale) if args.nv_scale is not None else choose_nv_scale(dataset_base, Nm=args.Nm)
-
-    prepared, stats = prepare_training_dataset(
-        dataset_base,
-        Nm=args.Nm,
-        k_scale=k_scale,
-        nv_scale=nv_scale,
-        context_mode=args.context_mode,
-    )
-    for regime, count in summarize_dataset(prepared).items():
-        print(f"[data] {regime}: {count} training samples")
-
-    input_dim = int(stats["input_mean"].shape[0])
-    params = init_interface_closure_params(
-        jax.random.PRNGKey(args.seed),
-        input_dim=input_dim,
-        hidden_width=int(args.hidden_width),
-        res_blocks=int(args.res_blocks),
-    )
     regime_weights = {
         REGIME_LINEAR: float(args.weight_linear),
         REGIME_WEAK: float(args.weight_weak),
         REGIME_STRONG: float(args.weight_strong),
     }
+    val_metrics: Dict[str, np.ndarray] = {}
     stability_component_history: Optional[Dict[str, np.ndarray]] = None
-    if args.train_objective == "stability_aware":
-        batch_loss_fn, active_regimes, regime_rollout_nvs = make_stability_aware_batch_loss(
-            prepared=prepared,
-            regime_weights=regime_weights,
+    online_component_history: Optional[Dict[str, np.ndarray]] = None
+
+    if training_mode == OFFLINE_TRAINING_MODE:
+        dataset_rollout_horizon = int(args.rollout_horizon) if args.train_objective == "stability_aware" else 0
+        dataset_base = build_mixed_landau_dataset(
+            dataset_cache=args.dataset_cache,
+            regimes=regimes,
+            teacher_backend=teacher_backend,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_L=args.teacher_L,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            teacher_proj_Nv=teacher_proj_Nv,
+            linear_T=args.linear_T,
+            linear_eps=args.linear_eps,
+            linear_modes=linear_modes,
+            linear_num_samples=args.linear_num_samples,
+            linear_seed=args.linear_seed,
+            linear_poisson_sign=args.teacher_poisson_sign,
+            linear_history_stride=args.linear_history_stride,
+            nonlinear_T=args.nonlinear_T,
+            nonlinear_k0=args.nonlinear_k0,
+            nonlinear_poisson_sign=args.teacher_poisson_sign,
+            nonlinear_history_stride=args.nonlinear_history_stride,
+            weak_eps=weak_eps,
+            strong_eps=strong_eps,
+            Nv_targets=Nv_targets,
+            Nm=args.Nm,
+            val_fraction=args.val_fraction,
+            n_low=args.n_low,
+            context_mode=args.context_mode,
+            rollout_horizon=dataset_rollout_horizon,
+            allow_cached_nv_superset=bool(args.allow_dataset_cache_nv_superset),
+            per_target_projection_orders=bool(args.per_target_projection_orders) if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND else False,
+        )
+        if bool(args.build_dataset_only):
+            cache_msg = f"Saved shared dataset cache to {args.dataset_cache}" if args.dataset_cache is not None else "Built dataset in memory"
+            print(cache_msg)
+            for regime, arrays in dataset_base.items():
+                print(f"[data] {regime}: {arrays['train_inputs_base'].shape[0]} training samples cached")
+            return
+
+        k_scale = float(args.k_scale) if args.k_scale is not None else choose_k_scale(dataset_base, Nm=args.Nm)
+        nv_scale = float(args.nv_scale) if args.nv_scale is not None else choose_nv_scale(dataset_base, Nm=args.Nm)
+        prepared, stats = prepare_training_dataset(
+            dataset_base,
+            Nm=args.Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            context_mode=args.context_mode,
+        )
+        for regime, count in summarize_dataset(prepared).items():
+            print(f"[data] {regime}: {count} training samples")
+
+        input_dim = int(stats["input_mean"].shape[0])
+        params = init_interface_closure_params(
+            jax.random.PRNGKey(args.seed),
+            input_dim=input_dim,
+            hidden_width=int(args.hidden_width),
+            res_blocks=int(args.res_blocks),
+        )
+        if args.train_objective == "stability_aware":
+            batch_loss_fn, active_regimes, regime_rollout_nvs = make_stability_aware_batch_loss(
+                prepared=prepared,
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=args.rollout_horizon,
+                tail_start_fraction=args.tail_start_fraction,
+                lambda_q=args.lambda_q,
+                lambda_E=args.lambda_E,
+                lambda_tail=args.lambda_tail,
+                lambda_reg=args.lambda_reg,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+                poisson_sign=args.teacher_poisson_sign,
+            )
+            q_train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
+            steps_per_epoch = int(args.steps_per_epoch)
+            if steps_per_epoch <= 0:
+                steps_per_epoch = max(1, math.ceil(max(q_train_sizes) / float(args.batch_size)))
+            params, stability_component_history = train_with_stability_aware_minibatch_loss(
+                params,
+                prepared,
+                batch_loss_fn,
+                active_regimes=active_regimes,
+                regime_rollout_nvs=regime_rollout_nvs,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+                batch_size=args.batch_size,
+                rollout_batch_size=args.rollout_batch_size,
+                steps_per_epoch=steps_per_epoch,
+                seed=args.seed,
+            )
+            loss_history = stability_component_history["total"]
+        elif int(args.batch_size) > 0:
+            batch_loss_fn, active_regimes = make_regime_balanced_batch_loss(
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+            )
+            train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
+            steps_per_epoch = int(args.steps_per_epoch)
+            if steps_per_epoch <= 0:
+                steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.batch_size)))
+            params, loss_history = train_with_minibatch_loss(
+                params,
+                prepared,
+                batch_loss_fn,
+                active_regimes=active_regimes,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+                batch_size=args.batch_size,
+                steps_per_epoch=steps_per_epoch,
+                seed=args.seed,
+            )
+        else:
+            loss_fn = make_regime_balanced_loss(
+                prepared,
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+            )
+            params, loss_history = train_with_loss(
+                params,
+                loss_fn,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+            )
+
+        learned = build_learned_interface_closure(
+            params=params,
             Nm=args.Nm,
             k_scale=k_scale,
             nv_scale=nv_scale,
@@ -2286,78 +3131,70 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             teacher_dt=args.teacher_dt,
             teacher_proj_Nv=teacher_proj_Nv,
             n_low=args.n_low,
+            training_mode=OFFLINE_TRAINING_MODE,
+            train_objective=args.train_objective,
             context_mode=args.context_mode,
-            rollout_horizon=args.rollout_horizon,
+            rollout_horizon=args.rollout_horizon if args.train_objective == "stability_aware" else 0,
             tail_start_fraction=args.tail_start_fraction,
             lambda_q=args.lambda_q,
-            lambda_E=args.lambda_E,
-            lambda_tail=args.lambda_tail,
-            lambda_reg=args.lambda_reg,
-            rollout_dealias_23=bool(args.rollout_dealias_23),
-            poisson_sign=args.teacher_poisson_sign,
+            lambda_E=args.lambda_E if args.train_objective == "stability_aware" else 0.0,
+            lambda_tail=args.lambda_tail if args.train_objective == "stability_aware" else 0.0,
+            lambda_reg=args.lambda_reg if args.train_objective == "stability_aware" else 0.0,
+            stability_loss_definition=(
+                STABILITY_LOSS_DEFINITION if args.train_objective == "stability_aware" else None
+            ),
         )
-        q_train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
-        steps_per_epoch = int(args.steps_per_epoch)
-        if steps_per_epoch <= 0:
-            steps_per_epoch = max(1, math.ceil(max(q_train_sizes) / float(args.batch_size)))
-        params, stability_component_history = train_with_stability_aware_minibatch_loss(
-            params,
-            prepared,
-            batch_loss_fn,
-            active_regimes=active_regimes,
-            regime_rollout_nvs=regime_rollout_nvs,
-            epochs=args.epochs,
-            learning_rate=args.lr,
-            grad_clip=args.grad_clip,
-            log_every=args.log_every,
-            batch_size=args.batch_size,
-            rollout_batch_size=args.rollout_batch_size,
-            steps_per_epoch=steps_per_epoch,
-            seed=args.seed,
-        )
-        loss_history = stability_component_history["total"]
-    elif int(args.batch_size) > 0:
-        batch_loss_fn, active_regimes = make_regime_balanced_batch_loss(
-            regime_weights=regime_weights,
-            Nm=args.Nm,
-            k_scale=k_scale,
-            nv_scale=nv_scale,
-            stats=stats,
-            hidden_width=args.hidden_width,
-            res_blocks=args.res_blocks,
-            Nv_targets=Nv_targets,
-            train_regimes=regimes,
-            teacher_backend=teacher_backend,
-            teacher_Lx=args.teacher_L,
-            teacher_Nx=args.teacher_Nx,
-            teacher_Nv=args.teacher_Nv,
-            teacher_vmin=args.teacher_vmin,
-            teacher_vmax=args.teacher_vmax,
-            teacher_dt=args.teacher_dt,
-            teacher_proj_Nv=teacher_proj_Nv,
-            n_low=args.n_low,
-            context_mode=args.context_mode,
-        )
-        train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
-        steps_per_epoch = int(args.steps_per_epoch)
-        if steps_per_epoch <= 0:
-            steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.batch_size)))
-        params, loss_history = train_with_minibatch_loss(
-            params,
-            prepared,
-            batch_loss_fn,
-            active_regimes=active_regimes,
-            epochs=args.epochs,
-            learning_rate=args.lr,
-            grad_clip=args.grad_clip,
-            log_every=args.log_every,
-            batch_size=args.batch_size,
-            steps_per_epoch=steps_per_epoch,
-            seed=args.seed,
-        )
+        val_metrics = evaluate_regime_metrics(learned, prepared)
     else:
-        loss_fn = make_regime_balanced_loss(
-            prepared,
+        online_dataset, _ = build_online_reference_dataset(
+            regimes=regimes,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_L=args.teacher_L,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            linear_T=args.linear_T,
+            linear_eps=args.linear_eps,
+            linear_modes=linear_modes,
+            linear_num_samples=args.linear_num_samples,
+            linear_seed=args.linear_seed,
+            linear_poisson_sign=args.teacher_poisson_sign,
+            nonlinear_T=args.nonlinear_T,
+            nonlinear_k0=args.nonlinear_k0,
+            nonlinear_poisson_sign=args.teacher_poisson_sign,
+            weak_eps=weak_eps,
+            strong_eps=strong_eps,
+            val_fraction=args.val_fraction,
+            online_v_probes=args.online_v_probes,
+        )
+        for regime in regimes:
+            if regime not in online_dataset:
+                continue
+            train_count = int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("train") else 0
+            val_count = int(online_dataset[regime]["val"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("val") else 0
+            print(f"[data] {regime}: train={train_count} episodes val={val_count} episodes")
+
+        integ = FourierHermiteIMEX(
+            Nx=int(args.teacher_Nx),
+            Nv=int(Nv_targets[0]),
+            Lx=float(args.teacher_L),
+            dt=float(args.teacher_dt),
+            vth=1.0,
+            dealias_23=bool(args.rollout_dealias_23),
+            closure=None,
+        )
+        k_scale = float(args.k_scale) if args.k_scale is not None else float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64)))
+        nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(Nv_targets[0])
+        stats = build_identity_training_stats(Nm=args.Nm, context_mode=args.context_mode)
+        params = init_online_rollout_params(
+            jax.random.PRNGKey(args.seed),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=int(args.hidden_width),
+            res_blocks=int(args.res_blocks),
+        )
+        batch_loss_fn, active_regimes = make_online_trajectory_batch_loss(
+            online_dataset=online_dataset,
             regime_weights=regime_weights,
             Nm=args.Nm,
             k_scale=k_scale,
@@ -2374,61 +3211,92 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             teacher_vmin=args.teacher_vmin,
             teacher_vmax=args.teacher_vmax,
             teacher_dt=args.teacher_dt,
-            teacher_proj_Nv=teacher_proj_Nv,
             n_low=args.n_low,
             context_mode=args.context_mode,
+            tail_start_fraction=args.tail_start_fraction,
+            loss_backend=args.online_loss_backend,
+            lambda_E=args.lambda_E,
+            lambda_dist=args.lambda_dist,
+            lambda_tail=args.lambda_tail,
+            lambda_neg=args.lambda_neg,
+            lambda_reg=args.lambda_reg,
+            online_v_probes=args.online_v_probes,
+            nonlinear_T=args.nonlinear_T,
+            nonlinear_k0=args.nonlinear_k0,
+            poisson_sign=args.teacher_poisson_sign,
+            rollout_dealias_23=bool(args.rollout_dealias_23),
         )
-        params, loss_history = train_with_loss(
+        train_sizes = [int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) for regime in active_regimes]
+        steps_per_epoch = int(args.steps_per_epoch)
+        if steps_per_epoch <= 0:
+            steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.online_case_batch_size)))
+        params, online_component_history = train_with_online_trajectory_minibatch_loss(
             params,
-            loss_fn,
+            online_dataset,
+            batch_loss_fn,
+            active_regimes=active_regimes,
             epochs=args.epochs,
             learning_rate=args.lr,
             grad_clip=args.grad_clip,
             log_every=args.log_every,
+            online_case_batch_size=args.online_case_batch_size,
+            steps_per_epoch=steps_per_epoch,
+            seed=args.seed,
+        )
+        loss_history = online_component_history["total"]
+        for regime in regimes:
+            if regime in online_dataset and online_dataset[regime].get("val"):
+                val_metrics[f"val_num_cases_{regime}"] = np.array(
+                    [int(online_dataset[regime]["val"]["E_hat_ref"].shape[0])],
+                    dtype=np.int32,
+                )
+
+        learned = build_learned_interface_closure(
+            params=params,
+            Nm=args.Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            stats=stats,
+            hidden_width=args.hidden_width,
+            res_blocks=args.res_blocks,
+            Nv_targets=Nv_targets,
+            train_regimes=regimes,
+            teacher_backend=teacher_backend,
+            teacher_Lx=args.teacher_L,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            teacher_proj_Nv=None,
+            n_low=args.n_low,
+            training_mode=ONLINE_TRAINING_MODE,
+            train_objective="trajectory",
+            context_mode=args.context_mode,
+            rollout_horizon=0,
+            tail_start_fraction=args.tail_start_fraction,
+            loss_backend=args.online_loss_backend,
+            lambda_q=0.0,
+            lambda_E=args.lambda_E,
+            lambda_dist=args.lambda_dist,
+            lambda_tail=args.lambda_tail,
+            lambda_neg=args.lambda_neg,
+            lambda_reg=args.lambda_reg,
+            online_v_probes=args.online_v_probes,
         )
 
-    learned = build_learned_interface_closure(
-        params=params,
-        Nm=args.Nm,
-        k_scale=k_scale,
-        nv_scale=nv_scale,
-        stats=stats,
-        hidden_width=args.hidden_width,
-        res_blocks=args.res_blocks,
-        Nv_targets=Nv_targets,
-        train_regimes=regimes,
-        teacher_backend=teacher_backend,
-        teacher_Lx=args.teacher_L,
-        teacher_Nx=args.teacher_Nx,
-        teacher_Nv=args.teacher_Nv,
-        teacher_vmin=args.teacher_vmin,
-        teacher_vmax=args.teacher_vmax,
-        teacher_dt=args.teacher_dt,
-        teacher_proj_Nv=teacher_proj_Nv,
-        n_low=args.n_low,
-        train_objective=args.train_objective,
-        context_mode=args.context_mode,
-        rollout_horizon=args.rollout_horizon if args.train_objective == "stability_aware" else 0,
-        tail_start_fraction=args.tail_start_fraction,
-        lambda_q=args.lambda_q,
-        lambda_E=args.lambda_E if args.train_objective == "stability_aware" else 0.0,
-        lambda_tail=args.lambda_tail if args.train_objective == "stability_aware" else 0.0,
-        lambda_reg=args.lambda_reg if args.train_objective == "stability_aware" else 0.0,
-        stability_loss_definition=(
-            STABILITY_LOSS_DEFINITION if args.train_objective == "stability_aware" else None
-        ),
-    )
-    val_metrics = evaluate_regime_metrics(learned, prepared)
-
+    assert args.checkpoint is not None
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     save_learned_interface_closure_npz(args.checkpoint, learned)
 
     metrics_path = args.checkpoint.with_suffix(".metrics.npz")
-    used_lambda_E = args.lambda_E if args.train_objective == "stability_aware" else 0.0
-    used_lambda_tail = args.lambda_tail if args.train_objective == "stability_aware" else 0.0
-    used_lambda_reg = args.lambda_reg if args.train_objective == "stability_aware" else 0.0
+    used_lambda_E = args.lambda_E if args.train_objective in {"stability_aware", "trajectory"} else 0.0
+    used_lambda_dist = args.lambda_dist if training_mode == ONLINE_TRAINING_MODE else 0.0
+    used_lambda_tail = args.lambda_tail if args.train_objective in {"stability_aware", "trajectory"} else 0.0
+    used_lambda_neg = args.lambda_neg if training_mode == ONLINE_TRAINING_MODE else 0.0
+    used_lambda_reg = args.lambda_reg if args.train_objective in {"stability_aware", "trajectory"} else 0.0
     metrics_payload: Dict[str, np.ndarray] = {
-        "train_loss": loss_history,
+        "train_loss": np.asarray(loss_history, dtype=np.float64),
         "Nm": np.array([args.Nm], dtype=np.int32),
         "hidden_width": np.array([args.hidden_width], dtype=np.int32),
         "res_blocks": np.array([args.res_blocks], dtype=np.int32),
@@ -2451,14 +3319,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "teacher_vmax": np.array([args.teacher_vmax], dtype=np.float64),
         "teacher_dt": np.array([args.teacher_dt], dtype=np.float64),
         "n_low": np.array([args.n_low], dtype=np.int32),
+        "training_mode": np.array([training_mode], dtype=np.str_),
         "train_objective": np.array([args.train_objective], dtype=np.str_),
         "context_mode": np.array([args.context_mode], dtype=np.str_),
         "rollout_horizon": np.array([args.rollout_horizon], dtype=np.int32),
         "tail_start_fraction": np.array([args.tail_start_fraction], dtype=np.float64),
-        "lambda_q": np.array([args.lambda_q], dtype=np.float64),
+        "loss_backend": np.array(
+            [] if training_mode == OFFLINE_TRAINING_MODE else [args.online_loss_backend],
+            dtype=np.str_,
+        ),
+        "lambda_q": np.array([args.lambda_q if training_mode == OFFLINE_TRAINING_MODE else 0.0], dtype=np.float64),
         "lambda_E": np.array([used_lambda_E], dtype=np.float64),
+        "lambda_dist": np.array([used_lambda_dist], dtype=np.float64),
         "lambda_tail": np.array([used_lambda_tail], dtype=np.float64),
+        "lambda_neg": np.array([used_lambda_neg], dtype=np.float64),
         "lambda_reg": np.array([used_lambda_reg], dtype=np.float64),
+        "online_v_probes": np.array([args.online_v_probes if training_mode == ONLINE_TRAINING_MODE else 0], dtype=np.int32),
     }
     if teacher_proj_Nv is not None:
         metrics_payload["teacher_proj_Nv"] = np.array([teacher_proj_Nv], dtype=np.int32)
@@ -2469,12 +3345,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         metrics_payload["train_loss_tail"] = np.asarray(stability_component_history["tail"], dtype=np.float64)
         metrics_payload["train_loss_reg"] = np.asarray(stability_component_history["reg"], dtype=np.float64)
         metrics_payload["stability_loss_definition"] = np.array([STABILITY_LOSS_DEFINITION], dtype=np.str_)
+    if training_mode == ONLINE_TRAINING_MODE:
+        assert online_component_history is not None
+        metrics_payload["train_loss_field"] = np.asarray(online_component_history["field"], dtype=np.float64)
+        metrics_payload["train_loss_dist"] = np.asarray(online_component_history["dist"], dtype=np.float64)
+        metrics_payload["train_loss_tail"] = np.asarray(online_component_history["tail"], dtype=np.float64)
+        metrics_payload["train_loss_neg"] = np.asarray(online_component_history["neg"], dtype=np.float64)
+        metrics_payload["train_loss_reg"] = np.asarray(online_component_history["reg"], dtype=np.float64)
     metrics_payload.update(val_metrics)
     np.savez(metrics_path, **metrics_payload)
 
     loss_plot_path = args.loss_plot if args.loss_plot is not None else args.checkpoint.with_suffix(".loss.png")
     save_training_loss_plot(
-        loss_history,
+        np.asarray(loss_history, dtype=np.float64),
         loss_plot_path,
         val_metrics=val_metrics,
         train_objective=args.train_objective,

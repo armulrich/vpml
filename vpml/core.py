@@ -298,16 +298,21 @@ class LearnedInterfaceClosure:
     teacher_proj_Nv: Optional[int] = None
     include_global_indicators: bool = True
     n_low: int = 2
+    training_mode: str = "offline_rollout"
     train_objective: str = "q_only"
     context_mode: str = "none"
     context_lags: int = 0
     base_input_dim: Optional[int] = None
     rollout_horizon: int = 0
     tail_start_fraction: float = 2.0 / 3.0
+    loss_backend: Optional[str] = None
     lambda_q: float = 1.0
     lambda_E: float = 0.0
+    lambda_dist: float = 0.0
     lambda_tail: float = 0.0
+    lambda_neg: float = 0.0
     lambda_reg: float = 0.0
+    online_v_probes: int = 0
     stability_loss_definition: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -323,6 +328,8 @@ class LearnedInterfaceClosure:
             raise ValueError("nv_scale must be positive")
         if int(self.n_low) < 0:
             raise ValueError("n_low must be nonnegative")
+        if str(self.training_mode) not in {"offline_rollout", "online_rollout"}:
+            raise ValueError(f"Unsupported training_mode={self.training_mode!r}")
         if str(self.context_mode) not in {"none", "lag1_delta"}:
             raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
         if int(self.context_lags) < 0:
@@ -331,8 +338,10 @@ class LearnedInterfaceClosure:
             raise ValueError("rollout_horizon must be nonnegative")
         if not (0.0 < float(self.tail_start_fraction) <= 1.0):
             raise ValueError("tail_start_fraction must lie in (0, 1]")
-        if str(self.train_objective) not in {"q_only", "stability_aware"}:
+        if str(self.train_objective) not in {"q_only", "stability_aware", "trajectory"}:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
+        if int(self.online_v_probes) < 0:
+            raise ValueError("online_v_probes must be nonnegative")
 
         input_dim = self.input_dim
         input_mean = jnp.asarray(self.input_mean, dtype=jnp.float64)
@@ -478,16 +487,21 @@ def save_learned_interface_closure_npz(
         ),
         "include_global_indicators": np.array([int(bool(learned.include_global_indicators))], dtype=np.int32),
         "n_low": np.array([int(learned.n_low)], dtype=np.int32),
+        "training_mode": np.array([str(learned.training_mode)], dtype=np.str_),
         "train_objective": np.array([str(learned.train_objective)], dtype=np.str_),
         "context_mode": np.array([str(learned.context_mode)], dtype=np.str_),
         "context_lags": np.array([int(learned.context_lags)], dtype=np.int32),
         "base_input_dim": np.array([int(learned.raw_base_dim if learned.base_input_dim is None else learned.base_input_dim)], dtype=np.int32),
         "rollout_horizon": np.array([int(learned.rollout_horizon)], dtype=np.int32),
         "tail_start_fraction": np.array([float(learned.tail_start_fraction)], dtype=np.float64),
+        "loss_backend": np.array([] if learned.loss_backend is None else [str(learned.loss_backend)], dtype=np.str_),
         "lambda_q": np.array([float(learned.lambda_q)], dtype=np.float64),
         "lambda_E": np.array([float(learned.lambda_E)], dtype=np.float64),
+        "lambda_dist": np.array([float(learned.lambda_dist)], dtype=np.float64),
         "lambda_tail": np.array([float(learned.lambda_tail)], dtype=np.float64),
+        "lambda_neg": np.array([float(learned.lambda_neg)], dtype=np.float64),
         "lambda_reg": np.array([float(learned.lambda_reg)], dtype=np.float64),
+        "online_v_probes": np.array([int(learned.online_v_probes)], dtype=np.int32),
     }
     if learned.stability_loss_definition is not None:
         payload["stability_loss_definition"] = np.array([str(learned.stability_loss_definition)], dtype=np.str_)
@@ -575,6 +589,11 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "n_low" in data.files and data["n_low"].size
             else 2
         )
+        training_mode = (
+            str(np.asarray(data["training_mode"], dtype=np.str_).reshape(-1)[0])
+            if "training_mode" in data.files and data["training_mode"].size
+            else "offline_rollout"
+        )
         train_objective = (
             str(np.asarray(data["train_objective"], dtype=np.str_).reshape(-1)[0])
             if "train_objective" in data.files and data["train_objective"].size
@@ -605,6 +624,11 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "tail_start_fraction" in data.files and data["tail_start_fraction"].size
             else 2.0 / 3.0
         )
+        loss_backend = (
+            str(np.asarray(data["loss_backend"], dtype=np.str_).reshape(-1)[0])
+            if "loss_backend" in data.files and data["loss_backend"].size
+            else None
+        )
         lambda_q = (
             float(np.asarray(data["lambda_q"]).reshape(-1)[0])
             if "lambda_q" in data.files and data["lambda_q"].size
@@ -615,15 +639,30 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "lambda_E" in data.files and data["lambda_E"].size
             else 0.0
         )
+        lambda_dist = (
+            float(np.asarray(data["lambda_dist"]).reshape(-1)[0])
+            if "lambda_dist" in data.files and data["lambda_dist"].size
+            else 0.0
+        )
         lambda_tail = (
             float(np.asarray(data["lambda_tail"]).reshape(-1)[0])
             if "lambda_tail" in data.files and data["lambda_tail"].size
+            else 0.0
+        )
+        lambda_neg = (
+            float(np.asarray(data["lambda_neg"]).reshape(-1)[0])
+            if "lambda_neg" in data.files and data["lambda_neg"].size
             else 0.0
         )
         lambda_reg = (
             float(np.asarray(data["lambda_reg"]).reshape(-1)[0])
             if "lambda_reg" in data.files and data["lambda_reg"].size
             else 0.0
+        )
+        online_v_probes = (
+            int(np.asarray(data["online_v_probes"]).reshape(-1)[0])
+            if "online_v_probes" in data.files and data["online_v_probes"].size
+            else 0
         )
         stability_loss_definition = (
             str(np.asarray(data["stability_loss_definition"], dtype=np.str_).reshape(-1)[0])
@@ -654,16 +693,21 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         teacher_proj_Nv=teacher_proj_Nv,
         include_global_indicators=include_global_indicators,
         n_low=n_low,
+        training_mode=training_mode,
         train_objective=train_objective,
         context_mode=context_mode,
         context_lags=context_lags,
         base_input_dim=base_input_dim,
         rollout_horizon=rollout_horizon,
         tail_start_fraction=tail_start_fraction,
+        loss_backend=loss_backend,
         lambda_q=lambda_q,
         lambda_E=lambda_E,
+        lambda_dist=lambda_dist,
         lambda_tail=lambda_tail,
+        lambda_neg=lambda_neg,
         lambda_reg=lambda_reg,
+        online_v_probes=online_v_probes,
         stability_loss_definition=stability_loss_definition,
     )
 
@@ -830,6 +874,11 @@ def learned_interface_q_hat(
     )
     raw_features = scale_learned_closure_raw_features(raw_features, learned)
     pred = learned.predict_q_components(raw_features)
+    if str(learned.training_mode) == "online_rollout":
+        # Keep solver-in-the-loop optimization in a numerically stable regime
+        # while preserving full JAX differentiability.
+        clip = jnp.asarray([0.25, 0.75], dtype=jnp.float64)
+        pred = clip * jnp.tanh(pred / clip)
     q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(jnp.complex128)
     return q_hat.at[1:].set(q_nonzero)
 
