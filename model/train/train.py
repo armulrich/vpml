@@ -272,6 +272,14 @@ def adam_step(
     return params, {"step": step, "m": m, "v": v}
 
 
+def _tree_all_finite(tree) -> Array:
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.asarray(True, dtype=jnp.bool_)
+    checks = [jnp.all(jnp.isfinite(jnp.asarray(leaf))) for leaf in leaves]
+    return jnp.all(jnp.stack(checks))
+
+
 def sample_initial_condition(
     rng: np.random.Generator,
     x: np.ndarray,
@@ -2847,18 +2855,26 @@ def train_with_online_trajectory_minibatch_loss(
         current_params: Dict[str, Array],
         current_state: Dict[str, object],
         regime_batches: Dict[str, Dict[str, Array]],
-    ) -> Tuple[Dict[str, Array], Dict[str, object], Dict[str, Array]]:
+    ) -> Tuple[Dict[str, Array], Dict[str, object], Dict[str, Array], Array]:
         (loss, aux), grads = jax.value_and_grad(batch_loss_fn, has_aux=True)(current_params, regime_batches)
-        next_params, next_state = adam_step(
-            current_params,
-            grads,
-            current_state,
-            learning_rate,
-            grad_clip=grad_clip,
-        )
         aux = dict(aux)
         aux["total"] = loss
-        return next_params, next_state, aux
+        all_finite = _tree_all_finite(aux) & _tree_all_finite(grads)
+
+        def apply_update(_: None) -> Tuple[Dict[str, Array], Dict[str, object]]:
+            return adam_step(
+                current_params,
+                grads,
+                current_state,
+                learning_rate,
+                grad_clip=grad_clip,
+            )
+
+        def keep_state(_: None) -> Tuple[Dict[str, Array], Dict[str, object]]:
+            return current_params, current_state
+
+        next_params, next_state = jax.lax.cond(all_finite, apply_update, keep_state, operand=None)
+        return next_params, next_state, aux, all_finite
 
     rng = np.random.default_rng(int(seed))
     for epoch in range(int(epochs)):
@@ -2866,7 +2882,7 @@ def train_with_online_trajectory_minibatch_loss(
             key: jnp.asarray(0.0, dtype=jnp.float64)
             for key in ("total", "field", "dist", "tail", "neg", "reg")
         }
-        for _ in range(int(steps_per_epoch)):
+        for step_idx in range(int(steps_per_epoch)):
             regime_batches: Dict[str, Dict[str, Array]] = {}
             for regime in active_regimes:
                 group = online_dataset[regime]["train"]
@@ -2874,7 +2890,14 @@ def train_with_online_trajectory_minibatch_loss(
                 batch_n = int(min(online_case_batch_size, size))
                 idx = rng.integers(0, size, size=batch_n, endpoint=False)
                 regime_batches[regime] = {key: value[idx] for key, value in group.items()}
-            params, state, aux = train_step(params, state, regime_batches)
+            params, state, aux, all_finite = train_step(params, state, regime_batches)
+            if not bool(all_finite):
+                raise FloatingPointError(
+                    "online rollout produced non-finite loss/gradients at "
+                    f"epoch {epoch + 1}, step {step_idx + 1}; "
+                    "reduce TRAIN_LR, TRAIN_LAMBDA_TAIL, TRAIN_GRAD_CLIP, "
+                    "or TRAIN_STEPS_PER_EPOCH."
+                )
             for key in running:
                 running[key] = running[key] + aux[key]
         for key in history:

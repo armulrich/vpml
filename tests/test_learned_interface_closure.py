@@ -727,6 +727,7 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         online_v_probes = 8
 
         online_dataset, _ = train_mod.build_online_reference_dataset(
+            dataset_cache=None,
             regimes=(train_mod.REGIME_LINEAR,),
             teacher_Nx=teacher_Nx,
             teacher_Nv=teacher_Nv,
@@ -854,6 +855,45 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertGreater(float(dist_loss), 0.0)
         self.assertGreater(float(tail_loss), 0.0)
         self.assertGreater(float(neg_loss), 0.0)
+
+    def test_online_rollout_training_raises_clear_error_on_nonfinite_step(self) -> None:
+        params = {"w": jnp.zeros((1,), dtype=jnp.float64)}
+        online_dataset = {
+            train_mod.REGIME_LINEAR: {
+                "train": {
+                    "E_hat_ref": jnp.zeros((1, 1, 1), dtype=jnp.complex128),
+                }
+            }
+        }
+
+        def bad_batch_loss_fn(current_params, regime_batches):
+            del regime_batches
+            nan_value = current_params["w"][0] * jnp.asarray(0.0, dtype=jnp.float64) + jnp.asarray(
+                jnp.nan,
+                dtype=jnp.float64,
+            )
+            return nan_value, {
+                "field": nan_value,
+                "dist": nan_value,
+                "tail": nan_value,
+                "neg": nan_value,
+                "reg": jnp.asarray(0.0, dtype=jnp.float64),
+            }
+
+        with self.assertRaisesRegex(FloatingPointError, r"online rollout produced non-finite loss/gradients"):
+            train_mod.train_with_online_trajectory_minibatch_loss(
+                params,
+                online_dataset,
+                bad_batch_loss_fn,
+                active_regimes=(train_mod.REGIME_LINEAR,),
+                epochs=1,
+                learning_rate=1e-4,
+                grad_clip=1.0,
+                log_every=1,
+                online_case_batch_size=1,
+                steps_per_epoch=1,
+                seed=0,
+            )
 
     def test_incompatible_dataset_cache_is_rebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
