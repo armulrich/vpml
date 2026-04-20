@@ -40,6 +40,8 @@ RUN_TRAIN="${RUN_TRAIN:-1}"
 TRAIN_PARALLEL_JOBS="${TRAIN_PARALLEL_JOBS:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
+TRAIN_NV_LADDER_MODE="${TRAIN_NV_LADDER_MODE:-fixed_ratio}"
+TRAIN_FIXED_RATIO="${TRAIN_FIXED_RATIO:-1.8}"
 TRAIN_NM="${TRAIN_NM:-6}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-128}"
 TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
@@ -184,6 +186,52 @@ wait_for_all_jobs() {
   return 0
 }
 
+ladder_csv_for_target() {
+  local target="$1"
+  "${PYTHON_BIN}" - <<'PY' "${target}" "${TRAIN_NM}" "${TRAIN_FIXED_RATIO}"
+import math
+import sys
+
+target = int(sys.argv[1])
+nm = int(sys.argv[2])
+ratio = float(sys.argv[3])
+if target < nm:
+    raise SystemExit(f"target Nv={target} must be at least TRAIN_NM={nm}")
+if ratio <= 1.0:
+    raise SystemExit(f"TRAIN_FIXED_RATIO must be greater than 1; got {ratio}")
+if target == nm:
+    ladder = [nm]
+else:
+    ladder = [target]
+    current = target
+    while True:
+        next_value = int(math.ceil(float(current) / ratio))
+        if next_value <= nm:
+            ladder.append(nm)
+            break
+        ladder.append(next_value)
+        current = next_value
+    ladder = sorted(set(max(nm, min(target, int(value))) for value in ladder))
+print(",".join(str(value) for value in ladder))
+PY
+}
+
+ladder_csv_for_mode() {
+  local target="$1"
+  case "${TRAIN_NV_LADDER_MODE}" in
+    target_only)
+      printf '%s\n' "${target}"
+      ;;
+    fixed_ratio)
+      ladder_csv_for_target "${target}"
+      ;;
+    *)
+      echo "Unsupported TRAIN_NV_LADDER_MODE='${TRAIN_NV_LADDER_MODE}'. Expected 'target_only' or 'fixed_ratio'." >&2
+      exit 1
+      ;;
+  esac
+}
+
 prepare_online_reference_cache() {
   local -a cache_args=(
     --training-mode online_rollout
@@ -219,7 +267,7 @@ prepare_online_reference_cache() {
 train_one_nv() {
   local idx="$1"
   local nv_raw="$2"
-  local nv model_dir checkpoint_nv loss_plot_nv log_path
+  local nv model_dir checkpoint_nv loss_plot_nv log_path train_ladder_csv
   nv="$(echo "${nv_raw}" | tr -d '[:space:]')"
   if [[ -z "${nv}" ]]; then
     return 0
@@ -228,6 +276,7 @@ train_one_nv() {
   checkpoint_nv="${model_dir}/interface_closure.npz"
   loss_plot_nv="${model_dir}/interface_closure.loss.png"
   log_path="${model_dir}/interface_closure.train.log"
+  train_ladder_csv="$(ladder_csv_for_mode "${nv}")"
   mkdir -p "${model_dir}"
 
   local -a train_args=(
@@ -240,7 +289,7 @@ train_one_nv() {
     --online-v-probes "${TRAIN_ONLINE_V_PROBES}"
     --online-case-batch-size "${TRAIN_ONLINE_CASE_BATCH_SIZE}"
     --teacher-backend grid_cubic_spline
-    --Nv-targets "${nv}"
+    --Nv-targets "${train_ladder_csv}"
     --Nm "${TRAIN_NM}"
     --hidden-width "${TRAIN_HIDDEN_WIDTH}"
     --res-blocks "${TRAIN_RES_BLOCKS}"
@@ -280,13 +329,13 @@ train_one_nv() {
   fi
 
   if [[ "${TRAIN_PARALLEL_JOBS}" -le 1 ]]; then
-    echo "[nv-sweep-online-rollout] [1/2] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${nv}"
+    echo "[nv-sweep-online-rollout] [1/2] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${nv} with Nv-targets=${train_ladder_csv}"
     "${PYTHON_BIN}" -m model.train.train "${train_args[@]}"
     return 0
   fi
 
   wait_for_available_slot || return 1
-  echo "[nv-sweep-online-rollout] [1/2] Launching closure $((idx + 1))/${TOTAL_NV} for Nv=${nv} (log: ${log_path})"
+  echo "[nv-sweep-online-rollout] [1/2] Launching closure $((idx + 1))/${TOTAL_NV} for Nv=${nv} with Nv-targets=${train_ladder_csv} (log: ${log_path})"
   (
     "${PYTHON_BIN}" -m model.train.train "${train_args[@]}"
   ) >"${log_path}" 2>&1 &
@@ -338,6 +387,8 @@ Artifacts:
 Defaults:
   objective:      trajectory
   loss backend:   ${TRAIN_ONLINE_LOSS_BACKEND}
+  ladder mode:    ${TRAIN_NV_LADDER_MODE}
+  fixed ratio:    ${TRAIN_FIXED_RATIO}
   train dt:       ${TRAIN_TEACHER_DT}
   train linear T: ${TRAIN_LINEAR_T}
   train nonlin T: ${TRAIN_NONLINEAR_T}

@@ -582,7 +582,7 @@ class NvSweepTests(unittest.TestCase):
             case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
             self.assertEqual(case_targets, expected)
 
-    def test_run_nv_sweep_online_rollout_wrapper_writes_target_only_checkpoints(self) -> None:
+    def test_run_nv_sweep_online_rollout_wrapper_uses_fixed_ratio_ladders(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             outdir = tmp / "nv_sweep_online_rollout"
@@ -656,7 +656,18 @@ class NvSweepTests(unittest.TestCase):
                 self.assertEqual(learned.train_objective, "trajectory")
                 self.assertEqual(learned.loss_backend, "field_distribution_v1")
                 self.assertEqual(learned.online_v_probes, 8)
-                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), (nv,))
+                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), _fixed_ratio_ladder(nv, nm=6, ratio=1.8))
+
+            summary = json.loads((outdir / "summary.json").read_text())
+            self.assertEqual(summary["nv_list"], [6, 8])
+            case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
+            self.assertEqual(
+                case_targets,
+                {
+                    6: _fixed_ratio_ladder(6, nm=6, ratio=1.8),
+                    8: _fixed_ratio_ladder(8, nm=6, ratio=1.8),
+                },
+            )
 
 
 if __name__ == "__main__":

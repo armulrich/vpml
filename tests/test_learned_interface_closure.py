@@ -1438,24 +1438,67 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                     ]
                 )
 
-    def test_online_rollout_requires_exactly_one_target_nv(self) -> None:
+    def test_online_rollout_accepts_multiple_target_nv_ladder(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt = Path(tmpdir) / "shared_interface.npz"
-            with self.assertRaisesRegex(ValueError, r"requires exactly one target Nv"):
-                train_main(
-                    [
-                        "--checkpoint",
-                        str(ckpt),
-                        "--training-mode",
-                        "online_rollout",
-                        "--train-objective",
-                        "trajectory",
-                        "--Nv-targets",
-                        "4,6",
-                        "--Nm",
-                        "1",
-                    ]
-                )
+            train_main(
+                [
+                    "--checkpoint",
+                    str(ckpt),
+                    "--training-mode",
+                    "online_rollout",
+                    "--train-objective",
+                    "trajectory",
+                    "--Nv-targets",
+                    "4,6",
+                    "--Nm",
+                    "1",
+                    "--hidden-width",
+                    "8",
+                    "--res-blocks",
+                    "1",
+                    "--epochs",
+                    "1",
+                    "--lr",
+                    "1e-3",
+                    "--grad-clip",
+                    "1.0",
+                    "--log-every",
+                    "1",
+                    "--steps-per-epoch",
+                    "1",
+                    "--online-case-batch-size",
+                    "1",
+                    "--regimes",
+                    "linear_landau",
+                    "--teacher-Nx",
+                    "8",
+                    "--teacher-Nv",
+                    "16",
+                    "--teacher-dt",
+                    "0.05",
+                    "--teacher-vmin",
+                    "-6",
+                    "--teacher-vmax",
+                    "6",
+                    "--linear-T",
+                    "0.10",
+                    "--linear-eps",
+                    "0.01",
+                    "--linear-modes",
+                    "0.5",
+                    "--linear-num-samples",
+                    "1",
+                    "--linear-seed",
+                    "0",
+                    "--online-v-probes",
+                    "8",
+                ]
+            )
+            learned = load_learned_interface_closure_npz(ckpt)
+            self.assertEqual(learned.training_mode, "online_rollout")
+            self.assertEqual(learned.train_objective, "trajectory")
+            self.assertEqual(tuple(int(v) for v in learned.Nv_targets), (4, 6))
 
     def test_learned_rollout_runs_for_linear_and_nonlinear_landau(self) -> None:
         closure = _make_closure()
