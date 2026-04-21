@@ -243,6 +243,36 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertAlmostEqual(loaded.lambda_reg, 1e-6)
         self.assertEqual(loaded.online_v_probes, 64)
 
+    def test_checkpoint_round_trip_preserves_online_hybrid_metadata(self) -> None:
+        closure = _make_closure(
+            training_mode="online_rollout",
+            train_objective="trajectory_q_hybrid",
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            lambda_q=1.0,
+            lambda_E=0.5,
+            lambda_dist=1.0,
+            lambda_tail=0.05,
+            lambda_neg=0.025,
+            lambda_reg=1e-6,
+            online_v_probes=64,
+            stability_loss_definition=train_mod.ONLINE_HYBRID_LOSS_DEFINITION,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "interface_closure.npz"
+            save_learned_interface_closure_npz(path, closure)
+            loaded = load_learned_interface_closure_npz(path)
+        self.assertEqual(loaded.training_mode, "online_rollout")
+        self.assertEqual(loaded.train_objective, "trajectory_q_hybrid")
+        self.assertEqual(loaded.loss_backend, train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
+        self.assertAlmostEqual(loaded.lambda_q, 1.0)
+        self.assertAlmostEqual(loaded.lambda_E, 0.5)
+        self.assertAlmostEqual(loaded.lambda_dist, 1.0)
+        self.assertAlmostEqual(loaded.lambda_tail, 0.05)
+        self.assertAlmostEqual(loaded.lambda_neg, 0.025)
+        self.assertAlmostEqual(loaded.lambda_reg, 1e-6)
+        self.assertEqual(loaded.online_v_probes, 64)
+        self.assertEqual(loaded.stability_loss_definition, train_mod.ONLINE_HYBRID_LOSS_DEFINITION)
+
     def test_boundary_flux_only_touches_last_row_and_zero_mode(self) -> None:
         params = _zero_interface_params(6)
         params["b_lin"] = jnp.array([2.0, -1.0], dtype=jnp.float64)
@@ -810,6 +840,145 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         for leaf in jax.tree_util.tree_leaves(grads):
             self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
 
+    def test_online_hybrid_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
+        target_nv = 4
+        teacher_Nx = 8
+        teacher_Nv = 16
+        teacher_L = 4.0 * math.pi
+        teacher_dt = 0.05
+        teacher_vmin = -6.0
+        teacher_vmax = 6.0
+        online_v_probes = 8
+
+        online_dataset, _ = train_mod.build_online_reference_dataset(
+            dataset_cache=None,
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_L=teacher_L,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            linear_T=0.10,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            val_fraction=0.2,
+            online_v_probes=online_v_probes,
+        )
+        dataset_base = train_mod.build_mixed_landau_dataset(
+            dataset_cache=None,
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_L=teacher_L,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            teacher_proj_Nv=target_nv + 1,
+            linear_T=0.10,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            linear_history_stride=1,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            nonlinear_history_stride=1,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            Nv_targets=(target_nv,),
+            Nm=1,
+            val_fraction=0.2,
+            n_low=2,
+            context_mode="none",
+            rollout_horizon=0,
+            allow_cached_nv_superset=False,
+            per_target_projection_orders=False,
+        )
+        k_scale = train_mod.choose_k_scale(dataset_base, Nm=1)
+        nv_scale = train_mod.choose_nv_scale(dataset_base, Nm=1)
+        prepared, stats = train_mod.prepare_training_dataset(
+            dataset_base,
+            Nm=1,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            context_mode="none",
+        )
+        params = train_mod.init_online_rollout_params(
+            jax.random.PRNGKey(0),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=8,
+            res_blocks=1,
+            target_mean=stats["target_mean"],
+            target_std=stats["target_std"],
+        )
+        loss_fn, active_regimes = train_mod.make_online_hybrid_batch_loss(
+            prepared=prepared,
+            online_dataset=online_dataset,
+            regime_weights={train_mod.REGIME_LINEAR: 1.0},
+            Nm=1,
+            k_scale=float(k_scale),
+            nv_scale=float(nv_scale),
+            stats=stats,
+            hidden_width=8,
+            res_blocks=1,
+            Nv_targets=(target_nv,),
+            train_regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
+            teacher_Lx=teacher_L,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            teacher_proj_Nv=target_nv + 1,
+            n_low=2,
+            context_mode="none",
+            tail_start_fraction=2.0 / 3.0,
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            lambda_q=1.0,
+            lambda_E=0.5,
+            lambda_dist=1.0,
+            lambda_tail=0.05,
+            lambda_neg=0.01,
+            lambda_reg=1e-6,
+            online_v_probes=online_v_probes,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            poisson_sign=1.0,
+            rollout_dealias_23=False,
+        )
+        self.assertEqual(tuple(active_regimes), (train_mod.REGIME_LINEAR,))
+        q_batches = {
+            regime: {
+                "inputs": prepared[regime]["train_inputs"],
+                "targets_std": prepared[regime]["train_targets_std"],
+            }
+            for regime in active_regimes
+        }
+        regime_batches = {
+            regime: online_dataset[regime]["train"]
+            for regime in active_regimes
+        }
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, q_batches, regime_batches)
+        self.assertTrue(np.isfinite(float(loss)))
+        for key, value in aux.items():
+            self.assertTrue(np.isfinite(np.asarray(value, dtype=np.float64)).all(), msg=key)
+        self.assertGreater(float(aux["q"]), 0.0)
+        for leaf in jax.tree_util.tree_leaves(grads):
+            self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
+
     def test_online_reconstruction_and_penalties_are_finite_and_nontrivial(self) -> None:
         Nx = 4
         Nv = 6
@@ -1253,6 +1422,7 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt = Path(tmpdir) / "shared_interface.npz"
             cache = Path(tmpdir) / "shared_dataset.npz"
+            online_cache = Path(tmpdir) / "online_reference_dataset.npz"
             with self.assertRaisesRegex(ValueError, r"--build-dataset-only requires --dataset-cache"):
                 train_main(
                     [
@@ -1265,6 +1435,40 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                         "--Nm",
                         "1",
                         "--build-dataset-only",
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, r"requires --online-reference-cache"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory_q_hybrid",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                    ]
+                )
+            with self.assertRaisesRegex(ValueError, r"requires --lambda-q > 0"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory_q_hybrid",
+                        "--online-reference-cache",
+                        str(online_cache),
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--lambda-q",
+                        "0.0",
                     ]
                 )
             with mock.patch.object(
@@ -1296,6 +1500,51 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                     ]
                 )
             patched.assert_called_once()
+            with mock.patch.object(
+                train_mod,
+                "build_online_reference_dataset",
+                return_value=(
+                    {
+                        train_mod.REGIME_LINEAR: {
+                            "train": {"E_hat_ref": np.zeros((1, 2, 2), dtype=np.complex128)},
+                            "val": {"E_hat_ref": np.zeros((1, 2, 2), dtype=np.complex128)},
+                        }
+                    },
+                    jnp.linspace(-6.0, 6.0, 4, dtype=jnp.float64),
+                ),
+            ) as patched_online, mock.patch.object(
+                train_mod,
+                "build_mixed_landau_dataset",
+                return_value={
+                    train_mod.REGIME_LINEAR: {
+                        "train_inputs_base": np.zeros((2, 2 * 1 + 4), dtype=np.float64),
+                        "train_targets": np.zeros((2, 2), dtype=np.float64),
+                        "val_inputs_base": np.zeros((1, 2 * 1 + 4), dtype=np.float64),
+                        "val_targets": np.zeros((1, 2), dtype=np.float64),
+                    }
+                },
+            ) as patched_q:
+                train_main(
+                    [
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory_q_hybrid",
+                        "--Nv-targets",
+                        "4,8",
+                        "--Nm",
+                        "1",
+                        "--dataset-cache",
+                        str(cache),
+                        "--online-reference-cache",
+                        str(online_cache),
+                        "--lambda-q",
+                        "1.0",
+                        "--build-dataset-only",
+                    ]
+                )
+            patched_online.assert_called_once()
+            patched_q.assert_called_once()
             with self.assertRaisesRegex(ValueError, r"does not support --allow-dataset-cache-nv-superset"):
                 train_main(
                     [

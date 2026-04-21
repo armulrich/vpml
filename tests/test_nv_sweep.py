@@ -669,6 +669,100 @@ class NvSweepTests(unittest.TestCase):
                 },
             )
 
+    def test_run_nv_sweep_online_rollout_q_hybrid_wrapper_uses_fixed_ratio_ladders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            outdir = tmp / "nv_sweep_online_rollout_q_hybrid"
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PYTHON": sys.executable,
+                    "NV_LIST": "6,8",
+                    "NX": "8",
+                    "DT": "0.05",
+                    "T_FINAL": "0.10",
+                    "EPS": "0.05",
+                    "K0": "0.5",
+                    "SNAPSHOT_TIMES": "0.05,0.10",
+                    "NV_PLOT": "16",
+                    "TEACHER_NX": "8",
+                    "TEACHER_NV": "16",
+                    "TEACHER_DT": "0.05",
+                    "TEACHER_VMIN": "-6",
+                    "TEACHER_VMAX": "6",
+                    "TRAIN_NM": "6",
+                    "TRAIN_HIDDEN_WIDTH": "8",
+                    "TRAIN_RES_BLOCKS": "1",
+                    "TRAIN_EPOCHS": "1",
+                    "TRAIN_LR": "1e-3",
+                    "TRAIN_GRAD_CLIP": "1.0",
+                    "TRAIN_LOG_EVERY": "1",
+                    "TRAIN_BATCH_SIZE": "0",
+                    "TRAIN_STEPS_PER_EPOCH": "1",
+                    "TRAIN_SEED": "0",
+                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak,nonlinear_landau_strong",
+                    "TRAIN_VAL_FRACTION": "0.2",
+                    "TRAIN_LINEAR_T": "0.10",
+                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
+                    "TRAIN_LINEAR_MODES": "0.5",
+                    "TRAIN_LINEAR_SEED": "0",
+                    "TRAIN_NONLINEAR_T": "0.10",
+                    "TRAIN_NONLINEAR_K0": "0.5",
+                    "TRAIN_WEAK_EPS": "0.05",
+                    "TRAIN_STRONG_EPS": "0.25",
+                    "TRAIN_TEACHER_NX": "8",
+                    "TRAIN_TEACHER_NV": "16",
+                    "TRAIN_TEACHER_DT": "0.05",
+                    "TRAIN_TEACHER_VMIN": "-6",
+                    "TRAIN_TEACHER_VMAX": "6",
+                    "TRAIN_ONLINE_V_PROBES": "8",
+                    "TRAIN_ONLINE_CASE_BATCH_SIZE": "1",
+                    "TRAIN_PARALLEL_JOBS": "1",
+                    "TRAIN_LAMBDA_Q": "1.0",
+                }
+            )
+            subprocess.run(
+                ["bash", "model/train/run_nv_sweep_online_rollout_q_hybrid_fixed_ratio.sh", str(outdir)],
+                cwd="/Users/armin/Documents/NYU/vpml",
+                env=env,
+                check=True,
+            )
+
+            self.assertTrue((outdir / "summary.json").exists())
+            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
+            self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
+            self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
+            self.assertTrue((outdir / "online_reference_dataset.npz").exists())
+
+            expected_teacher_proj_nv = {6: 7, 8: 9}
+            for nv in (6, 8):
+                model_dir = outdir / "models" / f"nv{nv}"
+                ckpt = model_dir / "interface_closure.npz"
+                q_dataset_cache = model_dir / "interface_closure_dataset.npz"
+                self.assertTrue(ckpt.exists())
+                self.assertTrue(q_dataset_cache.exists())
+                learned = load_learned_interface_closure_npz(ckpt)
+                self.assertEqual(learned.training_mode, "online_rollout")
+                self.assertEqual(learned.train_objective, "trajectory_q_hybrid")
+                self.assertEqual(learned.loss_backend, "field_distribution_v1")
+                self.assertEqual(learned.online_v_probes, 8)
+                self.assertAlmostEqual(float(learned.lambda_q), 1.0)
+                self.assertEqual(learned.stability_loss_definition, "q_trajectory_field_distribution_v1")
+                self.assertEqual(int(learned.teacher_proj_Nv), expected_teacher_proj_nv[nv])
+                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), _fixed_ratio_ladder(nv, nm=6, ratio=1.8))
+
+            summary = json.loads((outdir / "summary.json").read_text())
+            self.assertEqual(summary["nv_list"], [6, 8])
+            case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
+            self.assertEqual(
+                case_targets,
+                {
+                    6: _fixed_ratio_ladder(6, nm=6, ratio=1.8),
+                    8: _fixed_ratio_ladder(8, nm=6, ratio=1.8),
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

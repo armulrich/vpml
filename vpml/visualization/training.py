@@ -21,6 +21,16 @@ def _training_loss_ylabel(train_objective: str) -> str:
             r"\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+"
             r"\lambda_{\mathrm{reg}}\|\theta\|_2^2$"
         )
+    if str(train_objective) == "trajectory_q_hybrid":
+        return (
+            r"$\mathcal{L}_{\mathrm{traj+q}}(\theta)="
+            r"\lambda_q\mathcal{L}_q+"
+            r"\lambda_E\mathcal{L}_E+"
+            r"\lambda_{\mathrm{dist}}\mathcal{L}_{\delta f}+"
+            r"\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail}}+"
+            r"\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+"
+            r"\lambda_{\mathrm{reg}}\|\theta\|_2^2$"
+        )
     if str(train_objective) == "stability_aware":
         return (
             r"$\mathcal{L}_{\mathrm{stab}}(\theta)="

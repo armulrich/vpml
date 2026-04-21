@@ -9,8 +9,8 @@ the Fourier-Hermite basis, and the learned target is
 
 The higher-order-Hermite teacher uses direct Hermite-space rollouts to produce the same
 coefficient histories without a projection step. The current trainer preserves the q-only
-path and also supports a stability-aware mode that augments the supervised loss with
-short-horizon field and excess-tail penalties.
+path and also supports stability-aware and online-hybrid modes that augment the supervised
+loss with rollout penalties.
 """
 
 from __future__ import annotations
@@ -82,6 +82,7 @@ ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
 ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v1"
 STABILITY_LOSS_DEFINITION = "window_hybrid_v1"
+ONLINE_HYBRID_LOSS_DEFINITION = "q_trajectory_field_distribution_v1"
 ONLINE_TRAINING_MODE = "online_rollout"
 OFFLINE_TRAINING_MODE = "offline_rollout"
 ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
@@ -1387,6 +1388,8 @@ def init_online_rollout_params(
     input_dim: int,
     hidden_width: int,
     res_blocks: int,
+    target_mean: Optional[Array] = None,
+    target_std: Optional[Array] = None,
 ) -> Dict[str, Array]:
     """Initialize online training near the truncation baseline.
 
@@ -1403,6 +1406,10 @@ def init_online_rollout_params(
     )
     for name in ("W_lin", "b_lin", "W_out", "b_out"):
         params[name] = jnp.zeros_like(params[name])
+    if target_mean is not None and target_std is not None:
+        mean = jnp.asarray(target_mean, dtype=jnp.float64)
+        std = jnp.maximum(jnp.asarray(target_std, dtype=jnp.float64), 1e-12)
+        params["b_lin"] = (-(mean / std)).astype(jnp.float64)
     return params
 
 
@@ -2635,6 +2642,234 @@ def online_trajectory_loss_terms(
     return field_loss, dist_loss, tail_loss, neg_loss
 
 
+def make_online_hybrid_batch_loss(
+    *,
+    prepared: Dict[str, Dict[str, Array]],
+    online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
+    regime_weights: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    teacher_proj_Nv: int,
+    n_low: int,
+    context_mode: str,
+    tail_start_fraction: float,
+    loss_backend: str,
+    lambda_q: float,
+    lambda_E: float,
+    lambda_dist: float,
+    lambda_tail: float,
+    lambda_neg: float,
+    lambda_reg: float,
+    online_v_probes: int,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    poisson_sign: float,
+    rollout_dealias_23: bool,
+) -> Tuple[object, Sequence[str]]:
+    active_regimes = tuple(
+        regime
+        for regime in train_regimes
+        if regime in prepared
+        and regime in online_dataset
+        and int(prepared[regime]["train_inputs"].shape[0]) > 0
+        and bool(online_dataset[regime].get("train"))
+        and int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) > 0
+    )
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    target_nvs = tuple(int(v) for v in Nv_targets)
+    target_nv_max = max(target_nvs)
+    v_probe = jnp.linspace(float(teacher_vmin), float(teacher_vmax), int(online_v_probes), dtype=jnp.float64)
+    eq_probe = maxwellian_equilibrium(v_probe)
+    k_arr = FourierHermiteIMEX(
+        Nx=int(teacher_Nx),
+        Nv=int(target_nv_max),
+        Lx=float(teacher_Lx),
+        dt=float(teacher_dt),
+        vth=1.0,
+        dealias_23=bool(rollout_dealias_23),
+        closure=None,
+    ).k_arr
+    linear_T = (
+        float(online_dataset[REGIME_LINEAR]["train"]["times"].shape[1] - 1) * float(teacher_dt)
+        if REGIME_LINEAR in online_dataset and online_dataset[REGIME_LINEAR].get("train")
+        else float(nonlinear_T)
+    )
+    linear_configs = {
+        int(target_nv): LinearLandauConfig(
+            method="learned",
+            Nv=int(target_nv),
+            Nx=int(teacher_Nx),
+            L=float(teacher_Lx),
+            dt=float(teacher_dt),
+            T=linear_T,
+            poisson_sign=float(poisson_sign),
+        )
+        for target_nv in target_nvs
+    }
+    lambda_q_arr = jnp.asarray(float(lambda_q), dtype=jnp.float64)
+    lambda_E_arr = jnp.asarray(float(lambda_E), dtype=jnp.float64)
+    lambda_dist_arr = jnp.asarray(float(lambda_dist), dtype=jnp.float64)
+    lambda_tail_arr = jnp.asarray(float(lambda_tail), dtype=jnp.float64)
+    lambda_neg_arr = jnp.asarray(float(lambda_neg), dtype=jnp.float64)
+    lambda_reg_arr = jnp.asarray(float(lambda_reg), dtype=jnp.float64)
+
+    def make_loss_fn_for_target(target_nv: int):
+        linear_config = linear_configs[int(target_nv)]
+
+        def loss_fn_for_target(
+            params: Dict[str, Array],
+            q_batches: Dict[str, Dict[str, Array]],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            learned = build_learned_interface_closure(
+                params=params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=n_low,
+                training_mode=ONLINE_TRAINING_MODE,
+                train_objective="trajectory_q_hybrid",
+                context_mode=context_mode,
+                rollout_horizon=0,
+                tail_start_fraction=tail_start_fraction,
+                loss_backend=loss_backend,
+                lambda_q=lambda_q,
+                lambda_E=lambda_E,
+                lambda_dist=lambda_dist,
+                lambda_tail=lambda_tail,
+                lambda_neg=lambda_neg,
+                lambda_reg=lambda_reg,
+                online_v_probes=online_v_probes,
+                stability_loss_definition=ONLINE_HYBRID_LOSS_DEFINITION,
+            )
+            total_q = jnp.asarray(0.0, dtype=jnp.float64)
+            total_field = jnp.asarray(0.0, dtype=jnp.float64)
+            total_dist = jnp.asarray(0.0, dtype=jnp.float64)
+            total_tail = jnp.asarray(0.0, dtype=jnp.float64)
+            total_neg = jnp.asarray(0.0, dtype=jnp.float64)
+
+            for weight, regime in zip(weight_arr, active_regimes):
+                q_batch = q_batches[regime]
+                pred_std = learned.predict_standardized_components(q_batch["inputs"])
+                regime_q = jnp.mean((pred_std - q_batch["targets_std"]) ** 2)
+
+                batch = regime_batches[regime]
+                if regime == REGIME_LINEAR:
+                    field_terms, dist_terms, tail_terms, neg_terms = jax.vmap(
+                        lambda perturbation_x, ref_e_hat, ref_delta_f: online_trajectory_loss_terms(
+                            run_linear_landau_online_history(
+                                learned,
+                                config=linear_config,
+                                perturbation_x=perturbation_x,
+                            ),
+                            k_arr=k_arr,
+                            ref_E_hat=ref_e_hat,
+                            ref_delta_f=ref_delta_f,
+                            Nx=int(teacher_Nx),
+                            v_probe=v_probe,
+                            eq_probe=eq_probe,
+                            tail_start_fraction=tail_start_fraction,
+                            poisson_sign=float(poisson_sign),
+                        )
+                    )(
+                        batch["perturbation_x"],
+                        batch["E_hat_ref"],
+                        batch["delta_f_ref"],
+                    )
+                else:
+                    field_terms, dist_terms, tail_terms, neg_terms = jax.vmap(
+                        lambda eps, ref_e_hat, ref_delta_f: online_trajectory_loss_terms(
+                            run_nonlinear_landau_online_history(
+                                learned,
+                                Nx=int(teacher_Nx),
+                                Nv=int(target_nv),
+                                L=float(teacher_Lx),
+                                dt=float(teacher_dt),
+                                T=float(nonlinear_T),
+                                eps=eps,
+                                k0=float(nonlinear_k0),
+                                dealias_23=bool(rollout_dealias_23),
+                                poisson_sign=float(poisson_sign),
+                            ),
+                            k_arr=k_arr,
+                            ref_E_hat=ref_e_hat,
+                            ref_delta_f=ref_delta_f,
+                            Nx=int(teacher_Nx),
+                            v_probe=v_probe,
+                            eq_probe=eq_probe,
+                            tail_start_fraction=tail_start_fraction,
+                            poisson_sign=float(poisson_sign),
+                        )
+                    )(
+                        batch["eps"],
+                        batch["E_hat_ref"],
+                        batch["delta_f_ref"],
+                    )
+                total_q = total_q + weight * (lambda_q_arr * regime_q)
+                total_field = total_field + weight * (lambda_E_arr * jnp.mean(field_terms))
+                total_dist = total_dist + weight * (lambda_dist_arr * jnp.mean(dist_terms))
+                total_tail = total_tail + weight * (lambda_tail_arr * jnp.mean(tail_terms))
+                total_neg = total_neg + weight * (lambda_neg_arr * jnp.mean(neg_terms))
+
+            reg_term = lambda_reg_arr * l2_regularization(params)
+            total_loss = total_q + total_field + total_dist + total_tail + total_neg + reg_term
+            return total_loss, {
+                "q": total_q,
+                "field": total_field,
+                "dist": total_dist,
+                "tail": total_tail,
+                "neg": total_neg,
+                "reg": reg_term,
+            }
+
+        return loss_fn_for_target
+
+    target_loss_fns = {
+        int(target_nv): make_loss_fn_for_target(int(target_nv))
+        for target_nv in target_nvs
+    }
+    default_target_nv = int(target_nvs[0])
+
+    def loss_fn(
+        params: Dict[str, Array],
+        q_batches: Dict[str, Dict[str, Array]],
+        regime_batches: Dict[str, Dict[str, Array]],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        return target_loss_fns[default_target_nv](params, q_batches, regime_batches)
+
+    loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
+    loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    return loss_fn, active_regimes
+
+
 def make_online_trajectory_batch_loss(
     *,
     online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
@@ -2958,6 +3193,142 @@ def train_with_online_trajectory_minibatch_loss(
     return params, history
 
 
+def train_with_online_hybrid_minibatch_loss(
+    params: Dict[str, Array],
+    prepared: Dict[str, Dict[str, Array]],
+    online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
+    batch_loss_fn,
+    *,
+    active_regimes: Sequence[str],
+    epochs: int,
+    learning_rate: float,
+    grad_clip: Optional[float],
+    log_every: int,
+    batch_size: int,
+    online_case_batch_size: int,
+    steps_per_epoch: int,
+    seed: int,
+) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
+    if int(online_case_batch_size) <= 0:
+        raise ValueError("online_case_batch_size must be positive for online hybrid training")
+    if int(steps_per_epoch) <= 0:
+        raise ValueError("steps_per_epoch must be positive for online hybrid training")
+
+    q_train_sizes = {
+        regime: int(prepared[regime]["train_inputs"].shape[0])
+        for regime in active_regimes
+    }
+    online_train_sizes = {
+        regime: int(online_dataset[regime]["train"]["E_hat_ref"].shape[0])
+        for regime in active_regimes
+    }
+    state = adam_init(params)
+    history = {
+        key: np.zeros((int(epochs),), dtype=np.float64)
+        for key in ("total", "q", "field", "dist", "tail", "neg", "reg")
+    }
+
+    def make_train_step(target_batch_loss_fn):
+        @jax.jit
+        def train_step(
+            current_params: Dict[str, Array],
+            current_state: Dict[str, object],
+            q_batches: Dict[str, Dict[str, Array]],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Dict[str, Array], Dict[str, object], Dict[str, Array], Array]:
+            (loss, aux), grads = jax.value_and_grad(target_batch_loss_fn, has_aux=True)(
+                current_params,
+                q_batches,
+                regime_batches,
+            )
+            aux = dict(aux)
+            aux["total"] = loss
+            all_finite = _tree_all_finite(aux) & _tree_all_finite(grads)
+
+            def apply_update(_: None) -> Tuple[Dict[str, Array], Dict[str, object]]:
+                return adam_step(
+                    current_params,
+                    grads,
+                    current_state,
+                    learning_rate,
+                    grad_clip=grad_clip,
+                )
+
+            def keep_state(_: None) -> Tuple[Dict[str, Array], Dict[str, object]]:
+                return current_params, current_state
+
+            next_params, next_state = jax.lax.cond(all_finite, apply_update, keep_state, operand=None)
+            return next_params, next_state, aux, all_finite
+
+        return train_step
+
+    target_nvs = tuple(int(v) for v in getattr(batch_loss_fn, "target_nvs", ()))
+    target_loss_fns = getattr(batch_loss_fn, "target_loss_fns", None)
+    if target_nvs and isinstance(target_loss_fns, dict):
+        train_steps = {
+            int(target_nv): make_train_step(target_loss_fns[int(target_nv)])
+            for target_nv in target_nvs
+        }
+    else:
+        train_steps = {0: make_train_step(batch_loss_fn)}
+
+    rng = np.random.default_rng(int(seed))
+    use_full_q_batch = int(batch_size) <= 0
+    for epoch in range(int(epochs)):
+        running = {
+            key: jnp.asarray(0.0, dtype=jnp.float64)
+            for key in ("total", "q", "field", "dist", "tail", "neg", "reg")
+        }
+        for step_idx in range(int(steps_per_epoch)):
+            q_batches: Dict[str, Dict[str, Array]] = {}
+            regime_batches: Dict[str, Dict[str, Array]] = {}
+            for regime in active_regimes:
+                q_size = q_train_sizes[regime]
+                if use_full_q_batch:
+                    idx_q = np.arange(q_size, dtype=np.int64)
+                else:
+                    batch_n = int(min(batch_size, q_size))
+                    idx_q = rng.integers(0, q_size, size=batch_n, endpoint=False)
+                q_batches[regime] = {
+                    "inputs": prepared[regime]["train_inputs"][idx_q],
+                    "targets_std": prepared[regime]["train_targets_std"][idx_q],
+                }
+
+                online_group = online_dataset[regime]["train"]
+                online_size = online_train_sizes[regime]
+                batch_n = int(min(online_case_batch_size, online_size))
+                idx_online = rng.integers(0, online_size, size=batch_n, endpoint=False)
+                regime_batches[regime] = {key: value[idx_online] for key, value in online_group.items()}
+            if target_nvs:
+                target_nv = int(target_nvs[int(rng.integers(0, len(target_nvs)))])
+                params, state, aux, all_finite = train_steps[target_nv](params, state, q_batches, regime_batches)
+            else:
+                params, state, aux, all_finite = train_steps[0](params, state, q_batches, regime_batches)
+            if not bool(all_finite):
+                raise FloatingPointError(
+                    "online hybrid rollout produced non-finite loss/gradients at "
+                    f"epoch {epoch + 1}, step {step_idx + 1}; "
+                    "reduce TRAIN_LR, TRAIN_LAMBDA_Q, TRAIN_LAMBDA_TAIL, "
+                    "TRAIN_GRAD_CLIP, or TRAIN_STEPS_PER_EPOCH."
+                )
+            for key in running:
+                running[key] = running[key] + aux[key]
+        for key in history:
+            history[key][epoch] = float(running[key] / float(steps_per_epoch))
+        if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
+            print(
+                f"[train] epoch {epoch + 1:04d}/{int(epochs):04d} "
+                f"loss={history['total'][epoch]:.6e} "
+                f"q={history['q'][epoch]:.6e} "
+                f"field={history['field'][epoch]:.6e} "
+                f"dist={history['dist'][epoch]:.6e} "
+                f"tail={history['tail'][epoch]:.6e} "
+                f"neg={history['neg'][epoch]:.6e} "
+                f"reg={history['reg'][epoch]:.6e}"
+            )
+    return params, history
+
+
 def evaluate_regime_metrics(
     learned: LearnedInterfaceClosure,
     prepared: Dict[str, Dict[str, Array]],
@@ -3004,7 +3375,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-low", type=int, default=2)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--training-mode", type=str, default=OFFLINE_TRAINING_MODE, choices=(OFFLINE_TRAINING_MODE, ONLINE_TRAINING_MODE))
-    parser.add_argument("--train-objective", type=str, default="q_only", choices=("q_only", "stability_aware", "trajectory"))
+    parser.add_argument("--train-objective", type=str, default="q_only", choices=("q_only", "stability_aware", "trajectory", "trajectory_q_hybrid"))
     parser.add_argument("--context-mode", type=str, default="none", choices=("none", "lag1_delta"))
     parser.add_argument("--rollout-horizon", type=int, default=2)
     parser.add_argument("--tail-start-fraction", type=float, default=2.0 / 3.0)
@@ -3018,6 +3389,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--online-loss-backend", type=str, default=ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
     parser.add_argument("--online-v-probes", type=int, default=64)
     parser.add_argument("--online-case-batch-size", type=int, default=1)
+    parser.add_argument("--online-reference-cache", type=Path, default=None)
     parser.add_argument("--regimes", type=str, default="linear_landau,nonlinear_landau_weak,nonlinear_landau_strong")
     parser.add_argument("--weight-linear", type=float, default=1.0)
     parser.add_argument("--weight-weak", type=float, default=1.0)
@@ -3075,6 +3447,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     teacher_backend = normalize_teacher_backend_name(args.teacher_backend)
     teacher_proj_Nv: Optional[int] = None
+    online_reference_cache = args.dataset_cache
     if training_mode == ONLINE_TRAINING_MODE:
         if bool(args.allow_dataset_cache_nv_superset):
             raise ValueError("online_rollout does not support --allow-dataset-cache-nv-superset")
@@ -3082,12 +3455,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             raise ValueError("online_rollout does not support --per-target-projection-orders")
         if teacher_backend != GRID_CUBIC_SPLINE_TEACHER_BACKEND:
             raise ValueError("online_rollout only supports teacher_backend=grid_cubic_spline")
-        if bool(args.build_dataset_only) and args.dataset_cache is None:
-            raise ValueError("online_rollout --build-dataset-only requires --dataset-cache")
-        if args.teacher_proj_Nv is not None:
-            raise ValueError("online_rollout does not use --teacher-proj-Nv")
-        if args.train_objective != "trajectory":
-            raise ValueError("online_rollout requires --train-objective trajectory")
+        if args.train_objective == "trajectory":
+            if bool(args.build_dataset_only) and args.dataset_cache is None:
+                raise ValueError("online_rollout --build-dataset-only requires --dataset-cache")
+            if args.teacher_proj_Nv is not None:
+                raise ValueError("online_rollout trajectory does not use --teacher-proj-Nv")
+            if args.online_reference_cache is not None:
+                raise ValueError("online_rollout trajectory does not use --online-reference-cache")
+        elif args.train_objective == "trajectory_q_hybrid":
+            online_reference_cache = args.online_reference_cache
+            if online_reference_cache is None:
+                raise ValueError("online_rollout trajectory_q_hybrid requires --online-reference-cache")
+            teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
+            if teacher_proj_Nv <= max(Nv_targets):
+                raise ValueError("teacher-proj-Nv must exceed every target Nv")
+            if float(args.lambda_q) <= 0.0 and not bool(args.build_dataset_only):
+                raise ValueError("trajectory_q_hybrid requires --lambda-q > 0")
+        else:
+            raise ValueError(
+                "online_rollout requires --train-objective trajectory or trajectory_q_hybrid"
+            )
         if str(args.online_loss_backend) != ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1:
             raise ValueError(
                 f"Unsupported online loss backend {args.online_loss_backend!r}; "
@@ -3104,8 +3491,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ):
             raise ValueError("online_rollout requires lambda_E > 0 or lambda_dist > 0")
     else:
-        if args.train_objective == "trajectory":
-            raise ValueError("trajectory objective is only supported with --training-mode online_rollout")
+        if args.train_objective in {"trajectory", "trajectory_q_hybrid"}:
+            raise ValueError(f"{args.train_objective} objective is only supported with --training-mode online_rollout")
         if args.train_objective == "stability_aware" and int(args.batch_size) <= 0:
             raise ValueError("stability_aware training requires --batch-size > 0")
         if args.train_objective == "stability_aware" and (
@@ -3353,7 +3740,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         val_metrics = evaluate_regime_metrics(learned, prepared)
     else:
         online_dataset, _ = build_online_reference_dataset(
-            dataset_cache=args.dataset_cache,
+            dataset_cache=online_reference_cache,
             regimes=regimes,
             teacher_Nx=args.teacher_Nx,
             teacher_Nv=args.teacher_Nv,
@@ -3382,80 +3769,235 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             val_count = int(online_dataset[regime]["val"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("val") else 0
             print(f"[data] {regime}: train={train_count} episodes val={val_count} episodes")
 
-        if bool(args.build_dataset_only):
-            print(f"Prepared online reference dataset cache at {args.dataset_cache}")
-            return
+        if args.train_objective == "trajectory_q_hybrid":
+            dataset_base = build_mixed_landau_dataset(
+                dataset_cache=args.dataset_cache,
+                regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_L=args.teacher_L,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                linear_T=args.linear_T,
+                linear_eps=args.linear_eps,
+                linear_modes=linear_modes,
+                linear_num_samples=args.linear_num_samples,
+                linear_seed=args.linear_seed,
+                linear_poisson_sign=args.teacher_poisson_sign,
+                linear_history_stride=args.linear_history_stride,
+                nonlinear_T=args.nonlinear_T,
+                nonlinear_k0=args.nonlinear_k0,
+                nonlinear_poisson_sign=args.teacher_poisson_sign,
+                nonlinear_history_stride=args.nonlinear_history_stride,
+                weak_eps=weak_eps,
+                strong_eps=strong_eps,
+                Nv_targets=Nv_targets,
+                Nm=args.Nm,
+                val_fraction=args.val_fraction,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=0,
+                allow_cached_nv_superset=False,
+                per_target_projection_orders=False,
+            )
+            if bool(args.build_dataset_only):
+                if args.dataset_cache is not None:
+                    print(f"Saved hybrid q dataset cache to {args.dataset_cache}")
+                print(f"Prepared hybrid online reference dataset cache at {online_reference_cache}")
+                return
 
-        target_nv_max = max(int(v) for v in Nv_targets)
-        integ = FourierHermiteIMEX(
-            Nx=int(args.teacher_Nx),
-            Nv=int(target_nv_max),
-            Lx=float(args.teacher_L),
-            dt=float(args.teacher_dt),
-            vth=1.0,
-            dealias_23=bool(args.rollout_dealias_23),
-            closure=None,
-        )
-        k_scale = float(args.k_scale) if args.k_scale is not None else float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64)))
-        nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(target_nv_max)
-        stats = build_identity_training_stats(Nm=args.Nm, context_mode=args.context_mode)
-        params = init_online_rollout_params(
-            jax.random.PRNGKey(args.seed),
-            input_dim=int(stats["input_mean"].shape[0]),
-            hidden_width=int(args.hidden_width),
-            res_blocks=int(args.res_blocks),
-        )
-        batch_loss_fn, active_regimes = make_online_trajectory_batch_loss(
-            online_dataset=online_dataset,
-            regime_weights=regime_weights,
-            Nm=args.Nm,
-            k_scale=k_scale,
-            nv_scale=nv_scale,
-            stats=stats,
-            hidden_width=args.hidden_width,
-            res_blocks=args.res_blocks,
-            Nv_targets=Nv_targets,
-            train_regimes=regimes,
-            teacher_backend=teacher_backend,
-            teacher_Lx=args.teacher_L,
-            teacher_Nx=args.teacher_Nx,
-            teacher_Nv=args.teacher_Nv,
-            teacher_vmin=args.teacher_vmin,
-            teacher_vmax=args.teacher_vmax,
-            teacher_dt=args.teacher_dt,
-            n_low=args.n_low,
-            context_mode=args.context_mode,
-            tail_start_fraction=args.tail_start_fraction,
-            loss_backend=args.online_loss_backend,
-            lambda_E=args.lambda_E,
-            lambda_dist=args.lambda_dist,
-            lambda_tail=args.lambda_tail,
-            lambda_neg=args.lambda_neg,
-            lambda_reg=args.lambda_reg,
-            online_v_probes=args.online_v_probes,
-            nonlinear_T=args.nonlinear_T,
-            nonlinear_k0=args.nonlinear_k0,
-            poisson_sign=args.teacher_poisson_sign,
-            rollout_dealias_23=bool(args.rollout_dealias_23),
-        )
-        train_sizes = [int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) for regime in active_regimes]
-        steps_per_epoch = int(args.steps_per_epoch)
-        if steps_per_epoch <= 0:
-            steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.online_case_batch_size)))
-        params, online_component_history = train_with_online_trajectory_minibatch_loss(
-            params,
-            online_dataset,
-            batch_loss_fn,
-            active_regimes=active_regimes,
-            epochs=args.epochs,
-            learning_rate=args.lr,
-            grad_clip=args.grad_clip,
-            log_every=args.log_every,
-            online_case_batch_size=args.online_case_batch_size,
-            steps_per_epoch=steps_per_epoch,
-            seed=args.seed,
-        )
-        loss_history = online_component_history["total"]
+            k_scale = float(args.k_scale) if args.k_scale is not None else choose_k_scale(dataset_base, Nm=args.Nm)
+            nv_scale = float(args.nv_scale) if args.nv_scale is not None else choose_nv_scale(dataset_base, Nm=args.Nm)
+            prepared, stats = prepare_training_dataset(
+                dataset_base,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                context_mode=args.context_mode,
+            )
+            for regime, count in summarize_dataset(prepared).items():
+                print(f"[data] {regime}: {count} q samples")
+
+            params = init_online_rollout_params(
+                jax.random.PRNGKey(args.seed),
+                input_dim=int(stats["input_mean"].shape[0]),
+                hidden_width=int(args.hidden_width),
+                res_blocks=int(args.res_blocks),
+                target_mean=stats["target_mean"],
+                target_std=stats["target_std"],
+            )
+            batch_loss_fn, active_regimes = make_online_hybrid_batch_loss(
+                prepared=prepared,
+                online_dataset=online_dataset,
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=int(teacher_proj_Nv),
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                tail_start_fraction=args.tail_start_fraction,
+                loss_backend=args.online_loss_backend,
+                lambda_q=args.lambda_q,
+                lambda_E=args.lambda_E,
+                lambda_dist=args.lambda_dist,
+                lambda_tail=args.lambda_tail,
+                lambda_neg=args.lambda_neg,
+                lambda_reg=args.lambda_reg,
+                online_v_probes=args.online_v_probes,
+                nonlinear_T=args.nonlinear_T,
+                nonlinear_k0=args.nonlinear_k0,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+            )
+            train_sizes = [int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) for regime in active_regimes]
+            steps_per_epoch = int(args.steps_per_epoch)
+            if steps_per_epoch <= 0:
+                steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.online_case_batch_size)))
+            params, online_component_history = train_with_online_hybrid_minibatch_loss(
+                params,
+                prepared,
+                online_dataset,
+                batch_loss_fn,
+                active_regimes=active_regimes,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+                batch_size=args.batch_size,
+                online_case_batch_size=args.online_case_batch_size,
+                steps_per_epoch=steps_per_epoch,
+                seed=args.seed,
+            )
+            loss_history = online_component_history["total"]
+            val_metrics = evaluate_regime_metrics(
+                build_learned_interface_closure(
+                    params=params,
+                    Nm=args.Nm,
+                    k_scale=k_scale,
+                    nv_scale=nv_scale,
+                    stats=stats,
+                    hidden_width=args.hidden_width,
+                    res_blocks=args.res_blocks,
+                    Nv_targets=Nv_targets,
+                    train_regimes=regimes,
+                    teacher_backend=teacher_backend,
+                    teacher_Lx=args.teacher_L,
+                    teacher_Nx=args.teacher_Nx,
+                    teacher_Nv=args.teacher_Nv,
+                    teacher_vmin=args.teacher_vmin,
+                    teacher_vmax=args.teacher_vmax,
+                    teacher_dt=args.teacher_dt,
+                    teacher_proj_Nv=teacher_proj_Nv,
+                    n_low=args.n_low,
+                    training_mode=ONLINE_TRAINING_MODE,
+                    train_objective="trajectory_q_hybrid",
+                    context_mode=args.context_mode,
+                    rollout_horizon=0,
+                    tail_start_fraction=args.tail_start_fraction,
+                    loss_backend=args.online_loss_backend,
+                    lambda_q=args.lambda_q,
+                    lambda_E=args.lambda_E,
+                    lambda_dist=args.lambda_dist,
+                    lambda_tail=args.lambda_tail,
+                    lambda_neg=args.lambda_neg,
+                    lambda_reg=args.lambda_reg,
+                    online_v_probes=args.online_v_probes,
+                    stability_loss_definition=ONLINE_HYBRID_LOSS_DEFINITION,
+                ),
+                prepared,
+            )
+        else:
+            if bool(args.build_dataset_only):
+                print(f"Prepared online reference dataset cache at {online_reference_cache}")
+                return
+
+            target_nv_max = max(int(v) for v in Nv_targets)
+            integ = FourierHermiteIMEX(
+                Nx=int(args.teacher_Nx),
+                Nv=int(target_nv_max),
+                Lx=float(args.teacher_L),
+                dt=float(args.teacher_dt),
+                vth=1.0,
+                dealias_23=bool(args.rollout_dealias_23),
+                closure=None,
+            )
+            k_scale = float(args.k_scale) if args.k_scale is not None else float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64)))
+            nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(target_nv_max)
+            stats = build_identity_training_stats(Nm=args.Nm, context_mode=args.context_mode)
+            params = init_online_rollout_params(
+                jax.random.PRNGKey(args.seed),
+                input_dim=int(stats["input_mean"].shape[0]),
+                hidden_width=int(args.hidden_width),
+                res_blocks=int(args.res_blocks),
+            )
+            batch_loss_fn, active_regimes = make_online_trajectory_batch_loss(
+                online_dataset=online_dataset,
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                tail_start_fraction=args.tail_start_fraction,
+                loss_backend=args.online_loss_backend,
+                lambda_E=args.lambda_E,
+                lambda_dist=args.lambda_dist,
+                lambda_tail=args.lambda_tail,
+                lambda_neg=args.lambda_neg,
+                lambda_reg=args.lambda_reg,
+                online_v_probes=args.online_v_probes,
+                nonlinear_T=args.nonlinear_T,
+                nonlinear_k0=args.nonlinear_k0,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+            )
+            train_sizes = [int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) for regime in active_regimes]
+            steps_per_epoch = int(args.steps_per_epoch)
+            if steps_per_epoch <= 0:
+                steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.online_case_batch_size)))
+            params, online_component_history = train_with_online_trajectory_minibatch_loss(
+                params,
+                online_dataset,
+                batch_loss_fn,
+                active_regimes=active_regimes,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+                online_case_batch_size=args.online_case_batch_size,
+                steps_per_epoch=steps_per_epoch,
+                seed=args.seed,
+            )
+            loss_history = online_component_history["total"]
+
         for regime in regimes:
             if regime in online_dataset and online_dataset[regime].get("val"):
                 val_metrics[f"val_num_cases_{regime}"] = np.array(
@@ -3480,21 +4022,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             teacher_vmin=args.teacher_vmin,
             teacher_vmax=args.teacher_vmax,
             teacher_dt=args.teacher_dt,
-            teacher_proj_Nv=None,
+            teacher_proj_Nv=teacher_proj_Nv,
             n_low=args.n_low,
             training_mode=ONLINE_TRAINING_MODE,
-            train_objective="trajectory",
+            train_objective=args.train_objective,
             context_mode=args.context_mode,
             rollout_horizon=0,
             tail_start_fraction=args.tail_start_fraction,
             loss_backend=args.online_loss_backend,
-            lambda_q=0.0,
+            lambda_q=args.lambda_q if args.train_objective == "trajectory_q_hybrid" else 0.0,
             lambda_E=args.lambda_E,
             lambda_dist=args.lambda_dist,
             lambda_tail=args.lambda_tail,
             lambda_neg=args.lambda_neg,
             lambda_reg=args.lambda_reg,
             online_v_probes=args.online_v_probes,
+            stability_loss_definition=(
+                ONLINE_HYBRID_LOSS_DEFINITION if args.train_objective == "trajectory_q_hybrid" else None
+            ),
         )
 
     assert args.checkpoint is not None
@@ -3502,11 +4047,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     save_learned_interface_closure_npz(args.checkpoint, learned)
 
     metrics_path = args.checkpoint.with_suffix(".metrics.npz")
-    used_lambda_E = args.lambda_E if args.train_objective in {"stability_aware", "trajectory"} else 0.0
+    used_lambda_q = args.lambda_q if args.train_objective in {"q_only", "stability_aware", "trajectory_q_hybrid"} else 0.0
+    used_lambda_E = args.lambda_E if args.train_objective in {"stability_aware", "trajectory", "trajectory_q_hybrid"} else 0.0
     used_lambda_dist = args.lambda_dist if training_mode == ONLINE_TRAINING_MODE else 0.0
-    used_lambda_tail = args.lambda_tail if args.train_objective in {"stability_aware", "trajectory"} else 0.0
+    used_lambda_tail = args.lambda_tail if args.train_objective in {"stability_aware", "trajectory", "trajectory_q_hybrid"} else 0.0
     used_lambda_neg = args.lambda_neg if training_mode == ONLINE_TRAINING_MODE else 0.0
-    used_lambda_reg = args.lambda_reg if args.train_objective in {"stability_aware", "trajectory"} else 0.0
+    used_lambda_reg = args.lambda_reg if args.train_objective in {"stability_aware", "trajectory", "trajectory_q_hybrid"} else 0.0
     metrics_payload: Dict[str, np.ndarray] = {
         "train_loss": np.asarray(loss_history, dtype=np.float64),
         "Nm": np.array([args.Nm], dtype=np.int32),
@@ -3540,7 +4086,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             [] if training_mode == OFFLINE_TRAINING_MODE else [args.online_loss_backend],
             dtype=np.str_,
         ),
-        "lambda_q": np.array([args.lambda_q if training_mode == OFFLINE_TRAINING_MODE else 0.0], dtype=np.float64),
+        "lambda_q": np.array([used_lambda_q], dtype=np.float64),
         "lambda_E": np.array([used_lambda_E], dtype=np.float64),
         "lambda_dist": np.array([used_lambda_dist], dtype=np.float64),
         "lambda_tail": np.array([used_lambda_tail], dtype=np.float64),
@@ -3559,6 +4105,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         metrics_payload["stability_loss_definition"] = np.array([STABILITY_LOSS_DEFINITION], dtype=np.str_)
     if training_mode == ONLINE_TRAINING_MODE:
         assert online_component_history is not None
+        if args.train_objective == "trajectory_q_hybrid":
+            metrics_payload["train_loss_q"] = np.asarray(online_component_history["q"], dtype=np.float64)
+            metrics_payload["stability_loss_definition"] = np.array([ONLINE_HYBRID_LOSS_DEFINITION], dtype=np.str_)
         metrics_payload["train_loss_field"] = np.asarray(online_component_history["field"], dtype=np.float64)
         metrics_payload["train_loss_dist"] = np.asarray(online_component_history["dist"], dtype=np.float64)
         metrics_payload["train_loss_tail"] = np.asarray(online_component_history["tail"], dtype=np.float64)

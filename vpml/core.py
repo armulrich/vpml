@@ -338,7 +338,7 @@ class LearnedInterfaceClosure:
             raise ValueError("rollout_horizon must be nonnegative")
         if not (0.0 < float(self.tail_start_fraction) <= 1.0):
             raise ValueError("tail_start_fraction must lie in (0, 1]")
-        if str(self.train_objective) not in {"q_only", "stability_aware", "trajectory"}:
+        if str(self.train_objective) not in {"q_only", "stability_aware", "trajectory", "trajectory_q_hybrid"}:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
         if int(self.online_v_probes) < 0:
             raise ValueError("online_v_probes must be nonnegative")
