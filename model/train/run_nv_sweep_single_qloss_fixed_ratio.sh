@@ -52,7 +52,6 @@ TRAIN_VAL_FRACTION="${TRAIN_VAL_FRACTION:-0.2}"
 TRAIN_REGIMES="${TRAIN_REGIMES:-linear_landau,nonlinear_landau_weak,nonlinear_landau_strong}"
 TRAIN_OBJECTIVE="${TRAIN_OBJECTIVE:-q_only}"
 TRAIN_CONTEXT_MODE="${TRAIN_CONTEXT_MODE:-none}"
-TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-0}"
 
 TRAIN_TEACHER_NX="${TRAIN_TEACHER_NX:-${TEACHER_NX}}"
 TRAIN_TEACHER_NV="${TRAIN_TEACHER_NV:-${TEACHER_NV}}"
@@ -80,11 +79,6 @@ if [[ "${TRAIN_CONTEXT_MODE}" != "none" ]]; then
   echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
   exit 1
 fi
-if [[ "${TRAIN_ROLLOUT_HORIZON}" != "0" ]]; then
-  echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_ROLLOUT_HORIZON=0; got '${TRAIN_ROLLOUT_HORIZON}'." >&2
-  exit 1
-fi
-
 ladder_csv_for_target() {
   local target="$1"
   "${PYTHON_BIN}" - <<'PY' "${target}" "${TRAIN_NM}" "${TRAIN_FIXED_RATIO}"
@@ -189,7 +183,6 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --val-fraction "${TRAIN_VAL_FRACTION}"
       --train-objective q_only
       --context-mode none
-      --rollout-horizon 0
       --regimes "${TRAIN_REGIMES}"
       --teacher-Nx "${TRAIN_TEACHER_NX}"
       --teacher-Nv "${TRAIN_TEACHER_NV}"

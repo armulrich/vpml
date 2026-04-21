@@ -194,29 +194,6 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             loaded = load_learned_interface_closure_npz(path)
         self.assertEqual(loaded.teacher_backend, "grid_cubic_spline")
 
-    def test_checkpoint_round_trip_preserves_stability_metadata(self) -> None:
-        closure = _make_closure(
-            context_mode="lag1_delta",
-            train_objective="stability_aware",
-            rollout_horizon=2,
-            lambda_q=1.0,
-            lambda_E=0.5,
-            lambda_tail=0.05,
-            lambda_reg=1e-6,
-            stability_loss_definition=train_mod.STABILITY_LOSS_DEFINITION,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "interface_closure.npz"
-            save_learned_interface_closure_npz(path, closure)
-            loaded = load_learned_interface_closure_npz(path)
-        self.assertEqual(loaded.context_mode, "lag1_delta")
-        self.assertEqual(loaded.train_objective, "stability_aware")
-        self.assertEqual(loaded.rollout_horizon, 2)
-        self.assertAlmostEqual(loaded.lambda_E, 0.5)
-        self.assertAlmostEqual(loaded.lambda_tail, 0.05)
-        self.assertEqual(loaded.stability_loss_definition, train_mod.STABILITY_LOSS_DEFINITION)
-        self.assertEqual(loaded.input_dim, 18)
-
     def test_checkpoint_round_trip_preserves_online_metadata(self) -> None:
         closure = _make_closure(
             training_mode="online_rollout",
@@ -389,152 +366,6 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             atol=1e-12,
         )
 
-    def test_rollout_window_loss_terms_are_zero_for_zero_dynamics(self) -> None:
-        closure = _make_closure(context_mode="lag1_delta", train_objective="stability_aware", rollout_horizon=2)
-        integ = FourierHermiteIMEX(Nx=8, Nv=4, Lx=4.0 * math.pi, dt=0.05, vth=1.0, dealias_23=True, closure=None)
-        prev = jnp.zeros((4, integ.Nk), dtype=jnp.complex128)
-        curr = jnp.zeros((4, integ.Nk), dtype=jnp.complex128)
-        future = jnp.zeros((2, 4, integ.Nk), dtype=jnp.complex128)
-        future_e = jnp.zeros((2, integ.Nk), dtype=jnp.complex128)
-        m_eq = jnp.zeros((4,), dtype=jnp.float64).at[0].set(1.0)
-        field_loss, tail_loss = train_mod.rollout_window_loss_terms(
-            closure,
-            prev_state=prev,
-            curr_state=curr,
-            future_state=future,
-            future_E_hat=future_e,
-            integ=integ,
-            m_eq=m_eq,
-            poisson_sign=1.0,
-            rollout_weights=jnp.array([1.0, 0.5], dtype=jnp.float64),
-            tail_start_fraction=2.0 / 3.0,
-            field_ref_scale=jnp.asarray(0.0, dtype=jnp.float64),
-            tail_ref_scale=jnp.asarray(0.0, dtype=jnp.float64),
-        )
-        self.assertAlmostEqual(float(field_loss), 0.0, places=12)
-        self.assertAlmostEqual(float(tail_loss), 0.0, places=12)
-
-    def test_window_hybrid_field_loss_matches_closed_form(self) -> None:
-        pred_state = jnp.zeros((2, 4, 3), dtype=jnp.complex128)
-        true_state = jnp.zeros((2, 4, 3), dtype=jnp.complex128)
-        pred_e = jnp.array(
-            [
-                [0.0 + 0.0j, 1.0 + 0.0j, 2.0 + 0.0j],
-                [0.0 + 0.0j, 3.0 + 0.0j, 4.0 + 0.0j],
-            ],
-            dtype=jnp.complex128,
-        )
-        true_e = jnp.array(
-            [
-                [0.0 + 0.0j, 1.0e-8 + 0.0j, 0.0 + 0.0j],
-                [0.0 + 0.0j, 1.0 + 0.0j, 0.0 + 0.0j],
-            ],
-            dtype=jnp.complex128,
-        )
-        weights = jnp.array([1.0, 0.5], dtype=jnp.float64)
-        field_ref = 2.5
-        field_loss, tail_loss = train_mod.rollout_window_hybrid_loss_from_sequences(
-            pred_state,
-            pred_e,
-            true_state,
-            true_e,
-            rollout_weights=weights,
-            tail_start_fraction=2.0 / 3.0,
-            field_ref_scale=jnp.asarray(field_ref, dtype=jnp.float64),
-            tail_ref_scale=jnp.asarray(0.0, dtype=jnp.float64),
-        )
-        k_weights = np.array([1.0, 2.0, 1.0], dtype=np.float64)
-        field_num = (
-            1.0 * (2.0 * abs(1.0 - 1.0e-8) ** 2 + 1.0 * abs(2.0 - 0.0) ** 2)
-            + 0.5 * (2.0 * abs(3.0 - 1.0) ** 2 + 1.0 * abs(4.0 - 0.0) ** 2)
-        )
-        field_true = (
-            1.0 * (k_weights[1] * abs(1.0e-8) ** 2 + k_weights[2] * 0.0)
-            + 0.5 * (k_weights[1] * abs(1.0) ** 2 + k_weights[2] * 0.0)
-        )
-        expected = field_num / (field_true + field_ref + 1e-30)
-        self.assertTrue(math.isfinite(float(field_loss)))
-        self.assertAlmostEqual(float(field_loss), float(expected), places=12)
-        self.assertAlmostEqual(float(tail_loss), 0.0, places=12)
-
-    def test_window_hybrid_tail_loss_matches_closed_form(self) -> None:
-        pred_state = jnp.zeros((2, 4, 3), dtype=jnp.complex128)
-        true_state = jnp.zeros((2, 4, 3), dtype=jnp.complex128)
-        pred_state = pred_state.at[0, 3, 1].set(3.0 + 0.0j)
-        pred_state = pred_state.at[1, 3, 1].set(4.0 + 0.0j)
-        true_state = true_state.at[0, 3, 1].set(1.0 + 0.0j)
-        true_state = true_state.at[1, 3, 1].set(2.0 + 0.0j)
-        pred_e = jnp.zeros((2, 3), dtype=jnp.complex128)
-        true_e = jnp.zeros((2, 3), dtype=jnp.complex128)
-        weights = jnp.array([1.0, 0.5], dtype=jnp.float64)
-        tail_ref = 5.0
-        field_loss, tail_loss = train_mod.rollout_window_hybrid_loss_from_sequences(
-            pred_state,
-            pred_e,
-            true_state,
-            true_e,
-            rollout_weights=weights,
-            tail_start_fraction=2.0 / 3.0,
-            field_ref_scale=jnp.asarray(0.0, dtype=jnp.float64),
-            tail_ref_scale=jnp.asarray(tail_ref, dtype=jnp.float64),
-        )
-        # Nv=4 and tail_start_fraction=2/3 isolate the last retained mode only.
-        k_weights = np.array([1.0, 2.0, 1.0], dtype=np.float64)
-        excess0 = max(abs(3.0) ** 2 - abs(1.0) ** 2, 0.0)
-        excess1 = max(abs(4.0) ** 2 - abs(2.0) ** 2, 0.0)
-        tail_num = 1.0 * (k_weights[1] * (excess0 ** 2)) + 0.5 * (k_weights[1] * (excess1 ** 2))
-        true_tail = 1.0 * (k_weights[1] * (abs(1.0) ** 4)) + 0.5 * (k_weights[1] * (abs(2.0) ** 4))
-        expected = tail_num / (true_tail + tail_ref + 1e-30)
-        self.assertAlmostEqual(float(field_loss), 0.0, places=12)
-        self.assertTrue(math.isfinite(float(tail_loss)))
-        self.assertAlmostEqual(float(tail_loss), float(expected), places=12)
-
-    def test_reference_scales_match_mean_teacher_window_energies(self) -> None:
-        weights = jnp.array([1.0, 0.5], dtype=jnp.float64)
-        future_state = jnp.zeros((2, 2, 4, 3), dtype=jnp.complex128)
-        future_e = jnp.zeros((2, 2, 3), dtype=jnp.complex128)
-
-        future_e = future_e.at[0, 0, 1].set(1.0 + 0.0j)
-        future_e = future_e.at[0, 1, 1].set(2.0 + 0.0j)
-        future_state = future_state.at[0, 0, 3, 1].set(1.0 + 0.0j)
-        future_state = future_state.at[0, 1, 3, 1].set(2.0 + 0.0j)
-
-        future_e = future_e.at[1, 0, 1].set(2.0 + 0.0j)
-        future_e = future_e.at[1, 1, 1].set(1.0 + 0.0j)
-        future_state = future_state.at[1, 0, 3, 1].set(2.0 + 0.0j)
-        future_state = future_state.at[1, 1, 3, 1].set(1.0 + 0.0j)
-
-        prepared = {
-            train_mod.REGIME_LINEAR: {
-                "train_rollout": {
-                    4: {
-                        "future_state": future_state,
-                        "future_E_hat": future_e,
-                    }
-                }
-            }
-        }
-        scales = train_mod.build_stability_rollout_reference_scales(
-            prepared,
-            active_regimes=(train_mod.REGIME_LINEAR,),
-            regime_rollout_nvs={train_mod.REGIME_LINEAR: (4,)},
-            rollout_weights=weights,
-            tail_start_fraction=2.0 / 3.0,
-        )
-        expected = [
-            train_mod.rollout_window_teacher_scales(
-                future_state[idx],
-                future_e[idx],
-                rollout_weights=weights,
-                tail_start_fraction=2.0 / 3.0,
-            )
-            for idx in range(2)
-        ]
-        expected_field = float(np.mean([float(val[0]) for val in expected]))
-        expected_tail = float(np.mean([float(val[1]) for val in expected]))
-        self.assertAlmostEqual(float(scales[train_mod.REGIME_LINEAR][4]["field"]), expected_field, places=12)
-        self.assertAlmostEqual(float(scales[train_mod.REGIME_LINEAR][4]["tail"]), expected_tail, places=12)
-
     def test_cubic_periodic_matches_scipy_wrap(self) -> None:
         values = np.sin(np.linspace(0.0, 2.0 * math.pi, 16, endpoint=False))[None, :]
         coords = np.linspace(2.1, 13.7, 25, dtype=np.float64)[None, :]
@@ -670,81 +501,6 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             self.assertEqual(loaded.teacher_backend, "grid_cubic_spline")
             self.assertTrue(loaded.include_global_indicators)
             self.assertEqual(loaded.input_dim, 6)
-
-    def test_stability_aware_trainer_writes_finite_component_histories(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ckpt = Path(tmpdir) / "shared_interface_stability.npz"
-            cache = Path(tmpdir) / "shared_dataset_stability.npz"
-            train_main(
-                [
-                    "--checkpoint",
-                    str(ckpt),
-                    "--dataset-cache",
-                    str(cache),
-                    "--Nv-targets",
-                    "4",
-                    "--Nm",
-                    "1",
-                    "--hidden-width",
-                    "8",
-                    "--res-blocks",
-                    "1",
-                    "--epochs",
-                    "1",
-                    "--log-every",
-                    "1",
-                    "--batch-size",
-                    "4",
-                    "--rollout-batch-size",
-                    "2",
-                    "--steps-per-epoch",
-                    "1",
-                    "--train-objective",
-                    "stability_aware",
-                    "--context-mode",
-                    "lag1_delta",
-                    "--rollout-horizon",
-                    "2",
-                    "--teacher-Nx",
-                    "8",
-                    "--teacher-Nv",
-                    "16",
-                    "--teacher-vmin",
-                    "-6",
-                    "--teacher-vmax",
-                    "6",
-                    "--teacher-dt",
-                    "0.05",
-                    "--teacher-proj-Nv",
-                    "5",
-                    "--linear-T",
-                    "0.10",
-                    "--linear-num-samples",
-                    "1",
-                    "--linear-history-stride",
-                    "1",
-                    "--nonlinear-T",
-                    "0.10",
-                    "--nonlinear-history-stride",
-                    "1",
-                    "--weak-eps",
-                    "0.05",
-                    "--strong-eps",
-                    "0.25",
-                ]
-            )
-            self.assertTrue(ckpt.exists())
-            metrics_path = ckpt.with_suffix(".metrics.npz")
-            self.assertTrue(metrics_path.exists())
-            loaded = load_learned_interface_closure_npz(ckpt)
-            self.assertEqual(loaded.stability_loss_definition, train_mod.STABILITY_LOSS_DEFINITION)
-            with np.load(metrics_path) as data:
-                self.assertEqual(
-                    str(np.asarray(data["stability_loss_definition"], dtype=np.str_).reshape(-1)[0]),
-                    train_mod.STABILITY_LOSS_DEFINITION,
-                )
-                for key in ("train_loss", "train_loss_q", "train_loss_field", "train_loss_tail", "train_loss_reg"):
-                    self.assertTrue(np.isfinite(np.asarray(data[key], dtype=np.float64)).all(), msg=key)
 
     def test_online_rollout_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
         target_nv = 4
@@ -902,7 +658,6 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             val_fraction=0.2,
             n_low=2,
             context_mode="none",
-            rollout_horizon=0,
             allow_cached_nv_superset=False,
             per_target_projection_orders=False,
         )
@@ -1226,10 +981,10 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                     ]
                 )
 
-    def test_stability_aware_training_requires_minibatch_mode(self) -> None:
+    def test_removed_stability_aware_objective_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt = Path(tmpdir) / "shared_interface.npz"
-            with self.assertRaisesRegex(ValueError, r"batch-size > 0"):
+            with self.assertRaises(SystemExit):
                 train_main(
                     [
                         "--checkpoint",
@@ -1238,38 +993,6 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                         "4",
                         "--Nm",
                         "1",
-                        "--hidden-width",
-                        "8",
-                        "--res-blocks",
-                        "1",
-                        "--epochs",
-                        "1",
-                        "--teacher-Nx",
-                        "8",
-                        "--teacher-Nv",
-                        "16",
-                        "--teacher-vmin",
-                        "-6",
-                        "--teacher-vmax",
-                        "6",
-                        "--teacher-dt",
-                        "0.05",
-                        "--teacher-proj-Nv",
-                        "5",
-                        "--linear-T",
-                        "0.10",
-                        "--linear-num-samples",
-                        "1",
-                        "--linear-history-stride",
-                        "1",
-                        "--nonlinear-T",
-                        "0.10",
-                        "--nonlinear-history-stride",
-                        "1",
-                        "--weak-eps",
-                        "0.05",
-                        "--strong-eps",
-                        "0.25",
                         "--train-objective",
                         "stability_aware",
                     ]
@@ -1385,38 +1108,6 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             self.assertIn(regime, dataset)
             self.assertGreater(dataset[regime]["train_inputs_base"].shape[0], 0, msg=regime)
             self.assertGreater(dataset[regime]["val_inputs_base"].shape[0], 0, msg=regime)
-
-    def test_q_only_dataset_build_ignores_rollout_horizon(self) -> None:
-        captured = {}
-
-        def fake_build_mixed_landau_dataset(**kwargs):
-            captured.update(kwargs)
-            raise RuntimeError("stop after dataset build")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ckpt = Path(tmpdir) / "shared_interface.npz"
-            with mock.patch.object(
-                train_mod,
-                "build_mixed_landau_dataset",
-                side_effect=fake_build_mixed_landau_dataset,
-            ):
-                with self.assertRaisesRegex(RuntimeError, r"stop after dataset build"):
-                    train_main(
-                        [
-                            "--checkpoint",
-                            str(ckpt),
-                            "--Nv-targets",
-                            "4",
-                            "--Nm",
-                            "1",
-                            "--train-objective",
-                            "q_only",
-                            "--rollout-horizon",
-                            "5",
-                        ]
-                    )
-
-        self.assertEqual(captured["rollout_horizon"], 0)
 
     def test_online_rollout_supports_reference_cache_but_rejects_offline_cache_flags_and_projection_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

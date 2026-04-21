@@ -31,14 +31,6 @@ def _training_loss_ylabel(train_objective: str) -> str:
             r"\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+"
             r"\lambda_{\mathrm{reg}}\|\theta\|_2^2$"
         )
-    if str(train_objective) == "stability_aware":
-        return (
-            r"$\mathcal{L}_{\mathrm{stab}}(\theta)="
-            r"\lambda_q\mathcal{L}_q+"
-            r"\lambda_E\mathcal{L}_{E,\mathrm{window}}^{\mathrm{hyb}}+"
-            r"\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail},\mathrm{window}}^{\mathrm{hyb}}+"
-            r"\lambda_{\mathrm{reg}}\|\theta\|_2^2$"
-        )
     return r"$\mathcal{L}(\theta)=\mathbb{E}_{\mathrm{regime}}\mathbb{E}_{t,k>0}\left[\left|q_k^\theta-q_k^\star\right|^2\right]$"
 
 

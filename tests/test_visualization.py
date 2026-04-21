@@ -39,22 +39,22 @@ from vpml.metrics import FourierFieldComparison, GrowthComparisonResult, GrowthF
 class VisualizationTests(unittest.TestCase):
     def test_training_loss_plot_uses_objective_specific_ylabel(self) -> None:
         fig_q = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="q_only")
-        fig_stab = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="stability_aware")
+        fig_traj = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="trajectory")
         fig_hybrid = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="trajectory_q_hybrid")
         self.assertEqual(
             fig_q.axes[0].get_ylabel(),
             r"$\mathcal{L}(\theta)=\mathbb{E}_{\mathrm{regime}}\mathbb{E}_{t,k>0}\left[\left|q_k^\theta-q_k^\star\right|^2\right]$",
         )
         self.assertEqual(
-            fig_stab.axes[0].get_ylabel(),
-            r"$\mathcal{L}_{\mathrm{stab}}(\theta)=\lambda_q\mathcal{L}_q+\lambda_E\mathcal{L}_{E,\mathrm{window}}^{\mathrm{hyb}}+\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail},\mathrm{window}}^{\mathrm{hyb}}+\lambda_{\mathrm{reg}}\|\theta\|_2^2$",
+            fig_traj.axes[0].get_ylabel(),
+            r"$\mathcal{L}_{\mathrm{traj}}(\theta)=\lambda_E\mathcal{L}_E+\lambda_{\mathrm{dist}}\mathcal{L}_{\delta f}+\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail}}+\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+\lambda_{\mathrm{reg}}\|\theta\|_2^2$",
         )
         self.assertEqual(
             fig_hybrid.axes[0].get_ylabel(),
             r"$\mathcal{L}_{\mathrm{traj+q}}(\theta)=\lambda_q\mathcal{L}_q+\lambda_E\mathcal{L}_E+\lambda_{\mathrm{dist}}\mathcal{L}_{\delta f}+\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail}}+\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+\lambda_{\mathrm{reg}}\|\theta\|_2^2$",
         )
         plt.close(fig_q)
-        plt.close(fig_stab)
+        plt.close(fig_traj)
         plt.close(fig_hybrid)
 
     def test_training_and_nonlinear_visualizations_save(self) -> None:
