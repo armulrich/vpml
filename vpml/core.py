@@ -304,6 +304,7 @@ class LearnedInterfaceClosure:
     context_lags: int = 0
     base_input_dim: Optional[int] = None
     rollout_horizon: int = 0
+    rollout_anchor_samples: int = 0
     tail_start_fraction: float = 2.0 / 3.0
     loss_backend: Optional[str] = None
     lambda_q: float = 1.0
@@ -336,6 +337,8 @@ class LearnedInterfaceClosure:
             raise ValueError("context_lags must be nonnegative")
         if int(self.rollout_horizon) < 0:
             raise ValueError("rollout_horizon must be nonnegative")
+        if int(self.rollout_anchor_samples) < 0:
+            raise ValueError("rollout_anchor_samples must be nonnegative")
         if not (0.0 < float(self.tail_start_fraction) <= 1.0):
             raise ValueError("tail_start_fraction must lie in (0, 1]")
         if str(self.train_objective) not in {"q_only", "trajectory", "trajectory_q_hybrid"}:
@@ -493,6 +496,7 @@ def save_learned_interface_closure_npz(
         "context_lags": np.array([int(learned.context_lags)], dtype=np.int32),
         "base_input_dim": np.array([int(learned.raw_base_dim if learned.base_input_dim is None else learned.base_input_dim)], dtype=np.int32),
         "rollout_horizon": np.array([int(learned.rollout_horizon)], dtype=np.int32),
+        "rollout_anchor_samples": np.array([int(learned.rollout_anchor_samples)], dtype=np.int32),
         "tail_start_fraction": np.array([float(learned.tail_start_fraction)], dtype=np.float64),
         "loss_backend": np.array([] if learned.loss_backend is None else [str(learned.loss_backend)], dtype=np.str_),
         "lambda_q": np.array([float(learned.lambda_q)], dtype=np.float64),
@@ -619,6 +623,11 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "rollout_horizon" in data.files and data["rollout_horizon"].size
             else 0
         )
+        rollout_anchor_samples = (
+            int(np.asarray(data["rollout_anchor_samples"]).reshape(-1)[0])
+            if "rollout_anchor_samples" in data.files and data["rollout_anchor_samples"].size
+            else 0
+        )
         tail_start_fraction = (
             float(np.asarray(data["tail_start_fraction"]).reshape(-1)[0])
             if "tail_start_fraction" in data.files and data["tail_start_fraction"].size
@@ -699,6 +708,7 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         context_lags=context_lags,
         base_input_dim=base_input_dim,
         rollout_horizon=rollout_horizon,
+        rollout_anchor_samples=rollout_anchor_samples,
         tail_start_fraction=tail_start_fraction,
         loss_backend=loss_backend,
         lambda_q=lambda_q,
@@ -874,7 +884,10 @@ def learned_interface_q_hat(
     )
     raw_features = scale_learned_closure_raw_features(raw_features, learned)
     pred = learned.predict_q_components(raw_features)
-    if str(learned.training_mode) == "online_rollout":
+    if (
+        str(learned.training_mode) == "online_rollout"
+        and str(learned.loss_backend) == "field_distribution_v1"
+    ):
         # Keep solver-in-the-loop optimization in a numerically stable regime
         # while preserving full JAX differentiability.
         clip = jnp.asarray([0.25, 0.75], dtype=jnp.float64)

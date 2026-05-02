@@ -47,6 +47,8 @@ from vpml.core import (
     init_interface_closure_params,
     irfft_x,
     learned_boundary_flux_hat,
+    learned_interface_q_hat,
+    load_learned_interface_closure_npz,
     normalize_teacher_backend_name,
     rfft_x,
     scale_learned_closure_raw_features,
@@ -65,7 +67,7 @@ from vpml.physical_grid import (
     project_distribution_snapshot_to_fourier_hermite,
     run_semilagrangian_vlasov_poisson,
 )
-from vpml.visualization.training import save_training_loss_plot
+from vpml.visualization.training import save_training_loss_plot, save_training_loss_q_diagnostic_plot
 
 try:
     jax.config.update("jax_enable_x64", True)
@@ -77,11 +79,34 @@ REGIME_WEAK = "nonlinear_landau_weak"
 REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
-ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v1"
+ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v3"
 ONLINE_HYBRID_LOSS_DEFINITION = "q_trajectory_field_distribution_v1"
 ONLINE_TRAINING_MODE = "online_rollout"
 OFFLINE_TRAINING_MODE = "offline_rollout"
 ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR = "fourier_hermite_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR = "fourier_hermite_closure_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR = "fourier_hermite_closure_detached_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR = "fourier_hermite_closure_action_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR = "fourier_hermite_boundary_step_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR = "fourier_hermite_posterior_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR = "fourier_hermite_projected_xv_bidir"
+ONLINE_ROLLOUT_DIRECTION_BIDIR = "bidir"
+ONLINE_ROLLOUT_DIRECTION_FORWARD = "forward"
+ALL_ONLINE_ROLLOUT_DIRECTIONS = (
+    ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    ONLINE_ROLLOUT_DIRECTION_FORWARD,
+)
+ALL_ONLINE_LOSS_BACKENDS = (
+    ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR,
+)
 ALL_TEACHER_BACKENDS = (
     GRID_CUBIC_SPLINE_TEACHER_BACKEND,
     HIGHER_ORDER_HERMITE_TEACHER_BACKEND,
@@ -98,6 +123,62 @@ def parse_float_tuple(text: str) -> Tuple[float, ...]:
 
 def parse_str_tuple(text: str) -> Tuple[str, ...]:
     return tuple(part.strip() for part in text.split(",") if part.strip())
+
+
+def online_reference_coeff_key(target_nv: int) -> str:
+    return f"a_hat_ref_nv{int(target_nv)}"
+
+
+def online_reference_q_key(target_nv: int) -> str:
+    return f"q_hat_ref_nv{int(target_nv)}"
+
+
+def online_loss_backend_uses_projected_coefficients(backend: str) -> bool:
+    return str(backend) in {
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR,
+    }
+
+
+def online_loss_backend_uses_closure_q(backend: str) -> bool:
+    return str(backend) in {
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
+    }
+
+
+def online_loss_backend_uses_action_q(backend: str) -> bool:
+    return str(backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR
+
+
+def online_loss_backend_uses_boundary_step(backend: str) -> bool:
+    return str(backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR
+
+
+def online_loss_backend_uses_posterior_rollout(backend: str) -> bool:
+    return str(backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR
+
+
+def online_loss_backend_uses_projected_xv(backend: str) -> bool:
+    return str(backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR
+
+
+def online_reference_num_cases(payload: Dict[str, Array]) -> int:
+    if "E_hat_ref" in payload:
+        return int(np.asarray(payload["E_hat_ref"]).shape[0])
+    for key, value in payload.items():
+        if str(key).startswith("a_hat_ref_nv"):
+            return int(np.asarray(value).shape[0])
+    for key, value in payload.items():
+        if str(key).startswith("q_hat_ref_nv"):
+            return int(np.asarray(value).shape[0])
+    return 0
 
 
 def build_dataset_cache_metadata(
@@ -194,8 +275,11 @@ def build_online_reference_cache_metadata(
     strong_eps: Sequence[float],
     val_fraction: float,
     online_v_probes: int,
+    online_loss_backend: str,
+    Nv_targets: Optional[Sequence[int]] = None,
+    rollout_horizon: int = 0,
 ) -> Dict[str, np.ndarray]:
-    return {
+    payload = {
         "dataset_format": np.array([ONLINE_REFERENCE_CACHE_FORMAT], dtype=np.str_),
         "regimes": np.asarray(tuple(regimes), dtype=np.str_),
         "teacher_backend": np.array([GRID_CUBIC_SPLINE_TEACHER_BACKEND], dtype=np.str_),
@@ -218,7 +302,12 @@ def build_online_reference_cache_metadata(
         "strong_eps": np.asarray(tuple(float(v) for v in strong_eps), dtype=np.float64),
         "val_fraction": np.array([float(val_fraction)], dtype=np.float64),
         "online_v_probes": np.array([int(online_v_probes)], dtype=np.int32),
+        "online_loss_backend": np.array([str(online_loss_backend)], dtype=np.str_),
+        "rollout_horizon": np.array([int(rollout_horizon)], dtype=np.int32),
     }
+    if Nv_targets is not None:
+        payload["Nv_targets"] = np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32)
+    return payload
 
 
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
@@ -1372,6 +1461,49 @@ def build_physical_reference_episode(
     }
 
 
+def build_projected_reference_episode(
+    config: PhysicalGridVlasovPoissonConfig,
+    perturbation_x: Array,
+    *,
+    projection_orders: Sequence[int],
+    stored_projection_orders: Optional[Sequence[int]] = None,
+    closure_q_targets: Sequence[int] = (),
+) -> Dict[str, Array]:
+    coeff_histories, k_arr = _run_landau_teacher_projected_histories(
+        config,
+        perturbation_x,
+        projection_orders=projection_orders,
+        history_stride=1,
+    )
+    stored_orders = (
+        tuple(int(order) for order in projection_orders)
+        if stored_projection_orders is None
+        else tuple(int(order) for order in stored_projection_orders)
+    )
+    payload: Dict[str, Array] = {}
+    for order in stored_orders:
+        payload[online_reference_coeff_key(int(order))] = jnp.asarray(
+            coeff_histories[int(order)],
+            dtype=jnp.complex128,
+        )
+    k_arr_j = jnp.asarray(k_arr, dtype=jnp.float64)
+    for target_nv in closure_q_targets:
+        target_i = int(target_nv)
+        projection_order = target_i + 1
+        if projection_order not in coeff_histories:
+            raise ValueError(
+                f"closure q target Nv={target_i} requires projected coefficient order {projection_order}"
+            )
+        coeff_hist = jnp.asarray(coeff_histories[projection_order], dtype=jnp.complex128)
+        payload[online_reference_q_key(target_i)] = (
+            -1j
+            * k_arr_j[None, :]
+            * math.sqrt(float(target_i))
+            * coeff_hist[:, target_i, :]
+        ).astype(jnp.complex128)
+    return payload
+
+
 def build_online_reference_dataset(
     *,
     dataset_cache: Optional[Path],
@@ -1395,7 +1527,15 @@ def build_online_reference_dataset(
     strong_eps: Sequence[float],
     val_fraction: float,
     online_v_probes: int,
+    online_loss_backend: str,
+    Nv_targets: Sequence[int],
+    rollout_horizon: int,
 ) -> Tuple[Dict[str, Dict[str, Dict[str, Array]]], Array]:
+    effective_online_v_probes = (
+        int(online_v_probes)
+        if str(online_loss_backend) == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+        else 0
+    )
     cache_metadata = build_online_reference_cache_metadata(
         regimes=regimes,
         teacher_Nx=teacher_Nx,
@@ -1416,7 +1556,14 @@ def build_online_reference_dataset(
         weak_eps=weak_eps,
         strong_eps=strong_eps,
         val_fraction=val_fraction,
-        online_v_probes=online_v_probes,
+        online_v_probes=effective_online_v_probes,
+        online_loss_backend=online_loss_backend,
+        Nv_targets=(
+            tuple(int(v) for v in Nv_targets)
+            if online_loss_backend_uses_projected_coefficients(str(online_loss_backend))
+            else None
+        ),
+        rollout_horizon=rollout_horizon,
     )
     if dataset_cache is not None and dataset_cache.exists():
         try:
@@ -1429,8 +1576,102 @@ def build_online_reference_dataset(
         except ValueError as exc:
             print(f"[data] ignoring incompatible online reference cache {dataset_cache}: {exc}")
 
-    v_probe = jnp.linspace(float(teacher_vmin), float(teacher_vmax), int(online_v_probes), dtype=jnp.float64)
+    if str(online_loss_backend) == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1:
+        v_probe = jnp.linspace(float(teacher_vmin), float(teacher_vmax), effective_online_v_probes, dtype=jnp.float64)
+    else:
+        v_probe = jnp.zeros((0,), dtype=jnp.float64)
     dataset: Dict[str, Dict[str, Dict[str, Array]]] = {}
+
+    if online_loss_backend_uses_projected_coefficients(str(online_loss_backend)):
+        target_nvs = tuple(sorted({int(v) for v in Nv_targets}))
+        if not target_nvs:
+            raise ValueError(f"{online_loss_backend} requires at least one target Nv")
+        if int(rollout_horizon) <= 0:
+            raise ValueError(f"{online_loss_backend} requires rollout_horizon > 0")
+        closure_q_targets = (
+            target_nvs
+            if (
+                online_loss_backend_uses_closure_q(str(online_loss_backend))
+                or online_loss_backend_uses_projected_xv(str(online_loss_backend))
+            )
+            else ()
+        )
+        projection_orders = tuple(sorted(
+            set(target_nvs).union({int(v) + 1 for v in closure_q_targets})
+        ))
+
+        if REGIME_LINEAR in regimes:
+            config = PhysicalGridVlasovPoissonConfig(
+                Nx=int(teacher_Nx),
+                Nv=int(teacher_Nv),
+                Lx=float(teacher_L),
+                vmin=float(teacher_vmin),
+                vmax=float(teacher_vmax),
+                dt=float(teacher_dt),
+                T=float(linear_T),
+                poisson_sign=float(linear_poisson_sign),
+                snapshot_times=(),
+            )
+            rng = np.random.default_rng(int(linear_seed))
+            x = np.asarray(config.x, dtype=np.float64)
+            payloads: List[Dict[str, Array]] = []
+            for _ in range(int(linear_num_samples)):
+                perturb = sample_initial_condition(rng, x, linear_modes, linear_eps)
+                payload = build_projected_reference_episode(
+                    config,
+                    perturb,
+                    projection_orders=projection_orders,
+                    stored_projection_orders=target_nvs,
+                    closure_q_targets=closure_q_targets,
+                )
+                payloads.append(payload)
+            train_payloads, val_payloads = _split_episode_payloads(payloads, val_fraction=val_fraction)
+            dataset[REGIME_LINEAR] = {
+                "train": _stack_episode_payloads(train_payloads),
+                "val": _stack_episode_payloads(val_payloads),
+            }
+
+        nonlinear_config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(teacher_Nx),
+            Nv=int(teacher_Nv),
+            Lx=float(teacher_L),
+            vmin=float(teacher_vmin),
+            vmax=float(teacher_vmax),
+            dt=float(teacher_dt),
+            T=float(nonlinear_T),
+            poisson_sign=float(nonlinear_poisson_sign),
+            snapshot_times=(),
+        )
+        perturb_template = np.cos(float(nonlinear_k0) * np.asarray(nonlinear_config.x, dtype=np.float64))
+
+        for regime_name, eps_values in ((REGIME_WEAK, weak_eps), (REGIME_STRONG, strong_eps)):
+            if regime_name not in regimes:
+                continue
+            payloads = []
+            for eps in eps_values:
+                payloads.append(
+                    build_projected_reference_episode(
+                        nonlinear_config,
+                        float(eps) * perturb_template,
+                        projection_orders=projection_orders,
+                        stored_projection_orders=target_nvs,
+                        closure_q_targets=closure_q_targets,
+                    )
+                )
+            train_payloads, val_payloads = _split_episode_payloads(payloads, val_fraction=val_fraction)
+            dataset[regime_name] = {
+                "train": _stack_episode_payloads(train_payloads),
+                "val": _stack_episode_payloads(val_payloads),
+            }
+
+        if dataset_cache is not None:
+            save_online_reference_cache(
+                dataset_cache,
+                dataset,
+                v_probe=v_probe,
+                metadata=cache_metadata,
+            )
+        return dataset, v_probe
 
     if REGIME_LINEAR in regimes:
         config = PhysicalGridVlasovPoissonConfig(
@@ -1638,6 +1879,7 @@ def build_learned_interface_closure(
     train_objective: str = "q_only",
     context_mode: str = "none",
     rollout_horizon: int = 0,
+    rollout_anchor_samples: int = 0,
     tail_start_fraction: float = 2.0 / 3.0,
     loss_backend: Optional[str] = None,
     lambda_q: float = 1.0,
@@ -1678,6 +1920,7 @@ def build_learned_interface_closure(
         context_lags=1 if str(context_mode) == "lag1_delta" else 0,
         base_input_dim=2 * int(Nm) + 4,
         rollout_horizon=int(rollout_horizon),
+        rollout_anchor_samples=int(rollout_anchor_samples),
         tail_start_fraction=float(tail_start_fraction),
         loss_backend=None if loss_backend is None else str(loss_backend),
         lambda_q=float(lambda_q),
@@ -1945,6 +2188,28 @@ def _rollout_k_weights(nk: int) -> Array:
     return weights
 
 
+def _rollout_step_weights(nt: int) -> Array:
+    if int(nt) <= 1:
+        return jnp.ones((int(nt),), dtype=jnp.float64)
+    ramp = jnp.linspace(0.0, 1.0, int(nt), dtype=jnp.float64)
+    return 1.0 + 3.0 * (ramp ** 2)
+
+
+def _rollout_n_weights(nv: int) -> Array:
+    nv_i = int(nv)
+    weights = jnp.ones((nv_i,), dtype=jnp.float64)
+    if nv_i <= 0:
+        return weights
+    weights = weights.at[0].set(8.0)
+    if nv_i > 1:
+        tail_start = min(int(math.ceil((2.0 / 3.0) * float(nv_i))), nv_i - 1)
+        count = nv_i - tail_start
+        if count > 0:
+            tail_ramp = 1.0 + 7.0 * (jnp.linspace(0.0, 1.0, count, dtype=jnp.float64) ** 2)
+            weights = weights.at[tail_start:].set(jnp.maximum(weights[tail_start:], tail_ramp))
+    return weights
+
+
 def online_trajectory_loss_terms(
     a_hat_hist: Array,
     *,
@@ -1991,6 +2256,973 @@ def online_trajectory_loss_terms(
     neg_den = jnp.mean(eq_probe ** 2) + 1e-30
     neg_loss = neg_num / neg_den
     return field_loss, dist_loss, tail_loss, neg_loss
+
+
+def online_full_state_loss_terms(
+    pred_a_hat_hist: Array,
+    ref_a_hat_hist: Array,
+) -> Tuple[Array, Array]:
+    pred_a_hat_hist = jnp.asarray(pred_a_hat_hist, dtype=jnp.complex128)
+    ref_a_hat_hist = jnp.asarray(ref_a_hat_hist, dtype=jnp.complex128)
+    time_weights = _rollout_step_weights(int(ref_a_hat_hist.shape[0]))
+    n_weights = _rollout_n_weights(int(ref_a_hat_hist.shape[1]))
+    k_weights = _rollout_k_weights(int(ref_a_hat_hist.shape[2]))
+    weights = (
+        time_weights[:, None, None]
+        * n_weights[None, :, None]
+        * k_weights[None, None, :]
+    )
+    num = jnp.sum(weights * (jnp.abs(pred_a_hat_hist - ref_a_hat_hist) ** 2))
+    den = jnp.sum(weights * (jnp.abs(ref_a_hat_hist) ** 2))
+    return num, den
+
+
+def online_projected_xv_loss_terms(
+    pred_a_hat_hist: Array,
+    ref_a_hat_hist: Array,
+    *,
+    Nx: int,
+    Lx: float,
+    v_grid: Array,
+    vth: float = 1.0,
+    tail_window: int = 0,
+) -> Array:
+    """Relative projected physical-space L2 loss induced by the reconstruction basis.
+
+    The common equilibrium f0 cancels in the difference, so reconstructing the
+    perturbation delta-f is enough for the physical-space distribution error.  When
+    ``tail_window`` is set, both numerator and denominator are restricted to the
+    same closure-adjacent Hermite window so the loss measures error relative to
+    the scale of the tail the closure is supposed to control.
+    """
+    pred_a_hat_hist = jnp.asarray(pred_a_hat_hist, dtype=jnp.complex128)
+    ref_a_hat_hist = jnp.asarray(ref_a_hat_hist, dtype=jnp.complex128)
+    diff_a_hat = pred_a_hat_hist - ref_a_hat_hist
+    ref_scale_a_hat = ref_a_hat_hist
+    if int(tail_window) > 0 and int(tail_window) < int(diff_a_hat.shape[1]):
+        tail_start = int(diff_a_hat.shape[1]) - int(tail_window)
+        n_mask = (jnp.arange(int(diff_a_hat.shape[1])) >= tail_start).astype(jnp.float64)
+        n_mask = n_mask[None, :, None]
+        diff_a_hat = diff_a_hat * n_mask
+        ref_scale_a_hat = ref_scale_a_hat * n_mask
+    diff_delta_f = reconstruct_delta_f_from_a_hat_history(
+        diff_a_hat,
+        Nx=int(Nx),
+        v_probe=v_grid,
+        vth=float(vth),
+    )
+    ref_delta_f = reconstruct_delta_f_from_a_hat_history(
+        ref_scale_a_hat,
+        Nx=int(Nx),
+        v_probe=v_grid,
+        vth=float(vth),
+    )
+    v_grid = jnp.asarray(v_grid, dtype=jnp.float64)
+    loss_v = jnp.trapezoid(diff_delta_f ** 2, x=v_grid, axis=1)
+    ref_v = jnp.trapezoid(ref_delta_f ** 2, x=v_grid, axis=1)
+    dx = jnp.asarray(float(Lx) / float(Nx), dtype=jnp.float64)
+    num_t = dx * jnp.sum(loss_v, axis=1)
+    den_t = dx * jnp.sum(ref_v, axis=1)
+    return jnp.sum(num_t / (den_t + 1e-30))
+
+
+def online_field_hat_loss_terms(
+    pred_a_hat_hist: Array,
+    ref_a_hat_hist: Array,
+    *,
+    k_arr: Array,
+    poisson_sign: float,
+) -> Tuple[Array, Array]:
+    pred_e_hat_hist = e_hat_history_from_a_hat_history(
+        jnp.asarray(pred_a_hat_hist, dtype=jnp.complex128),
+        jnp.asarray(k_arr, dtype=jnp.float64),
+        poisson_sign=float(poisson_sign),
+    )
+    ref_e_hat_hist = e_hat_history_from_a_hat_history(
+        jnp.asarray(ref_a_hat_hist, dtype=jnp.complex128),
+        jnp.asarray(k_arr, dtype=jnp.float64),
+        poisson_sign=float(poisson_sign),
+    )
+    time_weights = _rollout_step_weights(int(ref_e_hat_hist.shape[0]))
+    k_weights = _rollout_k_weights(int(ref_e_hat_hist.shape[1]))
+    weights = time_weights[:, None] * k_weights[None, :]
+    num = jnp.sum(weights * (jnp.abs(pred_e_hat_hist - ref_e_hat_hist) ** 2))
+    den = jnp.sum(weights * (jnp.abs(ref_e_hat_hist) ** 2))
+    return num, den
+
+
+def online_closure_flux_loss_terms(
+    pred_q_hat_hist: Array,
+    ref_q_hat_hist: Array,
+) -> Tuple[Array, Array]:
+    pred_q_hat_hist = jnp.asarray(pred_q_hat_hist, dtype=jnp.complex128)
+    ref_q_hat_hist = jnp.asarray(ref_q_hat_hist, dtype=jnp.complex128)
+    time_weights = _rollout_step_weights(int(ref_q_hat_hist.shape[0]))
+    k_weights = _rollout_k_weights(int(ref_q_hat_hist.shape[1]))
+    weights = time_weights[:, None] * k_weights[None, :]
+    num = jnp.sum(weights * (jnp.abs(pred_q_hat_hist - ref_q_hat_hist) ** 2))
+    den = jnp.sum(weights * (jnp.abs(ref_q_hat_hist) ** 2))
+    return num, den
+
+
+def online_direct_q_relative_mse_for_history(
+    ref_a_hat_hist: Array,
+    ref_q_hat_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    k_arr: Array,
+    Nv: int,
+) -> Array:
+    """Diagnostic only: direct teacher-q error on reference states.
+
+    This is not added to the online objective. It checks whether a rollout loss
+    that is decreasing is also learning the actual boundary flux q_k.
+    """
+    ref_a_hat_hist = jnp.asarray(ref_a_hat_hist, dtype=jnp.complex128)
+    ref_q_hat_hist = jnp.asarray(ref_q_hat_hist, dtype=jnp.complex128)
+    if int(ref_a_hat_hist.shape[0]) > 1:
+        states = ref_a_hat_hist[1:]
+        prev_states = ref_a_hat_hist[:-1]
+        targets = ref_q_hat_hist[1:]
+    else:
+        states = ref_a_hat_hist
+        prev_states = ref_a_hat_hist
+        targets = ref_q_hat_hist
+
+    preds = jax.vmap(
+        lambda state, prev_state: learned_interface_q_hat(
+            state,
+            k_arr,
+            int(Nv),
+            learned,
+            a_hat_prev=prev_state,
+        )
+    )(states, prev_states)
+    diff = preds[:, 1:] - targets[:, 1:]
+    target = targets[:, 1:]
+    num = jnp.sum(jnp.abs(diff) ** 2)
+    den = jnp.sum(jnp.abs(target) ** 2)
+    return num / (den + 1e-30)
+
+
+def _closure_action_response(integ: FourierHermiteIMEX) -> Array:
+    """Linear CNAB2 response of the next state to a unit current-step closure q."""
+    basis = jnp.zeros((int(integ.Nv), int(integ.Nk)), dtype=jnp.complex128)
+    basis = basis.at[int(integ.Nv) - 1].set(1.0 + 0.0j)
+    rhs = float(integ.dt) * 1.5 * basis
+    response = integ.implicit_solve(integ.apply_mask_hat(rhs))
+    return integ.apply_mask_hat(response)
+
+
+def _closure_action_q_target_from_state_response(
+    *,
+    base_next: Array,
+    ref_next: Array,
+    response: Array,
+) -> Array:
+    """Infer the current closure q that best corrects the next retained state."""
+    response = jnp.asarray(response, dtype=jnp.complex128)
+    residual = (
+        jnp.asarray(ref_next, dtype=jnp.complex128)
+        - jnp.asarray(base_next, dtype=jnp.complex128)
+    )
+    n_weights = _rollout_n_weights(int(response.shape[0]))[:, None]
+    numerator = jnp.sum(n_weights * jnp.conj(response) * residual, axis=0)
+    denom = jnp.sum(n_weights * (jnp.abs(response) ** 2), axis=0)
+    q_target = jnp.where(
+        denom > 1e-30,
+        numerator / (denom + 1e-30),
+        jnp.zeros_like(numerator),
+    )
+    if q_target.shape[0] > 0:
+        q_target = q_target.at[0].set(0.0 + 0.0j)
+    return jax.lax.stop_gradient(q_target.astype(jnp.complex128))
+
+
+def _safe_history_state(ref_hist: Array, idx: Array) -> Array:
+    idx = jnp.asarray(idx, dtype=jnp.int32)
+    idx_clip = jnp.clip(idx, 0, int(ref_hist.shape[0]) - 1)
+    return ref_hist[idx_clip]
+
+
+def _linear_explicit_n_hat_for_state(
+    a_hat: Array,
+    *,
+    integ: FourierHermiteIMEX,
+    poisson_sign: float,
+) -> Array:
+    m_eq = jnp.zeros((int(integ.Nv),), dtype=jnp.float64).at[0].set(1.0)
+    return linear_explicit_N_hat(
+        a_hat,
+        integ,
+        m_eq,
+        poisson_sign=float(poisson_sign),
+        dissipation=None,
+    )
+
+
+def _nonlinear_explicit_n_hat_for_state(
+    a_hat: Array,
+    *,
+    integ: FourierHermiteIMEX,
+    poisson_sign: float,
+) -> Array:
+    m_eq = jnp.zeros((int(integ.Nv),), dtype=jnp.float64).at[0].set(1.0)
+    a_phys = irfft_x(a_hat, int(integ.Nx))
+    e_phys = integ.E_phys_from_a_hat(a_hat, poisson_sign=float(poisson_sign))
+    n_phys = jnp.zeros_like(a_phys)
+    n_phys = n_phys.at[1:].set(
+        -(integ.sqrt_n[1:, None] / float(integ.vth))
+        * e_phys[None, :]
+        * (a_phys[:-1] + m_eq[:-1, None])
+    )
+    return integ.apply_mask_hat(rfft_x(n_phys))
+
+
+def rollout_from_anchor_state(
+    ref_hist: Array,
+    *,
+    anchor_idx: Array,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    direction: int,
+    explicit_n_hat_fn,
+) -> Array:
+    direction_i = int(direction)
+    if direction_i not in {-1, 1}:
+        raise ValueError(f"direction must be +/-1, got {direction!r}")
+    anchor_idx = jnp.asarray(anchor_idx, dtype=jnp.int32)
+    current_state = _safe_history_state(ref_hist, anchor_idx)
+    prev_state = _safe_history_state(ref_hist, anchor_idx - direction_i)
+    prev_prev_state = _safe_history_state(ref_hist, anchor_idx - 2 * direction_i)
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+
+    def step(carry, _):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        n_hat = explicit_n_hat_fn(state, integ=integ)
+        b_hat = learned_boundary_flux_hat(
+            state,
+            integ.k_arr,
+            integ.Nv,
+            integ.vth,
+            learned,
+            a_hat_prev=state_prev,
+        )
+        state_new = integ.step_cnab2(
+            state,
+            n_hat,
+            n_prev_step,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step,
+        )
+        return (state_new, state, n_hat, b_hat), state_new
+
+    init = (current_state, prev_state, n_prev, b_prev)
+    (_, _, _, _), states = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
+    return states
+
+
+def rollout_closure_flux_from_anchor_state(
+    ref_hist: Array,
+    *,
+    anchor_idx: Array,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    direction: int,
+    explicit_n_hat_fn,
+    detach_rollout_state_for_q: bool = False,
+) -> Array:
+    direction_i = int(direction)
+    if direction_i not in {-1, 1}:
+        raise ValueError(f"direction must be +/-1, got {direction!r}")
+    anchor_idx = jnp.asarray(anchor_idx, dtype=jnp.int32)
+    current_state = _safe_history_state(ref_hist, anchor_idx)
+    prev_state = _safe_history_state(ref_hist, anchor_idx - direction_i)
+    prev_prev_state = _safe_history_state(ref_hist, anchor_idx - 2 * direction_i)
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+
+    def step(carry, _):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        n_hat = explicit_n_hat_fn(state, integ=integ)
+        q_state = jax.lax.stop_gradient(state) if bool(detach_rollout_state_for_q) else state
+        q_state_prev = (
+            jax.lax.stop_gradient(state_prev)
+            if bool(detach_rollout_state_for_q)
+            else state_prev
+        )
+        q_hat = learned_interface_q_hat(
+            q_state,
+            integ.k_arr,
+            integ.Nv,
+            learned,
+            a_hat_prev=q_state_prev,
+        )
+        b_hat = jnp.zeros_like(state, dtype=jnp.complex128).at[int(integ.Nv) - 1].set(q_hat)
+        state_new = integ.step_cnab2(
+            state,
+            n_hat,
+            n_prev_step,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step,
+        )
+        q_state_new = (
+            jax.lax.stop_gradient(state_new)
+            if bool(detach_rollout_state_for_q)
+            else state_new
+        )
+        q_state_new_prev = (
+            jax.lax.stop_gradient(state)
+            if bool(detach_rollout_state_for_q)
+            else state
+        )
+        q_new = learned_interface_q_hat(
+            q_state_new,
+            integ.k_arr,
+            integ.Nv,
+            learned,
+            a_hat_prev=q_state_new_prev,
+        )
+        if bool(detach_rollout_state_for_q):
+            return (
+                jax.lax.stop_gradient(state_new),
+                jax.lax.stop_gradient(state),
+                jax.lax.stop_gradient(n_hat),
+                jax.lax.stop_gradient(b_hat),
+            ), q_new
+        return (state_new, state, n_hat, b_hat), q_new
+
+    init = (current_state, prev_state, n_prev, b_prev)
+    (_, _, _, _), q_hist = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
+    return q_hist
+
+
+def rollout_closure_action_from_anchor_state(
+    ref_hist: Array,
+    *,
+    anchor_idx: Array,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    direction: int,
+    explicit_n_hat_fn,
+) -> Tuple[Array, Array]:
+    direction_i = int(direction)
+    if direction_i not in {-1, 1}:
+        raise ValueError(f"direction must be +/-1, got {direction!r}")
+    anchor_idx = jnp.asarray(anchor_idx, dtype=jnp.int32)
+    current_state = _safe_history_state(ref_hist, anchor_idx)
+    prev_state = _safe_history_state(ref_hist, anchor_idx - direction_i)
+    prev_prev_state = _safe_history_state(ref_hist, anchor_idx - 2 * direction_i)
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+    response = _closure_action_response(integ)
+    offsets = direction_i * jnp.arange(1, int(rollout_horizon) + 1, dtype=jnp.int32)
+    ref_next_hist = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
+
+    def step(carry, ref_next):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        state_sg = jax.lax.stop_gradient(state)
+        state_prev_sg = jax.lax.stop_gradient(state_prev)
+        n_prev_step_sg = jax.lax.stop_gradient(n_prev_step)
+        b_prev_step_sg = jax.lax.stop_gradient(b_prev_step)
+        n_hat = explicit_n_hat_fn(state_sg, integ=integ)
+
+        zero_current = jnp.zeros_like(state_sg, dtype=jnp.complex128)
+        base_next = integ.step_cnab2(
+            state_sg,
+            n_hat,
+            n_prev_step_sg,
+            extra_hat=zero_current,
+            extra_hat_prev=b_prev_step_sg,
+        )
+        q_target = _closure_action_q_target_from_state_response(
+            base_next=base_next,
+            ref_next=ref_next,
+            response=response,
+        )
+        q_pred = learned_interface_q_hat(
+            state_sg,
+            integ.k_arr,
+            integ.Nv,
+            learned,
+            a_hat_prev=state_prev_sg,
+        )
+        b_hat = jnp.zeros_like(state_sg, dtype=jnp.complex128).at[int(integ.Nv) - 1].set(q_pred)
+        state_new = integ.step_cnab2(
+            state_sg,
+            n_hat,
+            n_prev_step_sg,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step_sg,
+        )
+        return (
+            jax.lax.stop_gradient(state_new),
+            state_sg,
+            jax.lax.stop_gradient(n_hat),
+            jax.lax.stop_gradient(b_hat),
+        ), (q_pred, q_target)
+
+    init = (
+        jax.lax.stop_gradient(current_state),
+        jax.lax.stop_gradient(prev_state),
+        jax.lax.stop_gradient(n_prev),
+        jax.lax.stop_gradient(b_prev),
+    )
+    (_, _, _, _), (q_pred_hist, q_target_hist) = jax.lax.scan(
+        step,
+        init,
+        ref_next_hist,
+        length=int(rollout_horizon),
+    )
+    return q_pred_hist, q_target_hist
+
+
+def rollout_boundary_step_from_anchor_state(
+    ref_hist: Array,
+    *,
+    anchor_idx: Array,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    direction: int,
+    explicit_n_hat_fn,
+) -> Tuple[Array, Array]:
+    direction_i = int(direction)
+    if direction_i not in {-1, 1}:
+        raise ValueError(f"direction must be +/-1, got {direction!r}")
+    anchor_idx = jnp.asarray(anchor_idx, dtype=jnp.int32)
+    current_state = _safe_history_state(ref_hist, anchor_idx)
+    prev_state = _safe_history_state(ref_hist, anchor_idx - direction_i)
+    prev_prev_state = _safe_history_state(ref_hist, anchor_idx - 2 * direction_i)
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+    offsets = direction_i * jnp.arange(1, int(rollout_horizon) + 1, dtype=jnp.int32)
+    ref_next_hist = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
+
+    def step(carry, ref_next):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        state_sg = jax.lax.stop_gradient(state)
+        state_prev_sg = jax.lax.stop_gradient(state_prev)
+        n_prev_step_sg = jax.lax.stop_gradient(n_prev_step)
+        b_prev_step_sg = jax.lax.stop_gradient(b_prev_step)
+        n_hat = explicit_n_hat_fn(state_sg, integ=integ)
+        b_hat = learned_boundary_flux_hat(
+            state_sg,
+            integ.k_arr,
+            integ.Nv,
+            integ.vth,
+            learned,
+            a_hat_prev=state_prev_sg,
+        )
+        state_new = integ.step_cnab2(
+            state_sg,
+            n_hat,
+            n_prev_step_sg,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step_sg,
+        )
+        return (
+            jax.lax.stop_gradient(state_new),
+            state_sg,
+            jax.lax.stop_gradient(n_hat),
+            jax.lax.stop_gradient(b_hat),
+        ), (state_new[int(integ.Nv) - 1], ref_next[int(integ.Nv) - 1])
+
+    init = (
+        jax.lax.stop_gradient(current_state),
+        jax.lax.stop_gradient(prev_state),
+        jax.lax.stop_gradient(n_prev),
+        jax.lax.stop_gradient(b_prev),
+    )
+    (_, _, _, _), (pred_boundary_hist, ref_boundary_hist) = jax.lax.scan(
+        step,
+        init,
+        ref_next_hist,
+        length=int(rollout_horizon),
+    )
+    return pred_boundary_hist, ref_boundary_hist
+
+
+def _select_rollout_anchor_indices(
+    *,
+    history_length: int,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+) -> Array:
+    num_valid = int(history_length) - 2 * int(rollout_horizon)
+    if num_valid <= 0:
+        raise ValueError(
+            f"Reference history length={int(history_length)} is too short for rollout_horizon={int(rollout_horizon)}"
+        )
+    if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= num_valid:
+        return jnp.arange(
+            int(rollout_horizon),
+            int(history_length) - int(rollout_horizon),
+            dtype=jnp.int32,
+        )
+    if int(rollout_anchor_samples) == 1:
+        return jnp.asarray(
+            [int(rollout_horizon) + ((num_valid - 1) // 2)],
+            dtype=jnp.int32,
+        )
+    sampled_positions = np.rint(
+        np.linspace(0, num_valid - 1, num=int(rollout_anchor_samples), dtype=np.float64)
+    ).astype(np.int32)
+    sampled_positions = np.unique(sampled_positions)
+    return jnp.asarray(int(rollout_horizon) + sampled_positions, dtype=jnp.int32)
+
+
+def online_fourier_hermite_bidir_loss_for_history(
+    ref_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+) -> Array:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_bidir")
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+    offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward = rollout_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_forward = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
+        num_forward, den_forward = online_full_state_loss_terms(pred_forward, ref_forward)
+
+        pred_backward = rollout_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_backward = jnp.take(ref_hist, anchor_idx - offsets, axis=0)
+        num_backward, den_backward = online_full_state_loss_terms(pred_backward, ref_backward)
+
+        return (
+            carry[0] + num_forward + num_backward,
+            carry[1] + den_forward + den_backward,
+        ), None
+
+    (num_total, den_total), _ = jax.lax.scan(
+        anchor_step,
+        (
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        ),
+        anchor_indices,
+    )
+    return num_total / (den_total + 1e-30)
+
+
+def online_fourier_hermite_posterior_bidir_components_for_history(
+    ref_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+    poisson_sign: float,
+    state_weight: float,
+    field_weight: float,
+) -> Tuple[Array, Array, Array]:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_posterior_bidir")
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+    offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward = rollout_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_forward = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
+        state_num_forward, state_den_forward = online_full_state_loss_terms(pred_forward, ref_forward)
+        field_num_forward, field_den_forward = online_field_hat_loss_terms(
+            pred_forward,
+            ref_forward,
+            k_arr=forward_integ.k_arr,
+            poisson_sign=float(poisson_sign),
+        )
+
+        pred_backward = rollout_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_backward = jnp.take(ref_hist, anchor_idx - offsets, axis=0)
+        state_num_backward, state_den_backward = online_full_state_loss_terms(pred_backward, ref_backward)
+        field_num_backward, field_den_backward = online_field_hat_loss_terms(
+            pred_backward,
+            ref_backward,
+            k_arr=backward_integ.k_arr,
+            poisson_sign=float(poisson_sign),
+        )
+
+        return (
+            carry[0] + state_num_forward + state_num_backward,
+            carry[1] + state_den_forward + state_den_backward,
+            carry[2] + field_num_forward + field_num_backward,
+            carry[3] + field_den_forward + field_den_backward,
+        ), None
+
+    (state_num, state_den, field_num, field_den), _ = jax.lax.scan(
+        anchor_step,
+        (
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        ),
+        anchor_indices,
+    )
+    state_loss = state_num / (state_den + 1e-30)
+    field_loss = field_num / (field_den + 1e-30)
+    total_loss = (
+        jnp.asarray(float(state_weight), dtype=jnp.float64) * state_loss
+        + jnp.asarray(float(field_weight), dtype=jnp.float64) * field_loss
+    )
+    return total_loss, state_loss, field_loss
+
+
+def online_fourier_hermite_projected_xv_bidir_loss_for_history(
+    ref_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+    v_grid: Array,
+    projected_xv_tail_window: int = 0,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+) -> Array:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_projected_xv_bidir")
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+    offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward = rollout_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_forward = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
+        loss_forward = online_projected_xv_loss_terms(
+            pred_forward,
+            ref_forward,
+            Nx=int(forward_integ.Nx),
+            Lx=float(forward_integ.Lx),
+            v_grid=v_grid,
+            tail_window=int(projected_xv_tail_window),
+        )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return carry + loss_forward, None
+
+        pred_backward = rollout_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_backward = jnp.take(ref_hist, anchor_idx - offsets, axis=0)
+        loss_backward = online_projected_xv_loss_terms(
+            pred_backward,
+            ref_backward,
+            Nx=int(backward_integ.Nx),
+            Lx=float(backward_integ.Lx),
+            v_grid=v_grid,
+            tail_window=int(projected_xv_tail_window),
+        )
+
+        return carry + loss_forward + loss_backward, None
+
+    loss_total, _ = jax.lax.scan(
+        anchor_step,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        anchor_indices,
+    )
+    direction_count = 1 if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD else 2
+    sample_count = jnp.asarray(
+        int(direction_count) * int(horizon) * int(anchor_indices.shape[0]),
+        dtype=jnp.float64,
+    )
+    return loss_total / sample_count
+
+
+def online_fourier_hermite_closure_bidir_loss_for_history(
+    ref_hist: Array,
+    ref_q_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+    detach_rollout_state_for_q: bool = False,
+) -> Array:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    ref_q_hist = jnp.asarray(ref_q_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_closure_bidir")
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+    offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward = rollout_closure_flux_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+            detach_rollout_state_for_q=bool(detach_rollout_state_for_q),
+        )
+        ref_forward = jnp.take(ref_q_hist, anchor_idx + offsets, axis=0)
+        num_forward, den_forward = online_closure_flux_loss_terms(pred_forward, ref_forward)
+
+        pred_backward = rollout_closure_flux_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+            detach_rollout_state_for_q=bool(detach_rollout_state_for_q),
+        )
+        ref_backward = jnp.take(ref_q_hist, anchor_idx - offsets, axis=0)
+        num_backward, den_backward = online_closure_flux_loss_terms(pred_backward, ref_backward)
+
+        return (
+            carry[0] + num_forward + num_backward,
+            carry[1] + den_forward + den_backward,
+        ), None
+
+    (num_total, den_total), _ = jax.lax.scan(
+        anchor_step,
+        (
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        ),
+        anchor_indices,
+    )
+    return num_total / (den_total + 1e-30)
+
+
+def online_fourier_hermite_closure_action_bidir_loss_for_history(
+    ref_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+) -> Array:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_closure_action_bidir")
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward, target_forward = rollout_closure_action_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        num_forward, den_forward = online_closure_flux_loss_terms(pred_forward, target_forward)
+
+        pred_backward, target_backward = rollout_closure_action_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        num_backward, den_backward = online_closure_flux_loss_terms(pred_backward, target_backward)
+
+        return (
+            carry[0] + num_forward + num_backward,
+            carry[1] + den_forward + den_backward,
+        ), None
+
+    (num_total, den_total), _ = jax.lax.scan(
+        anchor_step,
+        (
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        ),
+        anchor_indices,
+    )
+    return num_total / (den_total + 1e-30)
+
+
+def online_fourier_hermite_boundary_step_bidir_loss_for_history(
+    ref_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+) -> Array:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_boundary_step_bidir")
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward, ref_forward = rollout_boundary_step_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        num_forward, den_forward = online_closure_flux_loss_terms(pred_forward, ref_forward)
+
+        pred_backward, ref_backward = rollout_boundary_step_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        num_backward, den_backward = online_closure_flux_loss_terms(pred_backward, ref_backward)
+
+        return (
+            carry[0] + num_forward + num_backward,
+            carry[1] + den_forward + den_backward,
+        ), None
+
+    (num_total, den_total), _ = jax.lax.scan(
+        anchor_step,
+        (
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        ),
+        anchor_indices,
+    )
+    return num_total / (den_total + 1e-30)
 
 
 def make_online_hybrid_batch_loss(
@@ -2194,6 +3426,7 @@ def make_online_hybrid_batch_loss(
             total_loss = total_q + total_field + total_dist + total_tail + total_neg + reg_term
             return total_loss, {
                 "q": total_q,
+                "state": jnp.asarray(0.0, dtype=jnp.float64),
                 "field": total_field,
                 "dist": total_dist,
                 "tail": total_tail,
@@ -2218,6 +3451,859 @@ def make_online_hybrid_batch_loss(
 
     loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
     loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    return loss_fn, active_regimes
+
+
+def make_online_fourier_hermite_bidir_batch_loss(
+    *,
+    online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
+    regime_weights: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    loss_backend: str,
+    poisson_sign: float,
+    rollout_dealias_23: bool,
+    posterior_state_weight: float = 0.25,
+    posterior_field_weight: float = 1.0,
+    projected_xv_tail_window: int = 0,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+) -> Tuple[object, Sequence[str]]:
+    target_nvs = tuple(int(v) for v in Nv_targets)
+    if not target_nvs:
+        raise ValueError(f"{loss_backend} requires at least one target Nv")
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    if str(loss_backend) not in {
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR,
+    }:
+        raise ValueError(f"Unsupported Fourier-Hermite online backend {loss_backend!r}")
+    active_regimes = tuple(
+        regime
+        for regime in train_regimes
+        if regime in online_dataset
+        and bool(online_dataset[regime].get("train"))
+        and online_reference_num_cases(online_dataset[regime]["train"]) > 0
+    )
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    projected_xv_v_grid = jnp.linspace(
+        float(teacher_vmin),
+        float(teacher_vmax),
+        int(teacher_Nv),
+        dtype=jnp.float64,
+    )
+
+    linear_integrators = {
+        int(target_nv): (
+            FourierHermiteIMEX(
+                Nx=int(teacher_Nx),
+                Nv=int(target_nv),
+                Lx=float(teacher_Lx),
+                dt=float(teacher_dt),
+                vth=1.0,
+                dealias_23=False,
+                closure=None,
+            ),
+            FourierHermiteIMEX(
+                Nx=int(teacher_Nx),
+                Nv=int(target_nv),
+                Lx=float(teacher_Lx),
+                dt=-float(teacher_dt),
+                vth=1.0,
+                dealias_23=False,
+                closure=None,
+            ),
+        )
+        for target_nv in target_nvs
+    }
+    nonlinear_integrators = {
+        int(target_nv): (
+            FourierHermiteIMEX(
+                Nx=int(teacher_Nx),
+                Nv=int(target_nv),
+                Lx=float(teacher_Lx),
+                dt=float(teacher_dt),
+                vth=1.0,
+                dealias_23=bool(rollout_dealias_23),
+                closure=None,
+            ),
+            FourierHermiteIMEX(
+                Nx=int(teacher_Nx),
+                Nv=int(target_nv),
+                Lx=float(teacher_Lx),
+                dt=-float(teacher_dt),
+                vth=1.0,
+                dealias_23=bool(rollout_dealias_23),
+                closure=None,
+            ),
+        )
+        for target_nv in target_nvs
+    }
+
+    def mean_history_loss(
+        ref_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        forward_integ: FourierHermiteIMEX,
+        backward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
+    ) -> Array:
+        ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
+
+        def case_step(total, ref_hist):
+            loss = online_fourier_hermite_bidir_loss_for_history(
+                ref_hist,
+                learned=learned,
+                forward_integ=forward_integ,
+                backward_integ=backward_integ,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+            )
+            return total + loss, None
+
+        total, _ = jax.lax.scan(
+            case_step,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            ref_batch,
+        )
+        return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
+
+    def mean_posterior_history_loss(
+        ref_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        forward_integ: FourierHermiteIMEX,
+        backward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
+    ) -> Tuple[Array, Array, Array]:
+        ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
+
+        def case_step(carry, ref_hist):
+            loss, state_loss, field_loss = online_fourier_hermite_posterior_bidir_components_for_history(
+                ref_hist,
+                learned=learned,
+                forward_integ=forward_integ,
+                backward_integ=backward_integ,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+                poisson_sign=float(poisson_sign),
+                state_weight=float(posterior_state_weight),
+                field_weight=float(posterior_field_weight),
+            )
+            return (
+                carry[0] + loss,
+                carry[1] + state_loss,
+                carry[2] + field_loss,
+            ), None
+
+        (loss_total, state_total, field_total), _ = jax.lax.scan(
+            case_step,
+            (
+                jnp.asarray(0.0, dtype=jnp.float64),
+                jnp.asarray(0.0, dtype=jnp.float64),
+                jnp.asarray(0.0, dtype=jnp.float64),
+            ),
+            ref_batch,
+        )
+        scale = jnp.asarray(1.0 / float(ref_batch.shape[0]), dtype=jnp.float64)
+        return loss_total * scale, state_total * scale, field_total * scale
+
+    def mean_projected_xv_history_loss(
+        ref_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        forward_integ: FourierHermiteIMEX,
+        backward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
+    ) -> Array:
+        ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
+
+        def case_step(total, ref_hist):
+            loss = online_fourier_hermite_projected_xv_bidir_loss_for_history(
+                ref_hist,
+                learned=learned,
+                forward_integ=forward_integ,
+                backward_integ=backward_integ,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+                v_grid=projected_xv_v_grid,
+                projected_xv_tail_window=int(projected_xv_tail_window),
+                rollout_direction=direction_mode,
+            )
+            return total + loss, None
+
+        total, _ = jax.lax.scan(
+            case_step,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            ref_batch,
+        )
+        return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
+
+    def mean_direct_q_diagnostic(
+        ref_batch: Array,
+        ref_q_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        integ: FourierHermiteIMEX,
+    ) -> Array:
+        ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
+        ref_q_batch = jnp.asarray(ref_q_batch, dtype=jnp.complex128)
+
+        def case_step(total, inputs):
+            ref_hist, ref_q_hist = inputs
+            q_rel_mse = online_direct_q_relative_mse_for_history(
+                ref_hist,
+                ref_q_hist,
+                learned=learned,
+                k_arr=integ.k_arr,
+                Nv=int(integ.Nv),
+            )
+            return total + q_rel_mse, None
+
+        total, _ = jax.lax.scan(
+            case_step,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            (ref_batch, ref_q_batch),
+        )
+        return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
+
+    def mean_closure_history_loss(
+        ref_batch: Array,
+        ref_q_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        forward_integ: FourierHermiteIMEX,
+        backward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
+    ) -> Array:
+        ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
+        ref_q_batch = jnp.asarray(ref_q_batch, dtype=jnp.complex128)
+        detach_rollout_state_for_q = (
+            str(loss_backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR
+        )
+
+        def case_step(total, inputs):
+            ref_hist, ref_q_hist = inputs
+            if online_loss_backend_uses_action_q(str(loss_backend)):
+                loss = online_fourier_hermite_closure_action_bidir_loss_for_history(
+                    ref_hist,
+                    learned=learned,
+                    forward_integ=forward_integ,
+                    backward_integ=backward_integ,
+                    rollout_horizon=rollout_horizon,
+                    rollout_anchor_samples=rollout_anchor_samples,
+                    explicit_n_hat_fn=explicit_n_hat_fn,
+                )
+            else:
+                loss = online_fourier_hermite_closure_bidir_loss_for_history(
+                    ref_hist,
+                    ref_q_hist,
+                    learned=learned,
+                    forward_integ=forward_integ,
+                    backward_integ=backward_integ,
+                    rollout_horizon=rollout_horizon,
+                    rollout_anchor_samples=rollout_anchor_samples,
+                    explicit_n_hat_fn=explicit_n_hat_fn,
+                    detach_rollout_state_for_q=detach_rollout_state_for_q,
+                )
+            return total + loss, None
+
+        total, _ = jax.lax.scan(
+            case_step,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            (ref_batch, ref_q_batch),
+        )
+        return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
+
+    def mean_boundary_history_loss(
+        ref_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        forward_integ: FourierHermiteIMEX,
+        backward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
+    ) -> Array:
+        ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
+
+        def case_step(total, ref_hist):
+            loss = online_fourier_hermite_boundary_step_bidir_loss_for_history(
+                ref_hist,
+                learned=learned,
+                forward_integ=forward_integ,
+                backward_integ=backward_integ,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+            )
+            return total + loss, None
+
+        total, _ = jax.lax.scan(
+            case_step,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            ref_batch,
+        )
+        return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
+
+    def make_loss_fn_for_target(target_nv: int):
+        coeff_key = online_reference_coeff_key(int(target_nv))
+        q_key = online_reference_q_key(int(target_nv))
+        linear_forward, linear_backward = linear_integrators[int(target_nv)]
+        nonlinear_forward, nonlinear_backward = nonlinear_integrators[int(target_nv)]
+
+        def linear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _linear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def nonlinear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _nonlinear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def loss_fn_for_target(
+            params: Dict[str, Array],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            learned = build_learned_interface_closure(
+                params=params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=None,
+                n_low=n_low,
+                training_mode=ONLINE_TRAINING_MODE,
+                train_objective="trajectory",
+                context_mode=context_mode,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                loss_backend=str(loss_backend),
+                lambda_q=0.0,
+                lambda_E=0.0,
+                lambda_dist=0.0,
+                lambda_tail=0.0,
+                lambda_neg=0.0,
+                lambda_reg=0.0,
+                online_v_probes=0,
+            )
+            total_q = jnp.asarray(0.0, dtype=jnp.float64)
+            total_state = jnp.asarray(0.0, dtype=jnp.float64)
+            total_field = jnp.asarray(0.0, dtype=jnp.float64)
+            total_q_diag = jnp.asarray(0.0, dtype=jnp.float64)
+
+            for weight, regime in zip(weight_arr, active_regimes):
+                batch = regime_batches[regime]
+                ref_batch = jnp.asarray(batch[coeff_key], dtype=jnp.complex128)
+                ref_q_batch = (
+                    jnp.asarray(batch[q_key], dtype=jnp.complex128)
+                    if q_key in batch
+                    else None
+                )
+                if regime == REGIME_LINEAR:
+                    if ref_q_batch is not None:
+                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                            ref_batch,
+                            ref_q_batch,
+                            learned=learned,
+                            integ=linear_forward,
+                        )
+                    if online_loss_backend_uses_projected_xv(str(loss_backend)):
+                        state_terms = jax.vmap(
+                            lambda ref_hist: online_fourier_hermite_projected_xv_bidir_loss_for_history(
+                                ref_hist,
+                                learned=learned,
+                                forward_integ=linear_forward,
+                                backward_integ=linear_backward,
+                                rollout_horizon=rollout_horizon,
+                                rollout_anchor_samples=rollout_anchor_samples,
+                                explicit_n_hat_fn=linear_explicit,
+                                v_grid=projected_xv_v_grid,
+                                projected_xv_tail_window=int(projected_xv_tail_window),
+                                rollout_direction=direction_mode,
+                            )
+                        )(ref_batch)
+                        total_state = total_state + weight * jnp.mean(state_terms)
+                        continue
+                    if online_loss_backend_uses_posterior_rollout(str(loss_backend)):
+                        posterior_terms, state_terms, field_terms = jax.vmap(
+                            lambda ref_hist: online_fourier_hermite_posterior_bidir_components_for_history(
+                                ref_hist,
+                                learned=learned,
+                                forward_integ=linear_forward,
+                                backward_integ=linear_backward,
+                                rollout_horizon=rollout_horizon,
+                                rollout_anchor_samples=rollout_anchor_samples,
+                                explicit_n_hat_fn=linear_explicit,
+                                poisson_sign=float(poisson_sign),
+                                state_weight=float(posterior_state_weight),
+                                field_weight=float(posterior_field_weight),
+                            )
+                        )(ref_batch)
+                        del posterior_terms
+                        total_state = total_state + weight * jnp.mean(state_terms)
+                        total_field = total_field + weight * jnp.mean(field_terms)
+                        continue
+                    if online_loss_backend_uses_boundary_step(str(loss_backend)):
+                        state_terms = jax.vmap(
+                            lambda ref_hist: online_fourier_hermite_boundary_step_bidir_loss_for_history(
+                                ref_hist,
+                                learned=learned,
+                                forward_integ=linear_forward,
+                                backward_integ=linear_backward,
+                                rollout_horizon=rollout_horizon,
+                                rollout_anchor_samples=rollout_anchor_samples,
+                                explicit_n_hat_fn=linear_explicit,
+                            )
+                        )(ref_batch)
+                        total_state = total_state + weight * jnp.mean(state_terms)
+                        continue
+                    if online_loss_backend_uses_closure_q(str(loss_backend)):
+                        assert ref_q_batch is not None
+                        if online_loss_backend_uses_action_q(str(loss_backend)):
+                            q_terms = jax.vmap(
+                                lambda ref_hist: online_fourier_hermite_closure_action_bidir_loss_for_history(
+                                    ref_hist,
+                                    learned=learned,
+                                    forward_integ=linear_forward,
+                                    backward_integ=linear_backward,
+                                    rollout_horizon=rollout_horizon,
+                                    rollout_anchor_samples=rollout_anchor_samples,
+                                    explicit_n_hat_fn=linear_explicit,
+                                )
+                            )(ref_batch)
+                        else:
+                            q_terms = jax.vmap(
+                                lambda ref_hist, ref_q_hist: online_fourier_hermite_closure_bidir_loss_for_history(
+                                    ref_hist,
+                                    ref_q_hist,
+                                    learned=learned,
+                                    forward_integ=linear_forward,
+                                    backward_integ=linear_backward,
+                                    rollout_horizon=rollout_horizon,
+                                    rollout_anchor_samples=rollout_anchor_samples,
+                                    explicit_n_hat_fn=linear_explicit,
+                                    detach_rollout_state_for_q=(
+                                        str(loss_backend)
+                                        == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR
+                                    ),
+                                )
+                            )(ref_batch, ref_q_batch)
+                        total_q = total_q + weight * jnp.mean(q_terms)
+                        continue
+                    state_terms = jax.vmap(
+                        lambda ref_hist: online_fourier_hermite_bidir_loss_for_history(
+                            ref_hist,
+                            learned=learned,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            rollout_horizon=rollout_horizon,
+                            rollout_anchor_samples=rollout_anchor_samples,
+                            explicit_n_hat_fn=linear_explicit,
+                        )
+                    )(ref_batch)
+                else:
+                    if ref_q_batch is not None:
+                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                            ref_batch,
+                            ref_q_batch,
+                            learned=learned,
+                            integ=nonlinear_forward,
+                        )
+                    if online_loss_backend_uses_projected_xv(str(loss_backend)):
+                        state_terms = jax.vmap(
+                            lambda ref_hist: online_fourier_hermite_projected_xv_bidir_loss_for_history(
+                                ref_hist,
+                                learned=learned,
+                                forward_integ=nonlinear_forward,
+                                backward_integ=nonlinear_backward,
+                                rollout_horizon=rollout_horizon,
+                                rollout_anchor_samples=rollout_anchor_samples,
+                                explicit_n_hat_fn=nonlinear_explicit,
+                                v_grid=projected_xv_v_grid,
+                                projected_xv_tail_window=int(projected_xv_tail_window),
+                                rollout_direction=direction_mode,
+                            )
+                        )(ref_batch)
+                        total_state = total_state + weight * jnp.mean(state_terms)
+                        continue
+                    if online_loss_backend_uses_posterior_rollout(str(loss_backend)):
+                        posterior_terms, state_terms, field_terms = jax.vmap(
+                            lambda ref_hist: online_fourier_hermite_posterior_bidir_components_for_history(
+                                ref_hist,
+                                learned=learned,
+                                forward_integ=nonlinear_forward,
+                                backward_integ=nonlinear_backward,
+                                rollout_horizon=rollout_horizon,
+                                rollout_anchor_samples=rollout_anchor_samples,
+                                explicit_n_hat_fn=nonlinear_explicit,
+                                poisson_sign=float(poisson_sign),
+                                state_weight=float(posterior_state_weight),
+                                field_weight=float(posterior_field_weight),
+                            )
+                        )(ref_batch)
+                        del posterior_terms
+                        total_state = total_state + weight * jnp.mean(state_terms)
+                        total_field = total_field + weight * jnp.mean(field_terms)
+                        continue
+                    if online_loss_backend_uses_boundary_step(str(loss_backend)):
+                        state_terms = jax.vmap(
+                            lambda ref_hist: online_fourier_hermite_boundary_step_bidir_loss_for_history(
+                                ref_hist,
+                                learned=learned,
+                                forward_integ=nonlinear_forward,
+                                backward_integ=nonlinear_backward,
+                                rollout_horizon=rollout_horizon,
+                                rollout_anchor_samples=rollout_anchor_samples,
+                                explicit_n_hat_fn=nonlinear_explicit,
+                            )
+                        )(ref_batch)
+                        total_state = total_state + weight * jnp.mean(state_terms)
+                        continue
+                    if online_loss_backend_uses_closure_q(str(loss_backend)):
+                        assert ref_q_batch is not None
+                        if online_loss_backend_uses_action_q(str(loss_backend)):
+                            q_terms = jax.vmap(
+                                lambda ref_hist: online_fourier_hermite_closure_action_bidir_loss_for_history(
+                                    ref_hist,
+                                    learned=learned,
+                                    forward_integ=nonlinear_forward,
+                                    backward_integ=nonlinear_backward,
+                                    rollout_horizon=rollout_horizon,
+                                    rollout_anchor_samples=rollout_anchor_samples,
+                                    explicit_n_hat_fn=nonlinear_explicit,
+                                )
+                            )(ref_batch)
+                        else:
+                            q_terms = jax.vmap(
+                                lambda ref_hist, ref_q_hist: online_fourier_hermite_closure_bidir_loss_for_history(
+                                    ref_hist,
+                                    ref_q_hist,
+                                    learned=learned,
+                                    forward_integ=nonlinear_forward,
+                                    backward_integ=nonlinear_backward,
+                                    rollout_horizon=rollout_horizon,
+                                    rollout_anchor_samples=rollout_anchor_samples,
+                                    explicit_n_hat_fn=nonlinear_explicit,
+                                    detach_rollout_state_for_q=(
+                                        str(loss_backend)
+                                        == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR
+                                    ),
+                                )
+                            )(ref_batch, ref_q_batch)
+                        total_q = total_q + weight * jnp.mean(q_terms)
+                        continue
+                    state_terms = jax.vmap(
+                        lambda ref_hist: online_fourier_hermite_bidir_loss_for_history(
+                            ref_hist,
+                            learned=learned,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            rollout_horizon=rollout_horizon,
+                            rollout_anchor_samples=rollout_anchor_samples,
+                            explicit_n_hat_fn=nonlinear_explicit,
+                        )
+                    )(ref_batch)
+                total_state = total_state + weight * jnp.mean(state_terms)
+
+            zero = jnp.asarray(0.0, dtype=jnp.float64)
+            if online_loss_backend_uses_posterior_rollout(str(loss_backend)):
+                total_loss = (
+                    jnp.asarray(float(posterior_state_weight), dtype=jnp.float64) * total_state
+                    + jnp.asarray(float(posterior_field_weight), dtype=jnp.float64) * total_field
+                )
+            else:
+                total_loss = total_q + total_state
+            return total_loss, {
+                "q": total_q,
+                "state": total_state,
+                "field": total_field,
+                "dist": zero,
+                "tail": zero,
+                "neg": zero,
+                "reg": zero,
+                "q_diag": total_q_diag,
+            }
+
+        return loss_fn_for_target
+
+    def make_exact_loss_fn_for_target(target_nv: int):
+        coeff_key = online_reference_coeff_key(int(target_nv))
+        q_key = online_reference_q_key(int(target_nv))
+        linear_forward, linear_backward = linear_integrators[int(target_nv)]
+        nonlinear_forward, nonlinear_backward = nonlinear_integrators[int(target_nv)]
+
+        def linear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _linear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def nonlinear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _nonlinear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def exact_loss_fn_for_target(
+            params: Dict[str, Array],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            learned = build_learned_interface_closure(
+                params=params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=None,
+                n_low=n_low,
+                training_mode=ONLINE_TRAINING_MODE,
+                train_objective="trajectory",
+                context_mode=context_mode,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                loss_backend=str(loss_backend),
+                lambda_q=0.0,
+                lambda_E=0.0,
+                lambda_dist=0.0,
+                lambda_tail=0.0,
+                lambda_neg=0.0,
+                lambda_reg=0.0,
+                online_v_probes=0,
+            )
+            total_q = jnp.asarray(0.0, dtype=jnp.float64)
+            total_state = jnp.asarray(0.0, dtype=jnp.float64)
+            total_field = jnp.asarray(0.0, dtype=jnp.float64)
+            total_q_diag = jnp.asarray(0.0, dtype=jnp.float64)
+
+            for weight, regime in zip(weight_arr, active_regimes):
+                ref_batch = jnp.asarray(online_dataset[regime]["train"][coeff_key], dtype=jnp.complex128)
+                ref_q_batch = (
+                    jnp.asarray(online_dataset[regime]["train"][q_key], dtype=jnp.complex128)
+                    if q_key in online_dataset[regime]["train"]
+                    else None
+                )
+                if regime == REGIME_LINEAR:
+                    if ref_q_batch is not None:
+                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                            ref_batch,
+                            ref_q_batch,
+                            learned=learned,
+                            integ=linear_forward,
+                        )
+                    if online_loss_backend_uses_projected_xv(str(loss_backend)):
+                        regime_state = mean_projected_xv_history_loss(
+                            ref_batch,
+                            learned=learned,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            explicit_n_hat_fn=linear_explicit,
+                        )
+                        total_state = total_state + weight * regime_state
+                        continue
+                    if online_loss_backend_uses_posterior_rollout(str(loss_backend)):
+                        _, regime_state, regime_field = mean_posterior_history_loss(
+                            ref_batch,
+                            learned=learned,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            explicit_n_hat_fn=linear_explicit,
+                        )
+                        total_state = total_state + weight * regime_state
+                        total_field = total_field + weight * regime_field
+                        continue
+                    if online_loss_backend_uses_boundary_step(str(loss_backend)):
+                        regime_state = mean_boundary_history_loss(
+                            ref_batch,
+                            learned=learned,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            explicit_n_hat_fn=linear_explicit,
+                        )
+                        total_state = total_state + weight * regime_state
+                        continue
+                    if online_loss_backend_uses_closure_q(str(loss_backend)):
+                        assert ref_q_batch is not None
+                        regime_q = mean_closure_history_loss(
+                            ref_batch,
+                            ref_q_batch,
+                            learned=learned,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            explicit_n_hat_fn=linear_explicit,
+                        )
+                        total_q = total_q + weight * regime_q
+                        continue
+                    regime_state = mean_history_loss(
+                        ref_batch,
+                        learned=learned,
+                        forward_integ=linear_forward,
+                        backward_integ=linear_backward,
+                        explicit_n_hat_fn=linear_explicit,
+                    )
+                else:
+                    if ref_q_batch is not None:
+                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                            ref_batch,
+                            ref_q_batch,
+                            learned=learned,
+                            integ=nonlinear_forward,
+                        )
+                    if online_loss_backend_uses_projected_xv(str(loss_backend)):
+                        regime_state = mean_projected_xv_history_loss(
+                            ref_batch,
+                            learned=learned,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            explicit_n_hat_fn=nonlinear_explicit,
+                        )
+                        total_state = total_state + weight * regime_state
+                        continue
+                    if online_loss_backend_uses_posterior_rollout(str(loss_backend)):
+                        _, regime_state, regime_field = mean_posterior_history_loss(
+                            ref_batch,
+                            learned=learned,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            explicit_n_hat_fn=nonlinear_explicit,
+                        )
+                        total_state = total_state + weight * regime_state
+                        total_field = total_field + weight * regime_field
+                        continue
+                    if online_loss_backend_uses_boundary_step(str(loss_backend)):
+                        regime_state = mean_boundary_history_loss(
+                            ref_batch,
+                            learned=learned,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            explicit_n_hat_fn=nonlinear_explicit,
+                        )
+                        total_state = total_state + weight * regime_state
+                        continue
+                    if online_loss_backend_uses_closure_q(str(loss_backend)):
+                        assert ref_q_batch is not None
+                        regime_q = mean_closure_history_loss(
+                            ref_batch,
+                            ref_q_batch,
+                            learned=learned,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            explicit_n_hat_fn=nonlinear_explicit,
+                        )
+                        total_q = total_q + weight * regime_q
+                        continue
+                    regime_state = mean_history_loss(
+                        ref_batch,
+                        learned=learned,
+                        forward_integ=nonlinear_forward,
+                        backward_integ=nonlinear_backward,
+                        explicit_n_hat_fn=nonlinear_explicit,
+                    )
+                total_state = total_state + weight * regime_state
+
+            zero = jnp.asarray(0.0, dtype=jnp.float64)
+            if online_loss_backend_uses_posterior_rollout(str(loss_backend)):
+                total_loss = (
+                    jnp.asarray(float(posterior_state_weight), dtype=jnp.float64) * total_state
+                    + jnp.asarray(float(posterior_field_weight), dtype=jnp.float64) * total_field
+                )
+            else:
+                total_loss = total_q + total_state
+            return total_loss, {
+                "q": total_q,
+                "state": total_state,
+                "field": total_field,
+                "dist": zero,
+                "tail": zero,
+                "neg": zero,
+                "reg": zero,
+                "q_diag": total_q_diag,
+            }
+
+        return exact_loss_fn_for_target
+
+    target_loss_fns = {
+        int(target_nv): make_loss_fn_for_target(int(target_nv))
+        for target_nv in target_nvs
+    }
+    exact_target_loss_fns = {
+        int(target_nv): make_exact_loss_fn_for_target(int(target_nv))
+        for target_nv in target_nvs
+    }
+    default_target_nv = int(target_nvs[0])
+
+    def loss_fn(
+        params: Dict[str, Array],
+        regime_batches: Dict[str, Dict[str, Array]],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        return target_loss_fns[default_target_nv](params, regime_batches)
+
+    loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
+    loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    if len(target_nvs) == 1:
+        loss_fn.exact_loss_fn = exact_target_loss_fns[default_target_nv]  # type: ignore[attr-defined]
+    else:
+        def exact_loss_fn(
+            params: Dict[str, Array],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            total = jnp.asarray(0.0, dtype=jnp.float64)
+            aux_sum: Optional[Dict[str, Array]] = None
+            for target_nv in target_nvs:
+                loss, aux = exact_target_loss_fns[int(target_nv)](params)
+                total = total + loss
+                if aux_sum is None:
+                    aux_sum = {key: jnp.asarray(value, dtype=jnp.float64) for key, value in aux.items()}
+                else:
+                    aux_sum = {
+                        key: aux_sum[key] + jnp.asarray(aux[key], dtype=jnp.float64)
+                        for key in aux_sum
+                    }
+            assert aux_sum is not None
+            scale = jnp.asarray(1.0 / float(len(target_nvs)), dtype=jnp.float64)
+            return total * scale, {key: value * scale for key, value in aux_sum.items()}
+
+        loss_fn.exact_loss_fn = exact_loss_fn  # type: ignore[attr-defined]
     return loss_fn, active_regimes
 
 
@@ -2407,6 +4493,8 @@ def make_online_trajectory_batch_loss(
             reg_term = lambda_reg_arr * l2_regularization(params)
             total_loss = total_field + total_dist + total_tail + total_neg + reg_term
             return total_loss, {
+                "q": jnp.asarray(0.0, dtype=jnp.float64),
+                "state": jnp.asarray(0.0, dtype=jnp.float64),
                 "field": total_field,
                 "dist": total_dist,
                 "tail": total_tail,
@@ -2433,6 +4521,48 @@ def make_online_trajectory_batch_loss(
     return loss_fn, active_regimes
 
 
+def _format_train_loss_log(
+    *,
+    epoch: int,
+    epochs: int,
+    history: Dict[str, np.ndarray],
+    components: Sequence[str],
+) -> str:
+    parts = [
+        f"[train] epoch {int(epoch) + 1:04d}/{int(epochs):04d}",
+        f"loss={history['total'][int(epoch)]:.6e}",
+    ]
+    for key in components:
+        if key == "total":
+            continue
+        if key in history:
+            parts.append(f"{key}={history[key][int(epoch)]:.6e}")
+    return " ".join(parts)
+
+
+def online_training_log_components(
+    *,
+    train_objective: str,
+    online_loss_backend: str,
+) -> Tuple[str, ...]:
+    if str(train_objective) == "trajectory":
+        if online_loss_backend_uses_closure_q(str(online_loss_backend)):
+            return ("q",)
+        if str(online_loss_backend) in {
+            ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+            ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
+        }:
+            return ("state",)
+        if str(online_loss_backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR:
+            return ("state", "q_diag")
+        if online_loss_backend_uses_posterior_rollout(str(online_loss_backend)):
+            return ("state", "field")
+        return ("field", "dist", "tail", "neg", "reg")
+    if str(train_objective) == "trajectory_q_hybrid":
+        return ("q", "field", "dist", "tail", "neg", "reg")
+    return ()
+
+
 def train_with_online_trajectory_minibatch_loss(
     params: Dict[str, Array],
     online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
@@ -2446,6 +4576,7 @@ def train_with_online_trajectory_minibatch_loss(
     online_case_batch_size: int,
     steps_per_epoch: int,
     seed: int,
+    log_components: Sequence[str] = (),
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
     if int(online_case_batch_size) <= 0:
         raise ValueError("online_case_batch_size must be positive for online rollout training")
@@ -2453,13 +4584,13 @@ def train_with_online_trajectory_minibatch_loss(
         raise ValueError("steps_per_epoch must be positive for online rollout training")
 
     train_sizes = {
-        regime: int(online_dataset[regime]["train"]["E_hat_ref"].shape[0])
+        regime: online_reference_num_cases(online_dataset[regime]["train"])
         for regime in active_regimes
     }
     state = adam_init(params)
     history = {
         key: np.zeros((int(epochs),), dtype=np.float64)
-        for key in ("total", "field", "dist", "tail", "neg", "reg")
+        for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
     }
 
     def make_train_step(target_batch_loss_fn):
@@ -2505,7 +4636,7 @@ def train_with_online_trajectory_minibatch_loss(
     for epoch in range(int(epochs)):
         running = {
             key: jnp.asarray(0.0, dtype=jnp.float64)
-            for key in ("total", "field", "dist", "tail", "neg", "reg")
+            for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
         }
         for step_idx in range(int(steps_per_epoch)):
             regime_batches: Dict[str, Dict[str, Array]] = {}
@@ -2528,13 +4659,122 @@ def train_with_online_trajectory_minibatch_loss(
                     "or TRAIN_STEPS_PER_EPOCH."
                 )
             for key in running:
-                running[key] = running[key] + aux[key]
+                if key in aux:
+                    running[key] = running[key] + aux[key]
         for key in history:
             history[key][epoch] = float(running[key] / float(steps_per_epoch))
+        if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
+            print(_format_train_loss_log(epoch=epoch, epochs=epochs, history=history, components=log_components))
+    return params, history
+
+
+def train_with_exact_monotone_online_loss(
+    params: Dict[str, Array],
+    exact_loss_fn,
+    *,
+    epochs: int,
+    learning_rate: float,
+    grad_clip: Optional[float],
+    log_every: int,
+    steps_per_epoch: int,
+    backtrack_factor: float = 0.5,
+    max_backtracks: int = 8,
+    min_learning_rate: float = 1e-8,
+) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
+    if int(epochs) <= 0:
+        return params, {
+            key: np.zeros((0,), dtype=np.float64)
+            for key in ("total", "state", "field", "dist", "tail", "neg", "reg")
+        }
+    if int(steps_per_epoch) <= 0:
+        raise ValueError("steps_per_epoch must be positive for exact online rollout training")
+
+    state = adam_init(params)
+    history = {
+        key: np.zeros((int(epochs),), dtype=np.float64)
+        for key in ("total", "state", "field", "dist", "tail", "neg", "reg")
+    }
+
+    @jax.jit
+    def evaluate_loss(
+        current_params: Dict[str, Array],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        loss, aux = exact_loss_fn(current_params)
+        aux = dict(aux)
+        aux["total"] = loss
+        return loss, aux
+
+    @jax.jit
+    def loss_and_grad(
+        current_params: Dict[str, Array],
+    ) -> Tuple[Array, Dict[str, Array], Dict[str, Array]]:
+        (loss, aux), grads = jax.value_and_grad(exact_loss_fn, has_aux=True)(current_params)
+        aux = dict(aux)
+        aux["total"] = loss
+        return loss, aux, grads
+
+    @jax.jit
+    def propose_step(
+        current_params: Dict[str, Array],
+        current_state: Dict[str, object],
+        grads: Dict[str, Array],
+        step_lr: Array,
+    ) -> Tuple[Dict[str, Array], Dict[str, object]]:
+        return adam_step(
+            current_params,
+            grads,
+            current_state,
+            step_lr,
+            grad_clip=grad_clip,
+        )
+
+    current_loss, current_aux = evaluate_loss(params)
+    if not bool(_tree_all_finite(current_aux)):
+        raise FloatingPointError("exact online rollout loss is non-finite before the first optimization step")
+
+    for epoch in range(int(epochs)):
+        for step_idx in range(int(steps_per_epoch)):
+            loss_before, aux_before, grads = loss_and_grad(params)
+            if not bool(_tree_all_finite(aux_before) & _tree_all_finite(grads)):
+                raise FloatingPointError(
+                    "exact online rollout produced non-finite loss/gradients at "
+                    f"epoch {epoch + 1}, step {step_idx + 1}"
+                )
+            accepted = False
+            step_lr = float(learning_rate)
+            loss_before_f = float(loss_before)
+            tolerance = 1e-12 * max(1.0, abs(loss_before_f))
+            for _ in range(int(max_backtracks) + 1):
+                proposal_params, proposal_state = propose_step(
+                    params,
+                    state,
+                    grads,
+                    jnp.asarray(step_lr, dtype=jnp.float64),
+                )
+                proposal_loss, proposal_aux = evaluate_loss(proposal_params)
+                if bool(_tree_all_finite(proposal_aux)):
+                    proposal_loss_f = float(proposal_loss)
+                    if proposal_loss_f <= loss_before_f + tolerance:
+                        params = proposal_params
+                        state = proposal_state
+                        current_loss = proposal_loss
+                        current_aux = proposal_aux
+                        accepted = True
+                        break
+                step_lr *= float(backtrack_factor)
+                if step_lr < float(min_learning_rate):
+                    break
+            if not accepted:
+                current_loss = loss_before
+                current_aux = aux_before
+                break
+        for key in history:
+            history[key][epoch] = float(current_aux[key])
         if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
             print(
                 f"[train] epoch {epoch + 1:04d}/{int(epochs):04d} "
                 f"loss={history['total'][epoch]:.6e} "
+                f"state={history['state'][epoch]:.6e} "
                 f"field={history['field'][epoch]:.6e} "
                 f"dist={history['dist'][epoch]:.6e} "
                 f"tail={history['tail'][epoch]:.6e} "
@@ -2559,6 +4799,7 @@ def train_with_online_hybrid_minibatch_loss(
     online_case_batch_size: int,
     steps_per_epoch: int,
     seed: int,
+    log_components: Sequence[str] = (),
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
     if int(online_case_batch_size) <= 0:
         raise ValueError("online_case_batch_size must be positive for online hybrid training")
@@ -2576,7 +4817,7 @@ def train_with_online_hybrid_minibatch_loss(
     state = adam_init(params)
     history = {
         key: np.zeros((int(epochs),), dtype=np.float64)
-        for key in ("total", "q", "field", "dist", "tail", "neg", "reg")
+        for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg")
     }
 
     def make_train_step(target_batch_loss_fn):
@@ -2628,7 +4869,7 @@ def train_with_online_hybrid_minibatch_loss(
     for epoch in range(int(epochs)):
         running = {
             key: jnp.asarray(0.0, dtype=jnp.float64)
-            for key in ("total", "q", "field", "dist", "tail", "neg", "reg")
+            for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg")
         }
         for step_idx in range(int(steps_per_epoch)):
             q_batches: Dict[str, Dict[str, Array]] = {}
@@ -2667,16 +4908,7 @@ def train_with_online_hybrid_minibatch_loss(
         for key in history:
             history[key][epoch] = float(running[key] / float(steps_per_epoch))
         if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
-            print(
-                f"[train] epoch {epoch + 1:04d}/{int(epochs):04d} "
-                f"loss={history['total'][epoch]:.6e} "
-                f"q={history['q'][epoch]:.6e} "
-                f"field={history['field'][epoch]:.6e} "
-                f"dist={history['dist'][epoch]:.6e} "
-                f"tail={history['tail'][epoch]:.6e} "
-                f"neg={history['neg'][epoch]:.6e} "
-                f"reg={history['reg'][epoch]:.6e}"
-            )
+            print(_format_train_loss_log(epoch=epoch, epochs=epochs, history=history, components=log_components))
     return params, history
 
 
@@ -2701,9 +4933,58 @@ def evaluate_regime_metrics(
     return metrics
 
 
+def _load_init_checkpoint_for_online_trajectory(
+    init_checkpoint: Path,
+    *,
+    Nm: int,
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    context_mode: str,
+) -> Tuple[Dict[str, Array], Dict[str, np.ndarray], float, float]:
+    learned = load_learned_interface_closure_npz(init_checkpoint)
+    expected_targets = tuple(int(v) for v in Nv_targets)
+    actual_targets = tuple(int(v) for v in learned.Nv_targets)
+    if actual_targets != expected_targets:
+        raise ValueError(
+            f"--init-checkpoint Nv_targets={actual_targets} does not match requested Nv-targets={expected_targets}"
+        )
+    if int(learned.Nm) != int(Nm):
+        raise ValueError(f"--init-checkpoint Nm={int(learned.Nm)} does not match requested Nm={int(Nm)}")
+    if int(learned.hidden_width) != int(hidden_width):
+        raise ValueError(
+            f"--init-checkpoint hidden_width={int(learned.hidden_width)} does not match requested hidden_width={int(hidden_width)}"
+        )
+    if int(learned.res_blocks) != int(res_blocks):
+        raise ValueError(
+            f"--init-checkpoint res_blocks={int(learned.res_blocks)} does not match requested res_blocks={int(res_blocks)}"
+        )
+    if str(learned.context_mode) != str(context_mode):
+        raise ValueError(
+            f"--init-checkpoint context_mode={learned.context_mode!r} does not match requested context_mode={context_mode!r}"
+        )
+    params = {
+        key: jnp.asarray(value, dtype=jnp.float64)
+        for key, value in learned.params.items()
+    }
+    stats = {
+        "input_mean": np.asarray(learned.input_mean, dtype=np.float64),
+        "input_std": np.asarray(learned.input_std, dtype=np.float64),
+        "target_mean": np.asarray(learned.target_mean, dtype=np.float64),
+        "target_std": np.asarray(learned.target_std, dtype=np.float64),
+    }
+    return params, stats, float(learned.k_scale), float(learned.nv_scale)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a shared learned interface closure from a selectable Landau teacher")
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional learned-closure checkpoint used to initialize online trajectory training.",
+    )
     parser.add_argument("--dataset-cache", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
     parser.add_argument("--build-dataset-only", action="store_true")
@@ -2734,8 +5015,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-tail", type=float, default=0.05)
     parser.add_argument("--lambda-neg", type=float, default=0.05)
     parser.add_argument("--lambda-reg", type=float, default=1e-6)
+    parser.add_argument("--rollout-horizon", type=int, default=0)
+    parser.add_argument("--rollout-anchor-samples", type=int, default=0)
+    parser.add_argument("--rollout-direction", type=str, default=ONLINE_ROLLOUT_DIRECTION_BIDIR, choices=ALL_ONLINE_ROLLOUT_DIRECTIONS)
     parser.add_argument("--rollout-dealias-23", action="store_true")
     parser.add_argument("--online-loss-backend", type=str, default=ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
+    parser.add_argument("--projected-xv-tail-window", type=int, default=0)
+    parser.add_argument("--posterior-state-weight", type=float, default=0.25)
+    parser.add_argument("--posterior-field-weight", type=float, default=1.0)
     parser.add_argument("--online-v-probes", type=int, default=64)
     parser.add_argument("--online-case-batch-size", type=int, default=1)
     parser.add_argument("--online-reference-cache", type=Path, default=None)
@@ -2795,9 +5082,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("At least one valid training regime must be selected")
 
     teacher_backend = normalize_teacher_backend_name(args.teacher_backend)
+    online_loss_backend = str(args.online_loss_backend)
     teacher_proj_Nv: Optional[int] = None
     online_reference_cache = args.dataset_cache
     if training_mode == ONLINE_TRAINING_MODE:
+        if args.init_checkpoint is not None and args.train_objective != "trajectory":
+            raise ValueError("--init-checkpoint is only supported for online_rollout trajectory training")
+        if args.init_checkpoint is not None and bool(args.build_dataset_only):
+            raise ValueError("--init-checkpoint is not used with --build-dataset-only")
+        if args.init_checkpoint is not None and not args.init_checkpoint.exists():
+            raise ValueError(f"--init-checkpoint does not exist: {args.init_checkpoint}")
         if bool(args.allow_dataset_cache_nv_superset):
             raise ValueError("online_rollout does not support --allow-dataset-cache-nv-superset")
         if bool(args.per_target_projection_orders):
@@ -2811,6 +5105,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 raise ValueError("online_rollout trajectory does not use --teacher-proj-Nv")
             if args.online_reference_cache is not None:
                 raise ValueError("online_rollout trajectory does not use --online-reference-cache")
+            if online_loss_backend_uses_projected_coefficients(online_loss_backend):
+                if int(args.rollout_horizon) <= 0:
+                    raise ValueError(f"{online_loss_backend} requires --rollout-horizon > 0")
         elif args.train_objective == "trajectory_q_hybrid":
             online_reference_cache = args.online_reference_cache
             if online_reference_cache is None:
@@ -2820,26 +5117,58 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 raise ValueError("teacher-proj-Nv must exceed every target Nv")
             if float(args.lambda_q) <= 0.0 and not bool(args.build_dataset_only):
                 raise ValueError("trajectory_q_hybrid requires --lambda-q > 0")
+            if online_loss_backend != ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1:
+                raise ValueError("trajectory_q_hybrid only supports online_loss_backend=field_distribution_v1")
         else:
             raise ValueError(
                 "online_rollout requires --train-objective trajectory or trajectory_q_hybrid"
             )
-        if str(args.online_loss_backend) != ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1:
+        if online_loss_backend not in ALL_ONLINE_LOSS_BACKENDS:
             raise ValueError(
                 f"Unsupported online loss backend {args.online_loss_backend!r}; "
-                f"expected {ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1!r}"
+                f"expected one of {ALL_ONLINE_LOSS_BACKENDS!r}"
             )
-        if int(args.online_v_probes) <= 0:
+        if (
+            online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+            and int(args.online_v_probes) <= 0
+        ):
             raise ValueError("online_rollout requires --online-v-probes > 0")
+        if online_loss_backend_uses_projected_coefficients(online_loss_backend):
+            if int(args.online_v_probes) != 0:
+                raise ValueError(f"{online_loss_backend} requires --online-v-probes 0")
+            if int(args.rollout_anchor_samples) < 0:
+                raise ValueError(f"{online_loss_backend} requires --rollout-anchor-samples >= 0")
+            if online_loss_backend_uses_posterior_rollout(online_loss_backend):
+                if float(args.posterior_state_weight) < 0.0 or float(args.posterior_field_weight) < 0.0:
+                    raise ValueError("posterior rollout weights must be nonnegative")
+                if float(args.posterior_state_weight) + float(args.posterior_field_weight) <= 0.0:
+                    raise ValueError("at least one posterior rollout weight must be positive")
+            if (
+                not bool(args.build_dataset_only)
+                and any(
+                float(value) != 0.0
+                for value in (
+                    args.lambda_E,
+                    args.lambda_dist,
+                    args.lambda_tail,
+                    args.lambda_neg,
+                    args.lambda_reg,
+                )
+                )
+            ):
+                raise ValueError(f"{online_loss_backend} requires lambda_E=lambda_dist=lambda_tail=lambda_neg=lambda_reg=0")
         if int(args.online_case_batch_size) <= 0 and not bool(args.build_dataset_only):
             raise ValueError("online_rollout requires --online-case-batch-size > 0")
         if (
-            float(args.lambda_E) <= 0.0
+            online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+            and float(args.lambda_E) <= 0.0
             and float(args.lambda_dist) <= 0.0
             and not bool(args.build_dataset_only)
         ):
             raise ValueError("online_rollout requires lambda_E > 0 or lambda_dist > 0")
     else:
+        if args.init_checkpoint is not None:
+            raise ValueError("--init-checkpoint is only supported for online_rollout trajectory training")
         if args.train_objective in {"trajectory", "trajectory_q_hybrid"}:
             raise ValueError(f"{args.train_objective} objective is only supported with --training-mode online_rollout")
         if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
@@ -3048,12 +5377,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             strong_eps=strong_eps,
             val_fraction=args.val_fraction,
             online_v_probes=args.online_v_probes,
+            online_loss_backend=online_loss_backend,
+            Nv_targets=Nv_targets,
+            rollout_horizon=args.rollout_horizon,
         )
         for regime in regimes:
             if regime not in online_dataset:
                 continue
-            train_count = int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("train") else 0
-            val_count = int(online_dataset[regime]["val"]["E_hat_ref"].shape[0]) if online_dataset[regime].get("val") else 0
+            train_count = online_reference_num_cases(online_dataset[regime]["train"]) if online_dataset[regime].get("train") else 0
+            val_count = online_reference_num_cases(online_dataset[regime]["val"]) if online_dataset[regime].get("val") else 0
             print(f"[data] {regime}: train={train_count} episodes val={val_count} episodes")
 
         if args.train_objective == "trajectory_q_hybrid":
@@ -3151,7 +5483,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 poisson_sign=args.teacher_poisson_sign,
                 rollout_dealias_23=bool(args.rollout_dealias_23),
             )
-            train_sizes = [int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) for regime in active_regimes]
+            train_sizes = [online_reference_num_cases(online_dataset[regime]["train"]) for regime in active_regimes]
             steps_per_epoch = int(args.steps_per_epoch)
             if steps_per_epoch <= 0:
                 steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.online_case_batch_size)))
@@ -3169,6 +5501,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 online_case_batch_size=args.online_case_batch_size,
                 steps_per_epoch=steps_per_epoch,
                 seed=args.seed,
+                log_components=online_training_log_components(
+                    train_objective=args.train_objective,
+                    online_loss_backend=online_loss_backend,
+                ),
             )
             loss_history = online_component_history["total"]
             val_metrics = evaluate_regime_metrics(
@@ -3226,46 +5562,93 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             k_scale = float(args.k_scale) if args.k_scale is not None else float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64)))
             nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(target_nv_max)
             stats = build_identity_training_stats(Nm=args.Nm, context_mode=args.context_mode)
-            params = init_online_rollout_params(
-                jax.random.PRNGKey(args.seed),
-                input_dim=int(stats["input_mean"].shape[0]),
-                hidden_width=int(args.hidden_width),
-                res_blocks=int(args.res_blocks),
-            )
-            batch_loss_fn, active_regimes = make_online_trajectory_batch_loss(
-                online_dataset=online_dataset,
-                regime_weights=regime_weights,
-                Nm=args.Nm,
-                k_scale=k_scale,
-                nv_scale=nv_scale,
-                stats=stats,
-                hidden_width=args.hidden_width,
-                res_blocks=args.res_blocks,
-                Nv_targets=Nv_targets,
-                train_regimes=regimes,
-                teacher_backend=teacher_backend,
-                teacher_Lx=args.teacher_L,
-                teacher_Nx=args.teacher_Nx,
-                teacher_Nv=args.teacher_Nv,
-                teacher_vmin=args.teacher_vmin,
-                teacher_vmax=args.teacher_vmax,
-                teacher_dt=args.teacher_dt,
-                n_low=args.n_low,
-                context_mode=args.context_mode,
-                tail_start_fraction=args.tail_start_fraction,
-                loss_backend=args.online_loss_backend,
-                lambda_E=args.lambda_E,
-                lambda_dist=args.lambda_dist,
-                lambda_tail=args.lambda_tail,
-                lambda_neg=args.lambda_neg,
-                lambda_reg=args.lambda_reg,
-                online_v_probes=args.online_v_probes,
-                nonlinear_T=args.nonlinear_T,
-                nonlinear_k0=args.nonlinear_k0,
-                poisson_sign=args.teacher_poisson_sign,
-                rollout_dealias_23=bool(args.rollout_dealias_23),
-            )
-            train_sizes = [int(online_dataset[regime]["train"]["E_hat_ref"].shape[0]) for regime in active_regimes]
+            if args.init_checkpoint is not None:
+                params, stats, k_scale, nv_scale = _load_init_checkpoint_for_online_trajectory(
+                    args.init_checkpoint,
+                    Nm=args.Nm,
+                    hidden_width=args.hidden_width,
+                    res_blocks=args.res_blocks,
+                    Nv_targets=Nv_targets,
+                    context_mode=args.context_mode,
+                )
+                if args.k_scale is not None and not np.isclose(float(args.k_scale), float(k_scale)):
+                    raise ValueError("--k-scale must match --init-checkpoint k_scale when warm-starting online training")
+                if args.nv_scale is not None and not np.isclose(float(args.nv_scale), float(nv_scale)):
+                    raise ValueError("--nv-scale must match --init-checkpoint nv_scale when warm-starting online training")
+                print(f"[train] initialized online trajectory parameters from {args.init_checkpoint}")
+            else:
+                params = init_online_rollout_params(
+                    jax.random.PRNGKey(args.seed),
+                    input_dim=int(stats["input_mean"].shape[0]),
+                    hidden_width=int(args.hidden_width),
+                    res_blocks=int(args.res_blocks),
+                )
+            if online_loss_backend_uses_projected_coefficients(online_loss_backend):
+                batch_loss_fn, active_regimes = make_online_fourier_hermite_bidir_batch_loss(
+                    online_dataset=online_dataset,
+                    regime_weights=regime_weights,
+                    Nm=args.Nm,
+                    k_scale=k_scale,
+                    nv_scale=nv_scale,
+                    stats=stats,
+                    hidden_width=args.hidden_width,
+                    res_blocks=args.res_blocks,
+                    Nv_targets=Nv_targets,
+                    train_regimes=regimes,
+                    teacher_backend=teacher_backend,
+                    teacher_Lx=args.teacher_L,
+                    teacher_Nx=args.teacher_Nx,
+                    teacher_Nv=args.teacher_Nv,
+                    teacher_vmin=args.teacher_vmin,
+                    teacher_vmax=args.teacher_vmax,
+                    teacher_dt=args.teacher_dt,
+                    n_low=args.n_low,
+                    context_mode=args.context_mode,
+                    rollout_horizon=args.rollout_horizon,
+                    rollout_anchor_samples=args.rollout_anchor_samples,
+                    projected_xv_tail_window=args.projected_xv_tail_window,
+                    rollout_direction=args.rollout_direction,
+                    loss_backend=online_loss_backend,
+                    poisson_sign=args.teacher_poisson_sign,
+                    rollout_dealias_23=bool(args.rollout_dealias_23),
+                    posterior_state_weight=args.posterior_state_weight,
+                    posterior_field_weight=args.posterior_field_weight,
+                )
+            else:
+                batch_loss_fn, active_regimes = make_online_trajectory_batch_loss(
+                    online_dataset=online_dataset,
+                    regime_weights=regime_weights,
+                    Nm=args.Nm,
+                    k_scale=k_scale,
+                    nv_scale=nv_scale,
+                    stats=stats,
+                    hidden_width=args.hidden_width,
+                    res_blocks=args.res_blocks,
+                    Nv_targets=Nv_targets,
+                    train_regimes=regimes,
+                    teacher_backend=teacher_backend,
+                    teacher_Lx=args.teacher_L,
+                    teacher_Nx=args.teacher_Nx,
+                    teacher_Nv=args.teacher_Nv,
+                    teacher_vmin=args.teacher_vmin,
+                    teacher_vmax=args.teacher_vmax,
+                    teacher_dt=args.teacher_dt,
+                    n_low=args.n_low,
+                    context_mode=args.context_mode,
+                    tail_start_fraction=args.tail_start_fraction,
+                    loss_backend=args.online_loss_backend,
+                    lambda_E=args.lambda_E,
+                    lambda_dist=args.lambda_dist,
+                    lambda_tail=args.lambda_tail,
+                    lambda_neg=args.lambda_neg,
+                    lambda_reg=args.lambda_reg,
+                    online_v_probes=args.online_v_probes,
+                    nonlinear_T=args.nonlinear_T,
+                    nonlinear_k0=args.nonlinear_k0,
+                    poisson_sign=args.teacher_poisson_sign,
+                    rollout_dealias_23=bool(args.rollout_dealias_23),
+                )
+            train_sizes = [online_reference_num_cases(online_dataset[regime]["train"]) for regime in active_regimes]
             steps_per_epoch = int(args.steps_per_epoch)
             if steps_per_epoch <= 0:
                 steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.online_case_batch_size)))
@@ -3281,13 +5664,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 online_case_batch_size=args.online_case_batch_size,
                 steps_per_epoch=steps_per_epoch,
                 seed=args.seed,
+                log_components=online_training_log_components(
+                    train_objective=args.train_objective,
+                    online_loss_backend=online_loss_backend,
+                ),
             )
             loss_history = online_component_history["total"]
 
         for regime in regimes:
             if regime in online_dataset and online_dataset[regime].get("val"):
                 val_metrics[f"val_num_cases_{regime}"] = np.array(
-                    [int(online_dataset[regime]["val"]["E_hat_ref"].shape[0])],
+                    [online_reference_num_cases(online_dataset[regime]["val"])],
                     dtype=np.int32,
                 )
 
@@ -3313,16 +5700,55 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             training_mode=ONLINE_TRAINING_MODE,
             train_objective=args.train_objective,
             context_mode=args.context_mode,
-            rollout_horizon=0,
+            rollout_horizon=(
+                int(args.rollout_horizon)
+                if (
+                    args.train_objective == "trajectory"
+                    and online_loss_backend_uses_projected_coefficients(online_loss_backend)
+                )
+                else 0
+            ),
+            rollout_anchor_samples=(
+                int(args.rollout_anchor_samples)
+                if (
+                    args.train_objective == "trajectory"
+                    and online_loss_backend_uses_projected_coefficients(online_loss_backend)
+                )
+                else 0
+            ),
             tail_start_fraction=args.tail_start_fraction,
             loss_backend=args.online_loss_backend,
             lambda_q=args.lambda_q if args.train_objective == "trajectory_q_hybrid" else 0.0,
-            lambda_E=args.lambda_E,
-            lambda_dist=args.lambda_dist,
-            lambda_tail=args.lambda_tail,
-            lambda_neg=args.lambda_neg,
-            lambda_reg=args.lambda_reg,
-            online_v_probes=args.online_v_probes,
+            lambda_E=(
+                args.lambda_E
+                if online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+                else 0.0
+            ),
+            lambda_dist=(
+                args.lambda_dist
+                if online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+                else 0.0
+            ),
+            lambda_tail=(
+                args.lambda_tail
+                if online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+                else 0.0
+            ),
+            lambda_neg=(
+                args.lambda_neg
+                if online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+                else 0.0
+            ),
+            lambda_reg=(
+                args.lambda_reg
+                if online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+                else 0.0
+            ),
+            online_v_probes=(
+                args.online_v_probes
+                if online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+                else 0
+            ),
             stability_loss_definition=(
                 ONLINE_HYBRID_LOSS_DEFINITION if args.train_objective == "trajectory_q_hybrid" else None
             ),
@@ -3334,11 +5760,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     metrics_path = args.checkpoint.with_suffix(".metrics.npz")
     used_lambda_q = args.lambda_q if args.train_objective in {"q_only", "trajectory_q_hybrid"} else 0.0
-    used_lambda_E = args.lambda_E if args.train_objective in {"trajectory", "trajectory_q_hybrid"} else 0.0
-    used_lambda_dist = args.lambda_dist if training_mode == ONLINE_TRAINING_MODE else 0.0
-    used_lambda_tail = args.lambda_tail if args.train_objective in {"trajectory", "trajectory_q_hybrid"} else 0.0
-    used_lambda_neg = args.lambda_neg if training_mode == ONLINE_TRAINING_MODE else 0.0
-    used_lambda_reg = args.lambda_reg if args.train_objective in {"trajectory", "trajectory_q_hybrid"} else 0.0
+    field_backend_active = (
+        training_mode == ONLINE_TRAINING_MODE
+        and online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
+    )
+    used_lambda_E = (
+        args.lambda_E
+        if field_backend_active and args.train_objective in {"trajectory", "trajectory_q_hybrid"}
+        else 0.0
+    )
+    used_lambda_dist = args.lambda_dist if field_backend_active else 0.0
+    used_lambda_tail = (
+        args.lambda_tail
+        if field_backend_active and args.train_objective in {"trajectory", "trajectory_q_hybrid"}
+        else 0.0
+    )
+    used_lambda_neg = args.lambda_neg if field_backend_active else 0.0
+    used_lambda_reg = (
+        args.lambda_reg
+        if field_backend_active and args.train_objective in {"trajectory", "trajectory_q_hybrid"}
+        else 0.0
+    )
     metrics_payload: Dict[str, np.ndarray] = {
         "train_loss": np.asarray(loss_history, dtype=np.float64),
         "Nm": np.array([args.Nm], dtype=np.int32),
@@ -3366,8 +5808,44 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "training_mode": np.array([training_mode], dtype=np.str_),
         "train_objective": np.array([args.train_objective], dtype=np.str_),
         "context_mode": np.array([args.context_mode], dtype=np.str_),
-        "rollout_horizon": np.array([0], dtype=np.int32),
+        "rollout_horizon": np.array(
+            [
+                int(args.rollout_horizon)
+                if (
+                    training_mode == ONLINE_TRAINING_MODE
+                    and online_loss_backend_uses_projected_coefficients(online_loss_backend)
+                    and args.train_objective == "trajectory"
+                )
+                else 0
+            ],
+            dtype=np.int32,
+        ),
+        "rollout_anchor_samples": np.array(
+            [
+                int(args.rollout_anchor_samples)
+                if (
+                    training_mode == ONLINE_TRAINING_MODE
+                    and online_loss_backend_uses_projected_coefficients(online_loss_backend)
+                    and args.train_objective == "trajectory"
+                )
+                else 0
+            ],
+            dtype=np.int32,
+        ),
+        "rollout_direction": np.array(
+            [
+                str(args.rollout_direction)
+                if (
+                    training_mode == ONLINE_TRAINING_MODE
+                    and online_loss_backend_uses_projected_coefficients(online_loss_backend)
+                    and args.train_objective == "trajectory"
+                )
+                else ""
+            ],
+            dtype=np.str_,
+        ),
         "tail_start_fraction": np.array([args.tail_start_fraction], dtype=np.float64),
+        "projected_xv_tail_window": np.array([args.projected_xv_tail_window], dtype=np.int32),
         "loss_backend": np.array(
             [] if training_mode == OFFLINE_TRAINING_MODE else [args.online_loss_backend],
             dtype=np.str_,
@@ -3378,20 +5856,36 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "lambda_tail": np.array([used_lambda_tail], dtype=np.float64),
         "lambda_neg": np.array([used_lambda_neg], dtype=np.float64),
         "lambda_reg": np.array([used_lambda_reg], dtype=np.float64),
-        "online_v_probes": np.array([args.online_v_probes if training_mode == ONLINE_TRAINING_MODE else 0], dtype=np.int32),
+        "online_v_probes": np.array(
+            [
+                args.online_v_probes
+                if field_backend_active
+                else 0
+            ],
+            dtype=np.int32,
+        ),
     }
     if teacher_proj_Nv is not None:
         metrics_payload["teacher_proj_Nv"] = np.array([teacher_proj_Nv], dtype=np.int32)
     if training_mode == ONLINE_TRAINING_MODE:
         assert online_component_history is not None
+        logged_components = online_training_log_components(
+            train_objective=args.train_objective,
+            online_loss_backend=online_loss_backend,
+        )
+        for component in logged_components:
+            if component in online_component_history:
+                metrics_payload[f"train_loss_{component}"] = np.asarray(
+                    online_component_history[component],
+                    dtype=np.float64,
+                )
+                if component == "q_diag":
+                    metrics_payload["train_q_rel_mse_diag"] = np.asarray(
+                        online_component_history[component],
+                        dtype=np.float64,
+                    )
         if args.train_objective == "trajectory_q_hybrid":
-            metrics_payload["train_loss_q"] = np.asarray(online_component_history["q"], dtype=np.float64)
             metrics_payload["stability_loss_definition"] = np.array([ONLINE_HYBRID_LOSS_DEFINITION], dtype=np.str_)
-        metrics_payload["train_loss_field"] = np.asarray(online_component_history["field"], dtype=np.float64)
-        metrics_payload["train_loss_dist"] = np.asarray(online_component_history["dist"], dtype=np.float64)
-        metrics_payload["train_loss_tail"] = np.asarray(online_component_history["tail"], dtype=np.float64)
-        metrics_payload["train_loss_neg"] = np.asarray(online_component_history["neg"], dtype=np.float64)
-        metrics_payload["train_loss_reg"] = np.asarray(online_component_history["reg"], dtype=np.float64)
     metrics_payload.update(val_metrics)
     np.savez(metrics_path, **metrics_payload)
 
@@ -3401,11 +5895,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         loss_plot_path,
         val_metrics=val_metrics,
         train_objective=args.train_objective,
+        loss_backend=(args.online_loss_backend if training_mode == ONLINE_TRAINING_MODE else None),
     )
+    q_diag_plot_path: Optional[Path] = None
+    if (
+        training_mode == ONLINE_TRAINING_MODE
+        and online_component_history is not None
+        and "q_diag" in online_component_history
+    ):
+        q_diag_history = np.asarray(online_component_history["q_diag"], dtype=np.float64)
+        if q_diag_history.size and np.any(np.isfinite(q_diag_history)) and np.nanmax(q_diag_history) > 0.0:
+            q_diag_plot_path = Path(loss_plot_path).with_suffix(".qdiag.png")
+            save_training_loss_q_diagnostic_plot(
+                np.asarray(loss_history, dtype=np.float64),
+                q_diag_history,
+                q_diag_plot_path,
+                loss_backend=args.online_loss_backend,
+            )
 
     print(f"Saved checkpoint to {args.checkpoint}")
     print(f"Saved metrics to {metrics_path}")
     print(f"Saved loss plot to {loss_plot_path}")
+    if q_diag_plot_path is not None:
+        print(f"Saved q diagnostic plot to {q_diag_plot_path}")
     for key in sorted(val_metrics):
         print(f"{key}: {float(np.asarray(val_metrics[key]).reshape(-1)[0]):.6e}")
 

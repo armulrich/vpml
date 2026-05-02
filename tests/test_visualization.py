@@ -40,6 +40,21 @@ class VisualizationTests(unittest.TestCase):
     def test_training_loss_plot_uses_objective_specific_ylabel(self) -> None:
         fig_q = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="q_only")
         fig_traj = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="trajectory")
+        fig_fh_state = plot_training_loss(
+            np.array([1.0, 0.5], dtype=np.float64),
+            train_objective="trajectory",
+            loss_backend="fourier_hermite_bidir",
+        )
+        fig_fh_q = plot_training_loss(
+            np.array([1.0, 0.5], dtype=np.float64),
+            train_objective="trajectory",
+            loss_backend="fourier_hermite_closure_bidir",
+        )
+        fig_fh_xv = plot_training_loss(
+            np.array([1.0, 0.5], dtype=np.float64),
+            train_objective="trajectory",
+            loss_backend="fourier_hermite_projected_xv_bidir",
+        )
         fig_hybrid = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="trajectory_q_hybrid")
         self.assertEqual(
             fig_q.axes[0].get_ylabel(),
@@ -53,8 +68,14 @@ class VisualizationTests(unittest.TestCase):
             fig_hybrid.axes[0].get_ylabel(),
             r"$\mathcal{L}_{\mathrm{traj+q}}(\theta)=\lambda_q\mathcal{L}_q+\lambda_E\mathcal{L}_E+\lambda_{\mathrm{dist}}\mathcal{L}_{\delta f}+\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail}}+\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+\lambda_{\mathrm{reg}}\|\theta\|_2^2$",
         )
+        self.assertIn(r"\mathrm{FH-state}", fig_fh_state.axes[0].get_ylabel())
+        self.assertIn(r"\mathrm{FH-q}", fig_fh_q.axes[0].get_ylabel())
+        self.assertIn(r"\mathcal{L}_{xv}^{N_v}", fig_fh_xv.axes[0].get_ylabel())
         plt.close(fig_q)
         plt.close(fig_traj)
+        plt.close(fig_fh_state)
+        plt.close(fig_fh_q)
+        plt.close(fig_fh_xv)
         plt.close(fig_hybrid)
 
     def test_training_and_nonlinear_visualizations_save(self) -> None:

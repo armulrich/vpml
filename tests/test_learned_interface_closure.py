@@ -90,6 +90,7 @@ def _make_closure(
     context_mode: str = "none",
     train_objective: str = "q_only",
     rollout_horizon: int = 0,
+    rollout_anchor_samples: int = 0,
     lambda_q: float = 1.0,
     lambda_E: float = 0.0,
     lambda_dist: float = 0.0,
@@ -135,6 +136,7 @@ def _make_closure(
         context_lags=1 if context_mode == "lag1_delta" else 0,
         base_input_dim=raw_base_dim,
         rollout_horizon=rollout_horizon,
+        rollout_anchor_samples=rollout_anchor_samples,
         loss_backend=loss_backend,
         lambda_q=lambda_q,
         lambda_E=lambda_E,
@@ -220,6 +222,31 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertAlmostEqual(loaded.lambda_reg, 1e-6)
         self.assertEqual(loaded.online_v_probes, 64)
 
+    def test_checkpoint_round_trip_preserves_fourier_hermite_bidir_metadata(self) -> None:
+        closure = _make_closure(
+            training_mode="online_rollout",
+            train_objective="trajectory",
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+            rollout_horizon=3,
+            rollout_anchor_samples=2,
+            online_v_probes=0,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "interface_closure.npz"
+            save_learned_interface_closure_npz(path, closure)
+            loaded = load_learned_interface_closure_npz(path)
+        self.assertEqual(loaded.training_mode, "online_rollout")
+        self.assertEqual(loaded.train_objective, "trajectory")
+        self.assertEqual(loaded.loss_backend, train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR)
+        self.assertEqual(loaded.rollout_horizon, 3)
+        self.assertEqual(loaded.rollout_anchor_samples, 2)
+        self.assertEqual(loaded.online_v_probes, 0)
+        self.assertAlmostEqual(loaded.lambda_E, 0.0)
+        self.assertAlmostEqual(loaded.lambda_dist, 0.0)
+        self.assertAlmostEqual(loaded.lambda_tail, 0.0)
+        self.assertAlmostEqual(loaded.lambda_neg, 0.0)
+        self.assertAlmostEqual(loaded.lambda_reg, 0.0)
+
     def test_checkpoint_round_trip_preserves_online_hybrid_metadata(self) -> None:
         closure = _make_closure(
             training_mode="online_rollout",
@@ -269,6 +296,71 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             rtol=1e-12,
             atol=1e-12,
         )
+
+    def test_online_field_distribution_boundary_flux_is_clipped(self) -> None:
+        params = _zero_interface_params(6)
+        params["b_lin"] = jnp.array([10.0, -10.0], dtype=jnp.float64)
+        closure = _make_closure(
+            params=params,
+            training_mode="online_rollout",
+            train_objective="trajectory",
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+        )
+        a_hat = jnp.zeros((4, 3), dtype=jnp.complex128)
+        B_hat = learned_boundary_flux_hat(
+            a_hat,
+            jnp.array([0.0, 1.0, 2.0], dtype=jnp.float64),
+            Nv=4,
+            vth=1.0,
+            learned=closure,
+        )
+        expected = 0.25 * np.tanh(10.0 / 0.25) + 1j * 0.75 * np.tanh(-10.0 / 0.75)
+        np.testing.assert_allclose(
+            np.asarray(B_hat[-1, 1:]),
+            np.full((2,), expected, dtype=np.complex128),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_online_fourier_hermite_bidir_boundary_flux_is_not_clipped(self) -> None:
+        params = _zero_interface_params(6)
+        params["b_lin"] = jnp.array([10.0, -10.0], dtype=jnp.float64)
+        closure = _make_closure(
+            params=params,
+            training_mode="online_rollout",
+            train_objective="trajectory",
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+        )
+        a_hat = jnp.zeros((4, 3), dtype=jnp.complex128)
+        B_hat = learned_boundary_flux_hat(
+            a_hat,
+            jnp.array([0.0, 1.0, 2.0], dtype=jnp.float64),
+            Nv=4,
+            vth=1.0,
+            learned=closure,
+        )
+        np.testing.assert_allclose(
+            np.asarray(B_hat[-1, 1:]),
+            np.full((2,), 10.0 - 10.0j, dtype=np.complex128),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_online_full_state_loss_terms_upweight_tail_and_late_steps(self) -> None:
+        ref = jnp.ones((3, 6, 3), dtype=jnp.complex128)
+
+        pred_mid = ref.at[:, 3, 1].add(1.0)
+        pred_tail = ref.at[:, 5, 1].add(1.0)
+        pred_early = ref.at[0, 3, 1].add(1.0)
+        pred_late = ref.at[2, 3, 1].add(1.0)
+
+        num_mid, _ = train_mod.online_full_state_loss_terms(pred_mid, ref)
+        num_tail, _ = train_mod.online_full_state_loss_terms(pred_tail, ref)
+        num_early, _ = train_mod.online_full_state_loss_terms(pred_early, ref)
+        num_late, _ = train_mod.online_full_state_loss_terms(pred_late, ref)
+
+        self.assertGreater(float(num_tail), float(num_mid))
+        self.assertGreater(float(num_late), float(num_early))
 
     def test_zero_output_closure_matches_truncation_for_linear_cnab2(self) -> None:
         closure = _make_closure()
@@ -534,6 +626,9 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             strong_eps=(0.25,),
             val_fraction=0.2,
             online_v_probes=online_v_probes,
+            online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            Nv_targets=(target_nv,),
+            rollout_horizon=0,
         )
         stats = train_mod.build_identity_training_stats(Nm=1, context_mode="none")
         params = train_mod.init_interface_closure_params(
@@ -596,6 +691,322 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         for leaf in jax.tree_util.tree_leaves(grads):
             self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
 
+    def test_online_fourier_hermite_bidir_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
+        target_nv = 4
+        teacher_Nx = 8
+        teacher_Nv = 16
+        teacher_L = 4.0 * math.pi
+        teacher_dt = 0.05
+        teacher_vmin = -6.0
+        teacher_vmax = 6.0
+
+        online_dataset, _ = train_mod.build_online_reference_dataset(
+            dataset_cache=None,
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_L=teacher_L,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            linear_T=0.20,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            val_fraction=0.2,
+            online_v_probes=0,
+            online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+            Nv_targets=(target_nv,),
+            rollout_horizon=1,
+        )
+        stats = train_mod.build_identity_training_stats(Nm=1, context_mode="none")
+        params = train_mod.init_interface_closure_params(
+            jax.random.PRNGKey(0),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=8,
+            res_blocks=1,
+        )
+        integ = FourierHermiteIMEX(
+            Nx=teacher_Nx,
+            Nv=target_nv,
+            Lx=teacher_L,
+            dt=teacher_dt,
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        loss_fn, active_regimes = train_mod.make_online_fourier_hermite_bidir_batch_loss(
+            online_dataset=online_dataset,
+            regime_weights={train_mod.REGIME_LINEAR: 1.0},
+            Nm=1,
+            k_scale=float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64))),
+            nv_scale=float(target_nv),
+            stats=stats,
+            hidden_width=8,
+            res_blocks=1,
+            Nv_targets=(target_nv,),
+            train_regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
+            teacher_Lx=teacher_L,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            n_low=2,
+            context_mode="none",
+            rollout_horizon=1,
+            rollout_anchor_samples=1,
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+            poisson_sign=1.0,
+            rollout_dealias_23=False,
+        )
+        self.assertEqual(tuple(active_regimes), (train_mod.REGIME_LINEAR,))
+        regime_batches = {
+            regime: online_dataset[regime]["train"]
+            for regime in active_regimes
+        }
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, regime_batches)
+        self.assertTrue(np.isfinite(float(loss)))
+        self.assertTrue(np.isfinite(float(aux["q"])))
+        self.assertEqual(float(aux["q"]), 0.0)
+        self.assertTrue(np.isfinite(float(aux["state"])))
+        self.assertGreaterEqual(float(aux["state"]), 0.0)
+        for leaf in jax.tree_util.tree_leaves(grads):
+            self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
+
+    def test_online_fourier_hermite_projected_xv_bidir_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
+        target_nv = 4
+        teacher_Nx = 8
+        teacher_Nv = 16
+        teacher_L = 4.0 * math.pi
+        teacher_dt = 0.05
+        teacher_vmin = -6.0
+        teacher_vmax = 6.0
+
+        online_dataset, _ = train_mod.build_online_reference_dataset(
+            dataset_cache=None,
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_L=teacher_L,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            linear_T=0.20,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            val_fraction=0.2,
+            online_v_probes=0,
+            online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR,
+            Nv_targets=(target_nv,),
+            rollout_horizon=1,
+        )
+        stats = train_mod.build_identity_training_stats(Nm=1, context_mode="none")
+        params = train_mod.init_interface_closure_params(
+            jax.random.PRNGKey(0),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=8,
+            res_blocks=1,
+        )
+        integ = FourierHermiteIMEX(
+            Nx=teacher_Nx,
+            Nv=target_nv,
+            Lx=teacher_L,
+            dt=teacher_dt,
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        loss_fn, active_regimes = train_mod.make_online_fourier_hermite_bidir_batch_loss(
+            online_dataset=online_dataset,
+            regime_weights={train_mod.REGIME_LINEAR: 1.0},
+            Nm=1,
+            k_scale=float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64))),
+            nv_scale=float(target_nv),
+            stats=stats,
+            hidden_width=8,
+            res_blocks=1,
+            Nv_targets=(target_nv,),
+            train_regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
+            teacher_Lx=teacher_L,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            n_low=2,
+            context_mode="none",
+            rollout_horizon=1,
+            rollout_anchor_samples=1,
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR,
+            poisson_sign=1.0,
+            rollout_dealias_23=False,
+        )
+        self.assertEqual(tuple(active_regimes), (train_mod.REGIME_LINEAR,))
+        regime_batches = {
+            regime: online_dataset[regime]["train"]
+            for regime in active_regimes
+        }
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, regime_batches)
+        self.assertTrue(np.isfinite(float(loss)))
+        self.assertTrue(np.isfinite(float(aux["state"])))
+        self.assertGreaterEqual(float(aux["state"]), 0.0)
+        self.assertEqual(float(aux["q"]), 0.0)
+        self.assertTrue(np.isfinite(float(aux["q_diag"])))
+        self.assertGreaterEqual(float(aux["q_diag"]), 0.0)
+        for leaf in jax.tree_util.tree_leaves(grads):
+            self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
+
+    def test_online_projected_xv_loss_terms_are_relative_to_tail_scale(self) -> None:
+        Nx = 8
+        Nv = 4
+        Nk = Nx // 2 + 1
+        v_grid = jnp.linspace(-6.0, 6.0, 48, dtype=jnp.float64)
+        ref = jnp.zeros((1, Nv, Nk), dtype=jnp.complex128).at[0, Nv - 1, 1].set(2.0 + 1.0j)
+        pred_zero = jnp.zeros_like(ref)
+
+        loss = train_mod.online_projected_xv_loss_terms(
+            pred_zero,
+            ref,
+            Nx=Nx,
+            Lx=4.0 * math.pi,
+            v_grid=v_grid,
+            tail_window=1,
+        )
+        scaled_loss = train_mod.online_projected_xv_loss_terms(
+            pred_zero,
+            7.0 * ref,
+            Nx=Nx,
+            Lx=4.0 * math.pi,
+            v_grid=v_grid,
+            tail_window=1,
+        )
+        zero_loss = train_mod.online_projected_xv_loss_terms(
+            ref,
+            ref,
+            Nx=Nx,
+            Lx=4.0 * math.pi,
+            v_grid=v_grid,
+            tail_window=1,
+        )
+
+        self.assertAlmostEqual(float(loss), 1.0, places=10)
+        self.assertAlmostEqual(float(scaled_loss), 1.0, places=10)
+        self.assertAlmostEqual(float(zero_loss), 0.0, places=12)
+
+    def test_online_fourier_hermite_closure_bidir_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
+        target_nv = 4
+        teacher_Nx = 8
+        teacher_Nv = 16
+        teacher_L = 4.0 * math.pi
+        teacher_dt = 0.05
+        teacher_vmin = -6.0
+        teacher_vmax = 6.0
+
+        online_dataset, _ = train_mod.build_online_reference_dataset(
+            dataset_cache=None,
+            regimes=(train_mod.REGIME_LINEAR,),
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_L=teacher_L,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            linear_T=0.20,
+            linear_eps=1e-2,
+            linear_modes=(0.5,),
+            linear_num_samples=1,
+            linear_seed=0,
+            linear_poisson_sign=1.0,
+            nonlinear_T=0.10,
+            nonlinear_k0=0.5,
+            nonlinear_poisson_sign=1.0,
+            weak_eps=(0.05,),
+            strong_eps=(0.25,),
+            val_fraction=0.2,
+            online_v_probes=0,
+            online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
+            Nv_targets=(target_nv,),
+            rollout_horizon=1,
+        )
+        train_payload = online_dataset[train_mod.REGIME_LINEAR]["train"]
+        self.assertIn(train_mod.online_reference_coeff_key(target_nv), train_payload)
+        self.assertNotIn(train_mod.online_reference_coeff_key(target_nv + 1), train_payload)
+        self.assertIn(train_mod.online_reference_q_key(target_nv), train_payload)
+
+        stats = train_mod.build_identity_training_stats(Nm=1, context_mode="none")
+        params = train_mod.init_interface_closure_params(
+            jax.random.PRNGKey(0),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=8,
+            res_blocks=1,
+        )
+        integ = FourierHermiteIMEX(
+            Nx=teacher_Nx,
+            Nv=target_nv,
+            Lx=teacher_L,
+            dt=teacher_dt,
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        loss_fn, active_regimes = train_mod.make_online_fourier_hermite_bidir_batch_loss(
+            online_dataset=online_dataset,
+            regime_weights={train_mod.REGIME_LINEAR: 1.0},
+            Nm=1,
+            k_scale=float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64))),
+            nv_scale=float(target_nv),
+            stats=stats,
+            hidden_width=8,
+            res_blocks=1,
+            Nv_targets=(target_nv,),
+            train_regimes=(train_mod.REGIME_LINEAR,),
+            teacher_backend="grid_cubic_spline",
+            teacher_Lx=teacher_L,
+            teacher_Nx=teacher_Nx,
+            teacher_Nv=teacher_Nv,
+            teacher_vmin=teacher_vmin,
+            teacher_vmax=teacher_vmax,
+            teacher_dt=teacher_dt,
+            n_low=2,
+            context_mode="none",
+            rollout_horizon=1,
+            rollout_anchor_samples=1,
+            loss_backend=train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
+            poisson_sign=1.0,
+            rollout_dealias_23=False,
+        )
+        self.assertEqual(tuple(active_regimes), (train_mod.REGIME_LINEAR,))
+        regime_batches = {
+            regime: online_dataset[regime]["train"]
+            for regime in active_regimes
+        }
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, regime_batches)
+        self.assertTrue(np.isfinite(float(loss)))
+        self.assertTrue(np.isfinite(float(aux["q"])))
+        self.assertGreaterEqual(float(aux["q"]), 0.0)
+        self.assertTrue(np.isfinite(float(aux["state"])))
+        self.assertEqual(float(aux["state"]), 0.0)
+        for leaf in jax.tree_util.tree_leaves(grads):
+            self.assertTrue(np.isfinite(np.asarray(leaf, dtype=np.float64)).all())
+
     def test_online_hybrid_loss_is_jax_differentiable_on_tiny_episode(self) -> None:
         target_nv = 4
         teacher_Nx = 8
@@ -628,6 +1039,9 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             strong_eps=(0.25,),
             val_fraction=0.2,
             online_v_probes=online_v_probes,
+            online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            Nv_targets=(target_nv,),
+            rollout_horizon=0,
         )
         dataset_base = train_mod.build_mixed_landau_dataset(
             dataset_cache=None,
@@ -1269,6 +1683,68 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                     ]
                 )
 
+    def test_fourier_hermite_bidir_rejects_nonzero_observable_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            with self.assertRaisesRegex(ValueError, r"requires lambda_E=lambda_dist=lambda_tail=lambda_neg=lambda_reg=0"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--online-loss-backend",
+                        train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+                        "--online-v-probes",
+                        "0",
+                        "--rollout-horizon",
+                        "1",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--lambda-E",
+                        "1.0",
+                    ]
+                )
+
+    def test_fourier_hermite_bidir_rejects_nonzero_probe_grid_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "shared_interface.npz"
+            with self.assertRaisesRegex(ValueError, r"requires --online-v-probes 0"):
+                train_main(
+                    [
+                        "--checkpoint",
+                        str(ckpt),
+                        "--training-mode",
+                        "online_rollout",
+                        "--train-objective",
+                        "trajectory",
+                        "--online-loss-backend",
+                        train_mod.ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
+                        "--online-v-probes",
+                        "8",
+                        "--rollout-horizon",
+                        "1",
+                        "--Nv-targets",
+                        "4",
+                        "--Nm",
+                        "1",
+                        "--lambda-E",
+                        "0.0",
+                        "--lambda-dist",
+                        "0.0",
+                        "--lambda-tail",
+                        "0.0",
+                        "--lambda-neg",
+                        "0.0",
+                        "--lambda-reg",
+                        "0.0",
+                    ]
+                )
+
     def test_cached_online_reference_dataset_is_reused(self) -> None:
         v_probe = np.linspace(-6.0, 6.0, 8, dtype=np.float64)
         shared_dataset = {
@@ -1308,6 +1784,9 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
             strong_eps=(0.25,),
             val_fraction=0.2,
             online_v_probes=8,
+            online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+            Nv_targets=None,
+            rollout_horizon=0,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir) / "online_reference_dataset.npz"
@@ -1344,6 +1823,9 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
                     strong_eps=(0.25,),
                     val_fraction=0.2,
                     online_v_probes=8,
+                    online_loss_backend=train_mod.ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
+                    Nv_targets=(4,),
+                    rollout_horizon=0,
                 )
             np.testing.assert_allclose(np.asarray(cached_v_probe, dtype=np.float64), v_probe)
             np.testing.assert_allclose(
