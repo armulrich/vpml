@@ -467,7 +467,7 @@ class NvSweepTests(unittest.TestCase):
             case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
             self.assertEqual(case_targets, expected)
 
-    def test_run_nv_sweep_online_rollout_wrapper_uses_fixed_ratio_ladders(self) -> None:
+    def test_run_nv_sweep_online_rollout_wrapper_uses_target_only_bidir_caches(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             outdir = tmp / "nv_sweep_online_rollout"
@@ -513,7 +513,8 @@ class NvSweepTests(unittest.TestCase):
                     "TRAIN_TEACHER_DT": "0.05",
                     "TRAIN_TEACHER_VMIN": "-6",
                     "TRAIN_TEACHER_VMAX": "6",
-                    "TRAIN_ONLINE_V_PROBES": "8",
+                    "TRAIN_ROLLOUT_HORIZON": "1",
+                    "TRAIN_ROLLOUT_ANCHOR_SAMPLES": "1",
                     "TRAIN_ONLINE_CASE_BATCH_SIZE": "1",
                     "TRAIN_PARALLEL_JOBS": "1",
                 }
@@ -529,7 +530,9 @@ class NvSweepTests(unittest.TestCase):
             self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
             self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
             self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
-            self.assertTrue((outdir / "online_reference_dataset.npz").exists())
+            self.assertFalse((outdir / "online_reference_dataset.npz").exists())
+            self.assertTrue((outdir / "online_reference_dataset_nv6.npz").exists())
+            self.assertTrue((outdir / "online_reference_dataset_nv8.npz").exists())
             self.assertFalse((outdir / "shared_interface_closure_dataset.npz").exists())
             self.assertEqual(list(outdir.rglob("interface_closure_dataset.npz")), [])
 
@@ -539,9 +542,11 @@ class NvSweepTests(unittest.TestCase):
                 learned = load_learned_interface_closure_npz(ckpt)
                 self.assertEqual(learned.training_mode, "online_rollout")
                 self.assertEqual(learned.train_objective, "trajectory")
-                self.assertEqual(learned.loss_backend, "field_distribution_v1")
-                self.assertEqual(learned.online_v_probes, 8)
-                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), _fixed_ratio_ladder(nv, nm=6, ratio=1.8))
+                self.assertEqual(learned.loss_backend, "fourier_hermite_bidir")
+                self.assertEqual(learned.online_v_probes, 0)
+                self.assertEqual(learned.rollout_horizon, 1)
+                self.assertEqual(learned.rollout_anchor_samples, 1)
+                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), (nv,))
 
             summary = json.loads((outdir / "summary.json").read_text())
             self.assertEqual(summary["nv_list"], [6, 8])
@@ -549,10 +554,39 @@ class NvSweepTests(unittest.TestCase):
             self.assertEqual(
                 case_targets,
                 {
-                    6: _fixed_ratio_ladder(6, nm=6, ratio=1.8),
-                    8: _fixed_ratio_ladder(8, nm=6, ratio=1.8),
+                    6: (6,),
+                    8: (8,),
                 },
             )
+
+    def test_run_nv_sweep_online_rollout_closure_bidir_wrapper_selects_closure_backend(self) -> None:
+        script = Path("model/train/run_nv_sweep_online_rollout_closure_bidir.sh")
+        self.assertTrue(script.exists())
+        self.assertTrue(os.access(script, os.X_OK))
+        subprocess.run(
+            ["bash", "-n", str(script)],
+            cwd="/Users/armin/Documents/NYU/vpml",
+            check=True,
+        )
+        text = script.read_text()
+        self.assertIn("fourier_hermite_closure_bidir", text)
+        self.assertIn("run_nv_sweep_online_rollout.sh", text)
+
+    def test_run_nv_sweep_online_rollout_projected_xv_wrapper_selects_projected_xv_backend(self) -> None:
+        script = Path("model/train/run_nv_sweep_online_rollout_projected_xv.sh")
+        self.assertTrue(script.exists())
+        self.assertTrue(os.access(script, os.X_OK))
+        subprocess.run(
+            ["bash", "-n", str(script)],
+            cwd="/Users/armin/Documents/NYU/vpml",
+            check=True,
+        )
+        text = script.read_text()
+        self.assertIn("fourier_hermite_projected_xv_bidir", text)
+        self.assertIn("TRAIN_NV_LADDER_MODE=\"${TRAIN_NV_LADDER_MODE:-fixed_ratio}\"", text)
+        self.assertIn("TRAIN_ROLLOUT_DIRECTION=\"${TRAIN_ROLLOUT_DIRECTION:-forward}\"", text)
+        self.assertIn("TRAIN_PROJECTED_XV_TAIL_WINDOW", text)
+        self.assertIn("run_nv_sweep_online_rollout.sh", text)
 
     def test_run_nv_sweep_online_rollout_q_hybrid_wrapper_uses_fixed_ratio_ladders(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -12,6 +12,9 @@ else
   PYTHON_BIN="${PYTHON:-python}"
 fi
 
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-True}"
+export VPML_JAX_BACKEND="${VPML_JAX_BACKEND:-cpu}"
+
 OUTDIR="${1:-${DEFAULT_OUTDIR}}"
 NV_LIST="${NV_LIST:-${DEFAULT_NV_LIST}}"
 ONLINE_DATASET_CACHE="${ONLINE_DATASET_CACHE:-${OUTDIR}/online_reference_dataset.npz}"
@@ -40,44 +43,97 @@ RUN_TRAIN="${RUN_TRAIN:-1}"
 TRAIN_PARALLEL_JOBS="${TRAIN_PARALLEL_JOBS:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
-TRAIN_NV_LADDER_MODE="${TRAIN_NV_LADDER_MODE:-fixed_ratio}"
+INIT_CHECKPOINT_ROOT="${INIT_CHECKPOINT_ROOT:-}"
+TRAIN_NV_LADDER_MODE="${TRAIN_NV_LADDER_MODE:-target_only}"
 TRAIN_FIXED_RATIO="${TRAIN_FIXED_RATIO:-1.8}"
 TRAIN_NM="${TRAIN_NM:-6}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-128}"
 TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
-TRAIN_LR="${TRAIN_LR:-5e-5}"
+TRAIN_LR="${TRAIN_LR:-}"
 TRAIN_GRAD_CLIP="${TRAIN_GRAD_CLIP:-0.25}"
 TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-10}"
-TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-1}"
+TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-}"
 TRAIN_SEED="${TRAIN_SEED:-0}"
 TRAIN_N_LOW="${TRAIN_N_LOW:-2}"
 TRAIN_VAL_FRACTION="${TRAIN_VAL_FRACTION:-0.2}"
 TRAIN_REGIMES="${TRAIN_REGIMES:-linear_landau,nonlinear_landau_weak,nonlinear_landau_strong}"
 TRAIN_CONTEXT_MODE="${TRAIN_CONTEXT_MODE:-none}"
 TRAIN_TAIL_START_FRACTION="${TRAIN_TAIL_START_FRACTION:-0.6666666666666666}"
-TRAIN_LAMBDA_E="${TRAIN_LAMBDA_E:-0.5}"
-TRAIN_LAMBDA_DIST="${TRAIN_LAMBDA_DIST:-1.0}"
-TRAIN_LAMBDA_TAIL="${TRAIN_LAMBDA_TAIL:-0.005}"
-TRAIN_LAMBDA_NEG="${TRAIN_LAMBDA_NEG:-0.05}"
-TRAIN_LAMBDA_REG="${TRAIN_LAMBDA_REG:-1e-6}"
 TRAIN_ROLLOUT_DEALIAS_23="${TRAIN_ROLLOUT_DEALIAS_23:-1}"
-TRAIN_ONLINE_LOSS_BACKEND="${TRAIN_ONLINE_LOSS_BACKEND:-field_distribution_v1}"
-# Keep the online objective cheaper and numerically safer than eval by default.
-TRAIN_ONLINE_V_PROBES="${TRAIN_ONLINE_V_PROBES:-128}"
-TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-2}"
+TRAIN_ONLINE_LOSS_BACKEND="${TRAIN_ONLINE_LOSS_BACKEND:-fourier_hermite_bidir}"
+TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-}"
+TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-}"
+TRAIN_ROLLOUT_DIRECTION="${TRAIN_ROLLOUT_DIRECTION:-bidir}"
+TRAIN_PROJECTED_XV_TAIL_WINDOW="${TRAIN_PROJECTED_XV_TAIL_WINDOW:-0}"
+TRAIN_POSTERIOR_STATE_WEIGHT="${TRAIN_POSTERIOR_STATE_WEIGHT:-0.25}"
+TRAIN_POSTERIOR_FIELD_WEIGHT="${TRAIN_POSTERIOR_FIELD_WEIGHT:-1.0}"
+
+uses_projected_online_backend() {
+  [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]]
+}
+
+if [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "field_distribution_v1" ]]; then
+  TRAIN_LR="${TRAIN_LR:-5e-5}"
+  TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-1}"
+  TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-2}"
+  TRAIN_LAMBDA_E="${TRAIN_LAMBDA_E:-0.5}"
+  TRAIN_LAMBDA_DIST="${TRAIN_LAMBDA_DIST:-1.0}"
+  TRAIN_LAMBDA_TAIL="${TRAIN_LAMBDA_TAIL:-0.005}"
+  TRAIN_LAMBDA_NEG="${TRAIN_LAMBDA_NEG:-0.05}"
+  TRAIN_LAMBDA_REG="${TRAIN_LAMBDA_REG:-1e-6}"
+  TRAIN_ONLINE_V_PROBES="${TRAIN_ONLINE_V_PROBES:-128}"
+  TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-0}"
+  TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-0}"
+elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]]; then
+  TRAIN_LR="${TRAIN_LR:-1e-4}"
+  TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-20}"
+  TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-1}"
+  TRAIN_LAMBDA_E="0.0"
+  TRAIN_LAMBDA_DIST="0.0"
+  TRAIN_LAMBDA_TAIL="0.0"
+  TRAIN_LAMBDA_NEG="0.0"
+  TRAIN_LAMBDA_REG="0.0"
+  TRAIN_ONLINE_V_PROBES="0"
+  TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-5}"
+  TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-8}"
+elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" ]]; then
+  TRAIN_LR="${TRAIN_LR:-3e-4}"
+  TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-10}"
+  TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-1}"
+  TRAIN_LAMBDA_E="0.0"
+  TRAIN_LAMBDA_DIST="0.0"
+  TRAIN_LAMBDA_TAIL="0.0"
+  TRAIN_LAMBDA_NEG="0.0"
+  TRAIN_LAMBDA_REG="0.0"
+  TRAIN_ONLINE_V_PROBES="0"
+  TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-64}"
+  TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-1}"
+else
+  TRAIN_LR="${TRAIN_LR:-1e-4}"
+  TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-20}"
+  TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-1}"
+  TRAIN_LAMBDA_E="0.0"
+  TRAIN_LAMBDA_DIST="0.0"
+  TRAIN_LAMBDA_TAIL="0.0"
+  TRAIN_LAMBDA_NEG="0.0"
+  TRAIN_LAMBDA_REG="0.0"
+  TRAIN_ONLINE_V_PROBES="0"
+  TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-128}"
+  TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-4}"
+fi
 
 TRAIN_TEACHER_NX="${TRAIN_TEACHER_NX:-${TEACHER_NX}}"
 TRAIN_TEACHER_NV="${TRAIN_TEACHER_NV:-${TEACHER_NV}}"
-TRAIN_TEACHER_DT="${TRAIN_TEACHER_DT:-0.01}"
+TRAIN_TEACHER_DT="${TRAIN_TEACHER_DT:-${TEACHER_DT}}"
 TRAIN_TEACHER_VMIN="${TRAIN_TEACHER_VMIN:-${TEACHER_VMIN}}"
 TRAIN_TEACHER_VMAX="${TRAIN_TEACHER_VMAX:-${TEACHER_VMAX}}"
-TRAIN_LINEAR_T="${TRAIN_LINEAR_T:-10.0}"
+TRAIN_LINEAR_T="${TRAIN_LINEAR_T:-2.0}"
 TRAIN_LINEAR_EPS="${TRAIN_LINEAR_EPS:-0.01}"
 TRAIN_LINEAR_MODES="${TRAIN_LINEAR_MODES:-0.5,1.0,1.5,2.0}"
 TRAIN_LINEAR_NUM_SAMPLES="${TRAIN_LINEAR_NUM_SAMPLES:-8}"
 TRAIN_LINEAR_SEED="${TRAIN_LINEAR_SEED:-0}"
-TRAIN_NONLINEAR_T="${TRAIN_NONLINEAR_T:-10.0}"
+TRAIN_NONLINEAR_T="${TRAIN_NONLINEAR_T:-4.0}"
 TRAIN_NONLINEAR_K0="${TRAIN_NONLINEAR_K0:-${K0}}"
 TRAIN_WEAK_EPS="${TRAIN_WEAK_EPS:-0.03,0.05,0.07,0.1,0.15}"
 TRAIN_STRONG_EPS="${TRAIN_STRONG_EPS:-0.15,0.25,0.35,0.5,0.65}"
@@ -233,15 +289,23 @@ ladder_csv_for_mode() {
 }
 
 prepare_online_reference_cache() {
+  local cache_path="$1"
+  local target_csv="$2"
   local -a cache_args=(
     --training-mode online_rollout
     --train-objective trajectory
     --build-dataset-only
-    --dataset-cache "${ONLINE_DATASET_CACHE}"
+    --dataset-cache "${cache_path}"
     --online-loss-backend "${TRAIN_ONLINE_LOSS_BACKEND}"
     --online-v-probes "${TRAIN_ONLINE_V_PROBES}"
+    --posterior-state-weight "${TRAIN_POSTERIOR_STATE_WEIGHT}"
+    --posterior-field-weight "${TRAIN_POSTERIOR_FIELD_WEIGHT}"
+    --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
+    --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}"
+    --rollout-direction "${TRAIN_ROLLOUT_DIRECTION}"
+    --projected-xv-tail-window "${TRAIN_PROJECTED_XV_TAIL_WINDOW}"
     --teacher-backend grid_cubic_spline
-    --Nv-targets "${NV_LIST}"
+    --Nv-targets "${target_csv}"
     --Nm "${TRAIN_NM}"
     --regimes "${TRAIN_REGIMES}"
     --val-fraction "${TRAIN_VAL_FRACTION}"
@@ -260,14 +324,14 @@ prepare_online_reference_cache() {
     --weak-eps "${TRAIN_WEAK_EPS}"
     --strong-eps "${TRAIN_STRONG_EPS}"
   )
-  echo "[nv-sweep-online-rollout] [1/2] Preparing shared online reference cache at ${ONLINE_DATASET_CACHE}"
+  echo "[nv-sweep-online-rollout] [1/2] Preparing online reference cache at ${cache_path} for Nv-targets=${target_csv}"
   "${PYTHON_BIN}" -m model.train.train "${cache_args[@]}"
 }
 
 train_one_nv() {
   local idx="$1"
   local nv_raw="$2"
-  local nv model_dir checkpoint_nv loss_plot_nv log_path train_ladder_csv
+  local nv model_dir checkpoint_nv loss_plot_nv log_path train_ladder_csv dataset_cache_path init_checkpoint_nv
   nv="$(echo "${nv_raw}" | tr -d '[:space:]')"
   if [[ -z "${nv}" ]]; then
     return 0
@@ -277,17 +341,29 @@ train_one_nv() {
   loss_plot_nv="${model_dir}/interface_closure.loss.png"
   log_path="${model_dir}/interface_closure.train.log"
   train_ladder_csv="$(ladder_csv_for_mode "${nv}")"
+  if uses_projected_online_backend; then
+    dataset_cache_path="${OUTDIR}/online_reference_dataset_nv${nv}.npz"
+    prepare_online_reference_cache "${dataset_cache_path}" "${train_ladder_csv}"
+  else
+    dataset_cache_path="${ONLINE_DATASET_CACHE}"
+  fi
   mkdir -p "${model_dir}"
 
   local -a train_args=(
     --checkpoint "${checkpoint_nv}"
-    --dataset-cache "${ONLINE_DATASET_CACHE}"
+    --dataset-cache "${dataset_cache_path}"
     --loss-plot "${loss_plot_nv}"
     --training-mode online_rollout
     --train-objective trajectory
     --online-loss-backend "${TRAIN_ONLINE_LOSS_BACKEND}"
     --online-v-probes "${TRAIN_ONLINE_V_PROBES}"
     --online-case-batch-size "${TRAIN_ONLINE_CASE_BATCH_SIZE}"
+    --posterior-state-weight "${TRAIN_POSTERIOR_STATE_WEIGHT}"
+    --posterior-field-weight "${TRAIN_POSTERIOR_FIELD_WEIGHT}"
+    --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
+    --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}"
+    --rollout-direction "${TRAIN_ROLLOUT_DIRECTION}"
+    --projected-xv-tail-window "${TRAIN_PROJECTED_XV_TAIL_WINDOW}"
     --teacher-backend grid_cubic_spline
     --Nv-targets "${train_ladder_csv}"
     --Nm "${TRAIN_NM}"
@@ -327,6 +403,14 @@ train_one_nv() {
   if [[ "${TRAIN_ROLLOUT_DEALIAS_23}" != "0" ]]; then
     train_args+=(--rollout-dealias-23)
   fi
+  if [[ -n "${INIT_CHECKPOINT_ROOT}" ]]; then
+    init_checkpoint_nv="${INIT_CHECKPOINT_ROOT}/nv${nv}/interface_closure.npz"
+    if [[ ! -f "${init_checkpoint_nv}" ]]; then
+      echo "INIT_CHECKPOINT_ROOT requires an existing checkpoint at ${init_checkpoint_nv}" >&2
+      exit 1
+    fi
+    train_args+=(--init-checkpoint "${init_checkpoint_nv}")
+  fi
 
   if [[ "${TRAIN_PARALLEL_JOBS}" -le 1 ]]; then
     echo "[nv-sweep-online-rollout] [1/2] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${nv} with Nv-targets=${train_ladder_csv}"
@@ -346,7 +430,9 @@ train_one_nv() {
 
 if [[ "${RUN_TRAIN}" != "0" ]]; then
   echo "[nv-sweep-online-rollout] [1/2] Training one online_rollout checkpoint per deployment Nv"
-  prepare_online_reference_cache
+  if ! uses_projected_online_backend; then
+    prepare_online_reference_cache "${ONLINE_DATASET_CACHE}" "${NV_LIST}"
+  fi
   for idx in "${!NV_VALUES[@]}"; do
     train_one_nv "${idx}" "${NV_VALUES[idx]}"
   done
@@ -370,14 +456,21 @@ ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
 echo "[nv-sweep-online-rollout] [2/2] Running nonlinear Nv sweep"
 "${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
 
+if uses_projected_online_backend; then
+  DATASET_CACHE_SUMMARY="${OUTDIR}/online_reference_dataset_nv*.npz"
+else
+  DATASET_CACHE_SUMMARY="${ONLINE_DATASET_CACHE}"
+fi
+
 cat <<EOF
 
 Done.
 
 Artifacts:
-  mode:           online_rollout_field_distribution_v1
+  mode:           online_rollout_${TRAIN_ONLINE_LOSS_BACKEND}
   checkpoint dir: ${CHECKPOINT_ROOT}
-  dataset cache:  ${ONLINE_DATASET_CACHE}
+  init checkpoints:${INIT_CHECKPOINT_ROOT:-<none>}
+  dataset cache:  ${DATASET_CACHE_SUMMARY}
   summary:        ${OUTDIR}/summary.json
   metric 1:       ${OUTDIR}/nv_sweep_metric1.png
   metric 2:       ${OUTDIR}/nv_sweep_metric2.png
@@ -392,6 +485,11 @@ Defaults:
   train dt:       ${TRAIN_TEACHER_DT}
   train linear T: ${TRAIN_LINEAR_T}
   train nonlin T: ${TRAIN_NONLINEAR_T}
+  rollout horiz:  ${TRAIN_ROLLOUT_HORIZON}
+  rollout dir:    ${TRAIN_ROLLOUT_DIRECTION}
+  xv tail window: ${TRAIN_PROJECTED_XV_TAIL_WINDOW}
+  posterior state:${TRAIN_POSTERIOR_STATE_WEIGHT}
+  posterior field:${TRAIN_POSTERIOR_FIELD_WEIGHT}
   v probes:       ${TRAIN_ONLINE_V_PROBES}
   case batch:     ${TRAIN_ONLINE_CASE_BATCH_SIZE}
   parallel jobs:  ${TRAIN_PARALLEL_JOBS}
