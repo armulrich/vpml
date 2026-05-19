@@ -41,13 +41,15 @@ TRAIN_VAL_FRACTION="${TRAIN_VAL_FRACTION:-0.2}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-64}"
 TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
-TRAIN_LR="${TRAIN_LR:-1e-4}"
+TRAIN_LR="${TRAIN_LR:-1e-5}"
 TRAIN_GRAD_CLIP="${TRAIN_GRAD_CLIP:-0.25}"
 TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-10}"
 TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-5}"
 TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-1}"
 TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-5}"
 TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-32}"
+TRAIN_BACKWARD_WEIGHT="${TRAIN_BACKWARD_WEIGHT:-1.0}"
+TRAIN_LOSS_EVAL_BATCH_SIZE="${TRAIN_LOSS_EVAL_BATCH_SIZE:-1}"
 TRAIN_SEED="${TRAIN_SEED:-0}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
@@ -75,7 +77,7 @@ for VGRID_RAW in "${VGRID_VALUES[@]}"; do
   MODEL_DIR="${OUTDIR}/vgrid${VGRID}"
   CHECKPOINT="${MODEL_DIR}/spline_fem_residual.npz"
   LOSS_PLOT="${MODEL_DIR}/spline_fem_residual.loss.png"
-  DATASET_CACHE="${OUTDIR}/spline_fem_reference_vgrid${VGRID}.npz"
+  DATASET_CACHE="${OUTDIR}/spline_fem_lr_teacher_reference_vgrid${VGRID}.npz"
 
   if [[ "${RUN_TRAIN}" == "0" ]]; then
     if [[ ! -f "${CHECKPOINT}" ]]; then
@@ -103,6 +105,8 @@ for VGRID_RAW in "${VGRID_VALUES[@]}"; do
       --seed "${TRAIN_SEED}" \
       --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}" \
       --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}" \
+      --backward-weight "${TRAIN_BACKWARD_WEIGHT}" \
+      --loss-eval-batch-size "${TRAIN_LOSS_EVAL_BATCH_SIZE}" \
       --regimes "${TRAIN_REGIMES}" \
       --val-fraction "${TRAIN_VAL_FRACTION}" \
       --teacher-Nx "${TEACHER_NX}" \
@@ -183,5 +187,6 @@ Defaults:
   eval T:        ${EVAL_T}
   rollout horiz: ${TRAIN_ROLLOUT_HORIZON}
   anchors:       ${TRAIN_ROLLOUT_ANCHOR_SAMPLES}
+  backward wt:   ${TRAIN_BACKWARD_WEIGHT}
   eval plots:    RUN_EVAL=${RUN_EVAL}
 EOF

@@ -122,15 +122,7 @@ def init_spline_residual_params(
             }
         )
     params["blocks"] = tuple(blocks)
-    params["Wout"] = (
-        1.0e-3
-        * jax.random.normal(
-            keys[-1],
-            (int(hidden_width), 1),
-            dtype=jnp.float64,
-        )
-        / math.sqrt(float(hidden_width))
-    )
+    params["Wout"] = jnp.zeros((int(hidden_width), 1), dtype=jnp.float64)
     params["bout"] = jnp.zeros((1,), dtype=jnp.float64)
     return params
 
@@ -189,7 +181,7 @@ def spline_residual(
     *,
     ops: Dict[str, Array] | None = None,
 ) -> Array:
-    """Evaluate a mass-neutral learned residual on the coarse physical grid."""
+    """Evaluate a mass-neutral learned coarse residual on the coarse grid."""
     features = spline_residual_features(f_state, config, ops=ops)
     raw = _residual_mlp_apply(params, features).reshape((int(config.Nv), int(config.Nx)))
     # Avoid a learned residual that changes total particle number at leading order.
@@ -203,11 +195,22 @@ def spline_fem_base_step(
     ops: Dict[str, Array] | None = None,
 ) -> Array:
     """One coarse cubic-spline semi-Lagrangian Vlasov-Poisson step."""
+    return spline_fem_base_step_dt(f_state, config, float(config.dt), ops=ops)
+
+
+def spline_fem_base_step_dt(
+    f_state: Array,
+    config: PhysicalGridVlasovPoissonConfig,
+    dt: float,
+    *,
+    ops: Dict[str, Array] | None = None,
+) -> Array:
+    """One cubic-spline semi-Lagrangian step with an explicit signed time step."""
     ops = _physical_grid_ops(config) if ops is None else ops
-    f_half = advect_x_cubic(f_state, config, ops, 0.5 * float(config.dt))
+    f_half = advect_x_cubic(f_state, config, ops, 0.5 * float(dt))
     e_mid = compute_electric_field_from_distribution(f_half, config, ops=ops)
-    f_vel = advect_v_cubic(f_half, config, ops, e_mid, float(config.dt))
-    return advect_x_cubic(f_vel, config, ops, 0.5 * float(config.dt)).astype(jnp.float64)
+    f_vel = advect_v_cubic(f_half, config, ops, e_mid, float(dt))
+    return advect_x_cubic(f_vel, config, ops, 0.5 * float(dt)).astype(jnp.float64)
 
 
 def spline_fem_step_with_residual(
@@ -222,6 +225,21 @@ def spline_fem_step_with_residual(
     base_next = spline_fem_base_step(f_state, config, ops=ops)
     correction = spline_residual(params, f_state, config, ops=ops)
     return (base_next + float(config.dt) * correction).astype(jnp.float64)
+
+
+def spline_fem_step_with_residual_dt(
+    f_state: Array,
+    params: Dict[str, object],
+    config: PhysicalGridVlasovPoissonConfig,
+    dt: float,
+    *,
+    ops: Dict[str, Array] | None = None,
+) -> Array:
+    """One signed coarse step with the residual inserted using the signed dt."""
+    ops = _physical_grid_ops(config) if ops is None else ops
+    base_next = spline_fem_base_step_dt(f_state, config, float(dt), ops=ops)
+    correction = spline_residual(params, f_state, config, ops=ops)
+    return (base_next + float(dt) * correction).astype(jnp.float64)
 
 
 def physical_l2_norm_sq(
@@ -292,3 +310,217 @@ def spline_fem_rollout_loss(
         return jnp.mean(jax.vmap(rel_one)(pred_hist, ref))
 
     return jnp.mean(jax.vmap(one_anchor)(anchors)).astype(jnp.float64)
+
+
+def spline_fem_teacher_lifted_rollout_loss(
+    params: Dict[str, object],
+    low_anchors: Array,
+    teacher_targets_fwd: Array,
+    teacher_targets_bwd: Array,
+    low_config: PhysicalGridVlasovPoissonConfig,
+    teacher_config: PhysicalGridVlasovPoissonConfig,
+    *,
+    backward_weight: float = 1.0,
+) -> Array:
+    """Relative online loss after lifting LR rollouts back to the fixed HR grid.
+
+    ``low_anchors`` has shape ``(B, M_v, N_x^lo)``. The target arrays have shape
+    ``(B, H, N_v^HR, N_x^HR)``. The model is still evolved entirely on the low
+    grid; only the predicted states used inside the loss are interpolated back
+    to the teacher grid.
+    """
+    low_ops = _physical_grid_ops(low_config)
+    teacher_ops = _physical_grid_ops(teacher_config)
+    low_anchors = jnp.asarray(low_anchors, dtype=jnp.float64)
+    teacher_targets_fwd = jnp.asarray(teacher_targets_fwd, dtype=jnp.float64)
+    teacher_targets_bwd = jnp.asarray(teacher_targets_bwd, dtype=jnp.float64)
+    equilibrium_hr = maxwellian_on_grid(teacher_ops["v"])[:, None]
+    horizon = int(teacher_targets_fwd.shape[1])
+
+    def rel_hr_error(low_pred: Array, target_hr: Array) -> Array:
+        pred_hr = restrict_state_to_grid(
+            low_pred,
+            low_config,
+            teacher_config,
+            src_ops=low_ops,
+        )
+        num = physical_l2_norm_sq(pred_hr - target_hr, teacher_config, ops=teacher_ops)
+        den = physical_l2_norm_sq(target_hr - equilibrium_hr, teacher_config, ops=teacher_ops)
+        return num / (den + 1.0e-30)
+
+    def one_window(anchor: Array, targets_fwd: Array, targets_bwd: Array) -> Array:
+        def step_fwd(carry: Array, _unused: Array) -> tuple[Array, Array]:
+            nxt = spline_fem_step_with_residual_dt(
+                carry,
+                params,
+                low_config,
+                float(low_config.dt),
+                ops=low_ops,
+            )
+            return nxt, nxt
+
+        def step_bwd(carry: Array, _unused: Array) -> tuple[Array, Array]:
+            nxt = spline_fem_step_with_residual_dt(
+                carry,
+                params,
+                low_config,
+                -float(low_config.dt),
+                ops=low_ops,
+            )
+            return nxt, nxt
+
+        _, pred_fwd = jax.lax.scan(step_fwd, anchor, xs=None, length=horizon)
+        _, pred_bwd = jax.lax.scan(step_bwd, anchor, xs=None, length=horizon)
+        loss_fwd = jnp.mean(jax.vmap(rel_hr_error)(pred_fwd, targets_fwd))
+        loss_bwd = jnp.mean(jax.vmap(rel_hr_error)(pred_bwd, targets_bwd))
+        weight = max(float(backward_weight), 0.0)
+        return (loss_fwd + weight * loss_bwd) / (1.0 + weight)
+
+    return jnp.mean(jax.vmap(one_window)(low_anchors, teacher_targets_fwd, teacher_targets_bwd)).astype(
+        jnp.float64
+    )
+
+
+def spline_fem_lr_teacher_rollout_loss(
+    params: Dict[str, object],
+    low_anchors: Array,
+    low_targets_fwd: Array,
+    low_targets_bwd: Array,
+    low_config: PhysicalGridVlasovPoissonConfig,
+    *,
+    backward_weight: float = 1.0,
+) -> Array:
+    """H-step closure-improvement loss against the restricted teacher.
+
+    The rollout is evolved entirely on the low grid, and each prediction is
+    compared to ``R_M F^{HR}`` on that same low grid. Lifting to the HR grid is
+    left to evaluation/plotting. The denominator is the corresponding
+    no-correction coarse-solver defect, so a no-correction model scores about
+    one and useful corrections must beat the baseline coarse solver.
+    """
+    low_ops = _physical_grid_ops(low_config)
+    low_anchors = jnp.asarray(low_anchors, dtype=jnp.float64)
+    low_targets_fwd = jnp.asarray(low_targets_fwd, dtype=jnp.float64)
+    low_targets_bwd = jnp.asarray(low_targets_bwd, dtype=jnp.float64)
+    horizon = int(low_targets_fwd.shape[1])
+
+    def improvement_error(pred: Array, baseline: Array, target: Array) -> Array:
+        num = physical_l2_norm_sq(pred - target, low_config, ops=low_ops)
+        base = physical_l2_norm_sq(baseline - target, low_config, ops=low_ops)
+        scale = physical_l2_norm_sq(target, low_config, ops=low_ops)
+        return num / (base + 1.0e-12 * scale + 1.0e-30)
+
+    def one_window(anchor: Array, targets_fwd: Array, targets_bwd: Array) -> Array:
+        def step_fwd(carry: Array, _unused: Array) -> tuple[Array, Array]:
+            nxt = spline_fem_step_with_residual_dt(
+                carry,
+                params,
+                low_config,
+                float(low_config.dt),
+                ops=low_ops,
+            )
+            return nxt, nxt
+
+        def base_step_fwd(carry: Array, _unused: Array) -> tuple[Array, Array]:
+            nxt = spline_fem_base_step_dt(
+                carry,
+                low_config,
+                float(low_config.dt),
+                ops=low_ops,
+            )
+            return nxt, nxt
+
+        def step_bwd(carry: Array, _unused: Array) -> tuple[Array, Array]:
+            nxt = spline_fem_step_with_residual_dt(
+                carry,
+                params,
+                low_config,
+                -float(low_config.dt),
+                ops=low_ops,
+            )
+            return nxt, nxt
+
+        def base_step_bwd(carry: Array, _unused: Array) -> tuple[Array, Array]:
+            nxt = spline_fem_base_step_dt(
+                carry,
+                low_config,
+                -float(low_config.dt),
+                ops=low_ops,
+            )
+            return nxt, nxt
+
+        _, pred_fwd = jax.lax.scan(step_fwd, anchor, xs=None, length=horizon)
+        _, pred_bwd = jax.lax.scan(step_bwd, anchor, xs=None, length=horizon)
+        _, base_fwd = jax.lax.scan(base_step_fwd, anchor, xs=None, length=horizon)
+        _, base_bwd = jax.lax.scan(base_step_bwd, anchor, xs=None, length=horizon)
+        loss_fwd = jnp.mean(jax.vmap(improvement_error)(pred_fwd, base_fwd, targets_fwd))
+        loss_bwd = jnp.mean(jax.vmap(improvement_error)(pred_bwd, base_bwd, targets_bwd))
+        weight = max(float(backward_weight), 0.0)
+        return (loss_fwd + weight * loss_bwd) / (1.0 + weight)
+
+    return jnp.mean(jax.vmap(one_window)(low_anchors, low_targets_fwd, low_targets_bwd)).astype(
+        jnp.float64
+    )
+
+
+def spline_fem_lr_teacher_defect_loss(
+    params: Dict[str, object],
+    low_anchors: Array,
+    low_targets_fwd: Array,
+    low_targets_bwd: Array,
+    low_config: PhysicalGridVlasovPoissonConfig,
+    *,
+    backward_weight: float = 1.0,
+) -> Array:
+    """Direct coarse-defect loss against the restricted HR teacher.
+
+    For each teacher state in the stored window, this loss compares the learned
+    signed ``dt * residual`` correction with the exact one-step LR defect
+
+        R_M F_{m +/- 1}^{HR} - Phi_{+/- dt}^M(R_M F_m^{HR}).
+
+    This is the spline-grid analogue of supervising the Hermite interface target:
+    the model is trained on the missing coarse update itself, not only on the
+    downstream H-step state error.
+    """
+    low_ops = _physical_grid_ops(low_config)
+    low_anchors = jnp.asarray(low_anchors, dtype=jnp.float64)
+    low_targets_fwd = jnp.asarray(low_targets_fwd, dtype=jnp.float64)
+    low_targets_bwd = jnp.asarray(low_targets_bwd, dtype=jnp.float64)
+    horizon = int(low_targets_fwd.shape[1])
+
+    def defect_error(state: Array, target_next: Array, dt: float) -> Array:
+        base_next = spline_fem_base_step_dt(state, low_config, float(dt), ops=low_ops)
+        exact_defect = target_next - base_next
+        predicted_defect = float(dt) * spline_residual(params, state, low_config, ops=low_ops)
+        num = physical_l2_norm_sq(predicted_defect - exact_defect, low_config, ops=low_ops)
+        den = physical_l2_norm_sq(exact_defect, low_config, ops=low_ops)
+        scale = physical_l2_norm_sq(target_next, low_config, ops=low_ops)
+        return num / (den + 1.0e-12 * scale + 1.0e-30)
+
+    def one_window(anchor: Array, targets_fwd: Array, targets_bwd: Array) -> Array:
+        if horizon > 1:
+            fwd_states = jnp.concatenate([anchor[None, :, :], targets_fwd[:-1]], axis=0)
+            bwd_states = jnp.concatenate([anchor[None, :, :], targets_bwd[:-1]], axis=0)
+        else:
+            fwd_states = anchor[None, :, :]
+            bwd_states = anchor[None, :, :]
+
+        loss_fwd = jnp.mean(
+            jax.vmap(lambda state, target: defect_error(state, target, float(low_config.dt)))(
+                fwd_states,
+                targets_fwd,
+            )
+        )
+        loss_bwd = jnp.mean(
+            jax.vmap(lambda state, target: defect_error(state, target, -float(low_config.dt)))(
+                bwd_states,
+                targets_bwd,
+            )
+        )
+        weight = max(float(backward_weight), 0.0)
+        return (loss_fwd + weight * loss_bwd) / (1.0 + weight)
+
+    return jnp.mean(jax.vmap(one_window)(low_anchors, low_targets_fwd, low_targets_bwd)).astype(
+        jnp.float64
+    )

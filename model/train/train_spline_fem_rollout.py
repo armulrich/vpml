@@ -30,12 +30,16 @@ from model.train.train import (
     parse_str_tuple,
     sample_initial_condition,
 )
-from vpml.physical_grid import PhysicalGridVlasovPoissonConfig, run_semilagrangian_vlasov_poisson
+from vpml.physical_grid import (
+    PhysicalGridVlasovPoissonConfig,
+    _physical_grid_ops,
+    run_semilagrangian_vlasov_poisson,
+)
 from vpml.rollout.spline_fem import (
     init_spline_residual_params,
     maxwellian_on_grid,
-    restrict_history_to_grid,
-    spline_fem_rollout_loss,
+    restrict_state_to_grid,
+    spline_fem_lr_teacher_defect_loss,
 )
 
 try:
@@ -44,7 +48,7 @@ except Exception:
     pass
 
 
-SPLINE_FEM_CACHE_FORMAT = "spline_fem_online_rollout_reference_v2"
+SPLINE_FEM_CACHE_FORMAT = "spline_fem_online_rollout_reference_v4_lr_teacher_windows"
 
 
 def _cache_mismatch(actual: np.ndarray, expected: np.ndarray) -> bool:
@@ -86,6 +90,8 @@ def build_metadata(args: argparse.Namespace, regimes: Sequence[str]) -> Dict[str
             dtype=np.float64,
         ),
         "val_fraction": np.array([float(args.val_fraction)], dtype=np.float64),
+        "rollout_horizon": np.array([int(args.rollout_horizon)], dtype=np.int32),
+        "rollout_anchor_samples": np.array([int(args.rollout_anchor_samples)], dtype=np.int32),
     }
 
 
@@ -98,8 +104,12 @@ def load_dataset_cache(path: Path, metadata: Dict[str, np.ndarray]) -> Optional[
                 if key not in data.files or _cache_mismatch(np.asarray(data[key]), np.asarray(expected)):
                     raise ValueError(key)
             return {
-                "train_histories": np.asarray(data["train_histories"], dtype=np.float64),
-                "val_histories": np.asarray(data["val_histories"], dtype=np.float64),
+                "train_low_anchors": np.asarray(data["train_low_anchors"], dtype=np.float32),
+                "train_low_fwd_targets": np.asarray(data["train_low_fwd_targets"], dtype=np.float32),
+                "train_low_bwd_targets": np.asarray(data["train_low_bwd_targets"], dtype=np.float32),
+                "val_low_anchors": np.asarray(data["val_low_anchors"], dtype=np.float32),
+                "val_low_fwd_targets": np.asarray(data["val_low_fwd_targets"], dtype=np.float32),
+                "val_low_bwd_targets": np.asarray(data["val_low_bwd_targets"], dtype=np.float32),
                 "train_regimes": np.asarray(data["train_regimes"], dtype=np.str_),
                 "val_regimes": np.asarray(data["val_regimes"], dtype=np.str_),
             }
@@ -113,40 +123,112 @@ def save_dataset_cache(path: Path, dataset: Dict[str, np.ndarray], metadata: Dic
     np.savez(path, **metadata, **dataset)
 
 
-def split_histories(
-    histories: Sequence[np.ndarray],
+def split_window_groups(
+    window_groups: Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray]],
     labels: Sequence[str],
     *,
     val_fraction: float,
 ) -> Dict[str, np.ndarray]:
-    if not histories:
-        raise ValueError("No histories were generated")
-    if len(histories) == 1:
-        train_histories = histories
-        train_labels = labels
-        val_histories = histories
-        val_labels = labels
+    if not window_groups:
+        raise ValueError("No training windows were generated")
+    if len(window_groups) == 1:
+        train_groups = window_groups
+        train_labels_raw = labels
+        val_groups = window_groups
+        val_labels_raw = labels
     else:
-        n_val = max(1, int(round(len(histories) * float(val_fraction))))
-        n_val = min(n_val, len(histories) - 1)
-        train_histories = histories[:-n_val]
-        train_labels = labels[:-n_val]
-        val_histories = histories[-n_val:]
-        val_labels = labels[-n_val:]
+        n_val = max(1, int(round(len(window_groups) * float(val_fraction))))
+        n_val = min(n_val, len(window_groups) - 1)
+        train_groups = window_groups[:-n_val]
+        train_labels_raw = labels[:-n_val]
+        val_groups = window_groups[-n_val:]
+        val_labels_raw = labels[-n_val:]
+
+    def concat_field(groups: Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray]], index: int) -> np.ndarray:
+        return np.concatenate([group[index] for group in groups], axis=0).astype(np.float32)
+
+    def expanded_labels(groups: Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray]], names: Sequence[str]) -> np.ndarray:
+        labels_out = []
+        for group, name in zip(groups, names):
+            labels_out.extend([name] * int(group[0].shape[0]))
+        return np.asarray(labels_out, dtype=np.str_)
+
     return {
-        "train_histories": np.stack(train_histories, axis=0).astype(np.float64),
-        "val_histories": np.stack(val_histories, axis=0).astype(np.float64),
-        "train_regimes": np.asarray(train_labels, dtype=np.str_),
-        "val_regimes": np.asarray(val_labels, dtype=np.str_),
+        "train_low_anchors": concat_field(train_groups, 0),
+        "train_low_fwd_targets": concat_field(train_groups, 1),
+        "train_low_bwd_targets": concat_field(train_groups, 2),
+        "val_low_anchors": concat_field(val_groups, 0),
+        "val_low_fwd_targets": concat_field(val_groups, 1),
+        "val_low_bwd_targets": concat_field(val_groups, 2),
+        "train_regimes": expanded_labels(train_groups, train_labels_raw),
+        "val_regimes": expanded_labels(val_groups, val_labels_raw),
     }
 
 
-def build_low_history(
+def bidirectional_anchor_indices(
+    *,
+    history_length: int,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+) -> np.ndarray:
+    horizon = int(rollout_horizon)
+    min_anchor = horizon
+    max_anchor = int(history_length) - horizon - 1
+    if max_anchor < min_anchor:
+        raise ValueError(
+            f"history_length={history_length} is too short for bidirectional horizon={horizon}"
+        )
+    num_available = max_anchor - min_anchor + 1
+    if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= num_available:
+        return np.arange(min_anchor, max_anchor + 1, dtype=np.int32)
+    anchors = np.rint(
+        np.linspace(float(min_anchor), float(max_anchor), int(rollout_anchor_samples))
+    ).astype(np.int32)
+    return np.unique(anchors)
+
+
+def restrict_indexed_teacher_history(
+    teacher_history: np.ndarray,
+    unique_indices: np.ndarray,
+    requested_indices: np.ndarray,
+    *,
+    teacher_config: PhysicalGridVlasovPoissonConfig,
+    low_config: PhysicalGridVlasovPoissonConfig,
+    teacher_ops: Dict[str, jnp.ndarray],
+) -> np.ndarray:
+    """Restrict selected teacher states and gather them with requested shape."""
+    unique_indices = np.asarray(unique_indices, dtype=np.int32).reshape(-1)
+    restricted = []
+    for idx in unique_indices:
+        restricted.append(
+            np.asarray(
+                restrict_state_to_grid(
+                    jnp.asarray(teacher_history[int(idx)], dtype=jnp.float64),
+                    teacher_config,
+                    low_config,
+                    src_ops=teacher_ops,
+                ),
+                dtype=np.float32,
+            )
+        )
+    restricted_arr = np.stack(restricted, axis=0).astype(np.float32)
+    index_to_pos = {int(idx): pos for pos, idx in enumerate(unique_indices)}
+    positions = np.asarray(
+        [index_to_pos[int(idx)] for idx in np.asarray(requested_indices).reshape(-1)],
+        dtype=np.int32,
+    ).reshape(np.asarray(requested_indices).shape)
+    return restricted_arr[positions].astype(np.float32)
+
+
+def build_low_teacher_windows(
     *,
     teacher_config: PhysicalGridVlasovPoissonConfig,
     low_config: PhysicalGridVlasovPoissonConfig,
     perturbation_x: np.ndarray,
-) -> np.ndarray:
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build H-step windows on the LR grid from one fixed HR teacher history."""
     equilibrium = maxwellian_on_grid(teacher_config.v)
     f0 = equilibrium[:, None] * (1.0 + jnp.asarray(perturbation_x, dtype=jnp.float64)[None, :])
     raw = run_semilagrangian_vlasov_poisson(
@@ -155,12 +237,51 @@ def build_low_history(
         history_stride=1,
         return_state_history=True,
     )
-    low_history = restrict_history_to_grid(
-        jnp.asarray(raw["state_history"], dtype=jnp.float64),
-        teacher_config,
-        low_config,
+    teacher_history = np.asarray(raw["state_history"], dtype=np.float32)
+    anchors = bidirectional_anchor_indices(
+        history_length=int(teacher_history.shape[0]),
+        rollout_horizon=int(rollout_horizon),
+        rollout_anchor_samples=int(rollout_anchor_samples),
     )
-    return np.asarray(low_history, dtype=np.float64)
+    teacher_ops = _physical_grid_ops(teacher_config)
+    offsets = np.arange(1, int(rollout_horizon) + 1, dtype=np.int32)
+    fwd_indices = anchors[:, None] + offsets[None, :]
+    bwd_indices = anchors[:, None] - offsets[None, :]
+    all_indices = np.unique(
+        np.concatenate(
+            [
+                anchors.reshape(-1),
+                fwd_indices.reshape(-1),
+                bwd_indices.reshape(-1),
+            ]
+        )
+    )
+    return (
+        restrict_indexed_teacher_history(
+            teacher_history,
+            all_indices,
+            anchors,
+            teacher_config=teacher_config,
+            low_config=low_config,
+            teacher_ops=teacher_ops,
+        ),
+        restrict_indexed_teacher_history(
+            teacher_history,
+            all_indices,
+            fwd_indices,
+            teacher_config=teacher_config,
+            low_config=low_config,
+            teacher_ops=teacher_ops,
+        ),
+        restrict_indexed_teacher_history(
+            teacher_history,
+            all_indices,
+            bwd_indices,
+            teacher_config=teacher_config,
+            low_config=low_config,
+            teacher_ops=teacher_ops,
+        ),
+    )
 
 
 def build_dataset(args: argparse.Namespace, regimes: Sequence[str]) -> Dict[str, np.ndarray]:
@@ -189,7 +310,7 @@ def build_dataset(args: argparse.Namespace, regimes: Sequence[str]) -> Dict[str,
         poisson_sign=float(args.teacher_poisson_sign),
         snapshot_times=(),
     )
-    histories: List[np.ndarray] = []
+    window_groups: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     labels: List[str] = []
 
     if REGIME_LINEAR in regimes:
@@ -198,11 +319,13 @@ def build_dataset(args: argparse.Namespace, regimes: Sequence[str]) -> Dict[str,
         modes = parse_float_tuple(args.linear_modes)
         for _ in range(int(args.linear_num_samples)):
             perturb = sample_initial_condition(rng, x, modes, float(args.linear_eps))
-            histories.append(
-                build_low_history(
+            window_groups.append(
+                build_low_teacher_windows(
                     teacher_config=teacher_config,
                     low_config=low_config,
                     perturbation_x=np.asarray(perturb, dtype=np.float64),
+                    rollout_horizon=int(args.rollout_horizon),
+                    rollout_anchor_samples=int(args.rollout_anchor_samples),
                 )
             )
             labels.append(REGIME_LINEAR)
@@ -216,16 +339,18 @@ def build_dataset(args: argparse.Namespace, regimes: Sequence[str]) -> Dict[str,
         if regime_name not in regimes:
             continue
         for eps in eps_values:
-            histories.append(
-                build_low_history(
+            window_groups.append(
+                build_low_teacher_windows(
                     teacher_config=teacher_config,
                     low_config=low_config,
                     perturbation_x=float(eps) * nonlinear_template,
+                    rollout_horizon=int(args.rollout_horizon),
+                    rollout_anchor_samples=int(args.rollout_anchor_samples),
                 )
             )
             labels.append(regime_name)
 
-    return split_histories(histories, labels, val_fraction=float(args.val_fraction))
+    return split_window_groups(window_groups, labels, val_fraction=float(args.val_fraction))
 
 
 def make_low_config(args: argparse.Namespace) -> PhysicalGridVlasovPoissonConfig:
@@ -244,22 +369,21 @@ def make_low_config(args: argparse.Namespace) -> PhysicalGridVlasovPoissonConfig
 
 def loss_on_batch(
     params: Dict[str, object],
-    batch: jnp.ndarray,
-    config: PhysicalGridVlasovPoissonConfig,
+    batch_low: jnp.ndarray,
+    batch_fwd: jnp.ndarray,
+    batch_bwd: jnp.ndarray,
+    low_config: PhysicalGridVlasovPoissonConfig,
     *,
-    rollout_horizon: int,
-    rollout_anchor_samples: int,
+    backward_weight: float,
 ) -> jnp.ndarray:
-    losses = jax.vmap(
-        lambda hist: spline_fem_rollout_loss(
-            params,
-            hist,
-            config,
-            rollout_horizon=int(rollout_horizon),
-            rollout_anchor_samples=int(rollout_anchor_samples),
-        )
-    )(batch)
-    return jnp.mean(losses)
+    return spline_fem_lr_teacher_defect_loss(
+        params,
+        batch_low,
+        batch_fwd,
+        batch_bwd,
+        low_config,
+        backward_weight=float(backward_weight),
+    )
 
 
 def adam_init(params: Dict[str, object]) -> Dict[str, object]:
@@ -314,6 +438,8 @@ def save_checkpoint(
         "rollout_horizon": np.array([int(args.rollout_horizon)], dtype=np.int32),
         "rollout_anchor_samples": np.array([int(args.rollout_anchor_samples)], dtype=np.int32),
         "teacher_dt": np.array([float(args.teacher_dt)], dtype=np.float64),
+        "loss_mode": np.array(["lr_teacher_direct_defect_forward_backward"], dtype=np.str_),
+        "correction_mode": np.array(["signed_dt_scaled_residual"], dtype=np.str_),
         "train_loss": np.asarray(train_loss, dtype=np.float64),
         "val_loss": np.array([float(val_loss)], dtype=np.float64),
         "W0": np.asarray(params["W0"]),
@@ -337,8 +463,8 @@ def save_loss_plot(path: Path, train_loss: Sequence[float], val_loss: float) -> 
     ax.semilogy(epochs, np.maximum(np.asarray(train_loss), 1.0e-30), label="train")
     ax.axhline(max(float(val_loss), 1.0e-30), color="#b45309", linestyle="--", label="validation")
     ax.set_xlabel("epoch")
-    ax.set_ylabel("relative spline-grid perturbation rollout loss")
-    ax.set_title("Spline/FEM Online Rollout Residual")
+    ax.set_ylabel("direct coarse-defect loss")
+    ax.set_title("Spline/FEM Direct Coarse-Defect Loss")
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
     fig.savefig(path, dpi=220)
@@ -366,9 +492,13 @@ def train(args: argparse.Namespace) -> Dict[str, object]:
         print("[spline-fem] dataset built; skipping training")
         return {"dataset": dataset, "train_loss": [], "val_loss": math.nan}
 
-    train_histories = jnp.asarray(dataset["train_histories"], dtype=jnp.float64)
-    val_histories = jnp.asarray(dataset["val_histories"], dtype=jnp.float64)
-    config = make_low_config(args)
+    train_low_anchors = jnp.asarray(dataset["train_low_anchors"], dtype=jnp.float64)
+    train_low_fwd_targets = jnp.asarray(dataset["train_low_fwd_targets"], dtype=jnp.float64)
+    train_low_bwd_targets = jnp.asarray(dataset["train_low_bwd_targets"], dtype=jnp.float64)
+    val_low_anchors = jnp.asarray(dataset["val_low_anchors"], dtype=jnp.float64)
+    val_low_fwd_targets = jnp.asarray(dataset["val_low_fwd_targets"], dtype=jnp.float64)
+    val_low_bwd_targets = jnp.asarray(dataset["val_low_bwd_targets"], dtype=jnp.float64)
+    low_config = make_low_config(args)
     params = init_spline_residual_params(
         jax.random.PRNGKey(int(args.seed)),
         hidden_width=int(args.hidden_width),
@@ -376,18 +506,19 @@ def train(args: argparse.Namespace) -> Dict[str, object]:
     )
     opt_state = adam_init(params)
 
-    def batch_loss(params_i, batch_i):
+    def batch_loss(params_i, batch_low_i, batch_fwd_i, batch_bwd_i):
         return loss_on_batch(
             params_i,
-            batch_i,
-            config,
-            rollout_horizon=int(args.rollout_horizon),
-            rollout_anchor_samples=int(args.rollout_anchor_samples),
+            batch_low_i,
+            batch_fwd_i,
+            batch_bwd_i,
+            low_config,
+            backward_weight=float(args.backward_weight),
         )
 
     @jax.jit
-    def train_step(params_i, opt_state_i, batch_i):
-        loss, grads = jax.value_and_grad(batch_loss)(params_i, batch_i)
+    def train_step(params_i, opt_state_i, batch_low_i, batch_fwd_i, batch_bwd_i):
+        loss, grads = jax.value_and_grad(batch_loss)(params_i, batch_low_i, batch_fwd_i, batch_bwd_i)
         params_o, opt_state_o = adam_step(
             params_i,
             grads,
@@ -397,22 +528,49 @@ def train(args: argparse.Namespace) -> Dict[str, object]:
         )
         return params_o, opt_state_o, loss
 
-    val_loss_fn = jax.jit(lambda params_i, batch_i: batch_loss(params_i, batch_i))
+    val_loss_fn = jax.jit(
+        lambda params_i, batch_low_i, batch_fwd_i, batch_bwd_i: batch_loss(
+            params_i,
+            batch_low_i,
+            batch_fwd_i,
+            batch_bwd_i,
+        )
+    )
+
+    def dataset_loss_in_chunks(
+        params_i: Dict[str, object],
+        lows: jnp.ndarray,
+        fwds: jnp.ndarray,
+        bwds: jnp.ndarray,
+        *,
+        chunk_size: int,
+    ) -> float:
+        n_items = int(lows.shape[0])
+        chunk_size = max(1, int(chunk_size))
+        weighted_total = 0.0
+        for start in range(0, n_items, chunk_size):
+            end = min(start + chunk_size, n_items)
+            chunk_loss = float(val_loss_fn(params_i, lows[start:end], fwds[start:end], bwds[start:end]))
+            weighted_total += chunk_loss * float(end - start)
+        return weighted_total / max(float(n_items), 1.0)
 
     rng = np.random.default_rng(int(args.seed))
     train_loss: List[float] = []
-    n_train = int(train_histories.shape[0])
+    n_train = int(train_low_anchors.shape[0])
     batch_size = max(1, int(args.online_case_batch_size))
     steps_per_epoch = max(1, int(args.steps_per_epoch))
     for epoch in range(1, int(args.epochs) + 1):
         epoch_losses = []
         for _ in range(steps_per_epoch):
             idx = rng.choice(n_train, size=batch_size, replace=n_train < batch_size)
-            batch = train_histories[np.asarray(idx, dtype=np.int32)]
-            params, opt_state, loss = train_step(params, opt_state, batch)
+            idx_arr = np.asarray(idx, dtype=np.int32)
+            batch_low = train_low_anchors[idx_arr]
+            batch_fwd = train_low_fwd_targets[idx_arr]
+            batch_bwd = train_low_bwd_targets[idx_arr]
+            params, opt_state, loss = train_step(params, opt_state, batch_low, batch_fwd, batch_bwd)
             epoch_losses.append(float(loss))
         update_loss = float(np.mean(epoch_losses))
-        mean_loss = float(val_loss_fn(params, train_histories))
+        mean_loss = update_loss
         train_loss.append(mean_loss)
         if int(args.log_every) > 0 and (
             epoch == 1
@@ -424,7 +582,13 @@ def train(args: argparse.Namespace) -> Dict[str, object]:
                 f"train_loss={mean_loss:.6e} update_loss={update_loss:.6e}"
             )
 
-    val_loss = float(val_loss_fn(params, val_histories))
+    val_loss = dataset_loss_in_chunks(
+        params,
+        val_low_anchors,
+        val_low_fwd_targets,
+        val_low_bwd_targets,
+        chunk_size=int(args.loss_eval_batch_size),
+    )
     checkpoint = args.checkpoint or (args.outdir / "spline_fem_residual.npz")
     loss_plot = args.loss_plot or checkpoint.with_suffix(".loss.png")
     save_checkpoint(checkpoint, params, args=args, train_loss=train_loss, val_loss=val_loss)
@@ -434,12 +598,17 @@ def train(args: argparse.Namespace) -> Dict[str, object]:
         "loss_plot": str(loss_plot),
         "target_vgrid": int(args.target_vgrid),
         "low_Nx": int(args.low_Nx),
-        "train_cases": int(train_histories.shape[0]),
-        "val_cases": int(val_histories.shape[0]),
+        "teacher_Nx": int(args.teacher_Nx),
+        "teacher_Nv": int(args.teacher_Nv),
+        "train_windows": int(train_low_anchors.shape[0]),
+        "val_windows": int(val_low_anchors.shape[0]),
         "train_loss_final": float(train_loss[-1]),
         "val_loss": float(val_loss),
         "rollout_horizon": int(args.rollout_horizon),
         "rollout_anchor_samples": int(args.rollout_anchor_samples),
+        "backward_weight": float(args.backward_weight),
+        "loss_mode": "lr_teacher_direct_defect_forward_backward",
+        "correction_mode": "signed_dt_scaled_residual",
     }
     args.outdir.mkdir(parents=True, exist_ok=True)
     (args.outdir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
@@ -469,7 +638,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-width", type=int, default=64)
     parser.add_argument("--res-blocks", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--lr", type=float, default=1.0e-4)
+    parser.add_argument("--lr", type=float, default=1.0e-5)
     parser.add_argument("--grad-clip", type=float, default=0.25)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--steps-per-epoch", type=int, default=5)
@@ -477,6 +646,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rollout-horizon", type=int, default=5)
     parser.add_argument("--rollout-anchor-samples", type=int, default=32)
+    parser.add_argument("--backward-weight", type=float, default=1.0)
+    parser.add_argument("--loss-eval-batch-size", type=int, default=1)
     parser.add_argument(
         "--regimes",
         type=str,
