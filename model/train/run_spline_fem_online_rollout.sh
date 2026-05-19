@@ -61,6 +61,10 @@ EVAL_K0="${EVAL_K0:-0.5}"
 EVAL_SNAPSHOT_TIMES="${EVAL_SNAPSHOT_TIMES:-20.0,40.0}"
 EVAL_FIELD_K_MAX="${EVAL_FIELD_K_MAX:-}"
 EVAL_FIELD_NUM_LOW_MODES="${EVAL_FIELD_NUM_LOW_MODES:-}"
+EVAL_PHASE_VMIN="${EVAL_PHASE_VMIN:-0.0}"
+EVAL_PHASE_VMAX="${EVAL_PHASE_VMAX:-0.5}"
+EVAL_PLOT_VMIN="${EVAL_PLOT_VMIN:--4.0}"
+EVAL_PLOT_VMAX="${EVAL_PLOT_VMAX:-4.0}"
 
 mkdir -p "${OUTDIR}"
 cd "${REPO_ROOT}"
@@ -157,6 +161,10 @@ if [[ "${RUN_EVAL}" == "1" ]]; then
     --eps "${EVAL_EPS}"
     --k0 "${EVAL_K0}"
     --snapshot-times "${EVAL_SNAPSHOT_TIMES}"
+    --phase-vmin "${EVAL_PHASE_VMIN}"
+    --phase-vmax "${EVAL_PHASE_VMAX}"
+    --plot-vmin "${EVAL_PLOT_VMIN}"
+    --plot-vmax "${EVAL_PLOT_VMAX}"
   )
   if [[ -n "${EVAL_FIELD_K_MAX}" ]]; then
     EVAL_ARGS+=(--field-k-max "${EVAL_FIELD_K_MAX}")

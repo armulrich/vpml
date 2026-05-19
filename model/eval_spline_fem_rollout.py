@@ -1,9 +1,11 @@
 """Evaluate the current spline-grid online residual rollout sweep.
 
 This evaluator intentionally uses the existing semi-Lagrangian coarse step plus
-the explicit ``dt * residual`` correction. It does not use the RK45 experiment.
-For each low velocity grid, it compares the fixed HR teacher restricted to that
-grid, the low-grid solver without correction, and the learned-correction rollout.
+the learned signed ``dt * residual`` correction. It does not use the RK45
+experiment.
+For each low velocity grid, it compares the fixed HR teacher, the low-grid solver
+without correction lifted back to the teacher grid, and the learned-correction
+rollout lifted back to the teacher grid.
 """
 
 from __future__ import annotations
@@ -73,6 +75,58 @@ def _json_scalar(value: float) -> float | str:
     if value < 0.0:
         return "-inf"
     return "nan"
+
+
+def _spectral_with_bad(color: str = "#d1d5db"):
+    cmap = plt.colormaps["Spectral_r"].copy()
+    cmap.set_bad(color=color)
+    return cmap
+
+
+def _magma_with_bad(color: str = "#d1d5db"):
+    cmap = plt.colormaps["magma"].copy()
+    cmap.set_bad(color=color)
+    return cmap
+
+
+def _phase_field_masked(field: np.ndarray) -> np.ma.MaskedArray:
+    return np.ma.masked_invalid(np.asarray(field, dtype=np.float64))
+
+
+def _safe_log10_masked(values: np.ndarray, floor: float) -> np.ma.MaskedArray:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = np.where(np.isfinite(arr), np.maximum(arr, float(floor)), np.nan)
+    return np.ma.masked_invalid(np.log10(arr))
+
+
+def _centers_to_edges(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        raise ValueError("values must be nonempty")
+    if values.size == 1:
+        delta = 0.5
+        return np.array([values[0] - delta, values[0] + delta], dtype=np.float64)
+    mids = 0.5 * (values[:-1] + values[1:])
+    first = values[0] - 0.5 * (values[1] - values[0])
+    last = values[-1] + 0.5 * (values[-1] - values[-2])
+    return np.concatenate([[first], mids, [last]]).astype(np.float64)
+
+
+def _finite_log_limits(arrays: Sequence[np.ndarray], floor: float) -> Tuple[float, float]:
+    finite_chunks = []
+    for arr in arrays:
+        log_arr = np.asarray(_safe_log10_masked(arr, floor).filled(np.nan), dtype=np.float64)
+        finite = log_arr[np.isfinite(log_arr)]
+        if finite.size:
+            finite_chunks.append(finite)
+    if not finite_chunks:
+        return math.log10(float(floor)), 0.0
+    values = np.concatenate(finite_chunks)
+    lo = float(np.nanmin(values))
+    hi = float(np.nanmax(values))
+    if math.isclose(lo, hi):
+        hi = lo + 1.0
+    return lo, hi
 
 
 def _checkpoint_for_vgrid(checkpoint_dir: Path, vgrid: int) -> Path:
@@ -282,23 +336,90 @@ def plot_metric1(
     return save_figure(fig, output_path, dpi=220)
 
 
-def plot_metric2(cases: Sequence[Dict[str, object]], output_path: Path) -> Path:
-    labels = [str(int(case["vgrid"])) for case in cases]
-    baseline_vals = [float(case["baseline_metrics"]["epsilon_E"]) for case in cases]
-    learned_vals = [float(case["learned_metrics"]["epsilon_E"]) for case in cases]
-    x = np.arange(len(labels), dtype=np.float64)
-    width = 0.38
-    fig, ax = plt.subplots(figsize=(7.5, 4.6), constrained_layout=True)
-    ax.bar(x - width / 2.0, baseline_vals, width, label="no correction", color="#64748b")
-    ax.bar(x + width / 2.0, learned_vals, width, label="learned correction", color="#2563eb")
-    ax.set_yscale("log")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_xlabel(r"low velocity grid $M_v$")
-    ax.set_ylabel(r"$\varepsilon_E(T)$")
-    ax.set_title("Spline-grid Metric 2: no correction vs learned correction")
-    ax.grid(True, axis="y", which="both", alpha=0.25)
-    ax.legend(frameon=False)
+def plot_metric2(cases: Sequence[Dict[str, object]], output_path: Path, *, log_floor: float = 1.0e-14) -> Path:
+    """Plot Metric 2 with the same spectral context as the Hermite sweeps.
+
+    Unlike the Hermite Nv-sweep, this spline-grid evaluation has two low-grid
+    rollouts per row: the raw coarse solver and the learned-correction solver.
+    The plot therefore shows HR, no-correction, and learned spectra side by side
+    instead of only HR/theta.
+    """
+
+    if not cases:
+        raise ValueError("cases must be nonempty")
+
+    fig = plt.figure(figsize=(14.2, 2.9 * len(cases) + 3.2), constrained_layout=True)
+    grid = fig.add_gridspec(
+        len(cases) + 1,
+        4,
+        height_ratios=[1.1] + [1.0] * len(cases),
+        width_ratios=[1.0, 1.0, 1.0, 0.045],
+    )
+
+    ax_top = fig.add_subplot(grid[0, :3])
+    m_vals = np.asarray([int(case["vgrid"]) for case in cases], dtype=np.float64)
+    baseline_vals = np.asarray([float(case["baseline_metrics"]["epsilon_E"]) for case in cases], dtype=np.float64)
+    learned_vals = np.asarray([float(case["learned_metrics"]["epsilon_E"]) for case in cases], dtype=np.float64)
+    ax_top.plot(m_vals, baseline_vals, marker="o", color="#64748b", lw=1.9, label="no correction")
+    ax_top.plot(m_vals, learned_vals, marker="o", color="#b91c1c", lw=1.9, label="learned correction")
+    ax_top.set_xscale("log", base=2)
+    ax_top.set_yscale("log")
+    ax_top.set_xticks(m_vals, [str(int(v)) for v in m_vals])
+    ax_top.set_xlabel(r"low velocity grid $M_v$")
+    ax_top.set_ylabel(r"$\varepsilon_E(T)$")
+    ax_top.set_title("Spline-grid Metric 2: self-generated field error")
+    ax_top.grid(True, which="both", alpha=0.3)
+    ax_top.legend(frameon=False, fontsize=9)
+
+    for row, case in enumerate(cases, start=1):
+        baseline_comp = case["baseline_field_comparison"]
+        learned_comp = case["learned_field_comparison"]
+        time_edges = _centers_to_edges(baseline_comp.times)
+        k_edges = _centers_to_edges(baseline_comp.selected_k)
+        cmap = _magma_with_bad()
+        row_vmin, row_vmax = _finite_log_limits([np.abs(baseline_comp.E_hat_hr)], log_floor)
+
+        panels = [
+            (_safe_log10_masked(np.abs(baseline_comp.E_hat_hr), log_floor).T, r"$\log_{10}|\hat E_k^{HR}(t)|$"),
+            (_safe_log10_masked(np.abs(baseline_comp.E_hat_theta), log_floor).T, r"$\log_{10}|\hat E_k(t)|$ no correction"),
+            (_safe_log10_masked(np.abs(learned_comp.E_hat_theta), log_floor).T, r"$\log_{10}|\hat E_k(t)|$ learned"),
+        ]
+        mesh_ref = None
+        for col, (data, title) in enumerate(panels):
+            ax = fig.add_subplot(grid[row, col])
+            mesh_ref = ax.pcolormesh(
+                time_edges,
+                k_edges,
+                data,
+                shading="auto",
+                cmap=cmap,
+                vmin=row_vmin,
+                vmax=row_vmax,
+            )
+            if row == 1:
+                ax.set_title(title, fontsize=10)
+            ax.set_xlabel("t")
+            ax.set_ylabel("k")
+            if col == 0:
+                ax.text(
+                    -0.42,
+                    0.5,
+                    (
+                        rf"$M_v={int(case['vgrid'])}$"
+                        "\n"
+                        rf"no corr. $\varepsilon_E={baseline_vals[row - 1]:.3e}$"
+                        "\n"
+                        rf"learned $\varepsilon_E={learned_vals[row - 1]:.3e}$"
+                    ),
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="center",
+                    fontsize=8.5,
+                )
+        cax = fig.add_subplot(grid[row, 3])
+        if mesh_ref is not None:
+            fig.colorbar(mesh_ref, cax=cax)
+
     return save_figure(fig, output_path, dpi=220)
 
 
@@ -309,33 +430,33 @@ def plot_fig10_teacher_baseline_learned(
     output_path: Path,
     phase_vmin: Optional[float],
     phase_vmax: Optional[float],
+    plot_vmin: float,
+    plot_vmax: float,
 ) -> Path:
     if len(times) != 2:
         raise ValueError("Fig. 10 spline comparison expects exactly two snapshot times")
     nrows = len(cases)
     ncols = 6
-    fig, axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(15.5, max(2.4 * nrows, 3.0)),
-        squeeze=False,
-        constrained_layout=True,
-    )
+    fig = plt.figure(figsize=(18.5, 2.6 * nrows + 1.0), constrained_layout=True)
+    grid = fig.add_gridspec(nrows, ncols, wspace=0.08, hspace=0.18)
     headers = (
-        f"teacher t={times[0]:g}",
-        f"teacher t={times[1]:g}",
-        f"no corr. t={times[0]:g}",
-        f"no corr. t={times[1]:g}",
-        f"learned t={times[0]:g}",
-        f"learned t={times[1]:g}",
+        f"High Resolution (HR)\nt={times[0]:g}",
+        f"High Resolution (HR)\nt={times[1]:g}",
+        f"Low Resolution (LR)\nt={times[0]:g}",
+        f"Low Resolution (LR)\nt={times[1]:g}",
+        f"Low Resolution +\nLearned Correction\nt={times[0]:g}",
+        f"Low Resolution +\nLearned Correction\nt={times[1]:g}",
     )
-    for col, header in enumerate(headers):
-        axes[0, col].set_title(header, fontsize=10)
+    cmap = _spectral_with_bad()
+    xticks = [0.0, 2.0 * math.pi, 4.0 * math.pi]
+    xticklabels = ["0", r"$2\pi$", r"$4\pi$"]
+    mesh_ref = None
+    all_axes = []
 
     for row, case in enumerate(cases):
-        teacher_snaps = np.asarray(case["teacher_restricted"]["snapshot_f"], dtype=np.float64)
-        baseline_snaps = np.asarray(case["baseline"]["snapshot_f"], dtype=np.float64)
-        learned_snaps = np.asarray(case["learned"]["snapshot_f"], dtype=np.float64)
+        teacher_snaps = np.asarray(case["teacher"]["snapshot_f"], dtype=np.float64)
+        baseline_snaps = np.asarray(case["baseline_lifted"]["snapshot_f"], dtype=np.float64)
+        learned_snaps = np.asarray(case["learned_lifted"]["snapshot_f"], dtype=np.float64)
         panels = (
             teacher_snaps[0],
             teacher_snaps[1],
@@ -344,62 +465,103 @@ def plot_fig10_teacher_baseline_learned(
             learned_snaps[0],
             learned_snaps[1],
         )
-        row_data = np.concatenate([panel.reshape(-1) for panel in panels])
-        row_data = row_data[np.isfinite(row_data)]
-        row_vmin = float(phase_vmin) if phase_vmin is not None else float(np.min(row_data))
-        row_vmax = float(phase_vmax) if phase_vmax is not None else float(np.max(row_data))
+        row_vmin = float(phase_vmin) if phase_vmin is not None else 0.0
+        row_vmax = float(phase_vmax) if phase_vmax is not None else 0.5
         if math.isclose(row_vmin, row_vmax):
             row_vmax = row_vmin + 1.0e-12
-        x = np.asarray(case["baseline"]["x"], dtype=np.float64)
-        v = np.asarray(case["baseline"]["v"], dtype=np.float64)
-        image = None
+        x = np.asarray(case["teacher"]["x"], dtype=np.float64)
+        v = np.asarray(case["teacher"]["v"], dtype=np.float64)
         for col, panel in enumerate(panels):
-            ax = axes[row, col]
-            image = ax.pcolormesh(
+            ax = fig.add_subplot(grid[row, col])
+            all_axes.append(ax)
+            field_raw = np.asarray(panel, dtype=np.float64)
+            field = _phase_field_masked(field_raw)
+            mesh_ref = ax.pcolormesh(
                 x,
                 v,
-                panel,
+                field,
                 shading="auto",
                 vmin=row_vmin,
                 vmax=row_vmax,
+                cmap=cmap,
                 rasterized=True,
             )
-            if row == nrows - 1:
-                ax.set_xlabel("x")
-            else:
-                ax.set_xticklabels([])
+            if not np.isfinite(field_raw).any():
+                ax.set_facecolor("#d1d5db")
+                ax.text(
+                    0.5,
+                    0.5,
+                    "nonfinite snapshot",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9.5,
+                    color="#334155",
+                    bbox={"facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
+                )
+            if row == 0:
+                ax.set_title(headers[col], fontsize=10.5, pad=6)
+            ax.set_xlabel("x")
+            ax.set_xticks(xticks, xticklabels)
+            ax.set_yticks([-4, -2, 0, 2, 4])
             if col == 0:
-                ax.set_ylabel(f"Mv={int(case['vgrid'])}\nv")
+                ax.set_ylabel("v")
+                ax.text(
+                    -0.34,
+                    0.5,
+                    rf"$M_v={int(case['vgrid'])}$",
+                    transform=ax.transAxes,
+                    rotation=90,
+                    va="center",
+                    ha="center",
+                    fontsize=10.5,
+                )
             else:
-                ax.set_yticklabels([])
-        if image is not None:
-            fig.colorbar(image, ax=axes[row, :].tolist(), fraction=0.015, pad=0.01)
+                ax.set_ylabel("")
+            ax.set_ylim(float(plot_vmin), float(plot_vmax))
 
-    fig.suptitle("Spline-grid Fig. 10: restricted teacher, low grid, learned correction", fontsize=12)
+    if mesh_ref is not None:
+        fig.colorbar(mesh_ref, ax=all_axes, fraction=0.018, pad=0.01)
+
+    fig.suptitle("Spline-grid Fig. 10: fixed HR teacher, lifted low grid, lifted learned correction", fontsize=12)
     return save_figure(fig, output_path, dpi=220)
 
 
-def restricted_teacher_payload(
-    teacher_snapshots: np.ndarray,
-    teacher_config: PhysicalGridVlasovPoissonConfig,
-    low_config: PhysicalGridVlasovPoissonConfig,
+def snapshot_payload(
+    snapshots: np.ndarray,
+    config: PhysicalGridVlasovPoissonConfig,
     snapshot_times: Sequence[float],
 ) -> Dict[str, np.ndarray]:
-    teacher_ops = _physical_grid_ops(teacher_config)
-    restricted = jax.vmap(
-        lambda state: restrict_state_to_grid(
-            state,
-            teacher_config,
-            low_config,
-            src_ops=teacher_ops,
-        )
-    )(jnp.asarray(teacher_snapshots, dtype=jnp.float64))
-    low_ops = _physical_grid_ops(low_config)
+    ops = _physical_grid_ops(config)
     return {
         "snapshot_times": np.asarray(tuple(float(t) for t in snapshot_times), dtype=np.float64),
-        "snapshot_f": np.asarray(restricted, dtype=np.float64),
-        "x": np.asarray(low_ops["x"], dtype=np.float64),
-        "v": np.asarray(low_ops["v"], dtype=np.float64),
+        "snapshot_f": np.asarray(snapshots, dtype=np.float64),
+        "x": np.asarray(ops["x"], dtype=np.float64),
+        "v": np.asarray(ops["v"], dtype=np.float64),
+    }
+
+
+def lifted_snapshot_payload(
+    low_snapshots: np.ndarray,
+    low_config: PhysicalGridVlasovPoissonConfig,
+    teacher_config: PhysicalGridVlasovPoissonConfig,
+    snapshot_times: Sequence[float],
+) -> Dict[str, np.ndarray]:
+    low_ops = _physical_grid_ops(low_config)
+    lifted = jax.vmap(
+        lambda state: restrict_state_to_grid(
+            state,
+            low_config,
+            teacher_config,
+            src_ops=low_ops,
+        )
+    )(jnp.asarray(low_snapshots, dtype=jnp.float64))
+    teacher_ops = _physical_grid_ops(teacher_config)
+    return {
+        "snapshot_times": np.asarray(tuple(float(t) for t in snapshot_times), dtype=np.float64),
+        "snapshot_f": np.asarray(lifted, dtype=np.float64),
+        "x": np.asarray(teacher_ops["x"], dtype=np.float64),
+        "v": np.asarray(teacher_ops["v"], dtype=np.float64),
     }
 
 
@@ -470,10 +632,9 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
             snapshot_times=snapshot_times,
         )
         initial_low = restrict_state_to_grid(initial_teacher, teacher_config, low_config)
-        teacher_row = restricted_teacher_payload(
+        teacher_row = snapshot_payload(
             teacher["snapshot_f"],
             teacher_config,
-            low_config,
             snapshot_times,
         )
         print(f"[spline-fem-eval] rolling low grid Mv={int(vgrid)} without correction")
@@ -490,6 +651,18 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
             snapshot_times=snapshot_times,
             params=params,
         )
+        baseline_lifted = lifted_snapshot_payload(
+            baseline["snapshot_f"],
+            low_config,
+            teacher_config,
+            snapshot_times,
+        )
+        learned_lifted = lifted_snapshot_payload(
+            learned["snapshot_f"],
+            low_config,
+            teacher_config,
+            snapshot_times,
+        )
         baseline_metrics = evaluate_metric_pair(
             baseline,
             teacher,
@@ -502,6 +675,22 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
             growth_metric=growth_metric,
             field_metric=field_metric,
         )
+        baseline_field_comparison = field_metric.prepare_fourier_comparison(
+            baseline["times"],
+            baseline["E_hat_hist"],
+            baseline["k_arr"],
+            teacher["times"],
+            teacher["E_hat_hist"],
+            teacher["k_arr"],
+        )
+        learned_field_comparison = field_metric.prepare_fourier_comparison(
+            learned["times"],
+            learned["E_hat_hist"],
+            learned["k_arr"],
+            teacher["times"],
+            teacher["E_hat_hist"],
+            teacher["k_arr"],
+        )
         case_path = outdir / f"spline_fem_eval_vgrid{int(vgrid)}.npz"
         np.savez(
             case_path,
@@ -509,19 +698,21 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
             teacher_energy=teacher["energy"],
             teacher_E_hat_hist=teacher["E_hat_hist"],
             teacher_k_arr=teacher["k_arr"],
-            teacher_restricted_snapshot_f=teacher_row["snapshot_f"],
+            teacher_snapshot_f=teacher_row["snapshot_f"],
             baseline_times=baseline["times"],
             baseline_energy=baseline["energy"],
             baseline_E_hat_hist=baseline["E_hat_hist"],
             baseline_k_arr=baseline["k_arr"],
             baseline_snapshot_f=baseline["snapshot_f"],
+            baseline_lifted_snapshot_f=baseline_lifted["snapshot_f"],
             learned_times=learned["times"],
             learned_energy=learned["energy"],
             learned_E_hat_hist=learned["E_hat_hist"],
             learned_k_arr=learned["k_arr"],
             learned_snapshot_f=learned["snapshot_f"],
-            x=baseline["x"],
-            v=baseline["v"],
+            learned_lifted_snapshot_f=learned_lifted["snapshot_f"],
+            x=teacher_row["x"],
+            v=teacher_row["v"],
             snapshot_times=np.asarray(snapshot_times, dtype=np.float64),
             baseline_epsilon_grow=np.array([baseline_metrics["epsilon_grow"]], dtype=np.float64),
             baseline_epsilon_E=np.array([baseline_metrics["epsilon_E"]], dtype=np.float64),
@@ -534,11 +725,15 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
                 "checkpoint": str(checkpoint),
                 "case_npz": str(case_path),
                 "checkpoint_meta": checkpoint_meta,
-                "teacher_restricted": teacher_row,
+                "teacher": teacher_row,
                 "baseline": baseline,
+                "baseline_lifted": baseline_lifted,
                 "learned": learned,
+                "learned_lifted": learned_lifted,
                 "baseline_metrics": baseline_metrics,
                 "learned_metrics": learned_metrics,
+                "baseline_field_comparison": baseline_field_comparison,
+                "learned_field_comparison": learned_field_comparison,
             }
         )
         print(
@@ -567,6 +762,8 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         output_path=outdir / "spline_fem_fig10_teacher_baseline_learned.png",
         phase_vmin=args.phase_vmin,
         phase_vmax=args.phase_vmax,
+        plot_vmin=float(args.plot_vmin),
+        plot_vmax=float(args.plot_vmax),
     )
     summary = {
         "outdir": str(outdir),
@@ -638,8 +835,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--growth-time-window", type=str, default="")
     parser.add_argument("--field-k-max", type=float, default=None)
     parser.add_argument("--field-num-low-modes", type=int, default=None)
-    parser.add_argument("--phase-vmin", type=float, default=None)
-    parser.add_argument("--phase-vmax", type=float, default=None)
+    parser.add_argument("--phase-vmin", type=float, default=0.0)
+    parser.add_argument("--phase-vmax", type=float, default=0.5)
+    parser.add_argument("--plot-vmin", type=float, default=-4.0)
+    parser.add_argument("--plot-vmax", type=float, default=4.0)
     parser.add_argument("--skip-missing", action="store_true")
     return parser
 
