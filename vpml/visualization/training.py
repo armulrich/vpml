@@ -123,7 +123,7 @@ def plot_training_loss_q_diagnostic(
     *,
     loss_backend: str | None = None,
 ) -> plt.Figure:
-    """Plot the optimized online loss beside direct teacher-q error."""
+    """Plot the optimized online loss beside the rollout-window q diagnostic."""
     fig, ax = plt.subplots(figsize=(7.5, 4.5), constrained_layout=True)
     epochs = np.arange(1, int(len(loss_history)) + 1, dtype=int)
     loss = np.maximum(np.asarray(loss_history, dtype=np.float64), 1e-30)
@@ -131,10 +131,10 @@ def plot_training_loss_q_diagnostic(
     if len(loss) > 0:
         ax.semilogy(epochs, loss, lw=2.0, color="#111827", label=r"optimized $\mathcal{L}_{xv}$")
     if len(q_diag) > 0:
-        ax.semilogy(epochs, q_diag, lw=2.0, color="#b45309", label=r"direct $q$ relative MSE")
+        ax.semilogy(epochs, q_diag, lw=2.0, color="#b45309", label=r"rollout-window $q$ relative MSE")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Training diagnostic")
-    title = "Online Loss vs Direct Closure Diagnostic"
+    title = "Online Loss vs Rollout-Window Closure Diagnostic"
     if loss_backend:
         title += f" ({loss_backend})"
     ax.set_title(title)

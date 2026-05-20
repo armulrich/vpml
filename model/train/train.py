@@ -2594,6 +2594,90 @@ def online_direct_q_relative_mse_for_history(
     return num / (den + 1e-30)
 
 
+def online_rollout_q_relative_mse_for_history(
+    ref_hist: Array,
+    ref_q_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+) -> Array:
+    """Diagnostic only: q error on the same rollout windows as the state loss."""
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    ref_q_hist = jnp.asarray(ref_q_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for rollout q diagnostic")
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _select_rollout_anchor_indices(
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+    offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
+
+    def anchor_step(carry, anchor_idx):
+        pred_forward = rollout_closure_flux_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+            detach_rollout_state_for_q=False,
+        )
+        ref_forward = jnp.take(ref_q_hist, anchor_idx + offsets, axis=0)
+        num_forward, den_forward = online_closure_flux_loss_terms(
+            pred_forward,
+            ref_forward,
+            k_mask=forward_integ.mask,
+        )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return (carry[0] + num_forward, carry[1] + den_forward), None
+
+        pred_backward = rollout_closure_flux_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+            detach_rollout_state_for_q=False,
+        )
+        ref_backward = jnp.take(ref_q_hist, anchor_idx - offsets, axis=0)
+        num_backward, den_backward = online_closure_flux_loss_terms(
+            pred_backward,
+            ref_backward,
+            k_mask=backward_integ.mask,
+        )
+        return (
+            carry[0] + num_forward + num_backward,
+            carry[1] + den_forward + den_backward,
+        ), None
+
+    (num_total, den_total), _ = jax.lax.scan(
+        anchor_step,
+        (
+            jnp.asarray(0.0, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        ),
+        anchor_indices,
+    )
+    return num_total / (den_total + 1e-30)
+
+
 def _closure_action_response(integ: FourierHermiteIMEX) -> Array:
     """Linear CNAB2 response of the next state to a unit current-step closure q."""
     basis = jnp.zeros((int(integ.Nv), int(integ.Nk)), dtype=jnp.complex128)
@@ -3903,25 +3987,30 @@ def make_online_fourier_hermite_bidir_batch_loss(
         )
         return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
 
-    def mean_direct_q_diagnostic(
+    def mean_rollout_q_diagnostic(
         ref_batch: Array,
         ref_q_batch: Array,
         *,
         learned: LearnedInterfaceClosure,
-        integ: FourierHermiteIMEX,
+        forward_integ: FourierHermiteIMEX,
+        backward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
     ) -> Array:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
         ref_q_batch = jnp.asarray(ref_q_batch, dtype=jnp.complex128)
 
         def case_step(total, inputs):
             ref_hist, ref_q_hist = inputs
-            q_rel_mse = online_direct_q_relative_mse_for_history(
+            q_rel_mse = online_rollout_q_relative_mse_for_history(
                 ref_hist,
                 ref_q_hist,
                 learned=learned,
-                k_arr=integ.k_arr,
-                Nv=int(integ.Nv),
-                k_mask=integ.mask,
+                forward_integ=forward_integ,
+                backward_integ=backward_integ,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+                rollout_direction=direction_mode,
             )
             return total + q_rel_mse, None
 
@@ -4073,11 +4162,13 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 )
                 if regime == REGIME_LINEAR:
                     if ref_q_batch is not None:
-                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                        total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
                             learned=learned,
-                            integ=linear_forward,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            explicit_n_hat_fn=linear_explicit,
                         )
                     if online_loss_backend_uses_projected_xv(str(loss_backend)):
                         state_terms = jax.vmap(
@@ -4175,11 +4266,13 @@ def make_online_fourier_hermite_bidir_batch_loss(
                     )(ref_batch)
                 else:
                     if ref_q_batch is not None:
-                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                        total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
                             learned=learned,
-                            integ=nonlinear_forward,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            explicit_n_hat_fn=nonlinear_explicit,
                         )
                     if online_loss_backend_uses_projected_xv(str(loss_backend)):
                         state_terms = jax.vmap(
@@ -4360,11 +4453,13 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 )
                 if regime == REGIME_LINEAR:
                     if ref_q_batch is not None:
-                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                        total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
                             learned=learned,
-                            integ=linear_forward,
+                            forward_integ=linear_forward,
+                            backward_integ=linear_backward,
+                            explicit_n_hat_fn=linear_explicit,
                         )
                     if online_loss_backend_uses_projected_xv(str(loss_backend)):
                         regime_state = mean_projected_xv_history_loss(
@@ -4418,11 +4513,13 @@ def make_online_fourier_hermite_bidir_batch_loss(
                     )
                 else:
                     if ref_q_batch is not None:
-                        total_q_diag = total_q_diag + weight * mean_direct_q_diagnostic(
+                        total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
                             learned=learned,
-                            integ=nonlinear_forward,
+                            forward_integ=nonlinear_forward,
+                            backward_integ=nonlinear_backward,
+                            explicit_n_hat_fn=nonlinear_explicit,
                         )
                     if online_loss_backend_uses_projected_xv(str(loss_backend)):
                         regime_state = mean_projected_xv_history_loss(
