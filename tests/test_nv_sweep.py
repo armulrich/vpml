@@ -413,6 +413,11 @@ class NvSweepTests(unittest.TestCase):
         text = script.read_text()
         self.assertIn("fourier_hermite_closure_bidir", text)
         self.assertIn("run_nv_sweep_online_rollout.sh", text)
+        self.assertIn('ONLINE_FINETUNE_ROLLOUT_HORIZON="${ONLINE_FINETUNE_ROLLOUT_HORIZON:-256}"', text)
+        self.assertIn('ONLINE_FINETUNE_ROLLOUT_ANCHOR_SAMPLES="${ONLINE_FINETUNE_ROLLOUT_ANCHOR_SAMPLES:-1}"', text)
+        self.assertIn('ONLINE_FINETUNE_ROLLOUT_DIRECTION="${ONLINE_FINETUNE_ROLLOUT_DIRECTION:-forward}"', text)
+        self.assertIn("nv_sweep_metric1.png", text)
+        self.assertIn("fig10_learned_vs_nonlocal_nv_sweep_phase_space.png", text)
 
     def test_run_fh_online_projected_xv_rollout_wrapper_selects_projected_xv_backend(self) -> None:
         script = Path("model/train/run_fh_online_projected_xv_rollout.sh")
