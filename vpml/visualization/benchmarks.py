@@ -463,29 +463,60 @@ def save_fig10_learned_comparison_nv_sweep_phase_space(
     if len(row_labels) != len(nv_list):
         raise ValueError("row_labels length must match nv_list length")
 
-    fig = plt.figure(figsize=(15.0, 2.6 * len(nv_list) + 1.0), constrained_layout=True)
-    grid = fig.add_gridspec(len(nv_list), 4, wspace=0.08, hspace=0.18)
+    has_projected_reference = all(
+        f"nv{int(Nv)}_reference_f_{time_key_fn(float(t))}" in payload
+        for Nv in nv_list
+        for t in times
+    )
+    has_truncation = all(
+        f"nv{int(Nv)}_truncation_f_{time_key_fn(float(t))}" in payload
+        for Nv in nv_list
+        for t in times
+    )
+    use_reference_truncation_layout = bool(has_projected_reference and has_truncation)
+    if use_reference_truncation_layout:
+        panel_specs = [
+            ("reference", times[0]),
+            ("reference", times[1]),
+            ("truncation", times[0]),
+            ("truncation", times[1]),
+            ("learned", times[0]),
+            ("learned", times[1]),
+        ]
+        column_titles = [
+            rf"Projected HR Reference, $t={times[0]:g}$",
+            rf"Projected HR Reference, $t={times[1]:g}$",
+            rf"Truncated FH ($q=0$), $t={times[0]:g}$",
+            rf"Truncated FH ($q=0$), $t={times[1]:g}$",
+            rf"Learned FH ($q_\theta$), $t={times[0]:g}$",
+            rf"Learned FH ($q_\theta$), $t={times[1]:g}$",
+        ]
+        fig_width = 21.0
+    else:
+        panel_specs = [
+            ("nonlocal", times[0]),
+            ("nonlocal", times[1]),
+            ("learned", times[0]),
+            ("learned", times[1]),
+        ]
+        column_titles = [
+            rf"Nonlocal, $t={times[0]:g}$",
+            rf"Nonlocal, $t={times[1]:g}$",
+            rf"Learned, $t={times[0]:g}$",
+            rf"Learned, $t={times[1]:g}$",
+        ]
+        fig_width = 15.0
+
+    fig = plt.figure(figsize=(fig_width, 2.6 * len(nv_list) + 1.0), constrained_layout=True)
+    grid = fig.add_gridspec(len(nv_list), len(panel_specs), wspace=0.08, hspace=0.18)
     xticks = [0.0, 2.0 * math.pi, 4.0 * math.pi]
     xticklabels = ["0", r"$2\pi$", r"$4\pi$"]
-    column_titles = [
-        rf"Nonlocal, $t={times[0]:g}$",
-        rf"Nonlocal, $t={times[1]:g}$",
-        rf"Learned, $t={times[0]:g}$",
-        rf"Learned, $t={times[1]:g}$",
-    ]
     cmap = _spectral_with_bad()
 
     mesh_ref = None
     all_axes = []
     for row, (Nv, row_label) in enumerate(zip(nv_list, row_labels)):
-        for col, (method_name, t) in enumerate(
-            [
-                ("nonlocal", times[0]),
-                ("nonlocal", times[1]),
-                ("learned", times[0]),
-                ("learned", times[1]),
-            ]
-        ):
+        for col, (method_name, t) in enumerate(panel_specs):
             ax = fig.add_subplot(grid[row, col])
             all_axes.append(ax)
             key = f"nv{int(Nv)}_{method_name}_f_{time_key_fn(float(t))}"

@@ -107,6 +107,7 @@ def run_physical_landau_reference(
     T: float,
     perturbation_x: np.ndarray,
     poisson_sign: float = +1.0,
+    snapshot_times: Sequence[float] = (),
 ) -> Dict[str, np.ndarray]:
     config = PhysicalGridVlasovPoissonConfig(
         Nx=int(Nx),
@@ -117,7 +118,7 @@ def run_physical_landau_reference(
         dt=float(dt),
         T=float(T),
         poisson_sign=float(poisson_sign),
-        snapshot_times=(),
+        snapshot_times=tuple(float(t) for t in snapshot_times),
     )
     equilibrium = _maxwellian_equilibrium(config.v)
     perturb = jnp.asarray(perturbation_x, dtype=jnp.float64)
@@ -129,12 +130,19 @@ def run_physical_landau_reference(
         return_state_history=True,
         history_projector=_physical_grid_ehat_projector(config),
     )
-    return {
+    payload = {
         "times": np.asarray(raw["state_history_times"], dtype=np.float64),
         "E_hat_hist": np.asarray(raw["state_history"], dtype=np.complex128),
         "energy": np.asarray(raw["energy"], dtype=np.float64),
         "k_arr": np.asarray(raw["k_arr"], dtype=np.float64),
+        "x": np.asarray(config.x, dtype=np.float64),
+        "v": np.asarray(config.v, dtype=np.float64),
+        "equilibrium": np.asarray(equilibrium, dtype=np.float64),
     }
+    if tuple(snapshot_times):
+        payload["snapshot_times"] = np.asarray(raw["snapshot_times"], dtype=np.float64)
+        payload["snapshot_f"] = np.asarray(raw["snapshot_f"], dtype=np.float64)
+    return payload
 
 
 def run_learned_linear_case(

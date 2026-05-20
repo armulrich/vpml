@@ -167,6 +167,10 @@ class FieldSweepCase:
     Nv: int
     comparison: FourierFieldComparison
     epsilon_E: float
+    baseline_comparison: Optional[FourierFieldComparison] = None
+    baseline_epsilon_E: Optional[float] = None
+    baseline_label: str = "truncation"
+    theta_label: str = "learned"
     in_training_targets: bool = False
     beyond_training_range: bool = False
 
@@ -427,27 +431,58 @@ def plot_field_metric_sweep(
     if not cases:
         raise ValueError("cases must be nonempty")
 
-    fig = plt.figure(figsize=(12.8, 2.9 * len(cases) + 3.2), constrained_layout=True)
+    has_baseline = any(case.baseline_comparison is not None for case in cases)
+    n_panel_cols = 3 if has_baseline else 2
+    fig_width = 16.2 if has_baseline else 12.8
+    fig = plt.figure(figsize=(fig_width, 2.9 * len(cases) + 3.2), constrained_layout=True)
     grid = fig.add_gridspec(
         len(cases) + 1,
-        3,
+        n_panel_cols + 1,
         height_ratios=[1.1] + [1.0] * len(cases),
-        width_ratios=[1.0, 1.0, 0.045],
+        width_ratios=[*[1.0] * n_panel_cols, 0.045],
     )
 
-    ax_top = fig.add_subplot(grid[0, :2])
+    ax_top = fig.add_subplot(grid[0, :n_panel_cols])
     nv_vals = np.asarray([int(case.Nv) for case in cases], dtype=np.float64)
     eps_vals = np.asarray([float(case.epsilon_E) for case in cases], dtype=np.float64)
+    baseline_eps_vals = np.asarray(
+        [
+            np.nan if case.baseline_epsilon_E is None else float(case.baseline_epsilon_E)
+            for case in cases
+        ],
+        dtype=np.float64,
+    )
     markers = [
         "^" if case.beyond_training_range else ("o" if case.in_training_targets else "s")
         for case in cases
     ]
     finite_mask = np.isfinite(eps_vals)
-    finite_eps = eps_vals[finite_mask]
+    finite_baseline_mask = np.isfinite(baseline_eps_vals)
+    finite_eps = np.concatenate([eps_vals[finite_mask], baseline_eps_vals[finite_baseline_mask]])
+    baseline_label = next(
+        (case.baseline_label for case in cases if case.baseline_comparison is not None),
+        "truncation",
+    )
+    theta_label = cases[0].theta_label
     if finite_eps.size:
         y_cap = float(np.max(finite_eps) * 1.2 if np.max(finite_eps) > 0.0 else 1.0)
     else:
         y_cap = 1.0
+    if has_baseline:
+        for nv, eps, marker in zip(nv_vals, baseline_eps_vals, markers):
+            if np.isfinite(eps):
+                ax_top.plot([nv], [eps], marker=marker, color="#4b5563", ms=7)
+            elif not np.isnan(eps):
+                ax_top.plot([nv], [y_cap], marker=marker, color="#374151", ms=7)
+                ax_top.text(nv, y_cap, " inf", fontsize=8, va="bottom", ha="left", color="#374151")
+        if np.count_nonzero(finite_baseline_mask) >= 2:
+            ax_top.plot(
+                nv_vals[finite_baseline_mask],
+                baseline_eps_vals[finite_baseline_mask],
+                color="#4b5563",
+                lw=1.8,
+                label=baseline_label,
+            )
     for nv, eps, marker in zip(nv_vals, eps_vals, markers):
         if np.isfinite(eps):
             ax_top.plot([nv], [eps], marker=marker, color="#b91c1c", ms=7)
@@ -455,7 +490,7 @@ def plot_field_metric_sweep(
             ax_top.plot([nv], [y_cap], marker=marker, color="#991b1b", ms=7)
             ax_top.text(nv, y_cap, " inf", fontsize=8, va="bottom", ha="left", color="#991b1b")
     if np.count_nonzero(finite_mask) >= 2:
-        ax_top.plot(nv_vals[finite_mask], eps_vals[finite_mask], color="#b91c1c", lw=1.8)
+        ax_top.plot(nv_vals[finite_mask], eps_vals[finite_mask], color="#b91c1c", lw=1.8, label=theta_label)
     ax_top.set_ylim(0.0, y_cap * 1.15)
     ax_top.set_xscale("log", base=2)
     ax_top.set_xticks(nv_vals, [str(int(v)) for v in nv_vals])
@@ -463,19 +498,30 @@ def plot_field_metric_sweep(
     ax_top.set_ylabel(r"$\varepsilon_E$")
     ax_top.set_title(title)
     ax_top.grid(True, alpha=0.3)
+    if has_baseline:
+        handles, labels = ax_top.get_legend_handles_labels()
+        if handles:
+            ax_top.legend(handles, labels, fontsize=8)
 
     for row, case in enumerate(cases, start=1):
         comp = case.comparison
         time_edges = _centers_to_edges(comp.times)
         k_edges = _centers_to_edges(comp.selected_k)
         hr_ax = fig.add_subplot(grid[row, 0])
-        theta_ax = fig.add_subplot(grid[row, 1])
-        cax = fig.add_subplot(grid[row, 2])
+        baseline_ax = fig.add_subplot(grid[row, 1]) if has_baseline else None
+        theta_col = 2 if has_baseline else 1
+        theta_ax = fig.add_subplot(grid[row, theta_col])
+        cax = fig.add_subplot(grid[row, n_panel_cols])
         cmap = _magma_with_bad()
 
         hr_log = _safe_log10_masked(np.abs(comp.E_hat_hr), log_floor).T
         theta_log = _safe_log10_masked(np.abs(comp.E_hat_theta), log_floor).T
-        row_vmin, row_vmax = _finite_log_limits([np.abs(comp.E_hat_hr)], log_floor)
+        row_limit_arrays = [np.abs(comp.E_hat_hr)]
+        baseline_log = None
+        if has_baseline and case.baseline_comparison is not None:
+            baseline_log = _safe_log10_masked(np.abs(case.baseline_comparison.E_hat_theta), log_floor).T
+            row_limit_arrays.append(np.abs(case.baseline_comparison.E_hat_theta))
+        row_vmin, row_vmax = _finite_log_limits(row_limit_arrays, log_floor)
         if row_vmax <= row_vmin:
             row_vmax = row_vmin + 1.0
 
@@ -488,6 +534,19 @@ def plot_field_metric_sweep(
             vmin=row_vmin,
             vmax=row_vmax,
         )
+        if baseline_ax is not None:
+            if case.baseline_comparison is not None and baseline_log is not None:
+                baseline_ax.pcolormesh(
+                    time_edges,
+                    k_edges,
+                    baseline_log,
+                    shading="auto",
+                    cmap=cmap,
+                    vmin=row_vmin,
+                    vmax=row_vmax,
+                )
+            else:
+                baseline_ax.axis("off")
         theta_ax.pcolormesh(
             time_edges,
             k_edges,
@@ -500,11 +559,35 @@ def plot_field_metric_sweep(
 
         if row == 1:
             hr_ax.set_title(r"$\log_{10}|\hat E_k^{HR}(t)|$")
+            if baseline_ax is not None:
+                baseline_ax.set_title(r"$\log_{10}|\hat E_k^{q=0}(t)|$")
             theta_ax.set_title(r"$\log_{10}|\hat E_k^\theta(t)|$")
         hr_ax.set_xlabel("t")
+        if baseline_ax is not None:
+            baseline_ax.set_xlabel("t")
         theta_ax.set_xlabel("t")
         hr_ax.set_ylabel("k")
+        if baseline_ax is not None:
+            baseline_ax.set_ylabel("k")
         theta_ax.set_ylabel("k")
+        if baseline_ax is not None and case.baseline_comparison is not None:
+            nonfinite_baseline_t = _first_nonfinite_time(
+                case.baseline_comparison.times,
+                case.baseline_comparison.E_hat_theta,
+            )
+            if nonfinite_baseline_t is not None:
+                baseline_ax.axvline(nonfinite_baseline_t, color="#475569", lw=1.1, ls="--", alpha=0.8)
+                baseline_ax.text(
+                    0.99,
+                    0.98,
+                    rf"nonfinite at $t \approx {nonfinite_baseline_t:.2f}$",
+                    transform=baseline_ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=8,
+                    color="#334155",
+                    bbox={"facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.9},
+                )
         nonfinite_theta_t = _first_nonfinite_time(comp.times, comp.E_hat_theta)
         if nonfinite_theta_t is not None:
             theta_ax.axvline(nonfinite_theta_t, color="#475569", lw=1.1, ls="--", alpha=0.8)
@@ -526,7 +609,15 @@ def plot_field_metric_sweep(
         hr_ax.text(
             -0.42,
             0.5,
-            row_label + "\n" + rf"$\varepsilon_E={_format_metric_value(case.epsilon_E)}$",
+            row_label
+            + "\n"
+            + (
+                rf"$\varepsilon_E^{{q=0}}={_format_metric_value(float(case.baseline_epsilon_E))}$"
+                + "\n"
+                if has_baseline and case.baseline_epsilon_E is not None
+                else ""
+            )
+            + rf"$\varepsilon_E^\theta={_format_metric_value(case.epsilon_E)}$",
             transform=hr_ax.transAxes,
             ha="left",
             va="center",

@@ -34,6 +34,7 @@ from vpml.core import (
     hermite_basis_phi,
     load_learned_interface_closure_npz,
 )
+from vpml.physical_grid import project_distribution_snapshot_to_fourier_hermite
 from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,
     EarlyGrowthConfig,
@@ -104,6 +105,67 @@ def _phase_space_payload_from_raw(
     }
     for idx, t in enumerate(params.snapshot_times):
         full_f = (snaps_phys[idx] + m_eq[:, None]).T @ phi
+        payload[f"f_{_time_key(float(t))}"] = full_f.T.astype(np.float64)
+    return payload
+
+
+def _resample_periodic_x(f_vx: np.ndarray, *, Lx: float, target_nx: int) -> np.ndarray:
+    f_vx = np.asarray(f_vx, dtype=np.float64)
+    source_nx = int(f_vx.shape[1])
+    target_nx = int(target_nx)
+    if source_nx == target_nx:
+        return f_vx.copy()
+    x_source = np.linspace(0.0, float(Lx), source_nx, endpoint=False, dtype=np.float64)
+    x_target = np.linspace(0.0, float(Lx), target_nx, endpoint=False, dtype=np.float64)
+    x_ext = np.concatenate([x_source, np.asarray([float(Lx)], dtype=np.float64)])
+    values_ext = np.concatenate([f_vx, f_vx[:, :1]], axis=1)
+    out = np.empty((f_vx.shape[0], target_nx), dtype=np.float64)
+    for j in range(f_vx.shape[0]):
+        out[j] = np.interp(x_target, x_ext, values_ext[j])
+    return out
+
+
+def _projected_hr_reference_phase_payload(
+    hr_payload: Dict[str, np.ndarray],
+    params: NonlinearLandauParams,
+) -> Dict[str, np.ndarray]:
+    if "snapshot_f" not in hr_payload:
+        raise ValueError("Projected HR phase payload requires HR reference snapshot_f")
+    v_teacher = np.asarray(hr_payload["v"], dtype=np.float64)
+    equilibrium = np.asarray(hr_payload["equilibrium"], dtype=np.float64)
+    snapshot_times = np.asarray(hr_payload["snapshot_times"], dtype=np.float64)
+    snapshot_f = np.asarray(hr_payload["snapshot_f"], dtype=np.float64)
+
+    x = np.linspace(0.0, float(params.L), int(params.Nx), endpoint=False, dtype=np.float64)
+    v_plot = np.linspace(params.v_range[0], params.v_range[1], int(params.Nv_plot), dtype=np.float64)
+    phi = np.asarray(hermite_basis_phi(int(params.Nv), v_plot), dtype=np.float64)
+    m_eq = np.zeros((int(params.Nv),), dtype=np.float64)
+    if int(params.Nv) > 0:
+        m_eq[0] = 1.0
+
+    payload: Dict[str, np.ndarray] = {
+        "x": x,
+        "v": v_plot,
+        "times": np.asarray(params.snapshot_times, dtype=np.float64),
+    }
+    for t in params.snapshot_times:
+        matches = np.flatnonzero(np.isclose(snapshot_times, float(t), rtol=0.0, atol=1e-10))
+        if matches.size == 0:
+            raise ValueError(f"HR reference is missing snapshot time t={float(t):g}")
+        f_hr = snapshot_f[int(matches[0])]
+        f_on_solver_x = _resample_periodic_x(f_hr, Lx=float(params.L), target_nx=int(params.Nx))
+        a_hat = np.asarray(
+            project_distribution_snapshot_to_fourier_hermite(
+                jnp.asarray(f_on_solver_x, dtype=jnp.float64),
+                jnp.asarray(v_teacher, dtype=jnp.float64),
+                int(params.Nv),
+                vth=float(params.vth),
+                equilibrium=jnp.asarray(equilibrium, dtype=jnp.float64),
+            ),
+            dtype=np.complex128,
+        )
+        a_phys = np.fft.irfft(a_hat, n=int(params.Nx), axis=1).real.astype(np.float64)
+        full_f = (a_phys + m_eq[:, None]).T @ phi
         payload[f"f_{_time_key(float(t))}"] = full_f.T.astype(np.float64)
     return payload
 
@@ -245,6 +307,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         dt=float(args.teacher_dt),
         T=float(args.T),
         perturbation_x=perturb_hr,
+        snapshot_times=snapshot_times,
     )
 
     growth_cases: List[GrowthSweepCase] = []
@@ -260,7 +323,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         case_train_nv_targets = tuple(int(v) for v in learned.Nv_targets)
         case_train_nv_min = min(case_train_nv_targets)
         case_train_nv_max = max(case_train_nv_targets)
-        print(f"[nv-sweep] running learned/nonlocal rollout pair for Nv={int(Nv)}")
+        print(f"[nv-sweep] running truncation/learned rollout pair for Nv={int(Nv)}")
         params = NonlinearLandauParams(
             Nx=int(args.Nx),
             Nv=int(Nv),
@@ -275,6 +338,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             Nv_plot=int(args.nv_plot),
             vmin=float(args.phase_vmin),
             vmax=float(args.phase_vmax),
+        )
+
+        truncation_raw = run_nonlinear_landau_rollout_raw(
+            params,
+            "truncation",
+            return_state_history=True,
+            history_stride=1,
+        )
+        truncation_payload = _learned_nonlinear_payload_from_raw(truncation_raw, params)
+        truncation_field_comparison = field_metric.prepare_fourier_comparison(
+            truncation_payload["times"],
+            truncation_payload["E_hat_hist"],
+            truncation_payload["k_arr"],
+            hr_payload["times"],
+            hr_payload["E_hat_hist"],
+            hr_payload["k_arr"],
+        )
+        truncation_field = field_metric.evaluate_fourier(
+            truncation_payload["times"],
+            truncation_payload["E_hat_hist"],
+            truncation_payload["k_arr"],
+            hr_payload["times"],
+            hr_payload["E_hat_hist"],
+            hr_payload["k_arr"],
         )
 
         learned_raw = run_nonlinear_landau_rollout_raw(
@@ -308,26 +395,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             hr_payload["k_arr"],
         )
 
-        nonlocal_raw = run_nonlinear_landau_rollout_raw(
-            params,
-            "nonlocal",
-            mu=float(args.nonlocal_mu),
-            return_state_history=False,
-        )
+        reference_phase = _projected_hr_reference_phase_payload(hr_payload, params)
+        truncation_phase = _phase_space_payload_from_raw(truncation_raw, params)
         learned_phase = _phase_space_payload_from_raw(learned_raw, params)
-        nonlocal_phase = _phase_space_payload_from_raw(nonlocal_raw, params)
 
         if not phase_payload:
             phase_payload["x"] = np.asarray(learned_phase["x"], dtype=np.float64)
             phase_payload["v"] = np.asarray(learned_phase["v"], dtype=np.float64)
             phase_payload["times"] = np.asarray(snapshot_times, dtype=np.float64)
         for t in snapshot_times:
-            phase_payload[f"nv{int(Nv)}_learned_f_{_time_key(float(t))}"] = np.asarray(
-                learned_phase[f"f_{_time_key(float(t))}"],
+            phase_payload[f"nv{int(Nv)}_reference_f_{_time_key(float(t))}"] = np.asarray(
+                reference_phase[f"f_{_time_key(float(t))}"],
                 dtype=np.float64,
             )
-            phase_payload[f"nv{int(Nv)}_nonlocal_f_{_time_key(float(t))}"] = np.asarray(
-                nonlocal_phase[f"f_{_time_key(float(t))}"],
+            phase_payload[f"nv{int(Nv)}_truncation_f_{_time_key(float(t))}"] = np.asarray(
+                truncation_phase[f"f_{_time_key(float(t))}"],
+                dtype=np.float64,
+            )
+            phase_payload[f"nv{int(Nv)}_learned_f_{_time_key(float(t))}"] = np.asarray(
+                learned_phase[f"f_{_time_key(float(t))}"],
                 dtype=np.float64,
             )
 
@@ -355,6 +441,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 Nv=int(Nv),
                 comparison=field_comparison,
                 epsilon_E=float(field.epsilon_E),
+                baseline_comparison=truncation_field_comparison,
+                baseline_epsilon_E=float(truncation_field.epsilon_E),
+                baseline_label="truncation",
+                theta_label="learned",
                 in_training_targets=in_training_targets,
                 beyond_training_range=beyond_training_range,
             )
@@ -375,14 +465,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             field_selected_k=np.asarray(field_comparison.selected_k, dtype=np.float64),
             field_E_hat_hr=np.asarray(field_comparison.E_hat_hr, dtype=np.complex128),
             field_E_hat_theta=np.asarray(field_comparison.E_hat_theta, dtype=np.complex128),
+            field_E_hat_truncation=np.asarray(truncation_field_comparison.E_hat_theta, dtype=np.complex128),
             epsilon_grow=np.array([growth.epsilon_grow], dtype=np.float64),
             gamma_grow_hr=np.array([growth.gamma_grow_hr], dtype=np.float64),
             gamma_grow_theta=np.array([growth.gamma_grow_theta], dtype=np.float64),
             epsilon_E=np.array([field.epsilon_E], dtype=np.float64),
+            epsilon_E_truncation=np.array([truncation_field.epsilon_E], dtype=np.float64),
             in_training_targets=np.array([int(in_training_targets)], dtype=np.int32),
             beyond_training_range=np.array([int(beyond_training_range)], dtype=np.int32),
-            nonlocal_f_t0=np.asarray(nonlocal_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
-            nonlocal_f_t1=np.asarray(nonlocal_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
+            reference_f_t0=np.asarray(reference_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
+            reference_f_t1=np.asarray(reference_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
+            truncation_f_t0=np.asarray(truncation_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
+            truncation_f_t1=np.asarray(truncation_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
             learned_f_t0=np.asarray(learned_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
             learned_f_t1=np.asarray(learned_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
             x=np.asarray(learned_phase["x"], dtype=np.float64),
@@ -397,6 +491,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "gamma_grow_hr": _json_scalar(growth.gamma_grow_hr),
                 "gamma_grow_theta": _json_scalar(growth.gamma_grow_theta),
                 "epsilon_E": _json_scalar(field.epsilon_E),
+                "epsilon_E_truncation": _json_scalar(truncation_field.epsilon_E),
                 "fit_t_a": _json_scalar(growth.t_a),
                 "fit_t_b": _json_scalar(growth.t_b),
                 "num_common_modes": int(field.num_modes),
@@ -409,7 +504,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print(
             f"[nv-sweep] Nv={int(Nv)}: epsilon_grow={growth.epsilon_grow:.4e} "
             f"gamma_hr={growth.gamma_grow_hr:.4e} gamma_theta={growth.gamma_grow_theta:.4e} "
-            f"epsilon_E={field.epsilon_E:.4e}"
+            f"epsilon_E_truncation={truncation_field.epsilon_E:.4e} "
+            f"epsilon_E_learned={field.epsilon_E:.4e}"
         )
 
     growth_fig = plot_growth_metric_sweep(
