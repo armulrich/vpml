@@ -148,7 +148,7 @@ IFS=',' read -r -a NV_VALUES <<< "${NV_LIST}"
 TOTAL_NV="${#NV_VALUES[@]}"
 
 if [[ "${RUN_TRAIN}" != "0" ]]; then
-  echo "[nv-sweep-single-qloss-fixed-ratio] [1/3] Using target-specific fixed-ratio q_only Nv ladders and per-model dataset caches"
+  echo "[fh-offline-qloss-ladder] [1/3] Using target-specific fixed-ratio q_only Nv ladders and per-model dataset caches"
   for idx in "${!NV_VALUES[@]}"; do
     NV_RAW="${NV_VALUES[idx]}"
     NV="$(echo "${NV_RAW}" | tr -d '[:space:]')"
@@ -203,7 +203,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --strong-eps "${TRAIN_STRONG_EPS}"
     )
 
-    echo "[nv-sweep-single-qloss-fixed-ratio] [2/3] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV} with Nv-targets=${TRAIN_LADDER_CSV}"
+    echo "[fh-offline-qloss-ladder] [2/3] Training closure $((idx + 1))/${TOTAL_NV} for Nv=${NV} with Nv-targets=${TRAIN_LADDER_CSV}"
     "${PYTHON_BIN}" -m model.train.train "${TRAIN_ARGS[@]}"
   done
 else
@@ -218,12 +218,12 @@ else
       exit 1
     fi
   done
-  echo "[nv-sweep-single-qloss-fixed-ratio] [1/3] Skipping model training because RUN_TRAIN=${RUN_TRAIN}"
-  echo "[nv-sweep-single-qloss-fixed-ratio] [2/3] Reusing existing checkpoints in ${CHECKPOINT_ROOT}"
+  echo "[fh-offline-qloss-ladder] [1/3] Skipping model training because RUN_TRAIN=${RUN_TRAIN}"
+  echo "[fh-offline-qloss-ladder] [2/3] Reusing existing checkpoints in ${CHECKPOINT_ROOT}"
 fi
 
 ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
-echo "[nv-sweep-single-qloss-fixed-ratio] [3/3] Running nonlinear Nv sweep"
+echo "[fh-offline-qloss-ladder] [3/3] Running nonlinear Nv sweep with HR/truncation/learned evaluation panels"
 "${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
 
 cat <<EOF
@@ -239,6 +239,7 @@ Artifacts:
   metric 2:       ${OUTDIR}/nv_sweep_metric2.png
   phase space:    ${OUTDIR}/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png
   phase payload:  ${OUTDIR}/nv_sweep_phase_space_payload.npz
+  Metric 2/Fig.10:HR reference | truncation (q=0) | learned closure
 
 Defaults:
   ladder mode:    target-specific fixed-ratio q_only

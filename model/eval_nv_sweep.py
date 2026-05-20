@@ -512,7 +512,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         np.asarray(hr_payload["times"], dtype=np.float64),
         np.asarray(hr_payload["energy"], dtype=np.float64),
         growth_cases,
-        title="Nonlinear Landau Metric 1 sweep across deployment $N_v$",
+        title=r"Metric 1: HR reference vs learned FH ($q_\theta$)",
     )
     growth_png = save_figure(growth_fig, outdir / "nv_sweep_metric1.png", dpi=220)
 

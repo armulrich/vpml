@@ -159,7 +159,9 @@ Example:
 ```
 
 The Fourier--Hermite wrappers train one checkpoint per deployment `N_v` and then
-call `python -m model.eval_nv_sweep ...`, emitting:
+call `python -m model.eval_nv_sweep ...`, emitting the same evaluation layout:
+Metric 1 plots HR against learned rollouts, while Metric 2 and Fig. 10 include
+the truncation (`q=0`) baseline beside the learned closure.
 
 - `summary.json`
 - `nv_sweep_metric1.png`, `nv_sweep_metric2.png`

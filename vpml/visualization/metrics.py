@@ -370,7 +370,7 @@ def plot_growth_metric_sweep(
     ax.axvspan(fit_window[0], fit_window[1], color="#d1d5db", alpha=0.22, label="fit window")
 
     for color, case in zip(colors, cases):
-        label = rf"$N_v={int(case.Nv)}$"
+        label = rf"Learned FH ($q_\theta$), $N_v={int(case.Nv)}$"
         if case.beyond_training_range:
             label += " (out)"
         elif not case.in_training_targets:
@@ -401,7 +401,7 @@ def plot_growth_metric_sweep(
     ax.set_ylabel(r"$\mathcal{E}_E(t)$")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, ncol=3)
+    ax.legend(fontsize=7.5, ncol=2)
     ax.text(
         0.99,
         0.99,
