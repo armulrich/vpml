@@ -347,8 +347,20 @@ class VisualizationTests(unittest.TestCase):
             )
             field_fig = plot_field_metric_sweep(
                 [
-                    FieldSweepCase(8, comparison, 0.2, True, False),
-                    FieldSweepCase(64, comparison, 0.1, False, False),
+                    FieldSweepCase(
+                        Nv=8,
+                        comparison=comparison,
+                        epsilon_E=0.2,
+                        in_training_targets=True,
+                        beyond_training_range=False,
+                    ),
+                    FieldSweepCase(
+                        Nv=64,
+                        comparison=comparison,
+                        epsilon_E=0.1,
+                        in_training_targets=False,
+                        beyond_training_range=False,
+                    ),
                 ],
                 title="field sweep",
             )
@@ -372,7 +384,15 @@ class VisualizationTests(unittest.TestCase):
                 selected_k=np.array([0.5, 1.0, 1.5], dtype=np.float64),
             )
             divergent_field_fig = plot_field_metric_sweep(
-                [FieldSweepCase(64, divergent_comparison, float("inf"), True, False)],
+                [
+                    FieldSweepCase(
+                        Nv=64,
+                        comparison=divergent_comparison,
+                        epsilon_E=float("inf"),
+                        in_training_targets=True,
+                        beyond_training_range=False,
+                    )
+                ],
                 title="field sweep divergent",
             )
             divergent_field_fig.savefig(outdir / "field_sweep_divergent.png")
