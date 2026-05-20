@@ -169,6 +169,10 @@ def online_loss_backend_uses_projected_xv(backend: str) -> bool:
     return str(backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR
 
 
+def online_loss_backend_has_reference_q_targets(backend: str) -> bool:
+    return online_loss_backend_uses_closure_q(str(backend)) or online_loss_backend_uses_projected_xv(str(backend))
+
+
 def online_reference_num_cases(payload: Dict[str, Array]) -> int:
     if "E_hat_ref" in payload:
         return int(np.asarray(payload["E_hat_ref"]).shape[0])
@@ -1317,6 +1321,172 @@ def build_identity_training_stats(
     }
 
 
+def _accumulate_feature_moments(
+    total: Optional[np.ndarray],
+    total_sq: Optional[np.ndarray],
+    count: int,
+    values: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError(f"Expected a 2D feature block, got shape {values.shape}")
+    if values.shape[0] == 0:
+        if total is None or total_sq is None:
+            return (
+                np.zeros((values.shape[1],), dtype=np.float64),
+                np.zeros((values.shape[1],), dtype=np.float64),
+                int(count),
+            )
+        return total, total_sq, int(count)
+    block_sum = np.sum(values, axis=0, dtype=np.float64)
+    block_sum_sq = np.sum(values * values, axis=0, dtype=np.float64)
+    if total is None or total_sq is None:
+        total = np.zeros_like(block_sum, dtype=np.float64)
+        total_sq = np.zeros_like(block_sum_sq, dtype=np.float64)
+    return total + block_sum, total_sq + block_sum_sq, int(count) + int(values.shape[0])
+
+
+def _online_extended_coeff_history_for_q_stats(
+    a_hat_hist: np.ndarray,
+    q_hat_hist: Optional[np.ndarray],
+    *,
+    target_nv: int,
+    k_arr: np.ndarray,
+) -> np.ndarray:
+    """Append the omitted Hermite coefficient reconstructed from q, or zero if q is unavailable."""
+    target_nv = int(target_nv)
+    a_hat_hist = np.asarray(a_hat_hist, dtype=np.complex128)
+    q_hat_arr = None if q_hat_hist is None else np.asarray(q_hat_hist, dtype=np.complex128)
+    k_arr = np.asarray(k_arr, dtype=np.float64)
+    if a_hat_hist.ndim != 3:
+        raise ValueError(f"a_hat_hist must have shape (T, Nv, Nk), got {a_hat_hist.shape}")
+    if q_hat_arr is not None and q_hat_arr.shape != (a_hat_hist.shape[0], a_hat_hist.shape[2]):
+        raise ValueError(
+            f"q_hat_hist must have shape {(a_hat_hist.shape[0], a_hat_hist.shape[2])}, "
+            f"got {q_hat_arr.shape}"
+        )
+    if int(a_hat_hist.shape[1]) != target_nv:
+        raise ValueError(
+            f"Expected retained history for Nv={target_nv}, got Nv={a_hat_hist.shape[1]}"
+        )
+    extended = np.zeros(
+        (a_hat_hist.shape[0], target_nv + 1, a_hat_hist.shape[2]),
+        dtype=np.complex128,
+    )
+    extended[:, :target_nv, :] = a_hat_hist
+    if q_hat_arr is not None and a_hat_hist.shape[2] > 1:
+        denom = -1j * k_arr[1:] * math.sqrt(float(target_nv))
+        extended[:, target_nv, 1:] = q_hat_arr[:, 1:] / denom[None, :]
+    return extended
+
+
+def build_online_q_training_stats_from_reference(
+    online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
+    *,
+    active_regimes: Sequence[str],
+    Nv_targets: Sequence[int],
+    Nm: int,
+    k_arr: np.ndarray,
+    k_scale: float,
+    nv_scale: float,
+    n_low: int,
+    context_mode: str,
+    require_q_targets: bool = False,
+) -> Dict[str, np.ndarray]:
+    """Compute q-feature normalization for online projected-coefficient training.
+
+    The pure online rollout losses do not always optimize a direct q loss, but
+    the learned object inserted in the PDE is still q_k.  When q targets are
+    available, this builds the same feature/target statistics used by the
+    offline q-loss branch.  Otherwise it still standardizes the closure inputs
+    from retained reference histories and leaves the output scale at the zero
+    baseline.
+    """
+    input_sum: Optional[np.ndarray] = None
+    input_sum_sq: Optional[np.ndarray] = None
+    target_sum: Optional[np.ndarray] = None
+    target_sum_sq: Optional[np.ndarray] = None
+    input_count = 0
+    target_count = 0
+
+    for regime in active_regimes:
+        group = online_dataset.get(regime, {}).get("train", {})
+        if not group:
+            continue
+        for target_nv in Nv_targets:
+            coeff_key = online_reference_coeff_key(int(target_nv))
+            q_key = online_reference_q_key(int(target_nv))
+            if coeff_key not in group:
+                continue
+            if bool(require_q_targets) and q_key not in group:
+                continue
+            coeff_cases = np.asarray(group[coeff_key], dtype=np.complex128)
+            q_cases = (
+                None
+                if q_key not in group
+                else np.asarray(group[q_key], dtype=np.complex128)
+            )
+            if q_cases is not None and coeff_cases.shape[0] != q_cases.shape[0]:
+                raise ValueError(
+                    f"{regime} Nv={target_nv} coeff/q case-count mismatch: "
+                    f"{coeff_cases.shape[0]} vs {q_cases.shape[0]}"
+                )
+            for case_idx in range(int(coeff_cases.shape[0])):
+                extended_hist = _online_extended_coeff_history_for_q_stats(
+                    coeff_cases[case_idx],
+                    None if q_cases is None else q_cases[case_idx],
+                    target_nv=int(target_nv),
+                    k_arr=k_arr,
+                )
+                pairs = extract_interface_supervised_pairs_from_coeff_history(
+                    extended_hist,
+                    Nv_targets=(int(target_nv),),
+                    Nm=int(Nm),
+                    k_arr=np.asarray(k_arr, dtype=np.float64),
+                    vth=1.0,
+                    include_global_indicators=True,
+                    n_low=int(n_low),
+                    context_mode=str(context_mode),
+                )[int(target_nv)]
+                inputs = build_model_inputs(
+                    pairs["inputs_base"],
+                    Nm=int(Nm),
+                    k_scale=float(k_scale),
+                    nv_scale=float(nv_scale),
+                    context_mode=str(context_mode),
+                    include_global_indicators=True,
+                )
+                targets = np.asarray(pairs["targets"], dtype=np.float64)
+                input_sum, input_sum_sq, input_count = _accumulate_feature_moments(
+                    input_sum,
+                    input_sum_sq,
+                    input_count,
+                    inputs,
+                )
+                target_sum, target_sum_sq, target_count = _accumulate_feature_moments(
+                    target_sum,
+                    target_sum_sq,
+                    target_count,
+                    targets,
+                )
+
+    if input_sum is None or input_sum_sq is None or target_sum is None or target_sum_sq is None:
+        raise ValueError("No online q reference samples were available for normalization")
+    if input_count <= 0 or target_count <= 0:
+        raise ValueError("Online q reference normalization received zero samples")
+
+    input_mean = input_sum / float(input_count)
+    input_var = np.maximum(input_sum_sq / float(input_count) - input_mean * input_mean, 0.0)
+    target_mean = target_sum / float(target_count)
+    target_var = np.maximum(target_sum_sq / float(target_count) - target_mean * target_mean, 0.0)
+    return {
+        "input_mean": np.asarray(input_mean, dtype=np.float64),
+        "input_std": safe_feature_std(np.sqrt(input_var)),
+        "target_mean": np.asarray(target_mean, dtype=np.float64),
+        "target_std": safe_feature_std(np.sqrt(target_var)),
+    }
+
+
 def init_online_rollout_params(
     key: Array,
     *,
@@ -1590,10 +1760,7 @@ def build_online_reference_dataset(
             raise ValueError(f"{online_loss_backend} requires rollout_horizon > 0")
         closure_q_targets = (
             target_nvs
-            if (
-                online_loss_backend_uses_closure_q(str(online_loss_backend))
-                or online_loss_backend_uses_projected_xv(str(online_loss_backend))
-            )
+            if online_loss_backend_has_reference_q_targets(str(online_loss_backend))
             else ()
         )
         projection_orders = tuple(sorted(
@@ -2261,12 +2428,16 @@ def online_trajectory_loss_terms(
 def online_full_state_loss_terms(
     pred_a_hat_hist: Array,
     ref_a_hat_hist: Array,
+    *,
+    k_mask: Optional[Array] = None,
 ) -> Tuple[Array, Array]:
     pred_a_hat_hist = jnp.asarray(pred_a_hat_hist, dtype=jnp.complex128)
     ref_a_hat_hist = jnp.asarray(ref_a_hat_hist, dtype=jnp.complex128)
     time_weights = _rollout_step_weights(int(ref_a_hat_hist.shape[0]))
     n_weights = _rollout_n_weights(int(ref_a_hat_hist.shape[1]))
     k_weights = _rollout_k_weights(int(ref_a_hat_hist.shape[2]))
+    if k_mask is not None:
+        k_weights = k_weights * jnp.asarray(k_mask, dtype=jnp.float64)
     weights = (
         time_weights[:, None, None]
         * n_weights[None, :, None]
@@ -2286,6 +2457,7 @@ def online_projected_xv_loss_terms(
     v_grid: Array,
     vth: float = 1.0,
     tail_window: int = 0,
+    k_mask: Optional[Array] = None,
 ) -> Array:
     """Relative projected physical-space L2 loss induced by the reconstruction basis.
 
@@ -2299,6 +2471,10 @@ def online_projected_xv_loss_terms(
     ref_a_hat_hist = jnp.asarray(ref_a_hat_hist, dtype=jnp.complex128)
     diff_a_hat = pred_a_hat_hist - ref_a_hat_hist
     ref_scale_a_hat = ref_a_hat_hist
+    if k_mask is not None:
+        mask = jnp.asarray(k_mask, dtype=jnp.float64)[None, None, :]
+        diff_a_hat = diff_a_hat * mask
+        ref_scale_a_hat = ref_scale_a_hat * mask
     if int(tail_window) > 0 and int(tail_window) < int(diff_a_hat.shape[1]):
         tail_start = int(diff_a_hat.shape[1]) - int(tail_window)
         n_mask = (jnp.arange(int(diff_a_hat.shape[1])) >= tail_start).astype(jnp.float64)
@@ -2332,6 +2508,7 @@ def online_field_hat_loss_terms(
     *,
     k_arr: Array,
     poisson_sign: float,
+    k_mask: Optional[Array] = None,
 ) -> Tuple[Array, Array]:
     pred_e_hat_hist = e_hat_history_from_a_hat_history(
         jnp.asarray(pred_a_hat_hist, dtype=jnp.complex128),
@@ -2345,6 +2522,8 @@ def online_field_hat_loss_terms(
     )
     time_weights = _rollout_step_weights(int(ref_e_hat_hist.shape[0]))
     k_weights = _rollout_k_weights(int(ref_e_hat_hist.shape[1]))
+    if k_mask is not None:
+        k_weights = k_weights * jnp.asarray(k_mask, dtype=jnp.float64)
     weights = time_weights[:, None] * k_weights[None, :]
     num = jnp.sum(weights * (jnp.abs(pred_e_hat_hist - ref_e_hat_hist) ** 2))
     den = jnp.sum(weights * (jnp.abs(ref_e_hat_hist) ** 2))
@@ -2354,11 +2533,15 @@ def online_field_hat_loss_terms(
 def online_closure_flux_loss_terms(
     pred_q_hat_hist: Array,
     ref_q_hat_hist: Array,
+    *,
+    k_mask: Optional[Array] = None,
 ) -> Tuple[Array, Array]:
     pred_q_hat_hist = jnp.asarray(pred_q_hat_hist, dtype=jnp.complex128)
     ref_q_hat_hist = jnp.asarray(ref_q_hat_hist, dtype=jnp.complex128)
     time_weights = _rollout_step_weights(int(ref_q_hat_hist.shape[0]))
     k_weights = _rollout_k_weights(int(ref_q_hat_hist.shape[1]))
+    if k_mask is not None:
+        k_weights = k_weights * jnp.asarray(k_mask, dtype=jnp.float64)
     weights = time_weights[:, None] * k_weights[None, :]
     num = jnp.sum(weights * (jnp.abs(pred_q_hat_hist - ref_q_hat_hist) ** 2))
     den = jnp.sum(weights * (jnp.abs(ref_q_hat_hist) ** 2))
@@ -2372,6 +2555,7 @@ def online_direct_q_relative_mse_for_history(
     learned: LearnedInterfaceClosure,
     k_arr: Array,
     Nv: int,
+    k_mask: Optional[Array] = None,
 ) -> Array:
     """Diagnostic only: direct teacher-q error on reference states.
 
@@ -2400,8 +2584,13 @@ def online_direct_q_relative_mse_for_history(
     )(states, prev_states)
     diff = preds[:, 1:] - targets[:, 1:]
     target = targets[:, 1:]
-    num = jnp.sum(jnp.abs(diff) ** 2)
-    den = jnp.sum(jnp.abs(target) ** 2)
+    if k_mask is not None:
+        weights = jnp.asarray(k_mask, dtype=jnp.float64)[1:]
+        num = jnp.sum(weights[None, :] * (jnp.abs(diff) ** 2))
+        den = jnp.sum(weights[None, :] * (jnp.abs(target) ** 2))
+    else:
+        num = jnp.sum(jnp.abs(diff) ** 2)
+        den = jnp.sum(jnp.abs(target) ** 2)
     return num / (den + 1e-30)
 
 
@@ -2836,7 +3025,11 @@ def online_fourier_hermite_bidir_loss_for_history(
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
         ref_forward = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
-        num_forward, den_forward = online_full_state_loss_terms(pred_forward, ref_forward)
+        num_forward, den_forward = online_full_state_loss_terms(
+            pred_forward,
+            ref_forward,
+            k_mask=forward_integ.mask,
+        )
 
         pred_backward = rollout_from_anchor_state(
             ref_hist,
@@ -2848,7 +3041,11 @@ def online_fourier_hermite_bidir_loss_for_history(
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
         ref_backward = jnp.take(ref_hist, anchor_idx - offsets, axis=0)
-        num_backward, den_backward = online_full_state_loss_terms(pred_backward, ref_backward)
+        num_backward, den_backward = online_full_state_loss_terms(
+            pred_backward,
+            ref_backward,
+            k_mask=backward_integ.mask,
+        )
 
         return (
             carry[0] + num_forward + num_backward,
@@ -2901,12 +3098,17 @@ def online_fourier_hermite_posterior_bidir_components_for_history(
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
         ref_forward = jnp.take(ref_hist, anchor_idx + offsets, axis=0)
-        state_num_forward, state_den_forward = online_full_state_loss_terms(pred_forward, ref_forward)
+        state_num_forward, state_den_forward = online_full_state_loss_terms(
+            pred_forward,
+            ref_forward,
+            k_mask=forward_integ.mask,
+        )
         field_num_forward, field_den_forward = online_field_hat_loss_terms(
             pred_forward,
             ref_forward,
             k_arr=forward_integ.k_arr,
             poisson_sign=float(poisson_sign),
+            k_mask=forward_integ.mask,
         )
 
         pred_backward = rollout_from_anchor_state(
@@ -2919,12 +3121,17 @@ def online_fourier_hermite_posterior_bidir_components_for_history(
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
         ref_backward = jnp.take(ref_hist, anchor_idx - offsets, axis=0)
-        state_num_backward, state_den_backward = online_full_state_loss_terms(pred_backward, ref_backward)
+        state_num_backward, state_den_backward = online_full_state_loss_terms(
+            pred_backward,
+            ref_backward,
+            k_mask=backward_integ.mask,
+        )
         field_num_backward, field_den_backward = online_field_hat_loss_terms(
             pred_backward,
             ref_backward,
             k_arr=backward_integ.k_arr,
             poisson_sign=float(poisson_sign),
+            k_mask=backward_integ.mask,
         )
 
         return (
@@ -3001,6 +3208,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
             Lx=float(forward_integ.Lx),
             v_grid=v_grid,
             tail_window=int(projected_xv_tail_window),
+            k_mask=forward_integ.mask,
         )
 
         if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
@@ -3023,6 +3231,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
             Lx=float(backward_integ.Lx),
             v_grid=v_grid,
             tail_window=int(projected_xv_tail_window),
+            k_mask=backward_integ.mask,
         )
 
         return carry + loss_forward + loss_backward, None
@@ -3076,7 +3285,11 @@ def online_fourier_hermite_closure_bidir_loss_for_history(
             detach_rollout_state_for_q=bool(detach_rollout_state_for_q),
         )
         ref_forward = jnp.take(ref_q_hist, anchor_idx + offsets, axis=0)
-        num_forward, den_forward = online_closure_flux_loss_terms(pred_forward, ref_forward)
+        num_forward, den_forward = online_closure_flux_loss_terms(
+            pred_forward,
+            ref_forward,
+            k_mask=forward_integ.mask,
+        )
 
         pred_backward = rollout_closure_flux_from_anchor_state(
             ref_hist,
@@ -3089,7 +3302,11 @@ def online_fourier_hermite_closure_bidir_loss_for_history(
             detach_rollout_state_for_q=bool(detach_rollout_state_for_q),
         )
         ref_backward = jnp.take(ref_q_hist, anchor_idx - offsets, axis=0)
-        num_backward, den_backward = online_closure_flux_loss_terms(pred_backward, ref_backward)
+        num_backward, den_backward = online_closure_flux_loss_terms(
+            pred_backward,
+            ref_backward,
+            k_mask=backward_integ.mask,
+        )
 
         return (
             carry[0] + num_forward + num_backward,
@@ -3137,7 +3354,11 @@ def online_fourier_hermite_closure_action_bidir_loss_for_history(
             direction=+1,
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
-        num_forward, den_forward = online_closure_flux_loss_terms(pred_forward, target_forward)
+        num_forward, den_forward = online_closure_flux_loss_terms(
+            pred_forward,
+            target_forward,
+            k_mask=forward_integ.mask,
+        )
 
         pred_backward, target_backward = rollout_closure_action_from_anchor_state(
             ref_hist,
@@ -3148,7 +3369,11 @@ def online_fourier_hermite_closure_action_bidir_loss_for_history(
             direction=-1,
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
-        num_backward, den_backward = online_closure_flux_loss_terms(pred_backward, target_backward)
+        num_backward, den_backward = online_closure_flux_loss_terms(
+            pred_backward,
+            target_backward,
+            k_mask=backward_integ.mask,
+        )
 
         return (
             carry[0] + num_forward + num_backward,
@@ -3196,7 +3421,11 @@ def online_fourier_hermite_boundary_step_bidir_loss_for_history(
             direction=+1,
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
-        num_forward, den_forward = online_closure_flux_loss_terms(pred_forward, ref_forward)
+        num_forward, den_forward = online_closure_flux_loss_terms(
+            pred_forward,
+            ref_forward,
+            k_mask=forward_integ.mask,
+        )
 
         pred_backward, ref_backward = rollout_boundary_step_from_anchor_state(
             ref_hist,
@@ -3207,7 +3436,11 @@ def online_fourier_hermite_boundary_step_bidir_loss_for_history(
             direction=-1,
             explicit_n_hat_fn=explicit_n_hat_fn,
         )
-        num_backward, den_backward = online_closure_flux_loss_terms(pred_backward, ref_backward)
+        num_backward, den_backward = online_closure_flux_loss_terms(
+            pred_backward,
+            ref_backward,
+            k_mask=backward_integ.mask,
+        )
 
         return (
             carry[0] + num_forward + num_backward,
@@ -3688,6 +3921,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 learned=learned,
                 k_arr=integ.k_arr,
                 Nv=int(integ.Nv),
+                k_mask=integ.mask,
             )
             return total + q_rel_mse, None
 
@@ -5561,7 +5795,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             k_scale = float(args.k_scale) if args.k_scale is not None else float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64)))
             nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(target_nv_max)
-            stats = build_identity_training_stats(Nm=args.Nm, context_mode=args.context_mode)
             if args.init_checkpoint is not None:
                 params, stats, k_scale, nv_scale = _load_init_checkpoint_for_online_trajectory(
                     args.init_checkpoint,
@@ -5577,11 +5810,33 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     raise ValueError("--nv-scale must match --init-checkpoint nv_scale when warm-starting online training")
                 print(f"[train] initialized online trajectory parameters from {args.init_checkpoint}")
             else:
+                if online_loss_backend_uses_projected_coefficients(str(online_loss_backend)):
+                    stats = build_online_q_training_stats_from_reference(
+                        online_dataset,
+                        active_regimes=regimes,
+                        Nv_targets=Nv_targets,
+                        Nm=args.Nm,
+                        k_arr=np.asarray(integ.k_arr, dtype=np.float64),
+                        k_scale=k_scale,
+                        nv_scale=nv_scale,
+                        n_low=args.n_low,
+                        context_mode=args.context_mode,
+                        require_q_targets=online_loss_backend_has_reference_q_targets(str(online_loss_backend)),
+                    )
+                    print(
+                        "[data] online closure normalization: "
+                        f"input_std_max={float(np.max(stats['input_std'])):.3e} "
+                        f"target_std={np.asarray(stats['target_std'], dtype=np.float64)}"
+                    )
+                else:
+                    stats = build_identity_training_stats(Nm=args.Nm, context_mode=args.context_mode)
                 params = init_online_rollout_params(
                     jax.random.PRNGKey(args.seed),
                     input_dim=int(stats["input_mean"].shape[0]),
                     hidden_width=int(args.hidden_width),
                     res_blocks=int(args.res_blocks),
+                    target_mean=stats["target_mean"],
+                    target_std=stats["target_std"],
                 )
             if online_loss_backend_uses_projected_coefficients(online_loss_backend):
                 batch_loss_fn, active_regimes = make_online_fourier_hermite_bidir_batch_loss(
