@@ -4,14 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
-OUTDIR="${1:-${REPO_ROOT}/out_bench/nv_sweep_online_rollout_closure_bidir}"
+OUTDIR="${1:-${REPO_ROOT}/out_bench/fh_online_q_finetune}"
 OFFLINE_OUTDIR="${OFFLINE_OUTDIR:-${OUTDIR}/offline_qloss}"
 FINETUNE_OUTDIR="${FINETUNE_OUTDIR:-${OUTDIR}/online_finetuned}"
 OFFLINE_CHECKPOINT_ROOT="${OFFLINE_CHECKPOINT_ROOT:-${OFFLINE_OUTDIR}/models}"
 FINETUNE_CHECKPOINT_ROOT="${FINETUNE_CHECKPOINT_ROOT:-${FINETUNE_OUTDIR}/models}"
 
 # Stage 2 is intentionally controlled separately from the offline qloss stage.
-# The offline stage delegates to run_nv_sweep_single_qloss_fixed_ratio.sh, so
+# The offline stage delegates to run_fh_offline_qloss_ladder.sh, so
 # its defaults remain the current repo qloss defaults unless the OFFLINE_QLOSS_*
 # variables below are explicitly changed.
 OFFLINE_QLOSS_FIXED_RATIO="${OFFLINE_QLOSS_FIXED_RATIO:-1.8}"
@@ -55,7 +55,7 @@ TRAIN_LINEAR_T="${OFFLINE_QLOSS_LINEAR_T}" \
 TRAIN_NONLINEAR_T="${OFFLINE_QLOSS_NONLINEAR_T}" \
 TRAIN_OBJECTIVE="q_only" \
 TRAIN_CONTEXT_MODE="none" \
-  "${SCRIPT_DIR}/run_nv_sweep_single_qloss_fixed_ratio.sh" "${OFFLINE_OUTDIR}"
+  "${SCRIPT_DIR}/run_fh_offline_qloss_ladder.sh" "${OFFLINE_OUTDIR}"
 
 echo "[closure-bidir-finetune] [2/2] Fine-tuning/evaluating online closure-bidir models from offline qloss checkpoints"
 CHECKPOINT_ROOT="${FINETUNE_CHECKPOINT_ROOT}" \

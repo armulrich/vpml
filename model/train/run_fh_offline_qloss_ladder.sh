@@ -10,7 +10,7 @@ else
   PYTHON_BIN="${PYTHON:-python}"
 fi
 
-OUTDIR="${1:-${REPO_ROOT}/out_bench/nv_sweep_single_qloss_fixed_ratio}"
+OUTDIR="${1:-${REPO_ROOT}/out_bench/fh_offline_qloss_ladder}"
 NV_LIST="${NV_LIST:-8,64,256,300,512}"
 NX="${NX:-200}"
 DT="${DT:-0.005}"
@@ -72,11 +72,11 @@ TRAIN_WEAK_EPS="${TRAIN_WEAK_EPS:-0.03,0.05,0.07,0.1,0.15}"
 TRAIN_STRONG_EPS="${TRAIN_STRONG_EPS:-0.15,0.25,0.35,0.5,0.65}"
 
 if [[ "${TRAIN_OBJECTIVE}" != "q_only" ]]; then
-  echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_OBJECTIVE=q_only; got '${TRAIN_OBJECTIVE}'." >&2
+  echo "run_fh_offline_qloss_ladder.sh only supports TRAIN_OBJECTIVE=q_only; got '${TRAIN_OBJECTIVE}'." >&2
   exit 1
 fi
 if [[ "${TRAIN_CONTEXT_MODE}" != "none" ]]; then
-  echo "run_nv_sweep_single_qloss_fixed_ratio.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
+  echo "run_fh_offline_qloss_ladder.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
   exit 1
 fi
 ladder_csv_for_target() {

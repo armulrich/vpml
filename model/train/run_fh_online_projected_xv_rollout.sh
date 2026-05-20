@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
-OUTDIR="${1:-${REPO_ROOT}/out_bench/nv_sweep_online_rollout_projected_xv_H256_A1}"
+OUTDIR="${1:-${REPO_ROOT}/out_bench/fh_online_projected_xv_rollout}"
 PROJECTED_XV_TAIL_WINDOW="${TRAIN_PROJECTED_XV_TAIL_WINDOW:-0}"
 
 TRAIN_ONLINE_LOSS_BACKEND="fourier_hermite_projected_xv_bidir" \

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-DEFAULT_OUTDIR="${REPO_ROOT}/out_bench/spline_fem_online_rollout"
+DEFAULT_OUTDIR="${REPO_ROOT}/out_bench/spline_grid_online_residual_rollout"
 DEFAULT_VGRID_LIST="32,64,128,256"
 DEFAULT_PYTHON="${REPO_ROOT}/.venv/bin/python"
 if [[ -x "${DEFAULT_PYTHON}" ]]; then

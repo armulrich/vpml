@@ -146,28 +146,29 @@ under `heldout_landau/` and `benchmark_rollouts/`.
 
 | Wrapper                                                         | What it sweeps                             |
 | --------------------------------------------------------------- | ------------------------------------------ |
-| `run_nv_sweep_single_qloss.sh`                                  | Offline target-specific `q_only`           |
-| `run_nv_sweep_single_qloss_fixed_ratio.sh`                      | Offline fixed-ratio `q_only`               |
-| `run_nv_sweep_online_rollout.sh`                                | Pure `online_rollout`                      |
-| `run_nv_sweep_higher_order_hermite_fixed_ratio.sh`              | Higher-order-Hermite teacher, fixed ratio  |
+| `run_fh_offline_qloss_ladder.sh`                                | Fourier--Hermite offline fixed-ratio `q_only` baseline |
+| `run_fh_online_q_finetune.sh`                                   | Offline `q_only` pretraining plus online `q` fine-tuning |
+| `run_fh_online_projected_xv_rollout.sh`                         | Fourier--Hermite projected `x,v` online rollout loss |
+| `run_spline_grid_online_residual_rollout.sh`                    | Physical spline-grid online residual rollout loss |
+| `run_nv_sweep_online_rollout.sh`                                | Shared online-rollout driver used by wrappers |
 
 Example:
 
 ```bash
-./model/train/run_nv_sweep_single_qloss.sh out_bench/nv_sweep_single_qloss
+./model/train/run_fh_offline_qloss_ladder.sh out_bench/fh_offline_qloss_ladder
 ```
 
-Each wrapper trains one checkpoint per deployment `N_v` and then calls
-`python -m model.eval_nv_sweep ...`, emitting:
+The Fourier--Hermite wrappers train one checkpoint per deployment `N_v` and then
+call `python -m model.eval_nv_sweep ...`, emitting:
 
 - `summary.json`
 - `nv_sweep_metric1.png`, `nv_sweep_metric2.png`
 - `fig10_learned_vs_nonlocal_nv_sweep_phase_space.png`
 - `cases/*.npz`
 
-For the offline wrappers, per-`N_v` dataset caches live under
-`models/nv*/interface_closure_dataset.npz`. The pure-online wrapper writes no
-dataset cache.
+For the offline wrapper, per-`N_v` dataset caches live under
+`models/nv*/interface_closure_dataset.npz`. The spline-grid wrapper writes its
+own spline-grid metrics and phase-space plots under its output directory.
 
 ---
 
@@ -191,9 +192,10 @@ dataset cache.
 - `model/train/data.py` — dataset / cache / reference-building surface for learned-closure workflows
 - `model/eval.py` — post-train learned-model evaluation
 - `model/eval_nv_sweep.py` — learned-model nonlinear `N_v` sweep evaluation
-- `model/train/run_nv_sweep_single_qloss.sh` — per-`N_v` offline `q_only` sweep wrapper
-- `model/train/run_nv_sweep_single_qloss_fixed_ratio.sh` — per-`N_v` fixed-ratio offline `q_only` sweep wrapper
-- `model/train/run_nv_sweep_online_rollout.sh` — per-`N_v` pure `online_rollout` sweep wrapper
+- `model/train/run_fh_offline_qloss_ladder.sh` — per-`N_v` fixed-ratio offline `q_only` baseline wrapper
+- `model/train/run_fh_online_q_finetune.sh` — offline `q_only` pretraining followed by online `q` fine-tuning wrapper
+- `model/train/run_fh_online_projected_xv_rollout.sh` — projected `x,v` online rollout wrapper
+- `model/train/run_spline_grid_online_residual_rollout.sh` — physical spline-grid online residual rollout wrapper
+- `model/train/run_nv_sweep_online_rollout.sh` — shared per-`N_v` online rollout driver used by the Fourier--Hermite online wrappers
   Default recipe: denser nonlinear amplitude coverage, `TEACHER_NX=256`, `TEACHER_DT=0.005`, and `TRAIN_ONLINE_V_PROBES=256` for the top-end `N_v` comparison lane
   Runtime note: the wrapper prebuilds a shared `online_reference_dataset.npz`, reuses it across `N_v`, and enables bounded per-`N_v` parallel training on larger CPU boxes
-- `model/train/run_nv_sweep_higher_order_hermite_fixed_ratio.sh` — per-`N_v` higher-order-Hermite teacher sweep wrapper
