@@ -2622,6 +2622,7 @@ def online_rollout_q_relative_mse_for_history(
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
     offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
 
@@ -3053,28 +3054,42 @@ def _select_rollout_anchor_indices(
     history_length: int,
     rollout_horizon: int,
     rollout_anchor_samples: int,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
 ) -> Array:
-    num_valid = int(history_length) - 2 * int(rollout_horizon)
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+        start = 0
+        stop = int(history_length) - int(rollout_horizon)
+    else:
+        start = int(rollout_horizon)
+        stop = int(history_length) - int(rollout_horizon)
+    num_valid = int(stop) - int(start)
     if num_valid <= 0:
         raise ValueError(
-            f"Reference history length={int(history_length)} is too short for rollout_horizon={int(rollout_horizon)}"
+            f"Reference history length={int(history_length)} is too short for "
+            f"rollout_horizon={int(rollout_horizon)} and rollout_direction={direction_mode!r}"
         )
     if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= num_valid:
         return jnp.arange(
-            int(rollout_horizon),
-            int(history_length) - int(rollout_horizon),
+            int(start),
+            int(stop),
             dtype=jnp.int32,
         )
     if int(rollout_anchor_samples) == 1:
         return jnp.asarray(
-            [int(rollout_horizon) + ((num_valid - 1) // 2)],
+            [int(start) + ((num_valid - 1) // 2)],
             dtype=jnp.int32,
         )
     sampled_positions = np.rint(
         np.linspace(0, num_valid - 1, num=int(rollout_anchor_samples), dtype=np.float64)
     ).astype(np.int32)
     sampled_positions = np.unique(sampled_positions)
-    return jnp.asarray(int(rollout_horizon) + sampled_positions, dtype=jnp.int32)
+    return jnp.asarray(int(start) + sampled_positions, dtype=jnp.int32)
 
 
 def online_fourier_hermite_bidir_loss_for_history(
@@ -3271,6 +3286,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
     offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
 
