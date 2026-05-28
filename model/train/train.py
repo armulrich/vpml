@@ -91,6 +91,7 @@ ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR = "fourier_hermite_clos
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR = "fourier_hermite_boundary_step_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR = "fourier_hermite_posterior_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_PROJECTED_XV_BIDIR = "fourier_hermite_projected_xv_bidir"
+ROLLOUT_ANCHOR_INDICES_KEY = "__rollout_anchor_indices"
 ONLINE_ROLLOUT_DIRECTION_BIDIR = "bidir"
 ONLINE_ROLLOUT_DIRECTION_FORWARD = "forward"
 ALL_ONLINE_ROLLOUT_DIRECTIONS = (
@@ -2605,6 +2606,7 @@ def online_rollout_q_relative_mse_for_history(
     rollout_anchor_samples: int,
     explicit_n_hat_fn,
     rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
     """Diagnostic only: q error on the same rollout windows as the state loss."""
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
@@ -2618,7 +2620,8 @@ def online_rollout_q_relative_mse_for_history(
             f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
             f"got {rollout_direction!r}"
         )
-    anchor_indices = _select_rollout_anchor_indices(
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
@@ -3049,13 +3052,12 @@ def rollout_boundary_step_from_anchor_state(
     return pred_boundary_hist, ref_boundary_hist
 
 
-def _select_rollout_anchor_indices(
+def _rollout_anchor_bounds(
     *,
     history_length: int,
     rollout_horizon: int,
-    rollout_anchor_samples: int,
     rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
-) -> Array:
+) -> Tuple[int, int, int]:
     direction_mode = str(rollout_direction)
     if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
         raise ValueError(
@@ -3074,6 +3076,21 @@ def _select_rollout_anchor_indices(
             f"Reference history length={int(history_length)} is too short for "
             f"rollout_horizon={int(rollout_horizon)} and rollout_direction={direction_mode!r}"
         )
+    return int(start), int(stop), int(num_valid)
+
+
+def _select_rollout_anchor_indices(
+    *,
+    history_length: int,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+) -> Array:
+    start, stop, num_valid = _rollout_anchor_bounds(
+        history_length=int(history_length),
+        rollout_horizon=int(rollout_horizon),
+        rollout_direction=str(rollout_direction),
+    )
     if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= num_valid:
         return jnp.arange(
             int(start),
@@ -3092,6 +3109,49 @@ def _select_rollout_anchor_indices(
     return jnp.asarray(int(start) + sampled_positions, dtype=jnp.int32)
 
 
+def _sample_rollout_anchor_indices(
+    *,
+    history_length: int,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    rollout_direction: str,
+    rng: np.random.Generator,
+) -> Array:
+    start, stop, num_valid = _rollout_anchor_bounds(
+        history_length=int(history_length),
+        rollout_horizon=int(rollout_horizon),
+        rollout_direction=str(rollout_direction),
+    )
+    if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= num_valid:
+        anchors = np.arange(int(start), int(stop), dtype=np.int32)
+    else:
+        anchors = rng.choice(
+            np.arange(int(start), int(stop), dtype=np.int32),
+            size=int(rollout_anchor_samples),
+            replace=False,
+        )
+        anchors = np.sort(anchors.astype(np.int32))
+    return jnp.asarray(anchors, dtype=jnp.int32)
+
+
+def _resolve_rollout_anchor_indices(
+    rollout_anchor_indices: Optional[Array],
+    *,
+    history_length: int,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+) -> Array:
+    if rollout_anchor_indices is not None:
+        return jnp.asarray(rollout_anchor_indices, dtype=jnp.int32)
+    return _select_rollout_anchor_indices(
+        history_length=int(history_length),
+        rollout_horizon=int(rollout_horizon),
+        rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=str(rollout_direction),
+    )
+
+
 def online_fourier_hermite_bidir_loss_for_history(
     ref_hist: Array,
     *,
@@ -3101,15 +3161,25 @@ def online_fourier_hermite_bidir_loss_for_history(
     rollout_horizon: int,
     rollout_anchor_samples: int,
     explicit_n_hat_fn,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for fourier_hermite_bidir")
-    anchor_indices = _select_rollout_anchor_indices(
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
     offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
 
@@ -3129,6 +3199,9 @@ def online_fourier_hermite_bidir_loss_for_history(
             ref_forward,
             k_mask=forward_integ.mask,
         )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return (carry[0] + num_forward, carry[1] + den_forward), None
 
         pred_backward = rollout_from_anchor_state(
             ref_hist,
@@ -3174,15 +3247,25 @@ def online_fourier_hermite_posterior_bidir_components_for_history(
     poisson_sign: float,
     state_weight: float,
     field_weight: float,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Tuple[Array, Array, Array]:
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for fourier_hermite_posterior_bidir")
-    anchor_indices = _select_rollout_anchor_indices(
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
     offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
 
@@ -3209,6 +3292,14 @@ def online_fourier_hermite_posterior_bidir_components_for_history(
             poisson_sign=float(poisson_sign),
             k_mask=forward_integ.mask,
         )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return (
+                carry[0] + state_num_forward,
+                carry[1] + state_den_forward,
+                carry[2] + field_num_forward,
+                carry[3] + field_den_forward,
+            ), None
 
         pred_backward = rollout_from_anchor_state(
             ref_hist,
@@ -3271,6 +3362,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
     v_grid: Array,
     projected_xv_tail_window: int = 0,
     rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
     horizon = int(rollout_horizon)
@@ -3282,7 +3374,8 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
             f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
             f"got {rollout_direction!r}"
         )
-    anchor_indices = _select_rollout_anchor_indices(
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
@@ -3360,16 +3453,26 @@ def online_fourier_hermite_closure_bidir_loss_for_history(
     rollout_anchor_samples: int,
     explicit_n_hat_fn,
     detach_rollout_state_for_q: bool = False,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
     ref_q_hist = jnp.asarray(ref_q_hist, dtype=jnp.complex128)
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for fourier_hermite_closure_bidir")
-    anchor_indices = _select_rollout_anchor_indices(
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
     offsets = jnp.arange(1, horizon + 1, dtype=jnp.int32)
 
@@ -3390,6 +3493,12 @@ def online_fourier_hermite_closure_bidir_loss_for_history(
             ref_forward,
             k_mask=forward_integ.mask,
         )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return (
+                carry[0] + num_forward,
+                carry[1] + den_forward,
+            ), None
 
         pred_backward = rollout_closure_flux_from_anchor_state(
             ref_hist,
@@ -3433,15 +3542,25 @@ def online_fourier_hermite_closure_action_bidir_loss_for_history(
     rollout_horizon: int,
     rollout_anchor_samples: int,
     explicit_n_hat_fn,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for fourier_hermite_closure_action_bidir")
-    anchor_indices = _select_rollout_anchor_indices(
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
 
     def anchor_step(carry, anchor_idx):
@@ -3459,6 +3578,12 @@ def online_fourier_hermite_closure_action_bidir_loss_for_history(
             target_forward,
             k_mask=forward_integ.mask,
         )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return (
+                carry[0] + num_forward,
+                carry[1] + den_forward,
+            ), None
 
         pred_backward, target_backward = rollout_closure_action_from_anchor_state(
             ref_hist,
@@ -3500,15 +3625,25 @@ def online_fourier_hermite_boundary_step_bidir_loss_for_history(
     rollout_horizon: int,
     rollout_anchor_samples: int,
     explicit_n_hat_fn,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
     ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for fourier_hermite_boundary_step_bidir")
-    anchor_indices = _select_rollout_anchor_indices(
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
         history_length=int(ref_hist.shape[0]),
         rollout_horizon=horizon,
         rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
     )
 
     def anchor_step(carry, anchor_idx):
@@ -3526,6 +3661,12 @@ def online_fourier_hermite_boundary_step_bidir_loss_for_history(
             ref_forward,
             k_mask=forward_integ.mask,
         )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return (
+                carry[0] + num_forward,
+                carry[1] + den_forward,
+            ), None
 
         pred_backward, ref_backward = rollout_boundary_step_from_anchor_state(
             ref_hist,
@@ -3908,6 +4049,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         forward_integ: FourierHermiteIMEX,
         backward_integ: FourierHermiteIMEX,
         explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
     ) -> Array:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
 
@@ -3920,6 +4062,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 rollout_horizon=rollout_horizon,
                 rollout_anchor_samples=rollout_anchor_samples,
                 explicit_n_hat_fn=explicit_n_hat_fn,
+                rollout_direction=direction_mode,
+                rollout_anchor_indices=rollout_anchor_indices,
             )
             return total + loss, None
 
@@ -3937,6 +4081,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         forward_integ: FourierHermiteIMEX,
         backward_integ: FourierHermiteIMEX,
         explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
     ) -> Tuple[Array, Array, Array]:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
 
@@ -3952,6 +4097,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 poisson_sign=float(poisson_sign),
                 state_weight=float(posterior_state_weight),
                 field_weight=float(posterior_field_weight),
+                rollout_direction=direction_mode,
+                rollout_anchor_indices=rollout_anchor_indices,
             )
             return (
                 carry[0] + loss,
@@ -3978,6 +4125,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         forward_integ: FourierHermiteIMEX,
         backward_integ: FourierHermiteIMEX,
         explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
     ) -> Array:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
 
@@ -3993,6 +4141,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 v_grid=projected_xv_v_grid,
                 projected_xv_tail_window=int(projected_xv_tail_window),
                 rollout_direction=direction_mode,
+                rollout_anchor_indices=rollout_anchor_indices,
             )
             return total + loss, None
 
@@ -4011,6 +4160,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         forward_integ: FourierHermiteIMEX,
         backward_integ: FourierHermiteIMEX,
         explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
     ) -> Array:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
         ref_q_batch = jnp.asarray(ref_q_batch, dtype=jnp.complex128)
@@ -4027,6 +4177,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 rollout_anchor_samples=rollout_anchor_samples,
                 explicit_n_hat_fn=explicit_n_hat_fn,
                 rollout_direction=direction_mode,
+                rollout_anchor_indices=rollout_anchor_indices,
             )
             return total + q_rel_mse, None
 
@@ -4045,6 +4196,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         forward_integ: FourierHermiteIMEX,
         backward_integ: FourierHermiteIMEX,
         explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
     ) -> Array:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
         ref_q_batch = jnp.asarray(ref_q_batch, dtype=jnp.complex128)
@@ -4063,6 +4215,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                     rollout_horizon=rollout_horizon,
                     rollout_anchor_samples=rollout_anchor_samples,
                     explicit_n_hat_fn=explicit_n_hat_fn,
+                    rollout_direction=direction_mode,
+                    rollout_anchor_indices=rollout_anchor_indices,
                 )
             else:
                 loss = online_fourier_hermite_closure_bidir_loss_for_history(
@@ -4075,6 +4229,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                     rollout_anchor_samples=rollout_anchor_samples,
                     explicit_n_hat_fn=explicit_n_hat_fn,
                     detach_rollout_state_for_q=detach_rollout_state_for_q,
+                    rollout_direction=direction_mode,
+                    rollout_anchor_indices=rollout_anchor_indices,
                 )
             return total + loss, None
 
@@ -4092,6 +4248,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         forward_integ: FourierHermiteIMEX,
         backward_integ: FourierHermiteIMEX,
         explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
     ) -> Array:
         ref_batch = jnp.asarray(ref_batch, dtype=jnp.complex128)
 
@@ -4104,6 +4261,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 rollout_horizon=rollout_horizon,
                 rollout_anchor_samples=rollout_anchor_samples,
                 explicit_n_hat_fn=explicit_n_hat_fn,
+                rollout_direction=direction_mode,
+                rollout_anchor_indices=rollout_anchor_indices,
             )
             return total + loss, None
 
@@ -4170,6 +4329,11 @@ def make_online_fourier_hermite_bidir_batch_loss(
 
             for weight, regime in zip(weight_arr, active_regimes):
                 batch = regime_batches[regime]
+                rollout_anchor_indices = (
+                    jnp.asarray(batch[ROLLOUT_ANCHOR_INDICES_KEY], dtype=jnp.int32)
+                    if ROLLOUT_ANCHOR_INDICES_KEY in batch
+                    else None
+                )
                 ref_batch = jnp.asarray(batch[coeff_key], dtype=jnp.complex128)
                 ref_q_batch = (
                     jnp.asarray(batch[q_key], dtype=jnp.complex128)
@@ -4185,6 +4349,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                             forward_integ=linear_forward,
                             backward_integ=linear_backward,
                             explicit_n_hat_fn=linear_explicit,
+                            rollout_anchor_indices=rollout_anchor_indices,
                         )
                     if online_loss_backend_uses_projected_xv(str(loss_backend)):
                         state_terms = jax.vmap(
@@ -4199,6 +4364,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 v_grid=projected_xv_v_grid,
                                 projected_xv_tail_window=int(projected_xv_tail_window),
                                 rollout_direction=direction_mode,
+                                rollout_anchor_indices=rollout_anchor_indices,
                             )
                         )(ref_batch)
                         total_state = total_state + weight * jnp.mean(state_terms)
@@ -4216,6 +4382,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 poisson_sign=float(poisson_sign),
                                 state_weight=float(posterior_state_weight),
                                 field_weight=float(posterior_field_weight),
+                                rollout_direction=direction_mode,
+                                rollout_anchor_indices=rollout_anchor_indices,
                             )
                         )(ref_batch)
                         del posterior_terms
@@ -4232,6 +4400,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 rollout_horizon=rollout_horizon,
                                 rollout_anchor_samples=rollout_anchor_samples,
                                 explicit_n_hat_fn=linear_explicit,
+                                rollout_direction=direction_mode,
+                                rollout_anchor_indices=rollout_anchor_indices,
                             )
                         )(ref_batch)
                         total_state = total_state + weight * jnp.mean(state_terms)
@@ -4248,6 +4418,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                     rollout_horizon=rollout_horizon,
                                     rollout_anchor_samples=rollout_anchor_samples,
                                     explicit_n_hat_fn=linear_explicit,
+                                    rollout_direction=direction_mode,
+                                    rollout_anchor_indices=rollout_anchor_indices,
                                 )
                             )(ref_batch)
                         else:
@@ -4265,6 +4437,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                         str(loss_backend)
                                         == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR
                                     ),
+                                    rollout_direction=direction_mode,
+                                    rollout_anchor_indices=rollout_anchor_indices,
                                 )
                             )(ref_batch, ref_q_batch)
                         total_q = total_q + weight * jnp.mean(q_terms)
@@ -4278,6 +4452,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                             rollout_horizon=rollout_horizon,
                             rollout_anchor_samples=rollout_anchor_samples,
                             explicit_n_hat_fn=linear_explicit,
+                            rollout_direction=direction_mode,
+                            rollout_anchor_indices=rollout_anchor_indices,
                         )
                     )(ref_batch)
                 else:
@@ -4289,6 +4465,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                             forward_integ=nonlinear_forward,
                             backward_integ=nonlinear_backward,
                             explicit_n_hat_fn=nonlinear_explicit,
+                            rollout_anchor_indices=rollout_anchor_indices,
                         )
                     if online_loss_backend_uses_projected_xv(str(loss_backend)):
                         state_terms = jax.vmap(
@@ -4303,6 +4480,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 v_grid=projected_xv_v_grid,
                                 projected_xv_tail_window=int(projected_xv_tail_window),
                                 rollout_direction=direction_mode,
+                                rollout_anchor_indices=rollout_anchor_indices,
                             )
                         )(ref_batch)
                         total_state = total_state + weight * jnp.mean(state_terms)
@@ -4320,6 +4498,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 poisson_sign=float(poisson_sign),
                                 state_weight=float(posterior_state_weight),
                                 field_weight=float(posterior_field_weight),
+                                rollout_direction=direction_mode,
+                                rollout_anchor_indices=rollout_anchor_indices,
                             )
                         )(ref_batch)
                         del posterior_terms
@@ -4336,6 +4516,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 rollout_horizon=rollout_horizon,
                                 rollout_anchor_samples=rollout_anchor_samples,
                                 explicit_n_hat_fn=nonlinear_explicit,
+                                rollout_direction=direction_mode,
+                                rollout_anchor_indices=rollout_anchor_indices,
                             )
                         )(ref_batch)
                         total_state = total_state + weight * jnp.mean(state_terms)
@@ -4352,6 +4534,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                     rollout_horizon=rollout_horizon,
                                     rollout_anchor_samples=rollout_anchor_samples,
                                     explicit_n_hat_fn=nonlinear_explicit,
+                                    rollout_direction=direction_mode,
+                                    rollout_anchor_indices=rollout_anchor_indices,
                                 )
                             )(ref_batch)
                         else:
@@ -4369,6 +4553,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                         str(loss_backend)
                                         == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR
                                     ),
+                                    rollout_direction=direction_mode,
+                                    rollout_anchor_indices=rollout_anchor_indices,
                                 )
                             )(ref_batch, ref_q_batch)
                         total_q = total_q + weight * jnp.mean(q_terms)
@@ -4382,6 +4568,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                             rollout_horizon=rollout_horizon,
                             rollout_anchor_samples=rollout_anchor_samples,
                             explicit_n_hat_fn=nonlinear_explicit,
+                            rollout_direction=direction_mode,
+                            rollout_anchor_indices=rollout_anchor_indices,
                         )
                     )(ref_batch)
                 total_state = total_state + weight * jnp.mean(state_terms)
@@ -4628,6 +4816,10 @@ def make_online_fourier_hermite_bidir_batch_loss(
 
     loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
     loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    loss_fn.rollout_horizon = int(rollout_horizon)  # type: ignore[attr-defined]
+    loss_fn.rollout_anchor_samples = int(rollout_anchor_samples)  # type: ignore[attr-defined]
+    loss_fn.rollout_direction = direction_mode  # type: ignore[attr-defined]
+    loss_fn.randomize_rollout_anchors = online_loss_backend_uses_projected_coefficients(str(loss_backend))  # type: ignore[attr-defined]
     if len(target_nvs) == 1:
         loss_fn.exact_loss_fn = exact_target_loss_fns[default_target_nv]  # type: ignore[attr-defined]
     else:
@@ -4910,6 +5102,16 @@ def online_training_log_components(
     return ()
 
 
+def _online_group_history_length(group: Dict[str, Array]) -> int:
+    for key, value in group.items():
+        if str(key).startswith("a_hat_ref_nv"):
+            arr = np.asarray(value)
+            if arr.ndim < 2:
+                raise ValueError(f"Expected online history array for {key!r}, got shape {arr.shape}")
+            return int(arr.shape[1])
+    raise ValueError("Online rollout batch is missing an a_hat_ref_nv* history array")
+
+
 def train_with_online_trajectory_minibatch_loss(
     params: Dict[str, Array],
     online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
@@ -4979,6 +5181,20 @@ def train_with_online_trajectory_minibatch_loss(
     else:
         train_steps = {0: make_train_step(batch_loss_fn)}
 
+    randomize_rollout_anchors = bool(getattr(batch_loss_fn, "randomize_rollout_anchors", False))
+    rollout_horizon_attr = int(getattr(batch_loss_fn, "rollout_horizon", 0))
+    rollout_anchor_samples_attr = int(getattr(batch_loss_fn, "rollout_anchor_samples", 0))
+    rollout_direction_attr = str(
+        getattr(batch_loss_fn, "rollout_direction", ONLINE_ROLLOUT_DIRECTION_BIDIR)
+    )
+    train_history_lengths = (
+        {
+            regime: _online_group_history_length(online_dataset[regime]["train"])
+            for regime in active_regimes
+        }
+        if randomize_rollout_anchors
+        else {}
+    )
     rng = np.random.default_rng(int(seed))
     for epoch in range(int(epochs)):
         running = {
@@ -4993,6 +5209,14 @@ def train_with_online_trajectory_minibatch_loss(
                 batch_n = int(min(online_case_batch_size, size))
                 idx = rng.integers(0, size, size=batch_n, endpoint=False)
                 regime_batches[regime] = {key: value[idx] for key, value in group.items()}
+                if randomize_rollout_anchors:
+                    regime_batches[regime][ROLLOUT_ANCHOR_INDICES_KEY] = _sample_rollout_anchor_indices(
+                        history_length=train_history_lengths[regime],
+                        rollout_horizon=rollout_horizon_attr,
+                        rollout_anchor_samples=rollout_anchor_samples_attr,
+                        rollout_direction=rollout_direction_attr,
+                        rng=rng,
+                    )
             if target_nvs:
                 target_nv = int(target_nvs[int(rng.integers(0, len(target_nvs)))])
                 params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
