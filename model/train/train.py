@@ -98,6 +98,12 @@ ALL_ONLINE_ROLLOUT_DIRECTIONS = (
     ONLINE_ROLLOUT_DIRECTION_BIDIR,
     ONLINE_ROLLOUT_DIRECTION_FORWARD,
 )
+PROJECTED_XV_METRIC_PHYSICAL_L2 = "physical_l2"
+PROJECTED_XV_METRIC_GRAM_RIESZ = "gram_riesz"
+ALL_PROJECTED_XV_METRICS = (
+    PROJECTED_XV_METRIC_PHYSICAL_L2,
+    PROJECTED_XV_METRIC_GRAM_RIESZ,
+)
 ALL_ONLINE_LOSS_BACKENDS = (
     ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
@@ -1557,6 +1563,67 @@ def reconstruct_delta_f_from_a_hat_history(
     return jnp.einsum("tnx,nv->tvx", a_phys_hist, phi).astype(jnp.float64)
 
 
+def build_projected_xv_metric_matrix(
+    *,
+    Nv: int,
+    v_grid: Array,
+    vth: float = 1.0,
+    metric: str = PROJECTED_XV_METRIC_PHYSICAL_L2,
+) -> Optional[Array]:
+    """Build the Hermite-space metric used by the projected-xv rollout loss.
+
+    ``physical_l2`` keeps the legacy decoded-space quadrature. ``gram_riesz`` uses
+    the finite-grid projection/reconstruction cross-Gram matrix to build the
+    Riesz metric of the biorthogonalized reconstruction basis. This keeps the
+    rollout loss in physical space while making it consistent with the discrete
+    Hermite projection that produced the reference coefficients.
+    """
+    metric_name = str(metric)
+    if metric_name == PROJECTED_XV_METRIC_PHYSICAL_L2:
+        return None
+    if metric_name != PROJECTED_XV_METRIC_GRAM_RIESZ:
+        raise ValueError(
+            f"projected_xv_metric must be one of {ALL_PROJECTED_XV_METRICS!r}, got {metric!r}"
+        )
+    v_np = np.asarray(v_grid, dtype=np.float64)
+    if v_np.ndim != 1 or v_np.size < 2:
+        raise ValueError("projected-xv gram_riesz metric requires a one-dimensional v grid")
+    phi = np.asarray(
+        jax_hermite_basis_phi_scaled(int(Nv), jnp.asarray(v_np, dtype=jnp.float64), vth=float(vth)),
+        dtype=np.float64,
+    )
+    dual = np.asarray(
+        hermite_dual_basis_scaled(int(Nv), jnp.asarray(v_np, dtype=jnp.float64), vth=float(vth)),
+        dtype=np.float64,
+    )
+    mass = np.trapezoid(phi[:, None, :] * phi[None, :, :], x=v_np, axis=2)
+    mass = 0.5 * (mass + mass.T)
+    cross_gram = np.trapezoid(dual[:, None, :] * phi[None, :, :], x=v_np, axis=2)
+    if not np.all(np.isfinite(cross_gram)):
+        raise ValueError("projected-xv Hermite cross-Gram matrix is nonfinite")
+    # Numerical pseudo-inverse of the finite-grid projection/reconstruction map.
+    # This is a rank/conditioning cutoff, not a hand-selected Hermite-mode taper.
+    biorthogonal_map = np.linalg.pinv(cross_gram, rcond=1e-6)
+    metric_matrix = biorthogonal_map.T @ mass @ biorthogonal_map
+    metric_matrix = 0.5 * (metric_matrix + metric_matrix.T)
+    return jnp.asarray(metric_matrix, dtype=jnp.float64)
+
+
+def coefficient_metric_history_norm(
+    a_hat_hist: Array,
+    *,
+    Nx: int,
+    Lx: float,
+    hermite_metric: Array,
+) -> Array:
+    a_hat_hist = jnp.asarray(a_hat_hist, dtype=jnp.complex128)
+    a_phys_hist = jax.vmap(lambda a_hat: irfft_x(a_hat, int(Nx)))(a_hat_hist)
+    metric = jnp.asarray(hermite_metric, dtype=jnp.float64)
+    density_tx = jnp.einsum("tnx,nm,tmx->tx", a_phys_hist, metric, a_phys_hist)
+    dx = jnp.asarray(float(Lx) / float(Nx), dtype=jnp.float64)
+    return jnp.maximum(dx * jnp.sum(density_tx, axis=1), 0.0)
+
+
 def resample_distribution_history_to_probe_grid(
     f_hist: Array,
     config: PhysicalGridVlasovPoissonConfig,
@@ -2459,6 +2526,7 @@ def online_projected_xv_loss_terms(
     vth: float = 1.0,
     tail_window: int = 0,
     k_mask: Optional[Array] = None,
+    hermite_metric: Optional[Array] = None,
 ) -> Array:
     """Relative projected physical-space L2 loss induced by the reconstruction basis.
 
@@ -2482,6 +2550,20 @@ def online_projected_xv_loss_terms(
         n_mask = n_mask[None, :, None]
         diff_a_hat = diff_a_hat * n_mask
         ref_scale_a_hat = ref_scale_a_hat * n_mask
+    if hermite_metric is not None:
+        num_t = coefficient_metric_history_norm(
+            diff_a_hat,
+            Nx=int(Nx),
+            Lx=float(Lx),
+            hermite_metric=hermite_metric,
+        )
+        den_t = coefficient_metric_history_norm(
+            ref_scale_a_hat,
+            Nx=int(Nx),
+            Lx=float(Lx),
+            hermite_metric=hermite_metric,
+        )
+        return jnp.sum(num_t / (den_t + 1e-30))
     diff_delta_f = reconstruct_delta_f_from_a_hat_history(
         diff_a_hat,
         Nx=int(Nx),
@@ -3361,6 +3443,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
     explicit_n_hat_fn,
     v_grid: Array,
     projected_xv_tail_window: int = 0,
+    projected_xv_hermite_metric: Optional[Array] = None,
     rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
     rollout_anchor_indices: Optional[Array] = None,
 ) -> Array:
@@ -3402,6 +3485,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
             v_grid=v_grid,
             tail_window=int(projected_xv_tail_window),
             k_mask=forward_integ.mask,
+            hermite_metric=projected_xv_hermite_metric,
         )
 
         if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
@@ -3425,6 +3509,7 @@ def online_fourier_hermite_projected_xv_bidir_loss_for_history(
             v_grid=v_grid,
             tail_window=int(projected_xv_tail_window),
             k_mask=backward_integ.mask,
+            hermite_metric=projected_xv_hermite_metric,
         )
 
         return carry + loss_forward + loss_backward, None
@@ -3957,6 +4042,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
     posterior_state_weight: float = 0.25,
     posterior_field_weight: float = 1.0,
     projected_xv_tail_window: int = 0,
+    projected_xv_metric: str = PROJECTED_XV_METRIC_PHYSICAL_L2,
     rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
 ) -> Tuple[object, Sequence[str]]:
     target_nvs = tuple(int(v) for v in Nv_targets)
@@ -3994,6 +4080,20 @@ def make_online_fourier_hermite_bidir_batch_loss(
         int(teacher_Nv),
         dtype=jnp.float64,
     )
+    projected_xv_metric_name = str(projected_xv_metric)
+    if projected_xv_metric_name not in ALL_PROJECTED_XV_METRICS:
+        raise ValueError(
+            f"projected_xv_metric must be one of {ALL_PROJECTED_XV_METRICS!r}, "
+            f"got {projected_xv_metric!r}"
+        )
+    projected_xv_metric_mats = {
+        int(target_nv): build_projected_xv_metric_matrix(
+            Nv=int(target_nv),
+            v_grid=projected_xv_v_grid,
+            metric=projected_xv_metric_name,
+        )
+        for target_nv in target_nvs
+    }
 
     linear_integrators = {
         int(target_nv): (
@@ -4140,6 +4240,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                 explicit_n_hat_fn=explicit_n_hat_fn,
                 v_grid=projected_xv_v_grid,
                 projected_xv_tail_window=int(projected_xv_tail_window),
+                projected_xv_hermite_metric=projected_xv_metric_mats[int(forward_integ.Nv)],
                 rollout_direction=direction_mode,
                 rollout_anchor_indices=rollout_anchor_indices,
             )
@@ -4363,6 +4464,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 explicit_n_hat_fn=linear_explicit,
                                 v_grid=projected_xv_v_grid,
                                 projected_xv_tail_window=int(projected_xv_tail_window),
+                                projected_xv_hermite_metric=projected_xv_metric_mats[int(linear_forward.Nv)],
                                 rollout_direction=direction_mode,
                                 rollout_anchor_indices=rollout_anchor_indices,
                             )
@@ -4479,6 +4581,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 explicit_n_hat_fn=nonlinear_explicit,
                                 v_grid=projected_xv_v_grid,
                                 projected_xv_tail_window=int(projected_xv_tail_window),
+                                projected_xv_hermite_metric=projected_xv_metric_mats[int(nonlinear_forward.Nv)],
                                 rollout_direction=direction_mode,
                                 rollout_anchor_indices=rollout_anchor_indices,
                             )
@@ -5592,6 +5695,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-dealias-23", action="store_true")
     parser.add_argument("--online-loss-backend", type=str, default=ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
     parser.add_argument("--projected-xv-tail-window", type=int, default=0)
+    parser.add_argument("--projected-xv-metric", type=str, default=PROJECTED_XV_METRIC_PHYSICAL_L2, choices=ALL_PROJECTED_XV_METRICS)
     parser.add_argument("--posterior-state-weight", type=float, default=0.25)
     parser.add_argument("--posterior-field-weight", type=float, default=1.0)
     parser.add_argument("--online-v-probes", type=int, default=64)
@@ -6199,6 +6303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     rollout_horizon=args.rollout_horizon,
                     rollout_anchor_samples=args.rollout_anchor_samples,
                     projected_xv_tail_window=args.projected_xv_tail_window,
+                    projected_xv_metric=args.projected_xv_metric,
                     rollout_direction=args.rollout_direction,
                     loss_backend=online_loss_backend,
                     poisson_sign=args.teacher_poisson_sign,
@@ -6438,6 +6543,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ),
         "tail_start_fraction": np.array([args.tail_start_fraction], dtype=np.float64),
         "projected_xv_tail_window": np.array([args.projected_xv_tail_window], dtype=np.int32),
+        "projected_xv_metric": np.array([args.projected_xv_metric], dtype=np.str_),
         "loss_backend": np.array(
             [] if training_mode == OFFLINE_TRAINING_MODE else [args.online_loss_backend],
             dtype=np.str_,

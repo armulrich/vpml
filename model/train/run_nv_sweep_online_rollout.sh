@@ -66,6 +66,7 @@ TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-}"
 TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-}"
 TRAIN_ROLLOUT_DIRECTION="${TRAIN_ROLLOUT_DIRECTION:-bidir}"
 TRAIN_PROJECTED_XV_TAIL_WINDOW="${TRAIN_PROJECTED_XV_TAIL_WINDOW:-0}"
+TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-}"
 TRAIN_POSTERIOR_STATE_WEIGHT="${TRAIN_POSTERIOR_STATE_WEIGHT:-0.25}"
 TRAIN_POSTERIOR_FIELD_WEIGHT="${TRAIN_POSTERIOR_FIELD_WEIGHT:-1.0}"
 
@@ -85,6 +86,7 @@ if [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "field_distribution_v1" ]]; then
   TRAIN_ONLINE_V_PROBES="${TRAIN_ONLINE_V_PROBES:-128}"
   TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-0}"
   TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-0}"
+  TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-physical_l2}"
 elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]]; then
   TRAIN_LR="${TRAIN_LR:-1e-4}"
   TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-20}"
@@ -97,6 +99,7 @@ elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]
   TRAIN_ONLINE_V_PROBES="0"
   TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-5}"
   TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-8}"
+  TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-gram_riesz}"
 elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" ]]; then
   TRAIN_LR="${TRAIN_LR:-3e-4}"
   TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-10}"
@@ -109,6 +112,7 @@ elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${
   TRAIN_ONLINE_V_PROBES="0"
   TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-64}"
   TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-1}"
+  TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-physical_l2}"
 else
   TRAIN_LR="${TRAIN_LR:-1e-4}"
   TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-20}"
@@ -121,6 +125,7 @@ else
   TRAIN_ONLINE_V_PROBES="0"
   TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-128}"
   TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-4}"
+  TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-physical_l2}"
 fi
 
 TRAIN_TEACHER_NX="${TRAIN_TEACHER_NX:-${TEACHER_NX}}"
@@ -304,6 +309,7 @@ prepare_online_reference_cache() {
     --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}"
     --rollout-direction "${TRAIN_ROLLOUT_DIRECTION}"
     --projected-xv-tail-window "${TRAIN_PROJECTED_XV_TAIL_WINDOW}"
+    --projected-xv-metric "${TRAIN_PROJECTED_XV_METRIC}"
     --teacher-backend grid_cubic_spline
     --Nv-targets "${target_csv}"
     --Nm "${TRAIN_NM}"
@@ -364,6 +370,7 @@ train_one_nv() {
     --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}"
     --rollout-direction "${TRAIN_ROLLOUT_DIRECTION}"
     --projected-xv-tail-window "${TRAIN_PROJECTED_XV_TAIL_WINDOW}"
+    --projected-xv-metric "${TRAIN_PROJECTED_XV_METRIC}"
     --teacher-backend grid_cubic_spline
     --Nv-targets "${train_ladder_csv}"
     --Nm "${TRAIN_NM}"
@@ -488,6 +495,7 @@ Defaults:
   rollout horiz:  ${TRAIN_ROLLOUT_HORIZON}
   rollout dir:    ${TRAIN_ROLLOUT_DIRECTION}
   xv tail window: ${TRAIN_PROJECTED_XV_TAIL_WINDOW}
+  xv metric:      ${TRAIN_PROJECTED_XV_METRIC}
   posterior state:${TRAIN_POSTERIOR_STATE_WEIGHT}
   posterior field:${TRAIN_POSTERIOR_FIELD_WEIGHT}
   v probes:       ${TRAIN_ONLINE_V_PROBES}
