@@ -458,8 +458,8 @@ def save_fig10_learned_comparison_nv_sweep_phase_space(
     v = np.asarray(payload["v"], dtype=float)
     times = tuple(float(t) for t in np.asarray(times, dtype=float))
     nv_list = tuple(int(vv) for vv in nv_list)
-    if len(times) != 2:
-        raise ValueError("nonlinear Landau Nv sweep expects exactly two snapshot times")
+    if len(times) < 1:
+        raise ValueError("nonlinear Landau Nv sweep expects at least one snapshot time")
     if len(row_labels) != len(nv_list):
         raise ValueError("row_labels length must match nv_list length")
 
@@ -475,37 +475,30 @@ def save_fig10_learned_comparison_nv_sweep_phase_space(
     )
     use_reference_truncation_layout = bool(has_projected_reference and has_truncation)
     if use_reference_truncation_layout:
-        panel_specs = [
-            ("reference", times[0]),
-            ("reference", times[1]),
-            ("truncation", times[0]),
-            ("truncation", times[1]),
-            ("learned", times[0]),
-            ("learned", times[1]),
-        ]
+        method_titles = {
+            "reference": "Projected HR Reference",
+            "truncation": r"Truncated FH ($q=0$)",
+            "learned": r"Learned FH ($q_\theta$)",
+        }
+        methods = ("reference", "truncation", "learned")
+        panel_specs = [(method, t) for method in methods for t in times]
         column_titles = [
-            rf"Projected HR Reference, $t={times[0]:g}$",
-            rf"Projected HR Reference, $t={times[1]:g}$",
-            rf"Truncated FH ($q=0$), $t={times[0]:g}$",
-            rf"Truncated FH ($q=0$), $t={times[1]:g}$",
-            rf"Learned FH ($q_\theta$), $t={times[0]:g}$",
-            rf"Learned FH ($q_\theta$), $t={times[1]:g}$",
+            rf"{method_titles[method]}, $t={float(t):g}$"
+            for method, t in panel_specs
         ]
-        fig_width = 21.0
+        fig_width = max(15.0, 3.5 * len(panel_specs))
     else:
-        panel_specs = [
-            ("nonlocal", times[0]),
-            ("nonlocal", times[1]),
-            ("learned", times[0]),
-            ("learned", times[1]),
-        ]
+        method_titles = {
+            "nonlocal": "Nonlocal",
+            "learned": "Learned",
+        }
+        methods = ("nonlocal", "learned")
+        panel_specs = [(method, t) for method in methods for t in times]
         column_titles = [
-            rf"Nonlocal, $t={times[0]:g}$",
-            rf"Nonlocal, $t={times[1]:g}$",
-            rf"Learned, $t={times[0]:g}$",
-            rf"Learned, $t={times[1]:g}$",
+            rf"{method_titles[method]}, $t={float(t):g}$"
+            for method, t in panel_specs
         ]
-        fig_width = 15.0
+        fig_width = max(15.0, 3.75 * len(panel_specs))
 
     fig = plt.figure(figsize=(fig_width, 2.6 * len(nv_list) + 1.0), constrained_layout=True)
     grid = fig.add_gridspec(len(nv_list), len(panel_specs), wspace=0.08, hspace=0.18)

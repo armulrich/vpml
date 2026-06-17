@@ -210,7 +210,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--T", type=float, default=40.0)
     parser.add_argument("--eps", type=float, default=0.5)
     parser.add_argument("--k0", type=float, default=0.5)
-    parser.add_argument("--snapshot-times", type=str, default="20.0,40.0")
+    parser.add_argument("--snapshot-times", type=str, default="20.0,40.0,60.0")
     parser.add_argument("--Nv-plot", dest="nv_plot", type=int, default=1000)
     parser.add_argument("--phase-vmin", dest="phase_vmin", type=float, default=0.0)
     parser.add_argument("--phase-vmax", dest="phase_vmax", type=float, default=0.5)
@@ -243,8 +243,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.checkpoint is not None and args.checkpoint_dir is not None:
         raise ValueError("Provide only one of --checkpoint or --checkpoint-dir")
     snapshot_times = parse_float_tuple(args.snapshot_times)
-    if len(snapshot_times) != 2:
-        raise ValueError("snapshot-times must contain exactly two times")
+    if len(snapshot_times) < 1:
+        raise ValueError("snapshot-times must contain at least one time")
     phase_vrange = parse_float_tuple(args.phase_vrange)
     if len(phase_vrange) != 2:
         raise ValueError("phase-vrange must contain exactly two values")
@@ -451,37 +451,46 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
 
         case_path = case_npz_dir / f"nv{int(Nv)}_nonlinear_sweep_case.npz"
-        np.savez(
-            case_path,
-            times_hr=np.asarray(hr_payload["times"], dtype=np.float64),
-            times_theta=np.asarray(theta_payload["times"], dtype=np.float64),
-            energy_hr=np.asarray(hr_payload["energy"], dtype=np.float64),
-            energy_theta=np.asarray(theta_payload["energy"], dtype=np.float64),
-            E_hat_hr=np.asarray(hr_payload["E_hat_hist"], dtype=np.complex128),
-            E_hat_theta=np.asarray(theta_payload["E_hat_hist"], dtype=np.complex128),
-            k_hr=np.asarray(hr_payload["k_arr"], dtype=np.float64),
-            k_theta=np.asarray(theta_payload["k_arr"], dtype=np.float64),
-            field_times=np.asarray(field_comparison.times, dtype=np.float64),
-            field_selected_k=np.asarray(field_comparison.selected_k, dtype=np.float64),
-            field_E_hat_hr=np.asarray(field_comparison.E_hat_hr, dtype=np.complex128),
-            field_E_hat_theta=np.asarray(field_comparison.E_hat_theta, dtype=np.complex128),
-            field_E_hat_truncation=np.asarray(truncation_field_comparison.E_hat_theta, dtype=np.complex128),
-            epsilon_grow=np.array([growth.epsilon_grow], dtype=np.float64),
-            gamma_grow_hr=np.array([growth.gamma_grow_hr], dtype=np.float64),
-            gamma_grow_theta=np.array([growth.gamma_grow_theta], dtype=np.float64),
-            epsilon_E=np.array([field.epsilon_E], dtype=np.float64),
-            epsilon_E_truncation=np.array([truncation_field.epsilon_E], dtype=np.float64),
-            in_training_targets=np.array([int(in_training_targets)], dtype=np.int32),
-            beyond_training_range=np.array([int(beyond_training_range)], dtype=np.int32),
-            reference_f_t0=np.asarray(reference_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
-            reference_f_t1=np.asarray(reference_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
-            truncation_f_t0=np.asarray(truncation_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
-            truncation_f_t1=np.asarray(truncation_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
-            learned_f_t0=np.asarray(learned_phase[f"f_{_time_key(float(snapshot_times[0]))}"], dtype=np.float64),
-            learned_f_t1=np.asarray(learned_phase[f"f_{_time_key(float(snapshot_times[1]))}"], dtype=np.float64),
-            x=np.asarray(learned_phase["x"], dtype=np.float64),
-            v=np.asarray(learned_phase["v"], dtype=np.float64),
-        )
+        case_payload = {
+            "times_hr": np.asarray(hr_payload["times"], dtype=np.float64),
+            "times_theta": np.asarray(theta_payload["times"], dtype=np.float64),
+            "energy_hr": np.asarray(hr_payload["energy"], dtype=np.float64),
+            "energy_theta": np.asarray(theta_payload["energy"], dtype=np.float64),
+            "E_hat_hr": np.asarray(hr_payload["E_hat_hist"], dtype=np.complex128),
+            "E_hat_theta": np.asarray(theta_payload["E_hat_hist"], dtype=np.complex128),
+            "k_hr": np.asarray(hr_payload["k_arr"], dtype=np.float64),
+            "k_theta": np.asarray(theta_payload["k_arr"], dtype=np.float64),
+            "field_times": np.asarray(field_comparison.times, dtype=np.float64),
+            "field_selected_k": np.asarray(field_comparison.selected_k, dtype=np.float64),
+            "field_E_hat_hr": np.asarray(field_comparison.E_hat_hr, dtype=np.complex128),
+            "field_E_hat_theta": np.asarray(field_comparison.E_hat_theta, dtype=np.complex128),
+            "field_E_hat_truncation": np.asarray(truncation_field_comparison.E_hat_theta, dtype=np.complex128),
+            "epsilon_grow": np.array([growth.epsilon_grow], dtype=np.float64),
+            "gamma_grow_hr": np.array([growth.gamma_grow_hr], dtype=np.float64),
+            "gamma_grow_theta": np.array([growth.gamma_grow_theta], dtype=np.float64),
+            "epsilon_E": np.array([field.epsilon_E], dtype=np.float64),
+            "epsilon_E_truncation": np.array([truncation_field.epsilon_E], dtype=np.float64),
+            "in_training_targets": np.array([int(in_training_targets)], dtype=np.int32),
+            "beyond_training_range": np.array([int(beyond_training_range)], dtype=np.int32),
+            "x": np.asarray(learned_phase["x"], dtype=np.float64),
+            "v": np.asarray(learned_phase["v"], dtype=np.float64),
+        }
+        for snap_idx, snap_t in enumerate(snapshot_times):
+            snap_key = _time_key(float(snap_t))
+            for prefix, phase in (
+                ("reference", reference_phase),
+                ("truncation", truncation_phase),
+                ("learned", learned_phase),
+            ):
+                case_payload[f"{prefix}_f_t{snap_idx}"] = np.asarray(
+                    phase[f"f_{snap_key}"],
+                    dtype=np.float64,
+                )
+                case_payload[f"{prefix}_f_{snap_key}"] = np.asarray(
+                    phase[f"f_{snap_key}"],
+                    dtype=np.float64,
+                )
+        np.savez(case_path, **case_payload)
 
         summary_cases.append(
             {
