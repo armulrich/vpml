@@ -64,6 +64,7 @@ TRAIN_ROLLOUT_DEALIAS_23="${TRAIN_ROLLOUT_DEALIAS_23:-1}"
 TRAIN_ONLINE_LOSS_BACKEND="${TRAIN_ONLINE_LOSS_BACKEND:-fourier_hermite_bidir}"
 TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-}"
 TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-}"
+TRAIN_ROLLOUT_ANCHOR_POOL_SIZE="${TRAIN_ROLLOUT_ANCHOR_POOL_SIZE:-128}"
 TRAIN_ROLLOUT_DIRECTION="${TRAIN_ROLLOUT_DIRECTION:-bidir}"
 TRAIN_PROJECTED_XV_TAIL_WINDOW="${TRAIN_PROJECTED_XV_TAIL_WINDOW:-0}"
 TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-}"
@@ -71,7 +72,7 @@ TRAIN_POSTERIOR_STATE_WEIGHT="${TRAIN_POSTERIOR_STATE_WEIGHT:-0.25}"
 TRAIN_POSTERIOR_FIELD_WEIGHT="${TRAIN_POSTERIOR_FIELD_WEIGHT:-1.0}"
 
 uses_projected_online_backend() {
-  [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]]
+  [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_rollout_qloss" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]]
 }
 
 if [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "field_distribution_v1" ]]; then
@@ -100,7 +101,7 @@ elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_projected_xv_bidir" ]
   TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-5}"
   TRAIN_ROLLOUT_ANCHOR_SAMPLES="${TRAIN_ROLLOUT_ANCHOR_SAMPLES:-8}"
   TRAIN_PROJECTED_XV_METRIC="${TRAIN_PROJECTED_XV_METRIC:-gram_riesz}"
-elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" ]]; then
+elif [[ "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_detached_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_rollout_qloss" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_closure_action_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_boundary_step_bidir" || "${TRAIN_ONLINE_LOSS_BACKEND}" == "fourier_hermite_posterior_bidir" ]]; then
   TRAIN_LR="${TRAIN_LR:-3e-4}"
   TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-10}"
   TRAIN_ONLINE_CASE_BATCH_SIZE="${TRAIN_ONLINE_CASE_BATCH_SIZE:-1}"
@@ -307,6 +308,7 @@ prepare_online_reference_cache() {
     --posterior-field-weight "${TRAIN_POSTERIOR_FIELD_WEIGHT}"
     --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
     --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}"
+    --rollout-anchor-pool-size "${TRAIN_ROLLOUT_ANCHOR_POOL_SIZE}"
     --rollout-direction "${TRAIN_ROLLOUT_DIRECTION}"
     --projected-xv-tail-window "${TRAIN_PROJECTED_XV_TAIL_WINDOW}"
     --projected-xv-metric "${TRAIN_PROJECTED_XV_METRIC}"
@@ -368,6 +370,7 @@ train_one_nv() {
     --posterior-field-weight "${TRAIN_POSTERIOR_FIELD_WEIGHT}"
     --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
     --rollout-anchor-samples "${TRAIN_ROLLOUT_ANCHOR_SAMPLES}"
+    --rollout-anchor-pool-size "${TRAIN_ROLLOUT_ANCHOR_POOL_SIZE}"
     --rollout-direction "${TRAIN_ROLLOUT_DIRECTION}"
     --projected-xv-tail-window "${TRAIN_PROJECTED_XV_TAIL_WINDOW}"
     --projected-xv-metric "${TRAIN_PROJECTED_XV_METRIC}"
@@ -493,6 +496,8 @@ Defaults:
   train linear T: ${TRAIN_LINEAR_T}
   train nonlin T: ${TRAIN_NONLINEAR_T}
   rollout horiz:  ${TRAIN_ROLLOUT_HORIZON}
+  rollout anchors:${TRAIN_ROLLOUT_ANCHOR_SAMPLES}
+  anchor pool:    ${TRAIN_ROLLOUT_ANCHOR_POOL_SIZE}
   rollout dir:    ${TRAIN_ROLLOUT_DIRECTION}
   xv tail window: ${TRAIN_PROJECTED_XV_TAIL_WINDOW}
   xv metric:      ${TRAIN_PROJECTED_XV_METRIC}

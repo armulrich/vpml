@@ -79,7 +79,7 @@ REGIME_WEAK = "nonlinear_landau_weak"
 REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
-ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v3"
+ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v4"
 ONLINE_HYBRID_LOSS_DEFINITION = "q_trajectory_field_distribution_v1"
 ONLINE_TRAINING_MODE = "online_rollout"
 OFFLINE_TRAINING_MODE = "offline_rollout"
@@ -87,6 +87,7 @@ ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR = "fourier_hermite_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR = "fourier_hermite_closure_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR = "fourier_hermite_closure_detached_bidir"
+ONLINE_LOSS_BACKEND_FOURIER_HERMITE_ROLLOUT_QLOSS = "fourier_hermite_rollout_qloss"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR = "fourier_hermite_closure_action_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR = "fourier_hermite_boundary_step_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR = "fourier_hermite_posterior_bidir"
@@ -109,6 +110,7 @@ ALL_ONLINE_LOSS_BACKENDS = (
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+    ONLINE_LOSS_BACKEND_FOURIER_HERMITE_ROLLOUT_QLOSS,
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
     ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR,
@@ -136,6 +138,14 @@ def online_reference_coeff_key(target_nv: int) -> str:
     return f"a_hat_ref_nv{int(target_nv)}"
 
 
+def online_reference_anchor_coeff_key(target_nv: int) -> str:
+    return f"a_hat_anchor_nv{int(target_nv)}"
+
+
+def online_reference_anchor_index_key(target_nv: int) -> str:
+    return f"anchor_index_nv{int(target_nv)}"
+
+
 def online_reference_q_key(target_nv: int) -> str:
     return f"q_hat_ref_nv{int(target_nv)}"
 
@@ -145,6 +155,7 @@ def online_loss_backend_uses_projected_coefficients(backend: str) -> bool:
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_ROLLOUT_QLOSS,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR,
@@ -156,8 +167,13 @@ def online_loss_backend_uses_closure_q(backend: str) -> bool:
     return str(backend) in {
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_ROLLOUT_QLOSS,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
     }
+
+
+def online_loss_backend_uses_rollout_qloss(backend: str) -> bool:
+    return str(backend) == ONLINE_LOSS_BACKEND_FOURIER_HERMITE_ROLLOUT_QLOSS
 
 
 def online_loss_backend_uses_action_q(backend: str) -> bool:
@@ -185,6 +201,9 @@ def online_reference_num_cases(payload: Dict[str, Array]) -> int:
         return int(np.asarray(payload["E_hat_ref"]).shape[0])
     for key, value in payload.items():
         if str(key).startswith("a_hat_ref_nv"):
+            return int(np.asarray(value).shape[0])
+    for key, value in payload.items():
+        if str(key).startswith("a_hat_anchor_nv"):
             return int(np.asarray(value).shape[0])
     for key, value in payload.items():
         if str(key).startswith("q_hat_ref_nv"):
@@ -289,6 +308,7 @@ def build_online_reference_cache_metadata(
     online_loss_backend: str,
     Nv_targets: Optional[Sequence[int]] = None,
     rollout_horizon: int = 0,
+    rollout_anchor_pool_size: int = 0,
 ) -> Dict[str, np.ndarray]:
     payload = {
         "dataset_format": np.array([ONLINE_REFERENCE_CACHE_FORMAT], dtype=np.str_),
@@ -315,6 +335,7 @@ def build_online_reference_cache_metadata(
         "online_v_probes": np.array([int(online_v_probes)], dtype=np.int32),
         "online_loss_backend": np.array([str(online_loss_backend)], dtype=np.str_),
         "rollout_horizon": np.array([int(rollout_horizon)], dtype=np.int32),
+        "rollout_anchor_pool_size": np.array([int(rollout_anchor_pool_size)], dtype=np.int32),
     }
     if Nv_targets is not None:
         payload["Nv_targets"] = np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32)
@@ -1422,16 +1443,27 @@ def build_online_q_training_stats_from_reference(
             continue
         for target_nv in Nv_targets:
             coeff_key = online_reference_coeff_key(int(target_nv))
+            anchor_coeff_key = online_reference_anchor_coeff_key(int(target_nv))
+            anchor_index_key = online_reference_anchor_index_key(int(target_nv))
             q_key = online_reference_q_key(int(target_nv))
-            if coeff_key not in group:
+            use_anchor_stencils = coeff_key not in group and anchor_coeff_key in group
+            if coeff_key not in group and not use_anchor_stencils:
                 continue
             if bool(require_q_targets) and q_key not in group:
                 continue
-            coeff_cases = np.asarray(group[coeff_key], dtype=np.complex128)
+            coeff_cases = np.asarray(
+                group[anchor_coeff_key] if use_anchor_stencils else group[coeff_key],
+                dtype=np.complex128,
+            )
             q_cases = (
                 None
                 if q_key not in group
                 else np.asarray(group[q_key], dtype=np.complex128)
+            )
+            anchor_index_cases = (
+                None
+                if not use_anchor_stencils
+                else np.asarray(group[anchor_index_key], dtype=np.int32)
             )
             if q_cases is not None and coeff_cases.shape[0] != q_cases.shape[0]:
                 raise ValueError(
@@ -1439,9 +1471,26 @@ def build_online_q_training_stats_from_reference(
                     f"{coeff_cases.shape[0]} vs {q_cases.shape[0]}"
                 )
             for case_idx in range(int(coeff_cases.shape[0])):
+                if use_anchor_stencils:
+                    if coeff_cases[case_idx].ndim != 4 or coeff_cases[case_idx].shape[1] != 3:
+                        raise ValueError(
+                            f"{anchor_coeff_key} must have shape (cases, anchors, 3, Nv, Nk), "
+                            f"got {coeff_cases.shape}"
+                        )
+                    assert anchor_index_cases is not None
+                    anchor_indices = np.asarray(anchor_index_cases[case_idx], dtype=np.int32)
+                    coeff_hist_for_stats = coeff_cases[case_idx][:, 0, :, :]
+                    q_hist_for_stats = (
+                        None
+                        if q_cases is None
+                        else np.asarray(q_cases[case_idx][anchor_indices], dtype=np.complex128)
+                    )
+                else:
+                    coeff_hist_for_stats = coeff_cases[case_idx]
+                    q_hist_for_stats = None if q_cases is None else q_cases[case_idx]
                 extended_hist = _online_extended_coeff_history_for_q_stats(
-                    coeff_cases[case_idx],
-                    None if q_cases is None else q_cases[case_idx],
+                    coeff_hist_for_stats,
+                    q_hist_for_stats,
                     target_nv=int(target_nv),
                     k_arr=k_arr,
                 )
@@ -1470,6 +1519,12 @@ def build_online_q_training_stats_from_reference(
                     input_count,
                     inputs,
                 )
+                if use_anchor_stencils and q_cases is not None:
+                    q_full = np.asarray(q_cases[case_idx], dtype=np.complex128)
+                    targets = np.stack(
+                        [np.real(q_full[:, 1:]), np.imag(q_full[:, 1:])],
+                        axis=-1,
+                    ).reshape(-1, 2)
                 target_sum, target_sum_sq, target_count = _accumulate_feature_moments(
                     target_sum,
                     target_sum_sq,
@@ -1706,6 +1761,10 @@ def build_projected_reference_episode(
     projection_orders: Sequence[int],
     stored_projection_orders: Optional[Sequence[int]] = None,
     closure_q_targets: Sequence[int] = (),
+    compact_rollout_qloss: bool = False,
+    rollout_horizon: int = 0,
+    rollout_anchor_pool_size: int = 0,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_FORWARD,
 ) -> Dict[str, Array]:
     coeff_histories, k_arr = _run_landau_teacher_projected_histories(
         config,
@@ -1719,11 +1778,42 @@ def build_projected_reference_episode(
         else tuple(int(order) for order in stored_projection_orders)
     )
     payload: Dict[str, Array] = {}
-    for order in stored_orders:
-        payload[online_reference_coeff_key(int(order))] = jnp.asarray(
-            coeff_histories[int(order)],
-            dtype=jnp.complex128,
-        )
+    if bool(compact_rollout_qloss):
+        if str(rollout_direction) != ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            raise ValueError("compact rollout q-loss reference caches currently require forward rollouts")
+        if int(rollout_horizon) <= 0:
+            raise ValueError("compact rollout q-loss reference caches require rollout_horizon > 0")
+        if int(rollout_anchor_pool_size) <= 0:
+            raise ValueError("compact rollout q-loss reference caches require rollout_anchor_pool_size > 0")
+        for target_nv in closure_q_targets:
+            target_i = int(target_nv)
+            if target_i not in coeff_histories:
+                raise ValueError(f"compact rollout q-loss requires retained coefficients for Nv={target_i}")
+            retained_hist = jnp.asarray(coeff_histories[target_i], dtype=jnp.complex128)
+            anchor_indices = _select_rollout_anchor_indices(
+                history_length=int(retained_hist.shape[0]),
+                rollout_horizon=int(rollout_horizon),
+                rollout_anchor_samples=int(rollout_anchor_pool_size),
+                rollout_direction=ONLINE_ROLLOUT_DIRECTION_FORWARD,
+            )
+            prev_indices = jnp.maximum(anchor_indices - 1, 0)
+            prev_prev_indices = jnp.maximum(anchor_indices - 2, 0)
+            anchor_stencils = jnp.stack(
+                (
+                    jnp.take(retained_hist, anchor_indices, axis=0),
+                    jnp.take(retained_hist, prev_indices, axis=0),
+                    jnp.take(retained_hist, prev_prev_indices, axis=0),
+                ),
+                axis=1,
+            )
+            payload[online_reference_anchor_coeff_key(target_i)] = anchor_stencils
+            payload[online_reference_anchor_index_key(target_i)] = anchor_indices
+    else:
+        for order in stored_orders:
+            payload[online_reference_coeff_key(int(order))] = jnp.asarray(
+                coeff_histories[int(order)],
+                dtype=jnp.complex128,
+            )
     k_arr_j = jnp.asarray(k_arr, dtype=jnp.float64)
     for target_nv in closure_q_targets:
         target_i = int(target_nv)
@@ -1768,6 +1858,9 @@ def build_online_reference_dataset(
     online_loss_backend: str,
     Nv_targets: Sequence[int],
     rollout_horizon: int,
+    rollout_anchor_samples: int,
+    rollout_anchor_pool_size: int,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
 ) -> Tuple[Dict[str, Dict[str, Dict[str, Array]]], Array]:
     effective_online_v_probes = (
         int(online_v_probes)
@@ -1802,6 +1895,12 @@ def build_online_reference_dataset(
             else None
         ),
         rollout_horizon=rollout_horizon,
+        rollout_anchor_pool_size=(
+            int(rollout_anchor_pool_size)
+            if online_loss_backend_uses_rollout_qloss(str(online_loss_backend))
+            and str(rollout_direction) == ONLINE_ROLLOUT_DIRECTION_FORWARD
+            else int(rollout_anchor_samples)
+        ),
     )
     if dataset_cache is not None and dataset_cache.exists():
         try:
@@ -1831,6 +1930,15 @@ def build_online_reference_dataset(
             if online_loss_backend_has_reference_q_targets(str(online_loss_backend))
             else ()
         )
+        compact_rollout_qloss = (
+            online_loss_backend_uses_rollout_qloss(str(online_loss_backend))
+            and str(rollout_direction) == ONLINE_ROLLOUT_DIRECTION_FORWARD
+        )
+        effective_anchor_pool_size = (
+            int(rollout_anchor_pool_size)
+            if compact_rollout_qloss
+            else int(rollout_anchor_samples)
+        )
         projection_orders = tuple(sorted(
             set(target_nvs).union({int(v) + 1 for v in closure_q_targets})
         ))
@@ -1856,8 +1964,12 @@ def build_online_reference_dataset(
                     config,
                     perturb,
                     projection_orders=projection_orders,
-                    stored_projection_orders=target_nvs,
+                    stored_projection_orders=() if compact_rollout_qloss else target_nvs,
                     closure_q_targets=closure_q_targets,
+                    compact_rollout_qloss=compact_rollout_qloss,
+                    rollout_horizon=int(rollout_horizon),
+                    rollout_anchor_pool_size=int(effective_anchor_pool_size),
+                    rollout_direction=str(rollout_direction),
                 )
                 payloads.append(payload)
             train_payloads, val_payloads = _split_episode_payloads(payloads, val_fraction=val_fraction)
@@ -1889,8 +2001,12 @@ def build_online_reference_dataset(
                         nonlinear_config,
                         float(eps) * perturb_template,
                         projection_orders=projection_orders,
-                        stored_projection_orders=target_nvs,
+                        stored_projection_orders=() if compact_rollout_qloss else target_nvs,
                         closure_q_targets=closure_q_targets,
+                        compact_rollout_qloss=compact_rollout_qloss,
+                        rollout_horizon=int(rollout_horizon),
+                        rollout_anchor_pool_size=int(effective_anchor_pool_size),
+                        rollout_direction=str(rollout_direction),
                     )
                 )
             train_payloads, val_payloads = _split_episode_payloads(payloads, val_fraction=val_fraction)
@@ -2631,6 +2747,28 @@ def online_closure_flux_loss_terms(
     return num, den
 
 
+def online_standardized_q_loss_terms(
+    pred_q_hat_hist: Array,
+    ref_q_hat_hist: Array,
+    *,
+    target_std: Array,
+) -> Array:
+    """Offline q-loss geometry evaluated on a q history."""
+    pred_q_hat_hist = jnp.asarray(pred_q_hat_hist, dtype=jnp.complex128)
+    ref_q_hat_hist = jnp.asarray(ref_q_hat_hist, dtype=jnp.complex128)
+    pred_components = jnp.stack(
+        [jnp.real(pred_q_hat_hist[:, 1:]), jnp.imag(pred_q_hat_hist[:, 1:])],
+        axis=-1,
+    )
+    ref_components = jnp.stack(
+        [jnp.real(ref_q_hat_hist[:, 1:]), jnp.imag(ref_q_hat_hist[:, 1:])],
+        axis=-1,
+    )
+    std = jnp.maximum(jnp.asarray(target_std, dtype=jnp.float64), 1e-12)
+    diff_std = (pred_components - ref_components) / std[None, None, :]
+    return jnp.mean(diff_std**2)
+
+
 def online_direct_q_relative_mse_for_history(
     ref_a_hat_hist: Array,
     ref_q_hat_hist: Array,
@@ -2973,6 +3111,112 @@ def rollout_closure_flux_from_anchor_state(
     return q_hist
 
 
+def rollout_anchor_closure_flux_from_anchor_state(
+    ref_hist: Array,
+    *,
+    anchor_idx: Array,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    direction: int,
+    explicit_n_hat_fn,
+) -> Array:
+    """Return q(C_h) for h=0..H-1, then step C_h -> C_{h+1}."""
+    direction_i = int(direction)
+    if direction_i not in {-1, 1}:
+        raise ValueError(f"direction must be +/-1, got {direction!r}")
+    anchor_idx = jnp.asarray(anchor_idx, dtype=jnp.int32)
+    current_state = _safe_history_state(ref_hist, anchor_idx)
+    prev_state = _safe_history_state(ref_hist, anchor_idx - direction_i)
+    prev_prev_state = _safe_history_state(ref_hist, anchor_idx - 2 * direction_i)
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+
+    def step(carry, _):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        n_hat = explicit_n_hat_fn(state, integ=integ)
+        q_hat = learned_interface_q_hat(
+            state,
+            integ.k_arr,
+            integ.Nv,
+            learned,
+            a_hat_prev=state_prev,
+        )
+        b_hat = jnp.zeros_like(state, dtype=jnp.complex128).at[int(integ.Nv) - 1].set(q_hat)
+        state_new = integ.step_cnab2(
+            state,
+            n_hat,
+            n_prev_step,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step,
+        )
+        return (state_new, state, n_hat, b_hat), q_hat
+
+    init = (current_state, prev_state, n_prev, b_prev)
+    (_, _, _, _), q_hist = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
+    return q_hist
+
+
+def rollout_anchor_closure_flux_from_anchor_stencil(
+    anchor_stencil: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    explicit_n_hat_fn,
+) -> Array:
+    """Return q(C_h) for h=0..H-1 from a compact forward CNAB2 anchor stencil.
+
+    The stencil stores (current, previous, previous-previous) retained states.
+    """
+    stencil = jnp.asarray(anchor_stencil, dtype=jnp.complex128)
+    if int(stencil.shape[0]) != 3:
+        raise ValueError(f"anchor_stencil must have shape (3, Nv, Nk), got {stencil.shape}")
+    current_state = stencil[0]
+    prev_state = stencil[1]
+    prev_prev_state = stencil[2]
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+
+    def step(carry, _):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        n_hat = explicit_n_hat_fn(state, integ=integ)
+        q_hat = learned_interface_q_hat(
+            state,
+            integ.k_arr,
+            integ.Nv,
+            learned,
+            a_hat_prev=state_prev,
+        )
+        b_hat = jnp.zeros_like(state, dtype=jnp.complex128).at[int(integ.Nv) - 1].set(q_hat)
+        state_new = integ.step_cnab2(
+            state,
+            n_hat,
+            n_prev_step,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step,
+        )
+        return (state_new, state, n_hat, b_hat), q_hat
+
+    init = (current_state, prev_state, n_prev, b_prev)
+    (_, _, _, _), q_hist = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
+    return q_hist
+
+
 def rollout_closure_action_from_anchor_state(
     ref_hist: Array,
     *,
@@ -3214,6 +3458,60 @@ def _sample_rollout_anchor_indices(
         )
         anchors = np.sort(anchors.astype(np.int32))
     return jnp.asarray(anchors, dtype=jnp.int32)
+
+
+def _select_rollout_anchor_pool_indices(
+    *,
+    anchor_pool_size: int,
+    rollout_anchor_samples: int,
+) -> Array:
+    pool_size = int(anchor_pool_size)
+    if pool_size <= 0:
+        raise ValueError("anchor_pool_size must be positive")
+    if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= pool_size:
+        return jnp.arange(pool_size, dtype=jnp.int32)
+    if int(rollout_anchor_samples) == 1:
+        return jnp.asarray([(pool_size - 1) // 2], dtype=jnp.int32)
+    sampled_positions = np.rint(
+        np.linspace(0, pool_size - 1, num=int(rollout_anchor_samples), dtype=np.float64)
+    ).astype(np.int32)
+    sampled_positions = np.unique(sampled_positions)
+    return jnp.asarray(sampled_positions, dtype=jnp.int32)
+
+
+def _sample_rollout_anchor_pool_indices(
+    *,
+    anchor_pool_size: int,
+    rollout_anchor_samples: int,
+    rng: np.random.Generator,
+) -> Array:
+    pool_size = int(anchor_pool_size)
+    if pool_size <= 0:
+        raise ValueError("anchor_pool_size must be positive")
+    if int(rollout_anchor_samples) <= 0 or int(rollout_anchor_samples) >= pool_size:
+        anchors = np.arange(pool_size, dtype=np.int32)
+    else:
+        anchors = rng.choice(
+            np.arange(pool_size, dtype=np.int32),
+            size=int(rollout_anchor_samples),
+            replace=False,
+        )
+        anchors = np.sort(anchors.astype(np.int32))
+    return jnp.asarray(anchors, dtype=jnp.int32)
+
+
+def _resolve_rollout_anchor_pool_indices(
+    rollout_anchor_indices: Optional[Array],
+    *,
+    anchor_pool_size: int,
+    rollout_anchor_samples: int,
+) -> Array:
+    if rollout_anchor_indices is not None:
+        return jnp.asarray(rollout_anchor_indices, dtype=jnp.int32)
+    return _select_rollout_anchor_pool_indices(
+        anchor_pool_size=int(anchor_pool_size),
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
 
 
 def _resolve_rollout_anchor_indices(
@@ -3616,6 +3914,140 @@ def online_fourier_hermite_closure_bidir_loss_for_history(
         anchor_indices,
     )
     return num_total / (den_total + 1e-30)
+
+
+def online_fourier_hermite_rollout_qloss_for_history(
+    ref_hist: Array,
+    ref_q_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    backward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+    rollout_direction: str = ONLINE_ROLLOUT_DIRECTION_BIDIR,
+    rollout_anchor_indices: Optional[Array] = None,
+) -> Array:
+    ref_hist = jnp.asarray(ref_hist, dtype=jnp.complex128)
+    ref_q_hist = jnp.asarray(ref_q_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for fourier_hermite_rollout_qloss")
+    direction_mode = str(rollout_direction)
+    if direction_mode not in ALL_ONLINE_ROLLOUT_DIRECTIONS:
+        raise ValueError(
+            f"rollout_direction must be one of {ALL_ONLINE_ROLLOUT_DIRECTIONS!r}, "
+            f"got {rollout_direction!r}"
+        )
+    anchor_indices = _resolve_rollout_anchor_indices(
+        rollout_anchor_indices,
+        history_length=int(ref_hist.shape[0]),
+        rollout_horizon=horizon,
+        rollout_anchor_samples=int(rollout_anchor_samples),
+        rollout_direction=direction_mode,
+    )
+    offsets = jnp.arange(0, horizon, dtype=jnp.int32)
+
+    def anchor_step(total, anchor_idx):
+        pred_forward = rollout_anchor_closure_flux_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            direction=+1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_forward = jnp.take(ref_q_hist, anchor_idx + offsets, axis=0)
+        loss_forward = online_standardized_q_loss_terms(
+            pred_forward,
+            ref_forward,
+            target_std=learned.target_std,
+        )
+
+        if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+            return total + loss_forward, None
+
+        pred_backward = rollout_anchor_closure_flux_from_anchor_state(
+            ref_hist,
+            anchor_idx=anchor_idx,
+            learned=learned,
+            integ=backward_integ,
+            rollout_horizon=horizon,
+            direction=-1,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_backward = jnp.take(ref_q_hist, anchor_idx - offsets, axis=0)
+        loss_backward = online_standardized_q_loss_terms(
+            pred_backward,
+            ref_backward,
+            target_std=learned.target_std,
+        )
+        return total + loss_forward + loss_backward, None
+
+    loss_total, _ = jax.lax.scan(
+        anchor_step,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        anchor_indices,
+    )
+    direction_count = 1 if direction_mode == ONLINE_ROLLOUT_DIRECTION_FORWARD else 2
+    sample_count = jnp.asarray(
+        int(direction_count) * int(anchor_indices.shape[0]),
+        dtype=jnp.float64,
+    )
+    return loss_total / sample_count
+
+
+def online_fourier_hermite_rollout_qloss_for_anchor_stencils(
+    anchor_stencils: Array,
+    anchor_time_indices: Array,
+    ref_q_hist: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    rollout_anchor_samples: int,
+    explicit_n_hat_fn,
+    rollout_anchor_indices: Optional[Array] = None,
+) -> Array:
+    """H-step online q-loss from compact forward anchor stencils."""
+    anchor_stencils = jnp.asarray(anchor_stencils, dtype=jnp.complex128)
+    anchor_time_indices = jnp.asarray(anchor_time_indices, dtype=jnp.int32)
+    ref_q_hist = jnp.asarray(ref_q_hist, dtype=jnp.complex128)
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for compact rollout q-loss")
+    anchor_indices = _resolve_rollout_anchor_pool_indices(
+        rollout_anchor_indices,
+        anchor_pool_size=int(anchor_stencils.shape[0]),
+        rollout_anchor_samples=int(rollout_anchor_samples),
+    )
+    offsets = jnp.arange(0, horizon, dtype=jnp.int32)
+
+    def anchor_step(total, pool_idx):
+        pred_forward = rollout_anchor_closure_flux_from_anchor_stencil(
+            anchor_stencils[pool_idx],
+            learned=learned,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+        ref_forward = jnp.take(ref_q_hist, anchor_time_indices[pool_idx] + offsets, axis=0)
+        loss_forward = online_standardized_q_loss_terms(
+            pred_forward,
+            ref_forward,
+            target_std=learned.target_std,
+        )
+        return total + loss_forward, None
+
+    loss_total, _ = jax.lax.scan(
+        anchor_step,
+        jnp.asarray(0.0, dtype=jnp.float64),
+        anchor_indices,
+    )
+    sample_count = jnp.asarray(int(anchor_indices.shape[0]), dtype=jnp.float64)
+    return loss_total / sample_count
 
 
 def online_fourier_hermite_closure_action_bidir_loss_for_history(
@@ -4058,6 +4490,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_DETACHED_BIDIR,
+        ONLINE_LOSS_BACKEND_FOURIER_HERMITE_ROLLOUT_QLOSS,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_ACTION_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BOUNDARY_STEP_BIDIR,
         ONLINE_LOSS_BACKEND_FOURIER_HERMITE_POSTERIOR_BIDIR,
@@ -4319,6 +4752,19 @@ def make_online_fourier_hermite_bidir_batch_loss(
                     rollout_direction=direction_mode,
                     rollout_anchor_indices=rollout_anchor_indices,
                 )
+            elif online_loss_backend_uses_rollout_qloss(str(loss_backend)):
+                loss = online_fourier_hermite_rollout_qloss_for_history(
+                    ref_hist,
+                    ref_q_hist,
+                    learned=learned,
+                    forward_integ=forward_integ,
+                    backward_integ=backward_integ,
+                    rollout_horizon=rollout_horizon,
+                    rollout_anchor_samples=rollout_anchor_samples,
+                    explicit_n_hat_fn=explicit_n_hat_fn,
+                    rollout_direction=direction_mode,
+                    rollout_anchor_indices=rollout_anchor_indices,
+                )
             else:
                 loss = online_fourier_hermite_closure_bidir_loss_for_history(
                     ref_hist,
@@ -4341,6 +4787,42 @@ def make_online_fourier_hermite_bidir_batch_loss(
             (ref_batch, ref_q_batch),
         )
         return total / jnp.asarray(ref_batch.shape[0], dtype=jnp.float64)
+
+    def mean_compact_rollout_q_loss(
+        ref_anchor_batch: Array,
+        ref_anchor_index_batch: Array,
+        ref_q_batch: Array,
+        *,
+        learned: LearnedInterfaceClosure,
+        forward_integ: FourierHermiteIMEX,
+        explicit_n_hat_fn,
+        rollout_anchor_indices: Optional[Array] = None,
+    ) -> Array:
+        ref_anchor_batch = jnp.asarray(ref_anchor_batch, dtype=jnp.complex128)
+        ref_anchor_index_batch = jnp.asarray(ref_anchor_index_batch, dtype=jnp.int32)
+        ref_q_batch = jnp.asarray(ref_q_batch, dtype=jnp.complex128)
+
+        def case_step(total, inputs):
+            anchor_stencils, anchor_indices, ref_q_hist = inputs
+            loss = online_fourier_hermite_rollout_qloss_for_anchor_stencils(
+                anchor_stencils,
+                anchor_indices,
+                ref_q_hist,
+                learned=learned,
+                forward_integ=forward_integ,
+                rollout_horizon=rollout_horizon,
+                rollout_anchor_samples=rollout_anchor_samples,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+                rollout_anchor_indices=rollout_anchor_indices,
+            )
+            return total + loss, None
+
+        total, _ = jax.lax.scan(
+            case_step,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            (ref_anchor_batch, ref_anchor_index_batch, ref_q_batch),
+        )
+        return total / jnp.asarray(ref_anchor_batch.shape[0], dtype=jnp.float64)
 
     def mean_boundary_history_loss(
         ref_batch: Array,
@@ -4376,6 +4858,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
 
     def make_loss_fn_for_target(target_nv: int):
         coeff_key = online_reference_coeff_key(int(target_nv))
+        anchor_coeff_key = online_reference_anchor_coeff_key(int(target_nv))
+        anchor_index_key = online_reference_anchor_index_key(int(target_nv))
         q_key = online_reference_q_key(int(target_nv))
         linear_forward, linear_backward = linear_integrators[int(target_nv)]
         nonlinear_forward, nonlinear_backward = nonlinear_integrators[int(target_nv)]
@@ -4435,14 +4919,26 @@ def make_online_fourier_hermite_bidir_batch_loss(
                     if ROLLOUT_ANCHOR_INDICES_KEY in batch
                     else None
                 )
-                ref_batch = jnp.asarray(batch[coeff_key], dtype=jnp.complex128)
+                use_anchor_stencils = (
+                    online_loss_backend_uses_rollout_qloss(str(loss_backend))
+                    and anchor_coeff_key in batch
+                )
+                ref_batch = jnp.asarray(
+                    batch[anchor_coeff_key] if use_anchor_stencils else batch[coeff_key],
+                    dtype=jnp.complex128,
+                )
+                ref_anchor_index_batch = (
+                    jnp.asarray(batch[anchor_index_key], dtype=jnp.int32)
+                    if use_anchor_stencils
+                    else None
+                )
                 ref_q_batch = (
                     jnp.asarray(batch[q_key], dtype=jnp.complex128)
                     if q_key in batch
                     else None
                 )
                 if regime == REGIME_LINEAR:
-                    if ref_q_batch is not None:
+                    if ref_q_batch is not None and not use_anchor_stencils:
                         total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
@@ -4524,6 +5020,37 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                     rollout_anchor_indices=rollout_anchor_indices,
                                 )
                             )(ref_batch)
+                        elif online_loss_backend_uses_rollout_qloss(str(loss_backend)):
+                            if use_anchor_stencils:
+                                assert ref_anchor_index_batch is not None
+                                q_terms = jax.vmap(
+                                    lambda anchor_stencils, anchor_indices, ref_q_hist: online_fourier_hermite_rollout_qloss_for_anchor_stencils(
+                                        anchor_stencils,
+                                        anchor_indices,
+                                        ref_q_hist,
+                                        learned=learned,
+                                        forward_integ=linear_forward,
+                                        rollout_horizon=rollout_horizon,
+                                        rollout_anchor_samples=rollout_anchor_samples,
+                                        explicit_n_hat_fn=linear_explicit,
+                                        rollout_anchor_indices=rollout_anchor_indices,
+                                    )
+                                )(ref_batch, ref_anchor_index_batch, ref_q_batch)
+                            else:
+                                q_terms = jax.vmap(
+                                    lambda ref_hist, ref_q_hist: online_fourier_hermite_rollout_qloss_for_history(
+                                        ref_hist,
+                                        ref_q_hist,
+                                        learned=learned,
+                                        forward_integ=linear_forward,
+                                        backward_integ=linear_backward,
+                                        rollout_horizon=rollout_horizon,
+                                        rollout_anchor_samples=rollout_anchor_samples,
+                                        explicit_n_hat_fn=linear_explicit,
+                                        rollout_direction=direction_mode,
+                                        rollout_anchor_indices=rollout_anchor_indices,
+                                    )
+                                )(ref_batch, ref_q_batch)
                         else:
                             q_terms = jax.vmap(
                                 lambda ref_hist, ref_q_hist: online_fourier_hermite_closure_bidir_loss_for_history(
@@ -4544,6 +5071,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 )
                             )(ref_batch, ref_q_batch)
                         total_q = total_q + weight * jnp.mean(q_terms)
+                        if use_anchor_stencils:
+                            total_q_diag = total_q_diag + weight * jnp.mean(q_terms)
                         continue
                     state_terms = jax.vmap(
                         lambda ref_hist: online_fourier_hermite_bidir_loss_for_history(
@@ -4559,7 +5088,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                         )
                     )(ref_batch)
                 else:
-                    if ref_q_batch is not None:
+                    if ref_q_batch is not None and not use_anchor_stencils:
                         total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
@@ -4641,6 +5170,37 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                     rollout_anchor_indices=rollout_anchor_indices,
                                 )
                             )(ref_batch)
+                        elif online_loss_backend_uses_rollout_qloss(str(loss_backend)):
+                            if use_anchor_stencils:
+                                assert ref_anchor_index_batch is not None
+                                q_terms = jax.vmap(
+                                    lambda anchor_stencils, anchor_indices, ref_q_hist: online_fourier_hermite_rollout_qloss_for_anchor_stencils(
+                                        anchor_stencils,
+                                        anchor_indices,
+                                        ref_q_hist,
+                                        learned=learned,
+                                        forward_integ=nonlinear_forward,
+                                        rollout_horizon=rollout_horizon,
+                                        rollout_anchor_samples=rollout_anchor_samples,
+                                        explicit_n_hat_fn=nonlinear_explicit,
+                                        rollout_anchor_indices=rollout_anchor_indices,
+                                    )
+                                )(ref_batch, ref_anchor_index_batch, ref_q_batch)
+                            else:
+                                q_terms = jax.vmap(
+                                    lambda ref_hist, ref_q_hist: online_fourier_hermite_rollout_qloss_for_history(
+                                        ref_hist,
+                                        ref_q_hist,
+                                        learned=learned,
+                                        forward_integ=nonlinear_forward,
+                                        backward_integ=nonlinear_backward,
+                                        rollout_horizon=rollout_horizon,
+                                        rollout_anchor_samples=rollout_anchor_samples,
+                                        explicit_n_hat_fn=nonlinear_explicit,
+                                        rollout_direction=direction_mode,
+                                        rollout_anchor_indices=rollout_anchor_indices,
+                                    )
+                                )(ref_batch, ref_q_batch)
                         else:
                             q_terms = jax.vmap(
                                 lambda ref_hist, ref_q_hist: online_fourier_hermite_closure_bidir_loss_for_history(
@@ -4661,6 +5221,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
                                 )
                             )(ref_batch, ref_q_batch)
                         total_q = total_q + weight * jnp.mean(q_terms)
+                        if use_anchor_stencils:
+                            total_q_diag = total_q_diag + weight * jnp.mean(q_terms)
                         continue
                     state_terms = jax.vmap(
                         lambda ref_hist: online_fourier_hermite_bidir_loss_for_history(
@@ -4700,6 +5262,8 @@ def make_online_fourier_hermite_bidir_batch_loss(
 
     def make_exact_loss_fn_for_target(target_nv: int):
         coeff_key = online_reference_coeff_key(int(target_nv))
+        anchor_coeff_key = online_reference_anchor_coeff_key(int(target_nv))
+        anchor_index_key = online_reference_anchor_index_key(int(target_nv))
         q_key = online_reference_q_key(int(target_nv))
         linear_forward, linear_backward = linear_integrators[int(target_nv)]
         nonlinear_forward, nonlinear_backward = nonlinear_integrators[int(target_nv)]
@@ -4752,14 +5316,27 @@ def make_online_fourier_hermite_bidir_batch_loss(
             total_q_diag = jnp.asarray(0.0, dtype=jnp.float64)
 
             for weight, regime in zip(weight_arr, active_regimes):
-                ref_batch = jnp.asarray(online_dataset[regime]["train"][coeff_key], dtype=jnp.complex128)
+                train_group = online_dataset[regime]["train"]
+                use_anchor_stencils = (
+                    online_loss_backend_uses_rollout_qloss(str(loss_backend))
+                    and anchor_coeff_key in train_group
+                )
+                ref_batch = jnp.asarray(
+                    train_group[anchor_coeff_key] if use_anchor_stencils else train_group[coeff_key],
+                    dtype=jnp.complex128,
+                )
+                ref_anchor_index_batch = (
+                    jnp.asarray(train_group[anchor_index_key], dtype=jnp.int32)
+                    if use_anchor_stencils
+                    else None
+                )
                 ref_q_batch = (
-                    jnp.asarray(online_dataset[regime]["train"][q_key], dtype=jnp.complex128)
-                    if q_key in online_dataset[regime]["train"]
+                    jnp.asarray(train_group[q_key], dtype=jnp.complex128)
+                    if q_key in train_group
                     else None
                 )
                 if regime == REGIME_LINEAR:
-                    if ref_q_batch is not None:
+                    if ref_q_batch is not None and not use_anchor_stencils:
                         total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
@@ -4801,14 +5378,26 @@ def make_online_fourier_hermite_bidir_batch_loss(
                         continue
                     if online_loss_backend_uses_closure_q(str(loss_backend)):
                         assert ref_q_batch is not None
-                        regime_q = mean_closure_history_loss(
-                            ref_batch,
-                            ref_q_batch,
-                            learned=learned,
-                            forward_integ=linear_forward,
-                            backward_integ=linear_backward,
-                            explicit_n_hat_fn=linear_explicit,
-                        )
+                        if use_anchor_stencils:
+                            assert ref_anchor_index_batch is not None
+                            regime_q = mean_compact_rollout_q_loss(
+                                ref_batch,
+                                ref_anchor_index_batch,
+                                ref_q_batch,
+                                learned=learned,
+                                forward_integ=linear_forward,
+                                explicit_n_hat_fn=linear_explicit,
+                            )
+                            total_q_diag = total_q_diag + weight * regime_q
+                        else:
+                            regime_q = mean_closure_history_loss(
+                                ref_batch,
+                                ref_q_batch,
+                                learned=learned,
+                                forward_integ=linear_forward,
+                                backward_integ=linear_backward,
+                                explicit_n_hat_fn=linear_explicit,
+                            )
                         total_q = total_q + weight * regime_q
                         continue
                     regime_state = mean_history_loss(
@@ -4819,7 +5408,7 @@ def make_online_fourier_hermite_bidir_batch_loss(
                         explicit_n_hat_fn=linear_explicit,
                     )
                 else:
-                    if ref_q_batch is not None:
+                    if ref_q_batch is not None and not use_anchor_stencils:
                         total_q_diag = total_q_diag + weight * mean_rollout_q_diagnostic(
                             ref_batch,
                             ref_q_batch,
@@ -4861,14 +5450,26 @@ def make_online_fourier_hermite_bidir_batch_loss(
                         continue
                     if online_loss_backend_uses_closure_q(str(loss_backend)):
                         assert ref_q_batch is not None
-                        regime_q = mean_closure_history_loss(
-                            ref_batch,
-                            ref_q_batch,
-                            learned=learned,
-                            forward_integ=nonlinear_forward,
-                            backward_integ=nonlinear_backward,
-                            explicit_n_hat_fn=nonlinear_explicit,
-                        )
+                        if use_anchor_stencils:
+                            assert ref_anchor_index_batch is not None
+                            regime_q = mean_compact_rollout_q_loss(
+                                ref_batch,
+                                ref_anchor_index_batch,
+                                ref_q_batch,
+                                learned=learned,
+                                forward_integ=nonlinear_forward,
+                                explicit_n_hat_fn=nonlinear_explicit,
+                            )
+                            total_q_diag = total_q_diag + weight * regime_q
+                        else:
+                            regime_q = mean_closure_history_loss(
+                                ref_batch,
+                                ref_q_batch,
+                                learned=learned,
+                                forward_integ=nonlinear_forward,
+                                backward_integ=nonlinear_backward,
+                                explicit_n_hat_fn=nonlinear_explicit,
+                            )
                         total_q = total_q + weight * regime_q
                         continue
                     regime_state = mean_history_loss(
@@ -5215,6 +5816,20 @@ def _online_group_history_length(group: Dict[str, Array]) -> int:
     raise ValueError("Online rollout batch is missing an a_hat_ref_nv* history array")
 
 
+def _online_group_anchor_pool_size(group: Dict[str, Array]) -> int:
+    for key, value in group.items():
+        if str(key).startswith("a_hat_anchor_nv"):
+            arr = np.asarray(value)
+            if arr.ndim < 2:
+                raise ValueError(f"Expected online anchor array for {key!r}, got shape {arr.shape}")
+            return int(arr.shape[1])
+    raise ValueError("Online rollout batch is missing an a_hat_anchor_nv* anchor array")
+
+
+def _online_group_uses_anchor_pool(group: Dict[str, Array]) -> bool:
+    return any(str(key).startswith("a_hat_anchor_nv") for key in group)
+
+
 def train_with_online_trajectory_minibatch_loss(
     params: Dict[str, Array],
     online_dataset: Dict[str, Dict[str, Dict[str, Array]]],
@@ -5294,6 +5909,16 @@ def train_with_online_trajectory_minibatch_loss(
         {
             regime: _online_group_history_length(online_dataset[regime]["train"])
             for regime in active_regimes
+            if not _online_group_uses_anchor_pool(online_dataset[regime]["train"])
+        }
+        if randomize_rollout_anchors
+        else {}
+    )
+    train_anchor_pool_sizes = (
+        {
+            regime: _online_group_anchor_pool_size(online_dataset[regime]["train"])
+            for regime in active_regimes
+            if _online_group_uses_anchor_pool(online_dataset[regime]["train"])
         }
         if randomize_rollout_anchors
         else {}
@@ -5313,13 +5938,20 @@ def train_with_online_trajectory_minibatch_loss(
                 idx = rng.integers(0, size, size=batch_n, endpoint=False)
                 regime_batches[regime] = {key: value[idx] for key, value in group.items()}
                 if randomize_rollout_anchors:
-                    regime_batches[regime][ROLLOUT_ANCHOR_INDICES_KEY] = _sample_rollout_anchor_indices(
-                        history_length=train_history_lengths[regime],
-                        rollout_horizon=rollout_horizon_attr,
-                        rollout_anchor_samples=rollout_anchor_samples_attr,
-                        rollout_direction=rollout_direction_attr,
-                        rng=rng,
-                    )
+                    if regime in train_anchor_pool_sizes:
+                        regime_batches[regime][ROLLOUT_ANCHOR_INDICES_KEY] = _sample_rollout_anchor_pool_indices(
+                            anchor_pool_size=train_anchor_pool_sizes[regime],
+                            rollout_anchor_samples=rollout_anchor_samples_attr,
+                            rng=rng,
+                        )
+                    else:
+                        regime_batches[regime][ROLLOUT_ANCHOR_INDICES_KEY] = _sample_rollout_anchor_indices(
+                            history_length=train_history_lengths[regime],
+                            rollout_horizon=rollout_horizon_attr,
+                            rollout_anchor_samples=rollout_anchor_samples_attr,
+                            rollout_direction=rollout_direction_attr,
+                            rng=rng,
+                        )
             if target_nvs:
                 target_nv = int(target_nvs[int(rng.integers(0, len(target_nvs)))])
                 params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
@@ -5691,6 +6323,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-reg", type=float, default=1e-6)
     parser.add_argument("--rollout-horizon", type=int, default=0)
     parser.add_argument("--rollout-anchor-samples", type=int, default=0)
+    parser.add_argument("--rollout-anchor-pool-size", type=int, default=0)
     parser.add_argument("--rollout-direction", type=str, default=ONLINE_ROLLOUT_DIRECTION_BIDIR, choices=ALL_ONLINE_ROLLOUT_DIRECTIONS)
     parser.add_argument("--rollout-dealias-23", action="store_true")
     parser.add_argument("--online-loss-backend", type=str, default=ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
@@ -5794,6 +6427,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 raise ValueError("trajectory_q_hybrid requires --lambda-q > 0")
             if online_loss_backend != ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1:
                 raise ValueError("trajectory_q_hybrid only supports online_loss_backend=field_distribution_v1")
+            if int(args.batch_size) <= 0 and not bool(args.build_dataset_only):
+                raise ValueError(
+                    "trajectory_q_hybrid requires --batch-size > 0 so the offline q-loss component "
+                    "does not compile the full q dataset into the JAX train step"
+                )
         else:
             raise ValueError(
                 "online_rollout requires --train-objective trajectory or trajectory_q_hybrid"
@@ -5813,6 +6451,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 raise ValueError(f"{online_loss_backend} requires --online-v-probes 0")
             if int(args.rollout_anchor_samples) < 0:
                 raise ValueError(f"{online_loss_backend} requires --rollout-anchor-samples >= 0")
+            if online_loss_backend_uses_rollout_qloss(online_loss_backend) and args.rollout_direction == ONLINE_ROLLOUT_DIRECTION_FORWARD:
+                if int(args.rollout_anchor_pool_size) <= 0:
+                    raise ValueError(f"{online_loss_backend} forward compact cache requires --rollout-anchor-pool-size > 0")
             if online_loss_backend_uses_posterior_rollout(online_loss_backend):
                 if float(args.posterior_state_weight) < 0.0 or float(args.posterior_field_weight) < 0.0:
                     raise ValueError("posterior rollout weights must be nonnegative")
@@ -6055,6 +6696,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             online_loss_backend=online_loss_backend,
             Nv_targets=Nv_targets,
             rollout_horizon=args.rollout_horizon,
+            rollout_anchor_samples=args.rollout_anchor_samples,
+            rollout_anchor_pool_size=args.rollout_anchor_pool_size,
+            rollout_direction=args.rollout_direction,
         )
         for regime in regimes:
             if regime not in online_dataset:
