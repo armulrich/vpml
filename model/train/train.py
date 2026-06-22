@@ -7062,8 +7062,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nv-scale", type=float, default=None)
     parser.add_argument("--n-low", type=int, default=2)
     parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--training-mode", type=str, default=OFFLINE_TRAINING_MODE, choices=(OFFLINE_TRAINING_MODE, ONLINE_TRAINING_MODE))
-    parser.add_argument("--train-objective", type=str, default="q_only", choices=("q_only", "trajectory", "trajectory_q_hybrid"))
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        default=OFFLINE_TRAINING_MODE,
+        choices=(OFFLINE_TRAINING_MODE, ONLINE_TRAINING_MODE, EXACT_Q_ROLLOUT_TRAINING_MODE),
+    )
+    parser.add_argument(
+        "--train-objective",
+        type=str,
+        default="q_only",
+        choices=("q_only", EXACT_Q_ROLLOUT_OBJECTIVE, "trajectory", "trajectory_q_hybrid"),
+    )
     parser.add_argument("--context-mode", type=str, default="none", choices=("none", "lag1_delta"))
     parser.add_argument("--tail-start-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--lambda-q", type=float, default=1.0)
@@ -7122,7 +7132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     training_mode = str(args.training_mode)
     if args.checkpoint is None and not bool(args.build_dataset_only):
         raise ValueError("--checkpoint is required unless --build-dataset-only is set")
-    if training_mode == OFFLINE_TRAINING_MODE and bool(args.build_dataset_only) and args.dataset_cache is None:
+    if training_mode in {OFFLINE_TRAINING_MODE, EXACT_Q_ROLLOUT_TRAINING_MODE} and bool(args.build_dataset_only) and args.dataset_cache is None:
         raise ValueError("--build-dataset-only requires --dataset-cache so the generated dataset can be reused")
 
     Nv_targets = parse_int_tuple(args.Nv_targets)
@@ -7144,7 +7154,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     online_loss_backend = str(args.online_loss_backend)
     teacher_proj_Nv: Optional[int] = None
     online_reference_cache = args.dataset_cache
-    if training_mode == ONLINE_TRAINING_MODE:
+    if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE:
+        if args.init_checkpoint is not None:
+            raise ValueError("--init-checkpoint is not supported for exact_q_rollout")
+        if args.online_reference_cache is not None:
+            raise ValueError("exact_q_rollout does not use --online-reference-cache")
+        if bool(args.allow_dataset_cache_nv_superset):
+            raise ValueError("exact_q_rollout does not use --allow-dataset-cache-nv-superset")
+        if bool(args.per_target_projection_orders):
+            raise ValueError("exact_q_rollout stores a single max-order superset history; do not pass --per-target-projection-orders")
+        if teacher_backend != GRID_CUBIC_SPLINE_TEACHER_BACKEND:
+            raise ValueError("exact_q_rollout only supports teacher_backend=grid_cubic_spline")
+        if args.teacher_proj_Nv is not None:
+            raise ValueError("exact_q_rollout computes max(Nv-targets)+1 internally; do not pass --teacher-proj-Nv")
+        if args.train_objective != EXACT_Q_ROLLOUT_OBJECTIVE:
+            raise ValueError("exact_q_rollout requires --train-objective q_rollout")
+        if int(args.rollout_horizon) <= 0:
+            raise ValueError("exact_q_rollout requires --rollout-horizon > 0")
+        if int(args.rollout_anchor_samples) != 0:
+            raise ValueError("exact_q_rollout does not use --rollout-anchor-samples")
+        if int(args.rollout_anchor_pool_size) != 0:
+            raise ValueError("exact_q_rollout does not use --rollout-anchor-pool-size; it samples from the full dense anchor set")
+        if int(args.batch_size) <= 0 and not bool(args.build_dataset_only):
+            raise ValueError("exact_q_rollout requires --batch-size > 0")
+        teacher_proj_Nv = max(Nv_targets) + 1
+    elif training_mode == ONLINE_TRAINING_MODE:
         if args.init_checkpoint is not None and args.train_objective != "trajectory":
             raise ValueError("--init-checkpoint is only supported for online_rollout trajectory training")
         if args.init_checkpoint is not None and bool(args.build_dataset_only):
@@ -7236,8 +7270,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     else:
         if args.init_checkpoint is not None:
             raise ValueError("--init-checkpoint is only supported for online_rollout trajectory training")
-        if args.train_objective in {"trajectory", "trajectory_q_hybrid"}:
-            raise ValueError(f"{args.train_objective} objective is only supported with --training-mode online_rollout")
+        if args.train_objective != "q_only":
+            raise ValueError("offline_rollout only supports --train-objective q_only")
         if teacher_backend == GRID_CUBIC_SPLINE_TEACHER_BACKEND:
             teacher_proj_Nv = int(args.teacher_proj_Nv) if args.teacher_proj_Nv is not None else max(Nv_targets) + 1
             if teacher_proj_Nv <= max(Nv_targets):
