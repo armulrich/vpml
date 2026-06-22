@@ -58,6 +58,12 @@ def _training_loss_ylabel(train_objective: str, loss_backend: str | None = None)
             r"\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+"
             r"\lambda_{\mathrm{reg}}\|\theta\|_2^2$"
         )
+    if str(train_objective) == "q_rollout":
+        return (
+            r"$\mathcal{L}_{q}^{H}(\theta)="
+            r"\frac{1}{H|\mathcal{S}|}\sum_{s,h,k>0}"
+            r"\left|S_q(q_k^\theta(C_h^\theta))-S_q(q_k^\star(t_s+h\Delta t))\right|^2$"
+        )
     return r"$\mathcal{L}(\theta)=\mathbb{E}_{\mathrm{regime}}\mathbb{E}_{t,k>0}\left[\left|q_k^\theta-q_k^\star\right|^2\right]$"
 
 
