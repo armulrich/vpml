@@ -329,7 +329,7 @@ class LearnedInterfaceClosure:
             raise ValueError("nv_scale must be positive")
         if int(self.n_low) < 0:
             raise ValueError("n_low must be nonnegative")
-        if str(self.training_mode) not in {"offline_rollout", "online_rollout"}:
+        if str(self.training_mode) not in {"offline_rollout", "online_rollout", "exact_q_rollout"}:
             raise ValueError(f"Unsupported training_mode={self.training_mode!r}")
         if str(self.context_mode) not in {"none", "lag1_delta"}:
             raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
@@ -341,7 +341,7 @@ class LearnedInterfaceClosure:
             raise ValueError("rollout_anchor_samples must be nonnegative")
         if not (0.0 < float(self.tail_start_fraction) <= 1.0):
             raise ValueError("tail_start_fraction must lie in (0, 1]")
-        if str(self.train_objective) not in {"q_only", "trajectory", "trajectory_q_hybrid"}:
+        if str(self.train_objective) not in {"q_only", "q_rollout", "trajectory", "trajectory_q_hybrid"}:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
         if int(self.online_v_probes) < 0:
             raise ValueError("online_v_probes must be nonnegative")
