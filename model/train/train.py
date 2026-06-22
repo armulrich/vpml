@@ -7455,6 +7455,226 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             stability_loss_definition=None,
         )
         val_metrics = evaluate_regime_metrics(learned, prepared)
+    elif training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE:
+        exact_dataset, max_projection_order = build_exact_q_rollout_reference_dataset(
+            dataset_cache=args.dataset_cache,
+            regimes=regimes,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_L=args.teacher_L,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            linear_T=args.linear_T,
+            linear_eps=args.linear_eps,
+            linear_modes=linear_modes,
+            linear_num_samples=args.linear_num_samples,
+            linear_seed=args.linear_seed,
+            linear_poisson_sign=args.teacher_poisson_sign,
+            nonlinear_T=args.nonlinear_T,
+            nonlinear_k0=args.nonlinear_k0,
+            nonlinear_poisson_sign=args.teacher_poisson_sign,
+            weak_eps=weak_eps,
+            strong_eps=strong_eps,
+            Nv_targets=Nv_targets,
+        )
+        coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+        for regime in regimes:
+            if regime not in exact_dataset:
+                continue
+            cases = np.asarray(exact_dataset[regime][coeff_key])
+            print(
+                f"[data] exact q-rollout {regime}: "
+                f"cases={int(cases.shape[0])} history={int(cases.shape[1])} "
+                f"order={int(cases.shape[2])}"
+            )
+        if bool(args.build_dataset_only):
+            cache_msg = f"Saved exact q-rollout reference cache to {args.dataset_cache}" if args.dataset_cache is not None else "Built exact q-rollout reference cache in memory"
+            print(cache_msg)
+            return
+
+        k_arr = np.asarray(
+            FourierHermiteIMEX(
+                Nx=int(args.teacher_Nx),
+                Nv=int(max(Nv_targets)),
+                Lx=float(args.teacher_L),
+                dt=float(args.teacher_dt),
+                vth=1.0,
+                dealias_23=bool(args.rollout_dealias_23),
+                closure=None,
+            ).k_arr,
+            dtype=np.float64,
+        )
+        dataset_base = build_exact_q_rollout_qpair_dataset(
+            exact_dataset,
+            max_projection_order=max_projection_order,
+            Nv_targets=Nv_targets,
+            Nm=args.Nm,
+            k_arr=k_arr,
+            val_fraction=args.val_fraction,
+            linear_history_stride=args.linear_history_stride,
+            nonlinear_history_stride=args.nonlinear_history_stride,
+            rollout_horizon=args.rollout_horizon,
+            n_low=args.n_low,
+            context_mode=args.context_mode,
+        )
+        k_scale = float(args.k_scale) if args.k_scale is not None else choose_k_scale(dataset_base, Nm=args.Nm)
+        nv_scale = float(args.nv_scale) if args.nv_scale is not None else choose_nv_scale(dataset_base, Nm=args.Nm)
+        prepared, stats = prepare_training_dataset(
+            dataset_base,
+            Nm=args.Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            context_mode=args.context_mode,
+        )
+        for regime, count in summarize_dataset(prepared).items():
+            q_windows = int(dataset_base[regime]["train_time_indices"].shape[0])
+            print(f"[data] {regime}: {count} q samples; {q_windows} exact rollout q-windows")
+
+        params = init_interface_closure_params(
+            jax.random.PRNGKey(args.seed),
+            input_dim=int(stats["input_mean"].shape[0]),
+            hidden_width=int(args.hidden_width),
+            res_blocks=int(args.res_blocks),
+        )
+        if int(args.rollout_horizon) == 1:
+            batch_loss_fn, active_regimes = make_regime_balanced_batch_loss(
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=max_projection_order,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+            )
+            train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
+            steps_per_epoch = int(args.steps_per_epoch)
+            if steps_per_epoch <= 0:
+                steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.batch_size)))
+            loss_history_raw: np.ndarray
+            params, loss_history_raw = train_with_minibatch_loss(
+                params,
+                prepared,
+                batch_loss_fn,
+                active_regimes=active_regimes,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+                batch_size=args.batch_size,
+                steps_per_epoch=steps_per_epoch,
+                seed=args.seed,
+            )
+            loss_history = loss_history_raw
+            online_component_history = {
+                key: np.zeros_like(loss_history_raw, dtype=np.float64)
+                for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
+            }
+            online_component_history["total"] = np.asarray(loss_history_raw, dtype=np.float64)
+            online_component_history["q"] = np.asarray(loss_history_raw, dtype=np.float64)
+            online_component_history["q_diag"] = np.asarray(loss_history_raw, dtype=np.float64)
+        else:
+            batch_loss_fn, active_regimes = make_exact_q_rollout_batch_loss(
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=max_projection_order,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=args.rollout_horizon,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+            )
+            steps_per_epoch = int(args.steps_per_epoch)
+            if steps_per_epoch <= 0:
+                qpair_counts = [
+                    int(dataset_base[regime]["train_time_indices"].shape[0])
+                    for regime in active_regimes
+                ]
+                steps_per_epoch = max(1, math.ceil(max(qpair_counts) / float(args.batch_size)))
+            params, online_component_history = train_with_exact_q_rollout_minibatch_loss(
+                params,
+                exact_dataset,
+                dataset_base,
+                batch_loss_fn,
+                max_projection_order=max_projection_order,
+                active_regimes=active_regimes,
+                k_arr=k_arr,
+                epochs=args.epochs,
+                learning_rate=args.lr,
+                grad_clip=args.grad_clip,
+                log_every=args.log_every,
+                batch_size=args.batch_size,
+                steps_per_epoch=steps_per_epoch,
+                rollout_horizon=args.rollout_horizon,
+                seed=args.seed,
+                log_components=online_training_log_components(
+                    train_objective=args.train_objective,
+                    online_loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+                ),
+            )
+            loss_history = online_component_history["total"]
+        learned = build_learned_interface_closure(
+            params=params,
+            Nm=args.Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            stats=stats,
+            hidden_width=args.hidden_width,
+            res_blocks=args.res_blocks,
+            Nv_targets=Nv_targets,
+            train_regimes=regimes,
+            teacher_backend=teacher_backend,
+            teacher_Lx=args.teacher_L,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            teacher_proj_Nv=max_projection_order,
+            n_low=args.n_low,
+            training_mode=EXACT_Q_ROLLOUT_TRAINING_MODE,
+            train_objective=args.train_objective,
+            context_mode=args.context_mode,
+            rollout_horizon=args.rollout_horizon,
+            rollout_anchor_samples=0,
+            tail_start_fraction=args.tail_start_fraction,
+            loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+            lambda_q=1.0,
+            lambda_E=0.0,
+            lambda_dist=0.0,
+            lambda_tail=0.0,
+            lambda_neg=0.0,
+            lambda_reg=0.0,
+            online_v_probes=0,
+            stability_loss_definition=None,
+        )
+        val_metrics = evaluate_regime_metrics(learned, prepared)
     else:
         online_dataset, _ = build_online_reference_dataset(
             dataset_cache=online_reference_cache,
