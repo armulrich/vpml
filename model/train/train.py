@@ -8105,7 +8105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     save_learned_interface_closure_npz(args.checkpoint, learned)
 
     metrics_path = args.checkpoint.with_suffix(".metrics.npz")
-    used_lambda_q = args.lambda_q if args.train_objective in {"q_only", "trajectory_q_hybrid"} else 0.0
+    used_lambda_q = args.lambda_q if args.train_objective in {"q_only", EXACT_Q_ROLLOUT_OBJECTIVE, "trajectory_q_hybrid"} else 0.0
     field_backend_active = (
         training_mode == ONLINE_TRAINING_MODE
         and online_loss_backend == ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1
@@ -8158,9 +8158,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             [
                 int(args.rollout_horizon)
                 if (
-                    training_mode == ONLINE_TRAINING_MODE
-                    and online_loss_backend_uses_projected_coefficients(online_loss_backend)
-                    and args.train_objective == "trajectory"
+                    (
+                        training_mode == ONLINE_TRAINING_MODE
+                        and online_loss_backend_uses_projected_coefficients(online_loss_backend)
+                        and args.train_objective == "trajectory"
+                    )
+                    or training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
                 )
                 else 0
             ],
@@ -8186,6 +8189,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     and online_loss_backend_uses_projected_coefficients(online_loss_backend)
                     and args.train_objective == "trajectory"
                 )
+                else ONLINE_ROLLOUT_DIRECTION_FORWARD
+                if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
                 else ""
             ],
             dtype=np.str_,
@@ -8194,7 +8199,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "projected_xv_tail_window": np.array([args.projected_xv_tail_window], dtype=np.int32),
         "projected_xv_metric": np.array([args.projected_xv_metric], dtype=np.str_),
         "loss_backend": np.array(
-            [] if training_mode == OFFLINE_TRAINING_MODE else [args.online_loss_backend],
+            []
+            if training_mode == OFFLINE_TRAINING_MODE
+            else [
+                EXACT_Q_ROLLOUT_LOSS_BACKEND
+                if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
+                else args.online_loss_backend
+            ],
             dtype=np.str_,
         ),
         "lambda_q": np.array([used_lambda_q], dtype=np.float64),
@@ -8214,11 +8225,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     }
     if teacher_proj_Nv is not None:
         metrics_payload["teacher_proj_Nv"] = np.array([teacher_proj_Nv], dtype=np.int32)
-    if training_mode == ONLINE_TRAINING_MODE:
+    if training_mode in {ONLINE_TRAINING_MODE, EXACT_Q_ROLLOUT_TRAINING_MODE}:
         assert online_component_history is not None
         logged_components = online_training_log_components(
             train_objective=args.train_objective,
-            online_loss_backend=online_loss_backend,
+            online_loss_backend=(
+                EXACT_Q_ROLLOUT_LOSS_BACKEND
+                if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
+                else online_loss_backend
+            ),
         )
         for component in logged_components:
             if component in online_component_history:
@@ -8242,7 +8257,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         loss_plot_path,
         val_metrics=val_metrics,
         train_objective=args.train_objective,
-        loss_backend=(args.online_loss_backend if training_mode == ONLINE_TRAINING_MODE else None),
+        loss_backend=(
+            EXACT_Q_ROLLOUT_LOSS_BACKEND
+            if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
+            else (args.online_loss_backend if training_mode == ONLINE_TRAINING_MODE else None)
+        ),
     )
     q_diag_plot_path: Optional[Path] = None
     if (
