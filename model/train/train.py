@@ -80,9 +80,13 @@ REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
 ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v4"
+EXACT_Q_ROLLOUT_CACHE_FORMAT = "landau_interface_exact_q_rollout_reference_v1"
 ONLINE_HYBRID_LOSS_DEFINITION = "q_trajectory_field_distribution_v1"
 ONLINE_TRAINING_MODE = "online_rollout"
 OFFLINE_TRAINING_MODE = "offline_rollout"
+EXACT_Q_ROLLOUT_TRAINING_MODE = "exact_q_rollout"
+EXACT_Q_ROLLOUT_OBJECTIVE = "q_rollout"
+EXACT_Q_ROLLOUT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout"
 ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR = "fourier_hermite_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR = "fourier_hermite_closure_bidir"
@@ -136,6 +140,10 @@ def parse_str_tuple(text: str) -> Tuple[str, ...]:
 
 def online_reference_coeff_key(target_nv: int) -> str:
     return f"a_hat_ref_nv{int(target_nv)}"
+
+
+def exact_q_rollout_coeff_key(projection_order: int) -> str:
+    return f"a_hat_ref_order{int(projection_order)}"
 
 
 def online_reference_anchor_coeff_key(target_nv: int) -> str:
@@ -340,6 +348,55 @@ def build_online_reference_cache_metadata(
     if Nv_targets is not None:
         payload["Nv_targets"] = np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32)
     return payload
+
+
+def build_exact_q_rollout_cache_metadata(
+    *,
+    regimes: Sequence[str],
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_L: float,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    linear_T: float,
+    linear_eps: float,
+    linear_modes: Sequence[float],
+    linear_num_samples: int,
+    linear_seed: int,
+    linear_poisson_sign: float,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    nonlinear_poisson_sign: float,
+    weak_eps: Sequence[float],
+    strong_eps: Sequence[float],
+    Nv_targets: Sequence[int],
+    max_projection_order: int,
+) -> Dict[str, np.ndarray]:
+    return {
+        "dataset_format": np.array([EXACT_Q_ROLLOUT_CACHE_FORMAT], dtype=np.str_),
+        "regimes": np.asarray(tuple(regimes), dtype=np.str_),
+        "teacher_backend": np.array([GRID_CUBIC_SPLINE_TEACHER_BACKEND], dtype=np.str_),
+        "teacher_Nx": np.array([int(teacher_Nx)], dtype=np.int32),
+        "teacher_Nv": np.array([int(teacher_Nv)], dtype=np.int32),
+        "teacher_L": np.array([float(teacher_L)], dtype=np.float64),
+        "teacher_vmin": np.array([float(teacher_vmin)], dtype=np.float64),
+        "teacher_vmax": np.array([float(teacher_vmax)], dtype=np.float64),
+        "teacher_dt": np.array([float(teacher_dt)], dtype=np.float64),
+        "linear_T": np.array([float(linear_T)], dtype=np.float64),
+        "linear_eps": np.array([float(linear_eps)], dtype=np.float64),
+        "linear_modes": np.asarray(tuple(float(v) for v in linear_modes), dtype=np.float64),
+        "linear_num_samples": np.array([int(linear_num_samples)], dtype=np.int32),
+        "linear_seed": np.array([int(linear_seed)], dtype=np.int32),
+        "linear_poisson_sign": np.array([float(linear_poisson_sign)], dtype=np.float64),
+        "nonlinear_T": np.array([float(nonlinear_T)], dtype=np.float64),
+        "nonlinear_k0": np.array([float(nonlinear_k0)], dtype=np.float64),
+        "nonlinear_poisson_sign": np.array([float(nonlinear_poisson_sign)], dtype=np.float64),
+        "weak_eps": np.asarray(tuple(float(v) for v in weak_eps), dtype=np.float64),
+        "strong_eps": np.asarray(tuple(float(v) for v in strong_eps), dtype=np.float64),
+        "Nv_targets": np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32),
+        "max_projection_order": np.array([int(max_projection_order)], dtype=np.int32),
+    }
 
 
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
@@ -995,6 +1052,35 @@ def load_online_reference_cache(
         return dataset, np.asarray(data["v_probe"], dtype=np.float64)
 
 
+def load_exact_q_rollout_reference_cache(
+    path: Path,
+    *,
+    expected_metadata: Dict[str, np.ndarray],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    with np.load(path) as data:
+        for key, expected in expected_metadata.items():
+            if key not in data.files:
+                raise ValueError(f"Exact q-rollout cache {path} is missing metadata field '{key}'.")
+            actual = np.asarray(data[key])
+            if _cache_value_mismatch(actual, np.asarray(expected)):
+                raise ValueError(
+                    f"Exact q-rollout cache {path} metadata mismatch for '{key}'. "
+                    "Rebuilding with the current teacher configuration is required."
+                )
+        regimes = tuple(str(v) for v in np.asarray(data["regimes"], dtype=np.str_).tolist())
+        max_projection_order = int(np.asarray(data["max_projection_order"], dtype=np.int32).reshape(-1)[0])
+        coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+        dataset: Dict[str, Dict[str, np.ndarray]] = {}
+        for regime in regimes:
+            field = f"{regime}_{coeff_key}"
+            if field not in data.files:
+                raise ValueError(f"Exact q-rollout cache {path} is missing '{field}'.")
+            dataset[regime] = {
+                coeff_key: np.asarray(data[field], dtype=np.complex128),
+            }
+        return dataset
+
+
 def save_dataset_cache(
     path: Path,
     dataset: Dict[str, Dict[str, np.ndarray]],
@@ -1007,6 +1093,20 @@ def save_dataset_cache(
         payload[f"{regime}_train_targets"] = np.asarray(arrays["train_targets"], dtype=np.float64)
         payload[f"{regime}_val_inputs_base"] = np.asarray(arrays["val_inputs_base"], dtype=np.float64)
         payload[f"{regime}_val_targets"] = np.asarray(arrays["val_targets"], dtype=np.float64)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **payload)
+
+
+def save_exact_q_rollout_reference_cache(
+    path: Path,
+    dataset: Dict[str, Dict[str, np.ndarray]],
+    *,
+    metadata: Dict[str, np.ndarray],
+) -> None:
+    payload: Dict[str, np.ndarray] = dict(metadata)
+    for regime, arrays in dataset.items():
+        for key, value in arrays.items():
+            payload[f"{regime}_{key}"] = np.asarray(value, dtype=np.complex128)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **payload)
 
@@ -1220,6 +1320,287 @@ def build_mixed_landau_dataset(
 
     if dataset_cache is not None:
         save_dataset_cache(dataset_cache, dataset, metadata=cache_metadata)
+    return dataset
+
+
+def _run_exact_q_rollout_projected_history(
+    config: PhysicalGridVlasovPoissonConfig,
+    perturbation_x: np.ndarray,
+    *,
+    max_projection_order: int,
+) -> np.ndarray:
+    coeff_histories, _ = _run_landau_teacher_projected_histories(
+        config,
+        perturbation_x,
+        projection_orders=(int(max_projection_order),),
+        history_stride=1,
+    )
+    return np.asarray(coeff_histories[int(max_projection_order)], dtype=np.complex128)
+
+
+def build_exact_q_rollout_reference_dataset(
+    *,
+    dataset_cache: Optional[Path],
+    regimes: Sequence[str],
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_L: float,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    linear_T: float,
+    linear_eps: float,
+    linear_modes: Sequence[float],
+    linear_num_samples: int,
+    linear_seed: int,
+    linear_poisson_sign: float,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    nonlinear_poisson_sign: float,
+    weak_eps: Sequence[float],
+    strong_eps: Sequence[float],
+    Nv_targets: Sequence[int],
+) -> Tuple[Dict[str, Dict[str, np.ndarray]], int]:
+    max_projection_order = max(int(v) for v in Nv_targets) + 1
+    cache_metadata = build_exact_q_rollout_cache_metadata(
+        regimes=regimes,
+        teacher_Nx=teacher_Nx,
+        teacher_Nv=teacher_Nv,
+        teacher_L=teacher_L,
+        teacher_vmin=teacher_vmin,
+        teacher_vmax=teacher_vmax,
+        teacher_dt=teacher_dt,
+        linear_T=linear_T,
+        linear_eps=linear_eps,
+        linear_modes=linear_modes,
+        linear_num_samples=linear_num_samples,
+        linear_seed=linear_seed,
+        linear_poisson_sign=linear_poisson_sign,
+        nonlinear_T=nonlinear_T,
+        nonlinear_k0=nonlinear_k0,
+        nonlinear_poisson_sign=nonlinear_poisson_sign,
+        weak_eps=weak_eps,
+        strong_eps=strong_eps,
+        Nv_targets=Nv_targets,
+        max_projection_order=max_projection_order,
+    )
+    if dataset_cache is not None and dataset_cache.exists():
+        try:
+            return (
+                load_exact_q_rollout_reference_cache(
+                    dataset_cache,
+                    expected_metadata=cache_metadata,
+                ),
+                max_projection_order,
+            )
+        except ValueError as exc:
+            print(f"[cache] ignoring exact q-rollout cache {dataset_cache}: {exc}")
+
+    coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+    dataset: Dict[str, Dict[str, np.ndarray]] = {}
+    active = tuple(regimes)
+
+    if REGIME_LINEAR in active:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(teacher_Nx),
+            Nv=int(teacher_Nv),
+            Lx=float(teacher_L),
+            vmin=float(teacher_vmin),
+            vmax=float(teacher_vmax),
+            dt=float(teacher_dt),
+            T=float(linear_T),
+            poisson_sign=float(linear_poisson_sign),
+            snapshot_times=(),
+        )
+        rng = np.random.default_rng(int(linear_seed))
+        x = np.asarray(config.x, dtype=np.float64)
+        cases = []
+        for _ in range(int(linear_num_samples)):
+            perturb = sample_initial_condition(
+                rng,
+                x,
+                modes=linear_modes,
+                eps=float(linear_eps),
+            )
+            cases.append(
+                _run_exact_q_rollout_projected_history(
+                    config,
+                    perturb,
+                    max_projection_order=max_projection_order,
+                )
+            )
+        dataset[REGIME_LINEAR] = {coeff_key: np.stack(cases, axis=0)}
+
+    nonlinear_config = PhysicalGridVlasovPoissonConfig(
+        Nx=int(teacher_Nx),
+        Nv=int(teacher_Nv),
+        Lx=float(teacher_L),
+        vmin=float(teacher_vmin),
+        vmax=float(teacher_vmax),
+        dt=float(teacher_dt),
+        T=float(nonlinear_T),
+        poisson_sign=float(nonlinear_poisson_sign),
+        snapshot_times=(),
+    )
+    perturb_template = np.cos(float(nonlinear_k0) * np.asarray(nonlinear_config.x, dtype=np.float64))
+    for regime, eps_values in (
+        (REGIME_WEAK, weak_eps),
+        (REGIME_STRONG, strong_eps),
+    ):
+        if regime not in active:
+            continue
+        cases = []
+        for eps in eps_values:
+            cases.append(
+                _run_exact_q_rollout_projected_history(
+                    nonlinear_config,
+                    float(eps) * perturb_template,
+                    max_projection_order=max_projection_order,
+                )
+            )
+        dataset[regime] = {coeff_key: np.stack(cases, axis=0)}
+
+    if dataset_cache is not None:
+        save_exact_q_rollout_reference_cache(dataset_cache, dataset, metadata=cache_metadata)
+    return dataset, max_projection_order
+
+
+def _exact_q_rollout_split_lengths(history_length: int, val_fraction: float) -> Tuple[int, int]:
+    if int(history_length) <= 1:
+        return int(history_length), int(history_length)
+    n_val = max(1, int(round(int(history_length) * float(val_fraction))))
+    n_val = min(n_val, int(history_length) - 1)
+    return int(history_length) - n_val, n_val
+
+
+def build_exact_q_rollout_qpair_dataset(
+    exact_dataset: Dict[str, Dict[str, np.ndarray]],
+    *,
+    max_projection_order: int,
+    Nv_targets: Sequence[int],
+    Nm: int,
+    k_arr: np.ndarray,
+    val_fraction: float,
+    linear_history_stride: int,
+    nonlinear_history_stride: int,
+    rollout_horizon: int,
+    n_low: int,
+    context_mode: str,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+    accum = {
+        regime: {
+            "train_inputs_base": [],
+            "train_targets": [],
+            "val_inputs_base": [],
+            "val_targets": [],
+            "train_case_indices": [],
+            "train_time_indices": [],
+            "train_k_indices": [],
+            "train_target_nvs": [],
+            "val_case_indices": [],
+            "val_time_indices": [],
+            "val_k_indices": [],
+            "val_target_nvs": [],
+        }
+        for regime in exact_dataset
+    }
+
+    def sampled_split_indices(history_length: int, stride: int) -> Tuple[np.ndarray, np.ndarray]:
+        nsteps = int(history_length) - 1
+        sampled = np.arange(0, nsteps + 1, max(int(stride), 1), dtype=np.int32)
+        if sampled.size == 0 or int(sampled[-1]) != nsteps:
+            sampled = np.concatenate([sampled, np.array([nsteps], dtype=np.int32)])
+        if sampled.shape[0] <= 1:
+            return sampled, sampled
+        n_val = max(1, int(round(int(sampled.shape[0]) * float(val_fraction))))
+        n_val = min(n_val, int(sampled.shape[0]) - 1)
+        return sampled[:-n_val], sampled[-n_val:]
+
+    def append_index_rows(
+        *,
+        regime: str,
+        split: str,
+        case_idx: int,
+        time_indices: np.ndarray,
+        k_count: int,
+    ) -> None:
+        if str(context_mode) == "lag1_delta":
+            time_indices = np.asarray(time_indices, dtype=np.int32)[1:]
+        else:
+            time_indices = np.asarray(time_indices, dtype=np.int32)
+        if int(time_indices.shape[0]) == 0:
+            return
+        k_indices_one_time = np.arange(1, int(k_count), dtype=np.int32)
+        if int(k_indices_one_time.shape[0]) == 0:
+            return
+        case_rows = np.full(
+            int(time_indices.shape[0]) * int(k_indices_one_time.shape[0]),
+            int(case_idx),
+            dtype=np.int32,
+        )
+        time_rows_base = np.repeat(time_indices, int(k_indices_one_time.shape[0])).astype(np.int32)
+        k_rows_base = np.tile(k_indices_one_time, int(time_indices.shape[0])).astype(np.int32)
+        for target_nv in Nv_targets:
+            rows = int(time_rows_base.shape[0])
+            accum[regime][f"{split}_case_indices"].append(case_rows)
+            accum[regime][f"{split}_time_indices"].append(time_rows_base)
+            accum[regime][f"{split}_k_indices"].append(k_rows_base)
+            accum[regime][f"{split}_target_nvs"].append(
+                np.full(rows, int(target_nv), dtype=np.int32)
+            )
+
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for exact q-rollout q-pairs")
+    for regime, group in exact_dataset.items():
+        cases = np.asarray(group[coeff_key], dtype=np.complex128)
+        stride = int(linear_history_stride) if regime == REGIME_LINEAR else int(nonlinear_history_stride)
+        stride = max(stride, 1)
+        for case_idx, case_hist in enumerate(cases):
+            train_times, val_times = sampled_split_indices(int(case_hist.shape[0]), stride)
+            if int(train_times.shape[0]) > 0:
+                train_limit = int(train_times[-1])
+                train_times = train_times[(train_times + horizon - 1) <= train_limit]
+            for split, original_times in (("train", train_times), ("val", val_times)):
+                if int(original_times.shape[0]) == 0:
+                    continue
+                hist = case_hist[np.asarray(original_times, dtype=np.int32)]
+                if int(hist.shape[0]) == 0:
+                    continue
+                pairs = extract_interface_supervised_pairs_from_coeff_history(
+                    hist,
+                    Nv_targets=Nv_targets,
+                    Nm=Nm,
+                    k_arr=k_arr,
+                    vth=1.0,
+                    include_global_indicators=True,
+                    n_low=int(n_low),
+                    context_mode=context_mode,
+                )
+                append_pairs(
+                    accum,
+                    regime,
+                    split,
+                    pairs,
+                )
+                append_index_rows(
+                    regime=regime,
+                    split=split,
+                    case_idx=int(case_idx),
+                    time_indices=np.asarray(original_times, dtype=np.int32),
+                    k_count=int(case_hist.shape[-1]),
+                )
+    dataset = finalize_regime_arrays(accum)
+    for regime, arrays in dataset.items():
+        for split in ("train", "val"):
+            for suffix in ("case_indices", "time_indices", "k_indices", "target_nvs"):
+                key = f"{split}_{suffix}"
+                arrays[key] = (
+                    np.concatenate(accum[regime][key], axis=0).astype(np.int32)
+                    if accum[regime][key]
+                    else np.zeros((0,), dtype=np.int32)
+                )
     return dataset
 
 
