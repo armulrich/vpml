@@ -374,14 +374,18 @@ class LearnedInterfaceClosure:
         raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
 
     def standardized_inputs(self, x: Array) -> Array:
-        x = jnp.asarray(x, dtype=jnp.float64)
-        std = jnp.maximum(jnp.asarray(self.input_std, dtype=jnp.float64), 1e-12)
-        return (x - jnp.asarray(self.input_mean, dtype=jnp.float64)) / std
+        input_mean = jnp.asarray(self.input_mean)
+        real_dtype = input_mean.dtype
+        x = jnp.asarray(x, dtype=real_dtype)
+        std = jnp.maximum(jnp.asarray(self.input_std, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+        return (x - input_mean) / std
 
     def unstandardized_targets(self, y: Array) -> Array:
-        y = jnp.asarray(y, dtype=jnp.float64)
-        std = jnp.maximum(jnp.asarray(self.target_std, dtype=jnp.float64), 1e-12)
-        return y * std + jnp.asarray(self.target_mean, dtype=jnp.float64)
+        target_mean = jnp.asarray(self.target_mean)
+        real_dtype = target_mean.dtype
+        y = jnp.asarray(y, dtype=real_dtype)
+        std = jnp.maximum(jnp.asarray(self.target_std, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+        return y * std + target_mean
 
     def predict_standardized_components(self, raw_features: Array) -> Array:
         feats = self.standardized_inputs(raw_features)
@@ -447,7 +451,8 @@ def interface_closure_apply(
 ) -> Array:
     """Apply the shared residual interface-closure network to one standardized feature vector."""
     del hidden_width  # encoded in parameter shapes
-    x = jnp.asarray(x, dtype=jnp.float64)
+    param_dtype = jnp.asarray(params["W_lin"]).dtype
+    x = jnp.asarray(x, dtype=param_dtype)
     y_lin = x @ params["W_lin"] + params["b_lin"]
     h = jax.nn.silu(x @ params["W_in"] + params["b_in"])
     for block_idx in range(int(res_blocks)):
@@ -455,7 +460,7 @@ def interface_closure_apply(
         residual = residual @ params[f"W2_{block_idx}"] + params[f"b2_{block_idx}"]
         h = h + residual
     y_nl = h @ params["W_out"] + params["b_out"]
-    return (y_lin + y_nl).astype(jnp.float64)
+    return (y_lin + y_nl).astype(param_dtype)
 
 
 def save_learned_interface_closure_npz(
@@ -722,10 +727,10 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
     )
 
 
-def _hermitian_rfft_weights(nk: int) -> Array:
+def _hermitian_rfft_weights(nk: int, *, dtype: object = jnp.float64) -> Array:
     if int(nk) <= 0:
         raise ValueError("nk must be positive")
-    weights = jnp.ones((int(nk),), dtype=jnp.float64)
+    weights = jnp.ones((int(nk),), dtype=dtype)
     if int(nk) > 2:
         weights = weights.at[1:-1].set(2.0)
     return weights
@@ -746,8 +751,10 @@ def learned_closure_global_indicators(
     The sums are evaluated on the stored rFFT half-spectrum with Hermitian weights so
     they remain comparable to the full-spectrum quantities for real-valued states.
     """
-    a_hat = jnp.asarray(a_hat, dtype=jnp.complex128)
-    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    complex_dtype = a_hat.dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
     if a_hat.ndim != 2:
         raise ValueError(f"a_hat must have shape (Nv, Nk), got {a_hat.shape}")
     if k_arr.ndim != 1 or k_arr.shape[0] != a_hat.shape[1]:
@@ -755,16 +762,16 @@ def learned_closure_global_indicators(
     if int(n_low) < 0:
         raise ValueError("n_low must be nonnegative")
 
-    weights = _hermitian_rfft_weights(a_hat.shape[1])
+    weights = _hermitian_rfft_weights(a_hat.shape[1], dtype=real_dtype)
 
-    e_hat = jnp.zeros((a_hat.shape[1],), dtype=jnp.complex128)
+    e_hat = jnp.zeros((a_hat.shape[1],), dtype=complex_dtype)
     if a_hat.shape[1] > 1:
         e_hat = e_hat.at[1:].set(1j * a_hat[0, 1:] / k_arr[1:])
     field_activity = jnp.sum(weights[1:] * (jnp.abs(e_hat[1:]) ** 2))
 
     n_hi = min(int(n_low), int(a_hat.shape[0]) - 1)
     low_energy = jnp.sum(weights[None, :] * (jnp.abs(a_hat[: n_hi + 1, :]) ** 2))
-    return field_activity.astype(jnp.float64), low_energy.astype(jnp.float64)
+    return field_activity.astype(real_dtype), low_energy.astype(real_dtype)
 
 
 def learned_closure_raw_base_features(
@@ -779,16 +786,18 @@ def learned_closure_raw_base_features(
     if Nm > Nv:
         raise ValueError(f"Learned closure Nm={Nm} exceeds Nv={Nv}")
 
-    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
     if k_arr.shape[0] <= 1:
-        return jnp.zeros((0, learned.raw_base_dim), dtype=jnp.float64)
+        return jnp.zeros((0, learned.raw_base_dim), dtype=real_dtype)
 
     z = jnp.swapaxes(a_hat[Nv - Nm : Nv, 1:], 0, 1)
     feature_cols = [
         jnp.real(z),
         jnp.imag(z),
         jnp.abs(k_arr[1:])[:, None],
-        jnp.full((z.shape[0], 1), float(Nv), dtype=jnp.float64),
+        jnp.full((z.shape[0], 1), float(Nv), dtype=real_dtype),
     ]
     if learned.include_global_indicators:
         field_activity, low_energy = learned_closure_global_indicators(
@@ -797,7 +806,7 @@ def learned_closure_raw_base_features(
             n_low=int(learned.n_low),
         )
         globals_mat = jnp.broadcast_to(
-            jnp.array([field_activity, low_energy], dtype=jnp.float64)[None, :],
+            jnp.array([field_activity, low_energy], dtype=real_dtype)[None, :],
             (z.shape[0], 2),
         )
         feature_cols.append(globals_mat)
@@ -828,12 +837,15 @@ def scale_learned_closure_raw_features(
     learned: LearnedInterfaceClosure,
 ) -> Array:
     """Apply the k/Nv scaling used before global feature standardization."""
-    raw_features = jnp.asarray(raw_features, dtype=jnp.float64)
+    raw_features = jnp.asarray(raw_features)
+    real_dtype = raw_features.dtype
+    k_scale = jnp.asarray(float(learned.k_scale), dtype=real_dtype)
+    nv_scale = jnp.asarray(float(learned.nv_scale), dtype=real_dtype)
     base_dim = int(learned.raw_base_dim)
     if learned.context_mode == "none":
         feats = raw_features
-        feats = feats.at[:, 2 * int(learned.Nm)].divide(float(learned.k_scale))
-        feats = feats.at[:, 2 * int(learned.Nm) + 1].divide(float(learned.nv_scale))
+        feats = feats.at[:, 2 * int(learned.Nm)].divide(k_scale)
+        feats = feats.at[:, 2 * int(learned.Nm) + 1].divide(nv_scale)
         return feats
     if learned.context_mode == "lag1_delta":
         current = raw_features[:, :base_dim]
@@ -841,10 +853,10 @@ def scale_learned_closure_raw_features(
         delta = raw_features[:, 2 * base_dim :]
         k_col = 2 * int(learned.Nm)
         nv_col = k_col + 1
-        current = current.at[:, k_col].divide(float(learned.k_scale))
-        current = current.at[:, nv_col].divide(float(learned.nv_scale))
-        previous = previous.at[:, k_col].divide(float(learned.k_scale))
-        previous = previous.at[:, nv_col].divide(float(learned.nv_scale))
+        current = current.at[:, k_col].divide(k_scale)
+        current = current.at[:, nv_col].divide(nv_scale)
+        previous = previous.at[:, k_col].divide(k_scale)
+        previous = previous.at[:, nv_col].divide(nv_scale)
         delta = current - previous
         return jnp.concatenate([current, previous, delta], axis=1)
     raise ValueError(f"Unsupported context_mode={learned.context_mode!r}")
@@ -870,8 +882,11 @@ def learned_interface_q_hat(
     if Nm > Nv:
         raise ValueError(f"Learned closure Nm={Nm} exceeds Nv={Nv}")
 
-    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
-    q_hat = jnp.zeros((k_arr.shape[0],), dtype=jnp.complex128)
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    complex_dtype = a_hat.dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
+    q_hat = jnp.zeros((k_arr.shape[0],), dtype=complex_dtype)
     if k_arr.shape[0] <= 1:
         return q_hat
 
@@ -890,9 +905,9 @@ def learned_interface_q_hat(
     ):
         # Keep solver-in-the-loop optimization in a numerically stable regime
         # while preserving full JAX differentiability.
-        clip = jnp.asarray([0.25, 0.75], dtype=jnp.float64)
+        clip = jnp.asarray([0.25, 0.75], dtype=pred.dtype)
         pred = clip * jnp.tanh(pred / clip)
-    q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(jnp.complex128)
+    q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(complex_dtype)
     return q_hat.at[1:].set(q_nonzero)
 
 
@@ -907,8 +922,9 @@ def learned_boundary_flux_hat(
 ) -> Array:
     """Return the learned Hermite-boundary interface contribution, nonzero only on the last row."""
     del vth  # q_k is learned directly in physical units.
+    a_hat = jnp.asarray(a_hat)
     q_hat = learned_interface_q_hat(a_hat, k_arr, Nv, learned, a_hat_prev=a_hat_prev)
-    B_hat = jnp.zeros_like(a_hat, dtype=jnp.complex128)
+    B_hat = jnp.zeros_like(a_hat)
     return B_hat.at[int(Nv) - 1].set(q_hat)
 
 
@@ -1263,35 +1279,39 @@ class FourierHermiteIMEX:
     vth: float = 1.0
     dealias_23: bool = True
     closure: Optional[NonlocalClosure] = None
+    real_dtype: object = jnp.float64
+    complex_dtype: object = jnp.complex128
 
     def __post_init__(self):
         if self.Nx <= 0 or self.Nv <= 0:
             raise ValueError("Nx and Nv must be positive")
         if self.vth <= 0:
             raise ValueError("vth must be positive")
+        self.real_dtype = jnp.dtype(self.real_dtype)
+        self.complex_dtype = jnp.dtype(self.complex_dtype)
 
         dx = float(self.Lx) / float(self.Nx)
         self.dx = dx
 
         self.x = jnp.linspace(0.0, float(self.Lx), int(self.Nx), endpoint=False)
-        self.k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(int(self.Nx), d=dx).astype(jnp.float64)
+        self.k_arr = (2.0 * jnp.pi * jnp.fft.rfftfreq(int(self.Nx), d=dx)).astype(self.real_dtype)
         self.Nk = int(self.Nx // 2 + 1)
 
-        self.sqrt_n = jnp.sqrt(jnp.arange(int(self.Nv), dtype=jnp.float64))
-        self.sqrt_np1 = jnp.sqrt(jnp.arange(1, int(self.Nv) + 1, dtype=jnp.float64))
+        self.sqrt_n = jnp.sqrt(jnp.arange(int(self.Nv), dtype=self.real_dtype))
+        self.sqrt_np1 = jnp.sqrt(jnp.arange(1, int(self.Nv) + 1, dtype=self.real_dtype))
 
         # 2/3 dealias mask (rFFT length Nk)
         self.mask = _mask_23(self.Nx) if self.dealias_23 else None
 
         # --- Precompute tridiagonal coefficients for the implicit CN solve ---
         dt_half = 0.5 * float(self.dt)
-        s = jnp.sqrt(jnp.arange(1, int(self.Nv), dtype=jnp.float64))              # sqrt(1..Nv-1)
-        val = (1j * dt_half * self.k_arr * float(self.vth)).astype(jnp.complex128)  # (Nk,)
+        s = jnp.sqrt(jnp.arange(1, int(self.Nv), dtype=self.real_dtype))              # sqrt(1..Nv-1)
+        val = (1j * dt_half * self.k_arr * float(self.vth)).astype(self.complex_dtype)  # (Nk,)
 
         # sub/sup: (Nk, Nv-1)
-        self.sub = (val[:, None] * s[None, :]).astype(jnp.complex128)
+        self.sub = (val[:, None] * s[None, :]).astype(self.complex_dtype)
         self.sup = self.sub.copy()
-        self.diag = jnp.ones((self.Nk, int(self.Nv)), dtype=jnp.complex128)
+        self.diag = jnp.ones((self.Nk, int(self.Nv)), dtype=self.complex_dtype)
 
         # Optional Nm=1 closure -> diagonal modification on last Hermite mode
         self._closure_Ldiag_last = None
@@ -1299,11 +1319,11 @@ class FourierHermiteIMEX:
             Nm = int(self.closure.Nm)
             if Nm != 1:
                 raise ValueError("Time-stepping integrator supports NonlocalClosure only for Nm=1.")
-            mu = jnp.asarray(self.closure.mu_tail[0], dtype=jnp.float64)
+            mu = jnp.asarray(self.closure.mu_tail[0], dtype=self.real_dtype)
             signk = jnp.sign(self.k_arr)
             # L_diag_last = k*vth*sqrt(Nv)*mu*sign(k)
             Ldiag_last = (self.k_arr * float(self.vth) * jnp.sqrt(float(self.Nv)) * mu * signk)
-            self._closure_Ldiag_last = Ldiag_last.astype(jnp.complex128)
+            self._closure_Ldiag_last = Ldiag_last.astype(self.complex_dtype)
             self.diag = self.diag.at[:, int(self.Nv) - 1].set(1.0 - dt_half * self._closure_Ldiag_last)
 
         # Batched solver (vmap over k)
@@ -1363,7 +1383,7 @@ class FourierHermiteIMEX:
         """Compute electric field E(x) in physical space from a_hat[0,k]."""
         rho_hat = a_hat[0]
         E_hat = self.E_hat_from_rho_hat(rho_hat, poisson_sign=poisson_sign)
-        return jnp.fft.irfft(E_hat, n=int(self.Nx)).astype(jnp.float64)
+        return jnp.fft.irfft(E_hat, n=int(self.Nx)).astype(self.real_dtype)
 
     def electric_energy(self, a_hat: Array, poisson_sign: float = +1.0) -> Array:
         """Return 0.5 * ∫ E^2 dx (discrete trapezoid == dx * sum)."""
