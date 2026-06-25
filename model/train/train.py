@@ -15,9 +15,11 @@ path and also supports pure online-rollout and online-hybrid training modes.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import math
 import os
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from vpml.jax_runtime import bootstrap_jax_runtime, print_jax_runtime_summary
@@ -108,6 +110,18 @@ PROJECTED_XV_METRIC_GRAM_RIESZ = "gram_riesz"
 ALL_PROJECTED_XV_METRICS = (
     PROJECTED_XV_METRIC_PHYSICAL_L2,
     PROJECTED_XV_METRIC_GRAM_RIESZ,
+)
+EXACT_ROLLOUT_PRECISION_FLOAT64 = "float64"
+EXACT_ROLLOUT_PRECISION_FLOAT32 = "float32"
+ALL_EXACT_ROLLOUT_PRECISIONS = (
+    EXACT_ROLLOUT_PRECISION_FLOAT64,
+    EXACT_ROLLOUT_PRECISION_FLOAT32,
+)
+EXACT_TARGET_SAMPLING_RANDOM = "random"
+EXACT_TARGET_SAMPLING_CYCLE = "cycle"
+ALL_EXACT_TARGET_SAMPLING_MODES = (
+    EXACT_TARGET_SAMPLING_RANDOM,
+    EXACT_TARGET_SAMPLING_CYCLE,
 )
 ALL_ONLINE_LOSS_BACKENDS = (
     ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1,
@@ -1486,7 +1500,10 @@ def build_exact_q_rollout_qpair_dataset(
     rollout_horizon: int,
     n_low: int,
     context_mode: str,
-) -> Dict[str, Dict[str, np.ndarray]]:
+    store_training_pairs: bool = True,
+    k_scale: Optional[float] = None,
+    nv_scale: Optional[float] = None,
+) -> Tuple[Dict[str, Dict[str, np.ndarray]], Optional[Dict[str, np.ndarray]]]:
     coeff_key = exact_q_rollout_coeff_key(max_projection_order)
     accum = {
         regime: {
@@ -1498,13 +1515,28 @@ def build_exact_q_rollout_qpair_dataset(
             "train_time_indices": [],
             "train_k_indices": [],
             "train_target_nvs": [],
+            "train_anchor_case_indices": [],
+            "train_anchor_time_indices": [],
+            "train_anchor_target_nvs": [],
             "val_case_indices": [],
             "val_time_indices": [],
             "val_k_indices": [],
             "val_target_nvs": [],
+            "val_anchor_case_indices": [],
+            "val_anchor_time_indices": [],
+            "val_anchor_target_nvs": [],
         }
         for regime in exact_dataset
     }
+    input_sum: Optional[np.ndarray] = None
+    input_sum_sq: Optional[np.ndarray] = None
+    target_sum: Optional[np.ndarray] = None
+    target_sum_sq: Optional[np.ndarray] = None
+    input_count = 0
+    target_count = 0
+
+    if not bool(store_training_pairs) and (k_scale is None or nv_scale is None):
+        raise ValueError("k_scale and nv_scale are required when store_training_pairs=False")
 
     def sampled_split_indices(history_length: int, stride: int) -> Tuple[np.ndarray, np.ndarray]:
         nsteps = int(history_length) - 1
@@ -1524,6 +1556,7 @@ def build_exact_q_rollout_qpair_dataset(
         case_idx: int,
         time_indices: np.ndarray,
         k_count: int,
+        include_flattened_k_rows: bool,
     ) -> None:
         if str(context_mode) == "lag1_delta":
             time_indices = np.asarray(time_indices, dtype=np.int32)[1:]
@@ -1531,23 +1564,63 @@ def build_exact_q_rollout_qpair_dataset(
             time_indices = np.asarray(time_indices, dtype=np.int32)
         if int(time_indices.shape[0]) == 0:
             return
-        k_indices_one_time = np.arange(1, int(k_count), dtype=np.int32)
-        if int(k_indices_one_time.shape[0]) == 0:
-            return
-        case_rows = np.full(
-            int(time_indices.shape[0]) * int(k_indices_one_time.shape[0]),
-            int(case_idx),
-            dtype=np.int32,
-        )
-        time_rows_base = np.repeat(time_indices, int(k_indices_one_time.shape[0])).astype(np.int32)
-        k_rows_base = np.tile(k_indices_one_time, int(time_indices.shape[0])).astype(np.int32)
         for target_nv in Nv_targets:
-            rows = int(time_rows_base.shape[0])
-            accum[regime][f"{split}_case_indices"].append(case_rows)
-            accum[regime][f"{split}_time_indices"].append(time_rows_base)
-            accum[regime][f"{split}_k_indices"].append(k_rows_base)
-            accum[regime][f"{split}_target_nvs"].append(
-                np.full(rows, int(target_nv), dtype=np.int32)
+            anchor_rows = int(time_indices.shape[0])
+            accum[regime][f"{split}_anchor_case_indices"].append(
+                np.full(anchor_rows, int(case_idx), dtype=np.int32)
+            )
+            accum[regime][f"{split}_anchor_time_indices"].append(time_indices.astype(np.int32))
+            accum[regime][f"{split}_anchor_target_nvs"].append(
+                np.full(anchor_rows, int(target_nv), dtype=np.int32)
+            )
+            if bool(include_flattened_k_rows):
+                k_indices_one_time = np.arange(1, int(k_count), dtype=np.int32)
+                if int(k_indices_one_time.shape[0]) == 0:
+                    continue
+                case_rows = np.full(
+                    int(time_indices.shape[0]) * int(k_indices_one_time.shape[0]),
+                    int(case_idx),
+                    dtype=np.int32,
+                )
+                time_rows_base = np.repeat(
+                    time_indices, int(k_indices_one_time.shape[0])
+                ).astype(np.int32)
+                k_rows_base = np.tile(k_indices_one_time, int(time_indices.shape[0])).astype(
+                    np.int32
+                )
+                rows = int(time_rows_base.shape[0])
+                accum[regime][f"{split}_case_indices"].append(case_rows)
+                accum[regime][f"{split}_time_indices"].append(time_rows_base)
+                accum[regime][f"{split}_k_indices"].append(k_rows_base)
+                accum[regime][f"{split}_target_nvs"].append(
+                    np.full(rows, int(target_nv), dtype=np.int32)
+                )
+
+    def accumulate_training_stats(pairs_by_nv: Dict[int, Dict[str, np.ndarray]]) -> None:
+        nonlocal input_sum, input_sum_sq, target_sum, target_sum_sq, input_count, target_count
+        assert k_scale is not None
+        assert nv_scale is not None
+        for payload in pairs_by_nv.values():
+            inputs = build_model_inputs(
+                payload["inputs_base"],
+                Nm=int(Nm),
+                k_scale=float(k_scale),
+                nv_scale=float(nv_scale),
+                context_mode=str(context_mode),
+                include_global_indicators=True,
+            )
+            targets = np.asarray(payload["targets"], dtype=np.float64)
+            input_sum, input_sum_sq, input_count = _accumulate_feature_moments(
+                input_sum,
+                input_sum_sq,
+                input_count,
+                inputs,
+            )
+            target_sum, target_sum_sq, target_count = _accumulate_feature_moments(
+                target_sum,
+                target_sum_sq,
+                target_count,
+                targets,
             )
 
     horizon = int(rollout_horizon)
@@ -1578,20 +1651,43 @@ def build_exact_q_rollout_qpair_dataset(
                     n_low=int(n_low),
                     context_mode=context_mode,
                 )
-                append_pairs(
-                    accum,
-                    regime,
-                    split,
-                    pairs,
-                )
+                if bool(store_training_pairs) or split == "val":
+                    append_pairs(
+                        accum,
+                        regime,
+                        split,
+                        pairs,
+                    )
+                elif split == "train":
+                    accumulate_training_stats(pairs)
                 append_index_rows(
                     regime=regime,
                     split=split,
                     case_idx=int(case_idx),
                     time_indices=np.asarray(original_times, dtype=np.int32),
                     k_count=int(case_hist.shape[-1]),
+                    include_flattened_k_rows=bool(store_training_pairs) or split == "val",
                 )
-    dataset = finalize_regime_arrays(accum)
+    raw_base_dim = 2 * int(Nm) + 4
+    input_dim = raw_base_dim if str(context_mode) == "none" else 3 * raw_base_dim
+    dataset: Dict[str, Dict[str, np.ndarray]] = {}
+    for regime, payload in accum.items():
+        has_any_rows = any(payload[f"{split}_case_indices"] for split in ("train", "val"))
+        if not has_any_rows:
+            continue
+
+        def concat_or_empty(key: str, shape_tail: Tuple[int, ...], dtype) -> np.ndarray:
+            values = payload[key]
+            if values:
+                return np.concatenate(values, axis=0).astype(dtype)
+            return np.zeros((0, *shape_tail), dtype=dtype)
+
+        dataset[regime] = {
+            "train_inputs_base": concat_or_empty("train_inputs_base", (input_dim,), np.float64),
+            "train_targets": concat_or_empty("train_targets", (2,), np.float64),
+            "val_inputs_base": concat_or_empty("val_inputs_base", (input_dim,), np.float64),
+            "val_targets": concat_or_empty("val_targets", (2,), np.float64),
+        }
     for regime, arrays in dataset.items():
         for split in ("train", "val"):
             for suffix in ("case_indices", "time_indices", "k_indices", "target_nvs"):
@@ -1601,7 +1697,35 @@ def build_exact_q_rollout_qpair_dataset(
                     if accum[regime][key]
                     else np.zeros((0,), dtype=np.int32)
                 )
-    return dataset
+            for suffix in ("anchor_case_indices", "anchor_time_indices", "anchor_target_nvs"):
+                key = f"{split}_{suffix}"
+                arrays[key] = (
+                    np.concatenate(accum[regime][key], axis=0).astype(np.int32)
+                    if accum[regime][key]
+                    else np.zeros((0,), dtype=np.int32)
+                )
+    computed_stats: Optional[Dict[str, np.ndarray]] = None
+    if not bool(store_training_pairs):
+        if (
+            input_sum is None
+            or input_sum_sq is None
+            or target_sum is None
+            or target_sum_sq is None
+            or input_count <= 0
+            or target_count <= 0
+        ):
+            raise ValueError("Exact q-rollout could not compute training normalization stats")
+        input_mean = input_sum / float(input_count)
+        input_var = np.maximum(input_sum_sq / float(input_count) - input_mean * input_mean, 0.0)
+        target_mean = target_sum / float(target_count)
+        target_var = np.maximum(target_sum_sq / float(target_count) - target_mean * target_mean, 0.0)
+        computed_stats = {
+            "input_mean": np.asarray(input_mean, dtype=np.float64),
+            "input_std": safe_feature_std(np.sqrt(input_var)),
+            "target_mean": np.asarray(target_mean, dtype=np.float64),
+            "target_std": safe_feature_std(np.sqrt(target_var)),
+        }
+    return dataset, computed_stats
 
 
 def build_model_inputs(
@@ -1636,6 +1760,44 @@ def build_model_inputs(
 def safe_feature_std(values: np.ndarray) -> np.ndarray:
     std = np.asarray(values, dtype=np.float64)
     return np.where(std > 1e-12, std, 1.0)
+
+
+def exact_rollout_precision_dtypes(precision: str) -> Tuple[object, object]:
+    mode = str(precision)
+    if mode == EXACT_ROLLOUT_PRECISION_FLOAT64:
+        return jnp.float64, jnp.complex128
+    if mode == EXACT_ROLLOUT_PRECISION_FLOAT32:
+        return jnp.float32, jnp.complex64
+    raise ValueError(
+        f"exact_rollout_precision must be one of {ALL_EXACT_ROLLOUT_PRECISIONS!r}, "
+        f"got {precision!r}"
+    )
+
+
+def cast_learned_closure_for_rollout(
+    learned: LearnedInterfaceClosure,
+    *,
+    precision: str,
+) -> LearnedInterfaceClosure:
+    real_dtype, _ = exact_rollout_precision_dtypes(str(precision))
+    if str(precision) == EXACT_ROLLOUT_PRECISION_FLOAT64:
+        return learned
+    params = jax.tree_util.tree_map(lambda value: jnp.asarray(value, dtype=real_dtype), learned.params)
+    return replace(
+        learned,
+        params=params,
+        input_mean=jnp.asarray(learned.input_mean, dtype=real_dtype),
+        input_std=jnp.asarray(learned.input_std, dtype=real_dtype),
+        target_mean=jnp.asarray(learned.target_mean, dtype=real_dtype),
+        target_std=jnp.asarray(learned.target_std, dtype=real_dtype),
+    )
+
+
+def default_exact_k_scale(k_arr: np.ndarray) -> float:
+    k_nonzero = np.asarray(k_arr, dtype=np.float64)[1:]
+    if int(k_nonzero.shape[0]) == 0:
+        return 1.0
+    return max(float(np.max(np.abs(k_nonzero))), 1.0)
 
 
 def choose_k_scale(dataset: Dict[str, Dict[str, np.ndarray]], *, Nm: int) -> float:
@@ -1708,6 +1870,43 @@ def prepare_training_dataset(
         "target_std": np.asarray(target_std, dtype=np.float64),
     }
     return prepared, stats
+
+
+def prepare_validation_dataset_from_stats(
+    dataset_base: Dict[str, Dict[str, np.ndarray]],
+    *,
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    context_mode: str,
+    stats: Dict[str, np.ndarray],
+) -> Dict[str, Dict[str, Array]]:
+    prepared: Dict[str, Dict[str, Array]] = {}
+    target_std_safe = np.maximum(np.asarray(stats["target_std"], dtype=np.float64), 1e-12)[None, :]
+    target_mean_row = np.asarray(stats["target_mean"], dtype=np.float64)[None, :]
+    input_dim = int(np.asarray(stats["input_mean"]).shape[0])
+    for regime, arrays in dataset_base.items():
+        val_inputs_base = np.asarray(arrays.get("val_inputs_base", np.zeros((0, input_dim), dtype=np.float64)), dtype=np.float64)
+        val_targets = np.asarray(arrays.get("val_targets", np.zeros((0, 2), dtype=np.float64)), dtype=np.float64)
+        if val_inputs_base.size:
+            val_inputs = build_model_inputs(
+                val_inputs_base,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                context_mode=context_mode,
+            )
+        else:
+            val_inputs = np.zeros((0, input_dim), dtype=np.float64)
+        prepared[regime] = {
+            "train_inputs": jnp.zeros((0, input_dim), dtype=jnp.float64),
+            "train_targets": jnp.zeros((0, 2), dtype=jnp.float64),
+            "train_targets_std": jnp.zeros((0, 2), dtype=jnp.float64),
+            "val_inputs": jnp.asarray(val_inputs, dtype=jnp.float64),
+            "val_targets": jnp.asarray(val_targets, dtype=jnp.float64),
+            "val_targets_std": jnp.asarray((val_targets - target_mean_row) / target_std_safe, dtype=jnp.float64),
+        }
+    return prepared
 
 
 def summarize_dataset(prepared: Dict[str, Dict[str, Array]]) -> Dict[str, int]:
@@ -3329,14 +3528,15 @@ def _linear_explicit_n_hat_for_state(
     integ: FourierHermiteIMEX,
     poisson_sign: float,
 ) -> Array:
-    m_eq = jnp.zeros((int(integ.Nv),), dtype=jnp.float64).at[0].set(1.0)
-    return linear_explicit_N_hat(
-        a_hat,
-        integ,
-        m_eq,
+    complex_dtype = getattr(integ, "complex_dtype", jnp.complex128)
+    e_hat = integ.E_hat_from_rho_hat(
+        jnp.asarray(a_hat, dtype=complex_dtype)[0],
         poisson_sign=float(poisson_sign),
-        dissipation=None,
-    )
+    ).astype(complex_dtype)
+    n_hat = jnp.zeros_like(a_hat, dtype=complex_dtype)
+    if int(integ.Nv) > 1:
+        n_hat = n_hat.at[1].set(-e_hat)
+    return integ.apply_mask_hat(n_hat)
 
 
 def _nonlinear_explicit_n_hat_for_state(
@@ -3345,8 +3545,11 @@ def _nonlinear_explicit_n_hat_for_state(
     integ: FourierHermiteIMEX,
     poisson_sign: float,
 ) -> Array:
-    m_eq = jnp.zeros((int(integ.Nv),), dtype=jnp.float64).at[0].set(1.0)
-    a_phys = irfft_x(a_hat, int(integ.Nx))
+    real_dtype = getattr(integ, "real_dtype", jnp.float64)
+    complex_dtype = getattr(integ, "complex_dtype", jnp.complex128)
+    a_hat = jnp.asarray(a_hat, dtype=complex_dtype)
+    m_eq = jnp.zeros((int(integ.Nv),), dtype=real_dtype).at[0].set(1.0)
+    a_phys = jnp.fft.irfft(a_hat, n=int(integ.Nx), axis=1).astype(real_dtype)
     e_phys = integ.E_phys_from_a_hat(a_hat, poisson_sign=float(poisson_sign))
     n_phys = jnp.zeros_like(a_phys)
     n_phys = n_phys.at[1:].set(
@@ -3354,7 +3557,7 @@ def _nonlinear_explicit_n_hat_for_state(
         * e_phys[None, :]
         * (a_phys[:-1] + m_eq[:-1, None])
     )
-    return integ.apply_mask_hat(rfft_x(n_phys))
+    return integ.apply_mask_hat(jnp.fft.rfft(n_phys, axis=1).astype(complex_dtype))
 
 
 def rollout_from_anchor_state(
@@ -3552,14 +3755,16 @@ def rollout_anchor_closure_flux_from_anchor_stencil(
     integ: FourierHermiteIMEX,
     rollout_horizon: int,
     explicit_n_hat_fn,
+    selected_k_index: Optional[Array] = None,
 ) -> Array:
     """Return q(C_h) for h=0..H-1 from a compact forward CNAB2 anchor stencil.
 
     The stencil stores (current, previous, previous-previous) retained states.
     """
-    stencil = jnp.asarray(anchor_stencil, dtype=jnp.complex128)
+    stencil = jnp.asarray(anchor_stencil)
     if int(stencil.shape[0]) != 3:
         raise ValueError(f"anchor_stencil must have shape (3, Nv, Nk), got {stencil.shape}")
+    selected_k = None if selected_k_index is None else jnp.asarray(selected_k_index, dtype=jnp.int32)
     current_state = stencil[0]
     prev_state = stencil[1]
     prev_prev_state = stencil[2]
@@ -3583,7 +3788,7 @@ def rollout_anchor_closure_flux_from_anchor_stencil(
             learned,
             a_hat_prev=state_prev,
         )
-        b_hat = jnp.zeros_like(state, dtype=jnp.complex128).at[int(integ.Nv) - 1].set(q_hat)
+        b_hat = jnp.zeros_like(state).at[int(integ.Nv) - 1].set(q_hat)
         state_new = integ.step_cnab2(
             state,
             n_hat,
@@ -3591,7 +3796,8 @@ def rollout_anchor_closure_flux_from_anchor_stencil(
             extra_hat=b_hat,
             extra_hat_prev=b_prev_step,
         )
-        return (state_new, state, n_hat, b_hat), q_hat
+        q_out = q_hat if selected_k is None else q_hat[selected_k]
+        return (state_new, state, n_hat, b_hat), q_out
 
     init = (current_state, prev_state, n_prev, b_prev)
     (_, _, _, _), q_hist = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
@@ -4440,37 +4646,61 @@ def exact_q_rollout_loss_for_anchor_batch(
     forward_integ: FourierHermiteIMEX,
     rollout_horizon: int,
     explicit_n_hat_fn,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
 ) -> Array:
     """H-step q-loss over sampled exact full-history anchors.
 
     Unlike the compact online path, the batch already contains the selected
     dense-history anchors. There is no precomputed anchor pool inside this loss.
     """
-    anchor_stencils = jnp.asarray(anchor_stencils, dtype=jnp.complex128)
-    ref_q_windows = jnp.asarray(ref_q_windows, dtype=jnp.complex128)
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    anchor_stencils = jnp.asarray(anchor_stencils, dtype=complex_dtype)
+    ref_q_windows = jnp.asarray(ref_q_windows, dtype=complex_dtype)
     k_indices = jnp.asarray(k_indices, dtype=jnp.int32)
+    learned_rollout = cast_learned_closure_for_rollout(
+        learned,
+        precision=str(rollout_precision),
+    )
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for exact q-rollout")
 
-    pred_q_windows = jax.vmap(
-        lambda anchor_stencil: rollout_anchor_closure_flux_from_anchor_stencil(
-            anchor_stencil,
-            learned=learned,
-            integ=forward_integ,
-            rollout_horizon=horizon,
-            explicit_n_hat_fn=explicit_n_hat_fn,
+    if int(ref_q_windows.ndim) == 3:
+        pred_selected = jax.vmap(
+            lambda anchor_stencil: rollout_anchor_closure_flux_from_anchor_stencil(
+                anchor_stencil,
+                learned=learned_rollout,
+                integ=forward_integ,
+                rollout_horizon=horizon,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+                selected_k_index=None,
+            )
+        )(anchor_stencils)
+        pred_components = jnp.stack(
+            [jnp.real(pred_selected[:, :, 1:]), jnp.imag(pred_selected[:, :, 1:])],
+            axis=-1,
         )
-    )(anchor_stencils)
-    gather_idx = jnp.broadcast_to(
-        k_indices[:, None, None],
-        (int(anchor_stencils.shape[0]), horizon, 1),
-    )
-    pred_selected = jnp.take_along_axis(pred_q_windows, gather_idx, axis=2)[:, :, 0]
-    pred_components = jnp.stack([jnp.real(pred_selected), jnp.imag(pred_selected)], axis=-1)
-    ref_components = jnp.stack([jnp.real(ref_q_windows), jnp.imag(ref_q_windows)], axis=-1)
-    std = jnp.maximum(jnp.asarray(learned.target_std, dtype=jnp.float64), 1e-12)
-    return jnp.mean(((pred_components - ref_components) / std[None, None, :]) ** 2)
+        ref_components = jnp.stack(
+            [jnp.real(ref_q_windows[:, :, 1:]), jnp.imag(ref_q_windows[:, :, 1:])],
+            axis=-1,
+        )
+        std_prefix = (None, None, None)
+    else:
+        pred_selected = jax.vmap(
+            lambda anchor_stencil, k_index: rollout_anchor_closure_flux_from_anchor_stencil(
+                anchor_stencil,
+                learned=learned_rollout,
+                integ=forward_integ,
+                rollout_horizon=horizon,
+                explicit_n_hat_fn=explicit_n_hat_fn,
+                selected_k_index=k_index,
+            )
+        )(anchor_stencils, k_indices)
+        pred_components = jnp.stack([jnp.real(pred_selected), jnp.imag(pred_selected)], axis=-1)
+        ref_components = jnp.stack([jnp.real(ref_q_windows), jnp.imag(ref_q_windows)], axis=-1)
+        std_prefix = (None, None)
+    std = jnp.maximum(jnp.asarray(learned_rollout.target_std, dtype=real_dtype), 1e-12)
+    return jnp.mean(((pred_components - ref_components) / std[std_prefix + (slice(None),)]) ** 2)
 
 
 def online_fourier_hermite_closure_action_bidir_loss_for_history(
@@ -5973,24 +6203,63 @@ def make_online_fourier_hermite_bidir_batch_loss(
     return loss_fn, active_regimes
 
 
-def sample_exact_q_rollout_regime_batch(
+def prepare_exact_q_rollout_sampling_state(
     exact_dataset: Dict[str, Dict[str, np.ndarray]],
     qpair_dataset: Dict[str, Dict[str, np.ndarray]],
     *,
-    regime: str,
     max_projection_order: int,
+    target_nvs: Sequence[int],
+) -> Dict[str, Dict[str, object]]:
+    coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+    sampling_state: Dict[str, Dict[str, object]] = {}
+    for regime, arrays in qpair_dataset.items():
+        train_target_nvs = np.asarray(arrays["train_target_nvs"], dtype=np.int32)
+        target_pools = {
+            int(target_nv): np.flatnonzero(train_target_nvs == int(target_nv)).astype(np.int32)
+            for target_nv in target_nvs
+        }
+        train_anchor_target_nvs = np.asarray(arrays["train_anchor_target_nvs"], dtype=np.int32)
+        anchor_target_pools = {
+            int(target_nv): np.flatnonzero(train_anchor_target_nvs == int(target_nv)).astype(
+                np.int32
+            )
+            for target_nv in target_nvs
+        }
+        sampling_state[regime] = {
+            "histories": np.asarray(exact_dataset[regime][coeff_key], dtype=np.complex128),
+            "train_case_indices": np.asarray(arrays["train_case_indices"], dtype=np.int32),
+            "train_time_indices": np.asarray(arrays["train_time_indices"], dtype=np.int32),
+            "train_k_indices": np.asarray(arrays["train_k_indices"], dtype=np.int32),
+            "target_pools": target_pools,
+            "train_anchor_case_indices": np.asarray(
+                arrays["train_anchor_case_indices"], dtype=np.int32
+            ),
+            "train_anchor_time_indices": np.asarray(
+                arrays["train_anchor_time_indices"], dtype=np.int32
+            ),
+            "anchor_target_pools": anchor_target_pools,
+        }
+    return sampling_state
+
+
+def sample_exact_q_rollout_regime_batch(
+    sampling_state: Dict[str, Dict[str, object]],
+    *,
+    regime: str,
     target_nv: int,
     rollout_horizon: int,
     batch_size: int,
     k_arr: np.ndarray,
     rng: np.random.Generator,
+    complex_dtype: object = jnp.complex128,
+    all_k_loss: bool = False,
 ) -> Dict[str, Array]:
-    coeff_key = exact_q_rollout_coeff_key(max_projection_order)
-    histories = np.asarray(exact_dataset[regime][coeff_key], dtype=np.complex128)
-    arrays = qpair_dataset[regime]
-    target_pool = np.flatnonzero(
-        np.asarray(arrays["train_target_nvs"], dtype=np.int32) == int(target_nv)
-    ).astype(np.int32)
+    regime_state = sampling_state[regime]
+    histories = regime_state["histories"]
+    target_pools = (
+        regime_state["anchor_target_pools"] if bool(all_k_loss) else regime_state["target_pools"]
+    )
+    target_pool = target_pools[int(target_nv)]
     if int(target_pool.shape[0]) <= 0:
         raise ValueError(
             f"Exact q-rollout regime '{regime}' has no valid q-pairs for Nv={int(target_nv)}"
@@ -5999,9 +6268,14 @@ def sample_exact_q_rollout_regime_batch(
     selected = target_pool[
         rng.integers(0, int(target_pool.shape[0]), size=batch_n, endpoint=False)
     ]
-    case_idx = np.asarray(arrays["train_case_indices"], dtype=np.int32)[selected]
-    time_idx = np.asarray(arrays["train_time_indices"], dtype=np.int32)[selected]
-    k_indices = np.asarray(arrays["train_k_indices"], dtype=np.int32)[selected]
+    if bool(all_k_loss):
+        case_idx = regime_state["train_anchor_case_indices"][selected]
+        time_idx = regime_state["train_anchor_time_indices"][selected]
+        k_indices = np.zeros((batch_n,), dtype=np.int32)
+    else:
+        case_idx = regime_state["train_case_indices"][selected]
+        time_idx = regime_state["train_time_indices"][selected]
+        k_indices = regime_state["train_k_indices"][selected]
     stencil_times = np.stack(
         (
             time_idx,
@@ -6017,16 +6291,25 @@ def sample_exact_q_rollout_regime_batch(
         raise ValueError("Exact q-rollout requires at least one nonzero Fourier mode")
     offsets = np.arange(int(rollout_horizon), dtype=np.int32)
     window_times = time_idx[:, None] + offsets[None, :]
-    q_coeff = histories[case_idx[:, None], window_times, target_nv_i, k_indices[:, None]]
-    q_windows = (
-        -1j
-        * np.asarray(k_arr, dtype=np.float64)[k_indices][:, None]
-        * math.sqrt(float(target_nv_i))
-        * q_coeff
-    )
+    if bool(all_k_loss):
+        q_coeff = histories[case_idx[:, None], window_times, target_nv_i, :]
+        q_windows = (
+            -1j
+            * np.asarray(k_arr, dtype=np.float64)[None, None, :]
+            * math.sqrt(float(target_nv_i))
+            * q_coeff
+        )
+    else:
+        q_coeff = histories[case_idx[:, None], window_times, target_nv_i, k_indices[:, None]]
+        q_windows = (
+            -1j
+            * np.asarray(k_arr, dtype=np.float64)[k_indices][:, None]
+            * math.sqrt(float(target_nv_i))
+            * q_coeff
+        )
     return {
-        "anchor_stencils": jnp.asarray(stencils, dtype=jnp.complex128),
-        "ref_q_windows": jnp.asarray(q_windows, dtype=jnp.complex128),
+        "anchor_stencils": jnp.asarray(stencils, dtype=complex_dtype),
+        "ref_q_windows": jnp.asarray(q_windows, dtype=complex_dtype),
         "k_indices": jnp.asarray(k_indices, dtype=jnp.int32),
     }
 
@@ -6055,12 +6338,14 @@ def make_exact_q_rollout_batch_loss(
     rollout_horizon: int,
     poisson_sign: float,
     rollout_dealias_23: bool,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
 ) -> Tuple[object, Sequence[str]]:
     active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
     weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
     weights = weights / np.sum(weights)
     weight_arr = jnp.asarray(weights, dtype=jnp.float64)
     target_nvs = tuple(int(v) for v in Nv_targets)
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
     linear_integrators = {
         int(target_nv): FourierHermiteIMEX(
             Nx=int(teacher_Nx),
@@ -6070,6 +6355,8 @@ def make_exact_q_rollout_batch_loss(
             vth=1.0,
             dealias_23=bool(rollout_dealias_23),
             closure=None,
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
         )
         for target_nv in target_nvs
     }
@@ -6082,6 +6369,8 @@ def make_exact_q_rollout_batch_loss(
             vth=1.0,
             dealias_23=bool(rollout_dealias_23),
             closure=None,
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
         )
         for target_nv in target_nvs
     }
@@ -6145,6 +6434,7 @@ def make_exact_q_rollout_batch_loss(
                         forward_integ=linear_forward,
                         rollout_horizon=rollout_horizon,
                         explicit_n_hat_fn=linear_explicit,
+                        rollout_precision=str(rollout_precision),
                     )
                 else:
                     q_loss = exact_q_rollout_loss_for_anchor_batch(
@@ -6155,6 +6445,7 @@ def make_exact_q_rollout_batch_loss(
                         forward_integ=nonlinear_forward,
                         rollout_horizon=rollout_horizon,
                         explicit_n_hat_fn=nonlinear_explicit,
+                        rollout_precision=str(rollout_precision),
                     )
                 total_q = total_q + weight * q_loss
             zero = jnp.asarray(0.0, dtype=jnp.float64)
@@ -6185,6 +6476,7 @@ def make_exact_q_rollout_batch_loss(
 
     loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
     loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    loss_fn.rollout_precision = str(rollout_precision)  # type: ignore[attr-defined]
     return loss_fn, active_regimes
 
 
@@ -6632,11 +6924,20 @@ def train_with_exact_q_rollout_minibatch_loss(
     rollout_horizon: int,
     seed: int,
     log_components: Sequence[str] = (),
+    target_sampling: str = EXACT_TARGET_SAMPLING_CYCLE,
+    profile_trace_dir: Optional[Path] = None,
+    profile_train_steps: int = 0,
+    profile_skip_steps: int = 1,
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
     if int(batch_size) <= 0:
         raise ValueError("batch_size must be positive for exact q-rollout training")
     if int(steps_per_epoch) <= 0:
         raise ValueError("steps_per_epoch must be positive for exact q-rollout training")
+    if str(target_sampling) not in ALL_EXACT_TARGET_SAMPLING_MODES:
+        raise ValueError(
+            f"target_sampling must be one of {ALL_EXACT_TARGET_SAMPLING_MODES!r}, "
+            f"got {target_sampling!r}"
+        )
 
     state = adam_init(params)
     history = {
@@ -6684,6 +6985,25 @@ def train_with_exact_q_rollout_minibatch_loss(
         train_steps = {0: make_train_step(batch_loss_fn)}
 
     rng = np.random.default_rng(int(seed))
+    rollout_precision = str(getattr(batch_loss_fn, "rollout_precision", EXACT_ROLLOUT_PRECISION_FLOAT64))
+    _, batch_complex_dtype = exact_rollout_precision_dtypes(rollout_precision)
+    sampling_state = prepare_exact_q_rollout_sampling_state(
+        exact_dataset,
+        qpair_dataset,
+        max_projection_order=int(max_projection_order),
+        target_nvs=target_nvs,
+    )
+    all_k_rollout_loss = int(rollout_horizon) > 1
+    profile_steps = max(int(profile_train_steps), 0)
+    profile_skip = max(int(profile_skip_steps), 0)
+    profile_dir = None if profile_trace_dir is None or profile_steps <= 0 else Path(profile_trace_dir)
+    if profile_dir is not None:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[profile] exact q-rollout tracing {profile_steps} train step(s) "
+            f"after {profile_skip} warmup step(s) to {profile_dir}"
+        )
+    profiled_seconds: List[float] = []
     for epoch in range(int(epochs)):
         running = {
             key: jnp.asarray(0.0, dtype=jnp.float64)
@@ -6691,24 +7011,41 @@ def train_with_exact_q_rollout_minibatch_loss(
         }
         for step_idx in range(int(steps_per_epoch)):
             if target_nvs:
-                target_nv = int(target_nvs[int(rng.integers(0, len(target_nvs)))])
+                if str(target_sampling) == EXACT_TARGET_SAMPLING_CYCLE:
+                    target_offset = (int(epoch) * int(steps_per_epoch) + int(step_idx)) % len(target_nvs)
+                    target_nv = int(target_nvs[target_offset])
+                else:
+                    target_nv = int(target_nvs[int(rng.integers(0, len(target_nvs)))])
             else:
                 target_nv = 0
             regime_batches = {
                 regime: sample_exact_q_rollout_regime_batch(
-                    exact_dataset,
-                    qpair_dataset,
+                    sampling_state,
                     regime=regime,
-                    max_projection_order=int(max_projection_order),
                     target_nv=int(target_nv),
                     rollout_horizon=int(rollout_horizon),
                     batch_size=int(batch_size),
                     k_arr=np.asarray(k_arr, dtype=np.float64),
                     rng=rng,
+                    complex_dtype=batch_complex_dtype,
+                    all_k_loss=bool(all_k_rollout_loss),
                 )
                 for regime in active_regimes
             }
-            params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
+            global_step = int(epoch) * int(steps_per_epoch) + int(step_idx)
+            should_profile = (
+                profile_dir is not None
+                and profile_skip <= global_step < profile_skip + profile_steps
+            )
+            t0 = time.perf_counter() if should_profile else 0.0
+            if should_profile:
+                with jax.profiler.trace(str(profile_dir)):
+                    params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
+                    jax.block_until_ready(aux["total"])
+            else:
+                params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
+            if should_profile:
+                profiled_seconds.append(time.perf_counter() - t0)
             if not bool(all_finite):
                 raise FloatingPointError(
                     "exact q-rollout produced non-finite loss/gradients at "
@@ -6722,6 +7059,12 @@ def train_with_exact_q_rollout_minibatch_loss(
             history[key][epoch] = float(running[key] / float(steps_per_epoch))
         if epoch == 0 or (epoch + 1) % max(int(log_every), 1) == 0 or epoch + 1 == int(epochs):
             print(_format_train_loss_log(epoch=epoch, epochs=epochs, history=history, components=log_components))
+    if profiled_seconds:
+        mean_s = float(np.mean(np.asarray(profiled_seconds, dtype=np.float64)))
+        print(
+            f"[profile] exact q-rollout traced {len(profiled_seconds)} step(s); "
+            f"mean profiled wall time={mean_s:.3f}s/step"
+        )
     return params, history
 
 
@@ -7090,6 +7433,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--online-loss-backend", type=str, default=ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1)
     parser.add_argument("--projected-xv-tail-window", type=int, default=0)
     parser.add_argument("--projected-xv-metric", type=str, default=PROJECTED_XV_METRIC_PHYSICAL_L2, choices=ALL_PROJECTED_XV_METRICS)
+    parser.add_argument("--exact-rollout-precision", type=str, default=EXACT_ROLLOUT_PRECISION_FLOAT64, choices=ALL_EXACT_ROLLOUT_PRECISIONS)
+    parser.add_argument("--exact-target-sampling", type=str, default=EXACT_TARGET_SAMPLING_CYCLE, choices=ALL_EXACT_TARGET_SAMPLING_MODES)
+    parser.add_argument("--exact-store-train-qpairs", action="store_true")
+    parser.add_argument("--profile-trace-dir", type=Path, default=None)
+    parser.add_argument("--profile-train-steps", type=int, default=0)
+    parser.add_argument("--profile-skip-steps", type=int, default=1)
     parser.add_argument("--posterior-state-weight", type=float, default=0.25)
     parser.add_argument("--posterior-field-weight", type=float, default=1.0)
     parser.add_argument("--online-v-probes", type=int, default=64)
@@ -7505,7 +7854,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ).k_arr,
             dtype=np.float64,
         )
-        dataset_base = build_exact_q_rollout_qpair_dataset(
+        k_scale = float(args.k_scale) if args.k_scale is not None else default_exact_k_scale(k_arr)
+        nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(max(Nv_targets))
+        store_exact_train_pairs = bool(args.exact_store_train_qpairs) or int(args.rollout_horizon) == 1
+        dataset_base, precomputed_stats = build_exact_q_rollout_qpair_dataset(
             exact_dataset,
             max_projection_order=max_projection_order,
             Nv_targets=Nv_targets,
@@ -7517,19 +7869,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             rollout_horizon=args.rollout_horizon,
             n_low=args.n_low,
             context_mode=args.context_mode,
-        )
-        k_scale = float(args.k_scale) if args.k_scale is not None else choose_k_scale(dataset_base, Nm=args.Nm)
-        nv_scale = float(args.nv_scale) if args.nv_scale is not None else choose_nv_scale(dataset_base, Nm=args.Nm)
-        prepared, stats = prepare_training_dataset(
-            dataset_base,
-            Nm=args.Nm,
+            store_training_pairs=store_exact_train_pairs,
             k_scale=k_scale,
             nv_scale=nv_scale,
-            context_mode=args.context_mode,
         )
-        for regime, count in summarize_dataset(prepared).items():
-            q_windows = int(dataset_base[regime]["train_time_indices"].shape[0])
-            print(f"[data] {regime}: {count} q samples; {q_windows} exact rollout q-windows")
+        if store_exact_train_pairs:
+            prepared, stats = prepare_training_dataset(
+                dataset_base,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                context_mode=args.context_mode,
+            )
+        else:
+            if precomputed_stats is None:
+                raise RuntimeError("exact q-rollout expected precomputed stats for index-only training")
+            stats = precomputed_stats
+            prepared = prepare_validation_dataset_from_stats(
+                dataset_base,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                context_mode=args.context_mode,
+                stats=stats,
+            )
+        for regime in dataset_base:
+            count = int(dataset_base[regime]["train_inputs_base"].shape[0])
+            q_windows = int(dataset_base[regime]["train_anchor_time_indices"].shape[0])
+            feature_note = "stored q samples" if store_exact_train_pairs else "stored q samples skipped"
+            print(f"[data] {regime}: {count} {feature_note}; {q_windows} exact rollout anchors")
 
         params = init_interface_closure_params(
             jax.random.PRNGKey(args.seed),
@@ -7609,6 +7977,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 rollout_horizon=args.rollout_horizon,
                 poisson_sign=args.teacher_poisson_sign,
                 rollout_dealias_23=bool(args.rollout_dealias_23),
+                rollout_precision=args.exact_rollout_precision,
             )
             steps_per_epoch = int(args.steps_per_epoch)
             if steps_per_epoch <= 0:
@@ -7637,6 +8006,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     train_objective=args.train_objective,
                     online_loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
                 ),
+                target_sampling=args.exact_target_sampling,
+                profile_trace_dir=args.profile_trace_dir,
+                profile_train_steps=args.profile_train_steps,
+                profile_skip_steps=args.profile_skip_steps,
             )
             loss_history = online_component_history["total"]
         learned = build_learned_interface_closure(
@@ -8207,6 +8580,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 else args.online_loss_backend
             ],
             dtype=np.str_,
+        ),
+        "exact_rollout_precision": np.array(
+            [args.exact_rollout_precision if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE else ""],
+            dtype=np.str_,
+        ),
+        "exact_target_sampling": np.array(
+            [args.exact_target_sampling if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE else ""],
+            dtype=np.str_,
+        ),
+        "exact_store_train_qpairs": np.array(
+            [
+                (
+                    bool(args.exact_store_train_qpairs)
+                    or int(args.rollout_horizon) == 1
+                )
+                if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
+                else False
+            ],
+            dtype=np.bool_,
         ),
         "lambda_q": np.array([used_lambda_q], dtype=np.float64),
         "lambda_E": np.array([used_lambda_E], dtype=np.float64),
