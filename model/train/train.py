@@ -4666,16 +4666,27 @@ def exact_q_rollout_loss_for_anchor_batch(
         raise ValueError("rollout_horizon must be positive for exact q-rollout")
 
     if int(ref_q_windows.ndim) == 3:
-        pred_selected = jax.vmap(
-            lambda anchor_stencil: rollout_anchor_closure_flux_from_anchor_stencil(
-                anchor_stencil,
-                learned=learned_rollout,
-                integ=forward_integ,
-                rollout_horizon=horizon,
-                explicit_n_hat_fn=explicit_n_hat_fn,
-                selected_k_index=None,
-            )
-        )(anchor_stencils)
+        if horizon == 1:
+            pred_selected = jax.vmap(
+                lambda anchor_stencil: learned_interface_q_hat(
+                    anchor_stencil[0],
+                    forward_integ.k_arr,
+                    forward_integ.Nv,
+                    learned_rollout,
+                    a_hat_prev=anchor_stencil[1],
+                )[None, :]
+            )(anchor_stencils)
+        else:
+            pred_selected = jax.vmap(
+                lambda anchor_stencil: rollout_anchor_closure_flux_from_anchor_stencil(
+                    anchor_stencil,
+                    learned=learned_rollout,
+                    integ=forward_integ,
+                    rollout_horizon=horizon,
+                    explicit_n_hat_fn=explicit_n_hat_fn,
+                    selected_k_index=None,
+                )
+            )(anchor_stencils)
         pred_components = jnp.stack(
             [jnp.real(pred_selected[:, :, 1:]), jnp.imag(pred_selected[:, :, 1:])],
             axis=-1,
@@ -6993,7 +7004,7 @@ def train_with_exact_q_rollout_minibatch_loss(
         max_projection_order=int(max_projection_order),
         target_nvs=target_nvs,
     )
-    all_k_rollout_loss = int(rollout_horizon) > 1
+    all_k_rollout_loss = True
     profile_steps = max(int(profile_train_steps), 0)
     profile_skip = max(int(profile_skip_steps), 0)
     profile_dir = None if profile_trace_dir is None or profile_steps <= 0 else Path(profile_trace_dir)
@@ -7856,7 +7867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         k_scale = float(args.k_scale) if args.k_scale is not None else default_exact_k_scale(k_arr)
         nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(max(Nv_targets))
-        store_exact_train_pairs = bool(args.exact_store_train_qpairs) or int(args.rollout_horizon) == 1
+        store_exact_train_pairs = bool(args.exact_store_train_qpairs)
         dataset_base, precomputed_stats = build_exact_q_rollout_qpair_dataset(
             exact_dataset,
             max_projection_order=max_projection_order,
@@ -7905,113 +7916,64 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             hidden_width=int(args.hidden_width),
             res_blocks=int(args.res_blocks),
         )
-        if int(args.rollout_horizon) == 1:
-            batch_loss_fn, active_regimes = make_regime_balanced_batch_loss(
-                regime_weights=regime_weights,
-                Nm=args.Nm,
-                k_scale=k_scale,
-                nv_scale=nv_scale,
-                stats=stats,
-                hidden_width=args.hidden_width,
-                res_blocks=args.res_blocks,
-                Nv_targets=Nv_targets,
-                train_regimes=regimes,
-                teacher_backend=teacher_backend,
-                teacher_Lx=args.teacher_L,
-                teacher_Nx=args.teacher_Nx,
-                teacher_Nv=args.teacher_Nv,
-                teacher_vmin=args.teacher_vmin,
-                teacher_vmax=args.teacher_vmax,
-                teacher_dt=args.teacher_dt,
-                teacher_proj_Nv=max_projection_order,
-                n_low=args.n_low,
-                context_mode=args.context_mode,
-            )
-            train_sizes = [int(prepared[regime]["train_inputs"].shape[0]) for regime in active_regimes]
-            steps_per_epoch = int(args.steps_per_epoch)
-            if steps_per_epoch <= 0:
-                steps_per_epoch = max(1, math.ceil(max(train_sizes) / float(args.batch_size)))
-            loss_history_raw: np.ndarray
-            params, loss_history_raw = train_with_minibatch_loss(
-                params,
-                prepared,
-                batch_loss_fn,
-                active_regimes=active_regimes,
-                epochs=args.epochs,
-                learning_rate=args.lr,
-                grad_clip=args.grad_clip,
-                log_every=args.log_every,
-                batch_size=args.batch_size,
-                steps_per_epoch=steps_per_epoch,
-                seed=args.seed,
-            )
-            loss_history = loss_history_raw
-            online_component_history = {
-                key: np.zeros_like(loss_history_raw, dtype=np.float64)
-                for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
-            }
-            online_component_history["total"] = np.asarray(loss_history_raw, dtype=np.float64)
-            online_component_history["q"] = np.asarray(loss_history_raw, dtype=np.float64)
-            online_component_history["q_diag"] = np.asarray(loss_history_raw, dtype=np.float64)
-        else:
-            batch_loss_fn, active_regimes = make_exact_q_rollout_batch_loss(
-                regime_weights=regime_weights,
-                Nm=args.Nm,
-                k_scale=k_scale,
-                nv_scale=nv_scale,
-                stats=stats,
-                hidden_width=args.hidden_width,
-                res_blocks=args.res_blocks,
-                Nv_targets=Nv_targets,
-                train_regimes=regimes,
-                teacher_backend=teacher_backend,
-                teacher_Lx=args.teacher_L,
-                teacher_Nx=args.teacher_Nx,
-                teacher_Nv=args.teacher_Nv,
-                teacher_vmin=args.teacher_vmin,
-                teacher_vmax=args.teacher_vmax,
-                teacher_dt=args.teacher_dt,
-                teacher_proj_Nv=max_projection_order,
-                n_low=args.n_low,
-                context_mode=args.context_mode,
-                rollout_horizon=args.rollout_horizon,
-                poisson_sign=args.teacher_poisson_sign,
-                rollout_dealias_23=bool(args.rollout_dealias_23),
-                rollout_precision=args.exact_rollout_precision,
-            )
-            steps_per_epoch = int(args.steps_per_epoch)
-            if steps_per_epoch <= 0:
-                qpair_counts = [
-                    int(dataset_base[regime]["train_time_indices"].shape[0])
-                    for regime in active_regimes
-                ]
-                steps_per_epoch = max(1, math.ceil(max(qpair_counts) / float(args.batch_size)))
-            params, online_component_history = train_with_exact_q_rollout_minibatch_loss(
-                params,
-                exact_dataset,
-                dataset_base,
-                batch_loss_fn,
-                max_projection_order=max_projection_order,
-                active_regimes=active_regimes,
-                k_arr=k_arr,
-                epochs=args.epochs,
-                learning_rate=args.lr,
-                grad_clip=args.grad_clip,
-                log_every=args.log_every,
-                batch_size=args.batch_size,
-                steps_per_epoch=steps_per_epoch,
-                rollout_horizon=args.rollout_horizon,
-                seed=args.seed,
-                log_components=online_training_log_components(
-                    train_objective=args.train_objective,
-                    online_loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
-                ),
-                target_sampling=args.exact_target_sampling,
-                profile_trace_dir=args.profile_trace_dir,
-                profile_train_steps=args.profile_train_steps,
-                profile_skip_steps=args.profile_skip_steps,
-            )
-            loss_history = online_component_history["total"]
+        batch_loss_fn, active_regimes = make_exact_q_rollout_batch_loss(
+            regime_weights=regime_weights,
+            Nm=args.Nm,
+            k_scale=k_scale,
+            nv_scale=nv_scale,
+            stats=stats,
+            hidden_width=args.hidden_width,
+            res_blocks=args.res_blocks,
+            Nv_targets=Nv_targets,
+            train_regimes=regimes,
+            teacher_backend=teacher_backend,
+            teacher_Lx=args.teacher_L,
+            teacher_Nx=args.teacher_Nx,
+            teacher_Nv=args.teacher_Nv,
+            teacher_vmin=args.teacher_vmin,
+            teacher_vmax=args.teacher_vmax,
+            teacher_dt=args.teacher_dt,
+            teacher_proj_Nv=max_projection_order,
+            n_low=args.n_low,
+            context_mode=args.context_mode,
+            rollout_horizon=args.rollout_horizon,
+            poisson_sign=args.teacher_poisson_sign,
+            rollout_dealias_23=bool(args.rollout_dealias_23),
+            rollout_precision=args.exact_rollout_precision,
+        )
+        steps_per_epoch = int(args.steps_per_epoch)
+        if steps_per_epoch <= 0:
+            qpair_counts = [
+                int(dataset_base[regime]["train_time_indices"].shape[0])
+                for regime in active_regimes
+            ]
+            steps_per_epoch = max(1, math.ceil(max(qpair_counts) / float(args.batch_size)))
+        params, online_component_history = train_with_exact_q_rollout_minibatch_loss(
+            params,
+            exact_dataset,
+            dataset_base,
+            batch_loss_fn,
+            max_projection_order=max_projection_order,
+            active_regimes=active_regimes,
+            k_arr=k_arr,
+            epochs=args.epochs,
+            learning_rate=args.lr,
+            grad_clip=args.grad_clip,
+            log_every=args.log_every,
+            batch_size=args.batch_size,
+            steps_per_epoch=steps_per_epoch,
+            rollout_horizon=args.rollout_horizon,
+            seed=args.seed,
+            log_components=online_training_log_components(
+                train_objective=args.train_objective,
+                online_loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+            ),
+            target_sampling=args.exact_target_sampling,
+            profile_trace_dir=args.profile_trace_dir,
+            profile_train_steps=args.profile_train_steps,
+            profile_skip_steps=args.profile_skip_steps,
+        )
+        loss_history = online_component_history["total"]
         learned = build_learned_interface_closure(
             params=params,
             Nm=args.Nm,
@@ -8591,10 +8553,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ),
         "exact_store_train_qpairs": np.array(
             [
-                (
-                    bool(args.exact_store_train_qpairs)
-                    or int(args.rollout_horizon) == 1
-                )
+                bool(args.exact_store_train_qpairs)
                 if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
                 else False
             ],
