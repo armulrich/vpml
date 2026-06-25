@@ -40,26 +40,33 @@ FIELD_K_MAX="${FIELD_K_MAX:-}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
+TRAIN_NV_LADDER_MODE="${TRAIN_NV_LADDER_MODE:-fixed_ratio}"
 TRAIN_FIXED_RATIO="${TRAIN_FIXED_RATIO:-1.8}"
 TRAIN_NM="${TRAIN_NM:-6}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-128}"
 TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
-TRAIN_LR="${TRAIN_LR:-1e-3}"
+if [[ -z "${TRAIN_LR:-}" ]]; then
+  if [[ "${TRAIN_ROLLOUT_HORIZON}" == "1" ]]; then
+    TRAIN_LR="1e-3"
+  else
+    TRAIN_LR="3e-4"
+  fi
+fi
 TRAIN_GRAD_CLIP="${TRAIN_GRAD_CLIP:-1.0}"
 TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-10}"
 if [[ -z "${TRAIN_BATCH_SIZE:-}" ]]; then
   if [[ "${TRAIN_ROLLOUT_HORIZON}" == "1" ]]; then
     TRAIN_BATCH_SIZE="8192"
   else
-    TRAIN_BATCH_SIZE="16"
+    TRAIN_BATCH_SIZE="512"
   fi
 fi
 if [[ -z "${TRAIN_STEPS_PER_EPOCH:-}" ]]; then
   if [[ "${TRAIN_ROLLOUT_HORIZON}" == "1" ]]; then
     TRAIN_STEPS_PER_EPOCH="50"
   else
-    TRAIN_STEPS_PER_EPOCH="5"
+    TRAIN_STEPS_PER_EPOCH="50"
   fi
 fi
 TRAIN_SEED="${TRAIN_SEED:-0}"
@@ -68,6 +75,23 @@ TRAIN_VAL_FRACTION="${TRAIN_VAL_FRACTION:-0.2}"
 TRAIN_REGIMES="${TRAIN_REGIMES:-linear_landau,nonlinear_landau_weak,nonlinear_landau_strong}"
 TRAIN_CONTEXT_MODE="${TRAIN_CONTEXT_MODE:-none}"
 TRAIN_ROLLOUT_DEALIAS_23="${TRAIN_ROLLOUT_DEALIAS_23:-1}"
+if [[ -z "${TRAIN_EXACT_ROLLOUT_PRECISION:-}" ]]; then
+  if [[ "${TRAIN_ROLLOUT_HORIZON}" == "1" ]]; then
+    TRAIN_EXACT_ROLLOUT_PRECISION="float64"
+  else
+    TRAIN_EXACT_ROLLOUT_PRECISION="float32"
+  fi
+fi
+TRAIN_EXACT_TARGET_SAMPLING="${TRAIN_EXACT_TARGET_SAMPLING:-cycle}"
+TRAIN_EXACT_STORE_TRAIN_QPAIRS="${TRAIN_EXACT_STORE_TRAIN_QPAIRS:-0}"
+if [[ "${TRAIN_ROLLOUT_HORIZON}" == "1" ]]; then
+  TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE="1"
+else
+  TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE="${TRAIN_EXACT_STORE_TRAIN_QPAIRS}"
+fi
+TRAIN_PROFILE_TRACE_DIR="${TRAIN_PROFILE_TRACE_DIR:-}"
+TRAIN_PROFILE_STEPS="${TRAIN_PROFILE_STEPS:-0}"
+TRAIN_PROFILE_SKIP_STEPS="${TRAIN_PROFILE_SKIP_STEPS:-1}"
 
 TRAIN_TEACHER_NX="${TRAIN_TEACHER_NX:-${TEACHER_NX}}"
 TRAIN_TEACHER_NV="${TRAIN_TEACHER_NV:-${TEACHER_NV}}"
@@ -121,6 +145,22 @@ print(",".join(str(value) for value in ladder))
 PY
 }
 
+ladder_csv_for_mode() {
+  local target="$1"
+  case "${TRAIN_NV_LADDER_MODE}" in
+    target_only)
+      printf '%s\n' "${target}"
+      ;;
+    fixed_ratio)
+      ladder_csv_for_target "${target}"
+      ;;
+    *)
+      echo "Unsupported TRAIN_NV_LADDER_MODE='${TRAIN_NV_LADDER_MODE}'. Expected 'target_only' or 'fixed_ratio'." >&2
+      exit 1
+      ;;
+  esac
+}
+
 mkdir -p "${OUTDIR}"
 cd "${REPO_ROOT}"
 
@@ -167,7 +207,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     if [[ -z "${NV}" ]]; then
       continue
     fi
-    TRAIN_LADDER_CSV="$(ladder_csv_for_target "${NV}")"
+    TRAIN_LADDER_CSV="$(ladder_csv_for_mode "${NV}")"
     MODEL_DIR="${CHECKPOINT_ROOT}/nv${NV}"
     CHECKPOINT_NV="${MODEL_DIR}/interface_closure.npz"
     LOSS_PLOT_NV="${MODEL_DIR}/interface_closure.loss.png"
@@ -181,6 +221,8 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --training-mode exact_q_rollout
       --train-objective q_rollout
       --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
+      --exact-rollout-precision "${TRAIN_EXACT_ROLLOUT_PRECISION}"
+      --exact-target-sampling "${TRAIN_EXACT_TARGET_SAMPLING}"
       --Nv-targets "${TRAIN_LADDER_CSV}"
       --Nm "${TRAIN_NM}"
       --hidden-width "${TRAIN_HIDDEN_WIDTH}"
@@ -213,6 +255,16 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --weak-eps "${TRAIN_WEAK_EPS}"
       --strong-eps "${TRAIN_STRONG_EPS}"
     )
+    if [[ "${TRAIN_EXACT_STORE_TRAIN_QPAIRS}" != "0" ]]; then
+      TRAIN_ARGS+=(--exact-store-train-qpairs)
+    fi
+    if [[ -n "${TRAIN_PROFILE_TRACE_DIR}" && "${TRAIN_PROFILE_STEPS}" != "0" ]]; then
+      TRAIN_ARGS+=(
+        --profile-trace-dir "${TRAIN_PROFILE_TRACE_DIR}"
+        --profile-train-steps "${TRAIN_PROFILE_STEPS}"
+        --profile-skip-steps "${TRAIN_PROFILE_SKIP_STEPS}"
+      )
+    fi
     if [[ "${TRAIN_ROLLOUT_DEALIAS_23}" != "0" ]]; then
       TRAIN_ARGS+=(--rollout-dealias-23)
     fi
@@ -245,7 +297,7 @@ cat <<EOF
 Done.
 
 Artifacts:
-  mode:           exact_q_rollout_fixed_ratio_grid_teacher
+  mode:           exact_q_rollout_${TRAIN_NV_LADDER_MODE}_grid_teacher
   checkpoint dir: ${CHECKPOINT_ROOT}
   history caches: ${CHECKPOINT_ROOT}/nv*/interface_closure_exact_q_rollout_histories.npz
   summary:        ${OUTDIR}/summary.json
@@ -256,7 +308,7 @@ Artifacts:
 
 Defaults:
   objective:      q_rollout
-  ladder mode:    target-specific fixed-ratio
+  ladder mode:    ${TRAIN_NV_LADDER_MODE}
   fixed ratio:    ${TRAIN_FIXED_RATIO}
   rollout horiz:  ${TRAIN_ROLLOUT_HORIZON}
   anchor pool:    none
@@ -268,6 +320,10 @@ Defaults:
   train Nm:       ${TRAIN_NM}
   batch size:     ${TRAIN_BATCH_SIZE}
   steps/epoch:    ${TRAIN_STEPS_PER_EPOCH}
+  lr:             ${TRAIN_LR}
+  precision:      ${TRAIN_EXACT_ROLLOUT_PRECISION}
+  target sampling:${TRAIN_EXACT_TARGET_SAMPLING}
+  store q-pairs:  ${TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE}
   context:        none
   Nv list:        ${NV_LIST}
 EOF
