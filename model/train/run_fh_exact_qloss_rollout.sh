@@ -26,6 +26,7 @@ NV_PLOT="${NV_PLOT:-1000}"
 PHASE_VMIN="${PHASE_VMIN:-0.0}"
 PHASE_VMAX="${PHASE_VMAX:-0.5}"
 PHASE_VRANGE="${PHASE_VRANGE:--4.0,4.0}"
+PHASE_REFERENCE_NV="${PHASE_REFERENCE_NV:-}"
 DEALIAS_23="${DEALIAS_23:-1}"
 NONLOCAL_MU="${NONLOCAL_MU:--1.017234}"
 
@@ -38,9 +39,14 @@ TEACHER_VMAX="${TEACHER_VMAX:-8.0}"
 FIELD_NUM_LOW_MODES="${FIELD_NUM_LOW_MODES:-}"
 FIELD_K_MAX="${FIELD_K_MAX:-}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
+RUN_EVAL="${RUN_EVAL:-1}"
 
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${OUTDIR}/models}"
+INIT_CHECKPOINT_ROOT="${INIT_CHECKPOINT_ROOT:-${TRAIN_INIT_CHECKPOINT_ROOT:-}}"
+INIT_CHECKPOINT_PATH="${INIT_CHECKPOINT_PATH:-${TRAIN_INIT_CHECKPOINT_PATH:-}}"
+TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE="0"
 TRAIN_NV_LADDER_MODE="${TRAIN_NV_LADDER_MODE:-fixed_ratio}"
+TRAIN_NV_TARGETS_CSV="${TRAIN_NV_TARGETS_CSV:-}"
 TRAIN_FIXED_RATIO="${TRAIN_FIXED_RATIO:-1.8}"
 TRAIN_NM="${TRAIN_NM:-6}"
 TRAIN_HIDDEN_WIDTH="${TRAIN_HIDDEN_WIDTH:-128}"
@@ -85,6 +91,21 @@ fi
 TRAIN_EXACT_TARGET_SAMPLING="${TRAIN_EXACT_TARGET_SAMPLING:-cycle}"
 TRAIN_EXACT_STORE_TRAIN_QPAIRS="${TRAIN_EXACT_STORE_TRAIN_QPAIRS:-0}"
 TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE="${TRAIN_EXACT_STORE_TRAIN_QPAIRS}"
+TRAIN_TAIL_CHAIN="${TRAIN_TAIL_CHAIN:-${TRAIN_TAIL_DECODER:-0}}"
+TRAIN_TAIL_CHAIN_NV="${TRAIN_TAIL_CHAIN_NV:-${TRAIN_TAIL_DECODER_NV:-512}}"
+TRAIN_TAIL_CHAIN_N_MIN="${TRAIN_TAIL_CHAIN_N_MIN:-}"
+TRAIN_TAIL_CHAIN_N_MAX="${TRAIN_TAIL_CHAIN_N_MAX:-${TRAIN_TAIL_DECODER_N_MAX:-}}"
+TRAIN_TAIL_CHAIN_CHUNK_SIZE="${TRAIN_TAIL_CHAIN_CHUNK_SIZE:-16}"
+TRAIN_TAIL_CHAIN_LIFT_HORIZONS="${TRAIN_TAIL_CHAIN_LIFT_HORIZONS:-}"
+TRAIN_TAIL_CHAIN_RECURSIVE_LIFT="${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT:-0}"
+TRAIN_LAMBDA_TAIL_CHAIN="${TRAIN_LAMBDA_TAIL_CHAIN:-${TRAIN_LAMBDA_TAIL_DECODER:-1.0}}"
+TRAIN_TAIL_HISTORY_LIFT="${TRAIN_TAIL_HISTORY_LIFT:-0}"
+TRAIN_TAIL_HISTORY_NV="${TRAIN_TAIL_HISTORY_NV:-512}"
+TRAIN_TAIL_HISTORY_N_MAX="${TRAIN_TAIL_HISTORY_N_MAX:-${TRAIN_TAIL_HISTORY_NV}}"
+TRAIN_TAIL_HISTORY_LAGS="${TRAIN_TAIL_HISTORY_LAGS:-8}"
+if [[ "${TRAIN_TAIL_CHAIN}" != "0" && -n "${INIT_CHECKPOINT_ROOT}${INIT_CHECKPOINT_PATH}" && "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" == "0" ]]; then
+  TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE="1"
+fi
 TRAIN_PROFILE_TRACE_DIR="${TRAIN_PROFILE_TRACE_DIR:-}"
 TRAIN_PROFILE_STEPS="${TRAIN_PROFILE_STEPS:-0}"
 TRAIN_PROFILE_SKIP_STEPS="${TRAIN_PROFILE_SKIP_STEPS:-1}"
@@ -157,6 +178,39 @@ ladder_csv_for_mode() {
   esac
 }
 
+normalize_nv_targets_csv() {
+  local csv="$1"
+  local target="$2"
+  "${PYTHON_BIN}" - <<'PY' "${csv}" "${target}" "${TRAIN_NM}"
+import sys
+
+raw = sys.argv[1]
+target = int(sys.argv[2])
+nm = int(sys.argv[3])
+values = []
+for part in raw.split(","):
+    part = part.strip()
+    if not part:
+        continue
+    try:
+        value = int(part)
+    except ValueError as exc:
+        raise SystemExit(f"TRAIN_NV_TARGETS_CSV contains a non-integer value: {part!r}") from exc
+    values.append(value)
+if not values:
+    raise SystemExit("TRAIN_NV_TARGETS_CSV must contain at least one Nv target")
+if any(value < nm for value in values):
+    raise SystemExit(f"TRAIN_NV_TARGETS_CSV values must be >= TRAIN_NM={nm}: {values}")
+if any(value > target for value in values):
+    raise SystemExit(f"TRAIN_NV_TARGETS_CSV values must be <= current NV={target}: {values}")
+if max(values) != target:
+    raise SystemExit(
+        f"TRAIN_NV_TARGETS_CSV must include current NV={target} as its maximum target: {values}"
+    )
+print(",".join(str(value) for value in sorted(set(values))))
+PY
+}
+
 mkdir -p "${OUTDIR}"
 cd "${REPO_ROOT}"
 
@@ -190,6 +244,9 @@ fi
 if [[ -n "${FIELD_K_MAX}" ]]; then
   ARGS+=(--field-k-max "${FIELD_K_MAX}")
 fi
+if [[ -n "${PHASE_REFERENCE_NV}" ]]; then
+  ARGS+=(--phase-reference-Nv "${PHASE_REFERENCE_NV}")
+fi
 
 mkdir -p "${CHECKPOINT_ROOT}"
 IFS=',' read -r -a NV_VALUES <<< "${NV_LIST}"
@@ -203,7 +260,11 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     if [[ -z "${NV}" ]]; then
       continue
     fi
-    TRAIN_LADDER_CSV="$(ladder_csv_for_mode "${NV}")"
+    if [[ -n "${TRAIN_NV_TARGETS_CSV}" ]]; then
+      TRAIN_LADDER_CSV="$(normalize_nv_targets_csv "${TRAIN_NV_TARGETS_CSV}" "${NV}")"
+    else
+      TRAIN_LADDER_CSV="$(ladder_csv_for_mode "${NV}")"
+    fi
     MODEL_DIR="${CHECKPOINT_ROOT}/nv${NV}"
     CHECKPOINT_NV="${MODEL_DIR}/interface_closure.npz"
     LOSS_PLOT_NV="${MODEL_DIR}/interface_closure.loss.png"
@@ -254,6 +315,52 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     if [[ "${TRAIN_EXACT_STORE_TRAIN_QPAIRS}" != "0" ]]; then
       TRAIN_ARGS+=(--exact-store-train-qpairs)
     fi
+    if [[ -n "${INIT_CHECKPOINT_PATH}" ]]; then
+      INIT_CHECKPOINT_NV="${INIT_CHECKPOINT_PATH}"
+      if [[ ! -f "${INIT_CHECKPOINT_NV}" ]]; then
+        echo "INIT_CHECKPOINT_PATH requires an existing checkpoint at ${INIT_CHECKPOINT_NV}" >&2
+        exit 1
+      fi
+      TRAIN_ARGS+=(--init-checkpoint "${INIT_CHECKPOINT_NV}")
+    elif [[ -n "${INIT_CHECKPOINT_ROOT}" ]]; then
+      INIT_CHECKPOINT_NV="${INIT_CHECKPOINT_ROOT}/nv${NV}/interface_closure.npz"
+      if [[ ! -f "${INIT_CHECKPOINT_NV}" ]]; then
+        echo "INIT_CHECKPOINT_ROOT requires an existing checkpoint at ${INIT_CHECKPOINT_NV}" >&2
+        exit 1
+      fi
+      TRAIN_ARGS+=(--init-checkpoint "${INIT_CHECKPOINT_NV}")
+    fi
+    if [[ "${TRAIN_TAIL_CHAIN}" != "0" ]]; then
+      TRAIN_ARGS+=(
+        --tail-chain
+        --tail-chain-Nv "${TRAIN_TAIL_CHAIN_NV}"
+        --tail-chain-chunk-size "${TRAIN_TAIL_CHAIN_CHUNK_SIZE}"
+      )
+      if [[ -n "${TRAIN_TAIL_CHAIN_LIFT_HORIZONS}" ]]; then
+        TRAIN_ARGS+=(--tail-chain-lift-horizons "${TRAIN_TAIL_CHAIN_LIFT_HORIZONS}")
+      fi
+      if [[ "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" != "0" ]]; then
+        TRAIN_ARGS+=(--tail-chain-recursive-lift --lambda-tail-chain "${TRAIN_LAMBDA_TAIL_CHAIN}")
+      elif [[ -n "${INIT_CHECKPOINT_ROOT}${INIT_CHECKPOINT_PATH}" ]]; then
+        TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE="1"
+      else
+        TRAIN_ARGS+=(--lambda-tail-chain "${TRAIN_LAMBDA_TAIL_CHAIN}")
+      fi
+      if [[ -n "${TRAIN_TAIL_CHAIN_N_MIN}" ]]; then
+        TRAIN_ARGS+=(--tail-chain-n-min "${TRAIN_TAIL_CHAIN_N_MIN}")
+      fi
+      if [[ -n "${TRAIN_TAIL_CHAIN_N_MAX}" ]]; then
+        TRAIN_ARGS+=(--tail-chain-n-max "${TRAIN_TAIL_CHAIN_N_MAX}")
+      fi
+    fi
+    if [[ "${TRAIN_TAIL_HISTORY_LIFT}" != "0" ]]; then
+      TRAIN_ARGS+=(
+        --tail-history-lift
+        --tail-history-Nv "${TRAIN_TAIL_HISTORY_NV}"
+        --tail-history-n-max "${TRAIN_TAIL_HISTORY_N_MAX}"
+        --tail-history-lags "${TRAIN_TAIL_HISTORY_LAGS}"
+      )
+    fi
     if [[ -n "${TRAIN_PROFILE_TRACE_DIR}" && "${TRAIN_PROFILE_STEPS}" != "0" ]]; then
       TRAIN_ARGS+=(
         --profile-trace-dir "${TRAIN_PROFILE_TRACE_DIR}"
@@ -285,8 +392,12 @@ else
 fi
 
 ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
-echo "[fh-exact-qloss-rollout] [3/3] Running nonlinear Nv sweep with HR/truncation/learned evaluation panels"
-"${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
+if [[ "${RUN_EVAL}" != "0" ]]; then
+  echo "[fh-exact-qloss-rollout] [3/3] Running nonlinear Nv sweep with HR/truncation/learned evaluation panels"
+  "${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
+else
+  echo "[fh-exact-qloss-rollout] [3/3] Skipping nonlinear Nv sweep because RUN_EVAL=${RUN_EVAL}"
+fi
 
 cat <<EOF
 
@@ -295,6 +406,7 @@ Done.
 Artifacts:
   mode:           exact_q_rollout_${TRAIN_NV_LADDER_MODE}_grid_teacher
   checkpoint dir: ${CHECKPOINT_ROOT}
+  init checkpoints:${INIT_CHECKPOINT_PATH:-${INIT_CHECKPOINT_ROOT:-<none>}}
   history caches: ${CHECKPOINT_ROOT}/nv*/interface_closure_exact_q_rollout_histories.npz
   summary:        ${OUTDIR}/summary.json
   metric 1:       ${OUTDIR}/nv_sweep_metric1.png
@@ -310,6 +422,7 @@ Defaults:
   anchor pool:    none
   eval dt:        ${DT}
   eval teacher dt:${TEACHER_DT}
+  phase ref Nv:  ${PHASE_REFERENCE_NV:-deployment}
   train teacher dt:${TRAIN_TEACHER_DT}
   train linear T: ${TRAIN_LINEAR_T}
   train nonlin T: ${TRAIN_NONLINEAR_T}
@@ -320,6 +433,18 @@ Defaults:
   precision:      ${TRAIN_EXACT_ROLLOUT_PRECISION}
   target sampling:${TRAIN_EXACT_TARGET_SAMPLING}
   store q-pairs:  ${TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE}
+  tail chain:     ${TRAIN_TAIL_CHAIN}
+  tail chain Nv:  ${TRAIN_TAIL_CHAIN_NV}
+  chain n range:  $(if [[ "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" != "0" ]]; then echo "${TRAIN_TAIL_CHAIN_N_MIN:-auto(target Nv)}"; else echo "${TRAIN_TAIL_CHAIN_N_MIN:-auto(target Nv+1)}"; fi)..${TRAIN_TAIL_CHAIN_N_MAX:-tail_Nv}
+  chain n batch:  all
+  chain chunk:    ${TRAIN_TAIL_CHAIN_CHUNK_SIZE}
+  lift horizons:  ${TRAIN_TAIL_CHAIN_LIFT_HORIZONS:-full}
+  chain objective:$(if [[ "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" != "0" ]]; then echo " recursive lift from frozen base"; elif [[ "${TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE}" == "1" ]]; then echo " chain-only continuation"; elif [[ "${TRAIN_TAIL_CHAIN}" != "0" ]]; then echo " dyn + lambda*chain"; else echo " disabled"; fi)
+  lambda chain:   $(if [[ "${TRAIN_TAIL_CHAIN}" == "0" || "${TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE}" == "1" ]]; then echo "not used"; else echo "${TRAIN_LAMBDA_TAIL_CHAIN}"; fi)
+  history lift:   ${TRAIN_TAIL_HISTORY_LIFT}
+  hist lift Nv:   ${TRAIN_TAIL_HISTORY_NV}
+  hist n range:   target Nv..${TRAIN_TAIL_HISTORY_N_MAX}
+  hist lags:      ${TRAIN_TAIL_HISTORY_LAGS}
   context:        none
   Nv list:        ${NV_LIST}
 EOF
