@@ -448,6 +448,7 @@ def save_fig10_learned_comparison_nv_sweep_phase_space(
     vmax: float,
     time_key_fn: Callable[[float], str],
     outdir: str | Path,
+    reference_title: str = "Projected HR Reference",
 ) -> Path:
     """Save a nonlinear Landau phase-space sweep across deployment Nv values."""
 
@@ -476,7 +477,7 @@ def save_fig10_learned_comparison_nv_sweep_phase_space(
     use_reference_truncation_layout = bool(has_projected_reference and has_truncation)
     if use_reference_truncation_layout:
         method_titles = {
-            "reference": "Projected HR Reference",
+            "reference": reference_title,
             "truncation": r"Truncated FH ($q=0$)",
             "learned": r"Learned FH ($q_\theta$)",
         }
