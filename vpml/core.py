@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import os
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -315,6 +315,18 @@ class LearnedInterfaceClosure:
     lambda_reg: float = 0.0
     online_v_probes: int = 0
     stability_loss_definition: Optional[str] = None
+    tail_chain_enabled: bool = False
+    tail_chain_nv: int = 0
+    tail_chain_n_min: int = 0
+    tail_chain_n_max: int = 0
+    lambda_tail_chain: float = 0.0
+    tail_lift_params: Optional[Dict[str, Array]] = None
+    tail_history_lift_enabled: bool = False
+    tail_history_nv: int = 0
+    tail_history_n_min: int = 0
+    tail_history_n_max: int = 0
+    tail_history_lags: int = 0
+    tail_history_lift_params: Optional[Dict[str, Array]] = None
 
     def __post_init__(self) -> None:
         if int(self.Nm) <= 0:
@@ -345,6 +357,30 @@ class LearnedInterfaceClosure:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
         if int(self.online_v_probes) < 0:
             raise ValueError("online_v_probes must be nonnegative")
+        if bool(self.tail_chain_enabled):
+            if int(self.tail_chain_nv) <= 0:
+                raise ValueError("tail_chain_nv must be positive when tail chain is enabled")
+            if int(self.tail_chain_n_min) < 0:
+                raise ValueError("tail_chain_n_min must be nonnegative")
+            if int(self.tail_chain_n_max) <= int(self.tail_chain_n_min):
+                raise ValueError("tail_chain_n_max must exceed tail_chain_n_min")
+            if int(self.tail_chain_n_max) > int(self.tail_chain_nv):
+                raise ValueError("tail_chain_n_max must not exceed tail_chain_nv")
+            if float(self.lambda_tail_chain) < 0.0:
+                raise ValueError("lambda_tail_chain must be nonnegative")
+        if bool(self.tail_history_lift_enabled):
+            if int(self.tail_history_nv) <= 0:
+                raise ValueError("tail_history_nv must be positive when history lift is enabled")
+            if int(self.tail_history_n_min) < 0:
+                raise ValueError("tail_history_n_min must be nonnegative")
+            if int(self.tail_history_n_max) <= int(self.tail_history_n_min):
+                raise ValueError("tail_history_n_max must exceed tail_history_n_min")
+            if int(self.tail_history_n_max) > int(self.tail_history_nv):
+                raise ValueError("tail_history_n_max must not exceed tail_history_nv")
+            if int(self.tail_history_lags) < 0:
+                raise ValueError("tail_history_lags must be nonnegative")
+            if self.tail_history_lift_params is None:
+                raise ValueError("tail_history_lift_params are required when history lift is enabled")
 
         input_dim = self.input_dim
         input_mean = jnp.asarray(self.input_mean, dtype=jnp.float64)
@@ -439,6 +475,7 @@ def init_interface_closure_params(
         params[f"b2_{block_idx}"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
     params["W_out"] = _xavier_normal(keys[idx], (int(hidden_width), 2))
     params["b_out"] = jnp.zeros((2,), dtype=jnp.float64)
+    idx += 1
     return params
 
 
@@ -461,6 +498,56 @@ def interface_closure_apply(
         h = h + residual
     y_nl = h @ params["W_out"] + params["b_out"]
     return (y_lin + y_nl).astype(param_dtype)
+
+
+def init_tail_history_lift_params(
+    key: Array,
+    *,
+    input_dim: int,
+    output_modes: int,
+    hidden_width: int = 128,
+    res_blocks: int = 2,
+) -> Dict[str, Array]:
+    """Initialize the direct history-conditioned Hermite-tail lift head."""
+    if int(input_dim) <= 0:
+        raise ValueError("input_dim must be positive")
+    if int(output_modes) <= 0:
+        raise ValueError("output_modes must be positive")
+    if int(hidden_width) <= 0:
+        raise ValueError("hidden_width must be positive")
+    if int(res_blocks) < 0:
+        raise ValueError("res_blocks must be nonnegative")
+
+    keys = jax.random.split(key, 1 + (2 * int(res_blocks)) + 1)
+    idx = 0
+    params: Dict[str, Array] = {}
+    params["W_in"] = _xavier_normal(keys[idx], (int(input_dim), int(hidden_width))); idx += 1
+    params["b_in"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
+    for block_idx in range(int(res_blocks)):
+        params[f"W1_{block_idx}"] = _xavier_normal(keys[idx], (int(hidden_width), int(hidden_width))); idx += 1
+        params[f"b1_{block_idx}"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
+        params[f"W2_{block_idx}"] = _xavier_normal(keys[idx], (int(hidden_width), int(hidden_width))); idx += 1
+        params[f"b2_{block_idx}"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
+    params["W_out"] = jnp.zeros((int(hidden_width), 2 * int(output_modes)), dtype=jnp.float64)
+    params["b_out"] = jnp.zeros((2 * int(output_modes),), dtype=jnp.float64)
+    return params
+
+
+def tail_history_lift_apply(
+    params: Dict[str, Array],
+    x: Array,
+    *,
+    res_blocks: int = 2,
+) -> Array:
+    """Apply the history-conditioned tail lift head to one or more feature vectors."""
+    param_dtype = jnp.asarray(params["W_in"]).dtype
+    x = jnp.asarray(x, dtype=param_dtype)
+    h = jax.nn.silu(x @ params["W_in"] + params["b_in"])
+    for block_idx in range(int(res_blocks)):
+        residual = jax.nn.silu(h @ params[f"W1_{block_idx}"] + params[f"b1_{block_idx}"])
+        residual = residual @ params[f"W2_{block_idx}"] + params[f"b2_{block_idx}"]
+        h = h + residual
+    return (h @ params["W_out"] + params["b_out"]).astype(param_dtype)
 
 
 def save_learned_interface_closure_npz(
@@ -511,6 +598,16 @@ def save_learned_interface_closure_npz(
         "lambda_neg": np.array([float(learned.lambda_neg)], dtype=np.float64),
         "lambda_reg": np.array([float(learned.lambda_reg)], dtype=np.float64),
         "online_v_probes": np.array([int(learned.online_v_probes)], dtype=np.int32),
+        "tail_chain_enabled": np.array([int(bool(learned.tail_chain_enabled))], dtype=np.int32),
+        "tail_chain_nv": np.array([int(learned.tail_chain_nv)], dtype=np.int32),
+        "tail_chain_n_min": np.array([int(learned.tail_chain_n_min)], dtype=np.int32),
+        "tail_chain_n_max": np.array([int(learned.tail_chain_n_max)], dtype=np.int32),
+        "lambda_tail_chain": np.array([float(learned.lambda_tail_chain)], dtype=np.float64),
+        "tail_history_lift_enabled": np.array([int(bool(learned.tail_history_lift_enabled))], dtype=np.int32),
+        "tail_history_nv": np.array([int(learned.tail_history_nv)], dtype=np.int32),
+        "tail_history_n_min": np.array([int(learned.tail_history_n_min)], dtype=np.int32),
+        "tail_history_n_max": np.array([int(learned.tail_history_n_max)], dtype=np.int32),
+        "tail_history_lags": np.array([int(learned.tail_history_lags)], dtype=np.int32),
     }
     if learned.stability_loss_definition is not None:
         payload["stability_loss_definition"] = np.array([str(learned.stability_loss_definition)], dtype=np.str_)
@@ -530,6 +627,12 @@ def save_learned_interface_closure_npz(
         payload["teacher_proj_Nv"] = np.array([int(learned.teacher_proj_Nv)], dtype=np.int32)
     for name, value in learned.params.items():
         payload[name] = np.asarray(value, dtype=np.float64)
+    if learned.tail_lift_params is not None:
+        for name, value in learned.tail_lift_params.items():
+            payload[f"tail_lift__{name}"] = np.asarray(value, dtype=np.float64)
+    if learned.tail_history_lift_params is not None:
+        for name, value in learned.tail_history_lift_params.items():
+            payload[f"tail_history__{name}"] = np.asarray(value, dtype=np.float64)
     np.savez(path, **payload)
 
 
@@ -554,6 +657,20 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
                 or name in {"W_lin", "b_lin", "W_in", "b_in", "W_out", "b_out"}
             )
         }
+        tail_lift_params = {
+            name.removeprefix("tail_lift__"): jnp.asarray(data[name], dtype=jnp.float64)
+            for name in data.files
+            if name.startswith("tail_lift__")
+        }
+        if not tail_lift_params:
+            tail_lift_params = None
+        tail_history_lift_params = {
+            name.removeprefix("tail_history__"): jnp.asarray(data[name], dtype=jnp.float64)
+            for name in data.files
+            if name.startswith("tail_history__")
+        }
+        if not tail_history_lift_params:
+            tail_history_lift_params = None
         if not params:
             raise ValueError(f"No learned-closure parameters found in checkpoint: {path}")
 
@@ -683,6 +800,56 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "stability_loss_definition" in data.files and data["stability_loss_definition"].size
             else None
         )
+        tail_chain_enabled = (
+            bool(np.asarray(data["tail_chain_enabled"]).reshape(-1)[0])
+            if "tail_chain_enabled" in data.files and data["tail_chain_enabled"].size
+            else False
+        )
+        tail_chain_nv = (
+            int(np.asarray(data["tail_chain_nv"]).reshape(-1)[0])
+            if "tail_chain_nv" in data.files and data["tail_chain_nv"].size
+            else 0
+        )
+        tail_chain_n_min = (
+            int(np.asarray(data["tail_chain_n_min"]).reshape(-1)[0])
+            if "tail_chain_n_min" in data.files and data["tail_chain_n_min"].size
+            else 0
+        )
+        tail_chain_n_max = (
+            int(np.asarray(data["tail_chain_n_max"]).reshape(-1)[0])
+            if "tail_chain_n_max" in data.files and data["tail_chain_n_max"].size
+            else 0
+        )
+        lambda_tail_chain = (
+            float(np.asarray(data["lambda_tail_chain"]).reshape(-1)[0])
+            if "lambda_tail_chain" in data.files and data["lambda_tail_chain"].size
+            else 0.0
+        )
+        tail_history_lift_enabled = (
+            bool(np.asarray(data["tail_history_lift_enabled"]).reshape(-1)[0])
+            if "tail_history_lift_enabled" in data.files and data["tail_history_lift_enabled"].size
+            else False
+        )
+        tail_history_nv = (
+            int(np.asarray(data["tail_history_nv"]).reshape(-1)[0])
+            if "tail_history_nv" in data.files and data["tail_history_nv"].size
+            else 0
+        )
+        tail_history_n_min = (
+            int(np.asarray(data["tail_history_n_min"]).reshape(-1)[0])
+            if "tail_history_n_min" in data.files and data["tail_history_n_min"].size
+            else 0
+        )
+        tail_history_n_max = (
+            int(np.asarray(data["tail_history_n_max"]).reshape(-1)[0])
+            if "tail_history_n_max" in data.files and data["tail_history_n_max"].size
+            else 0
+        )
+        tail_history_lags = (
+            int(np.asarray(data["tail_history_lags"]).reshape(-1)[0])
+            if "tail_history_lags" in data.files and data["tail_history_lags"].size
+            else 0
+        )
 
     return LearnedInterfaceClosure(
         params=params,
@@ -724,6 +891,18 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         lambda_reg=lambda_reg,
         online_v_probes=online_v_probes,
         stability_loss_definition=stability_loss_definition,
+        tail_chain_enabled=tail_chain_enabled,
+        tail_chain_nv=tail_chain_nv,
+        tail_chain_n_min=tail_chain_n_min,
+        tail_chain_n_max=tail_chain_n_max,
+        lambda_tail_chain=lambda_tail_chain,
+        tail_lift_params=tail_lift_params,
+        tail_history_lift_enabled=tail_history_lift_enabled,
+        tail_history_nv=tail_history_nv,
+        tail_history_n_min=tail_history_n_min,
+        tail_history_n_max=tail_history_n_max,
+        tail_history_lags=tail_history_lags,
+        tail_history_lift_params=tail_history_lift_params,
     )
 
 
@@ -842,21 +1021,22 @@ def scale_learned_closure_raw_features(
     k_scale = jnp.asarray(float(learned.k_scale), dtype=real_dtype)
     nv_scale = jnp.asarray(float(learned.nv_scale), dtype=real_dtype)
     base_dim = int(learned.raw_base_dim)
+    k_col = 2 * int(learned.Nm)
+
+    def scale_base_features(features: Array) -> Array:
+        prefix = jnp.ones((k_col,), dtype=real_dtype)
+        scaled_cols = jnp.stack((jnp.reciprocal(k_scale), jnp.reciprocal(nv_scale)))
+        suffix = jnp.ones((base_dim - k_col - 2,), dtype=real_dtype)
+        scale = jnp.concatenate((prefix, scaled_cols, suffix), axis=0)
+        return features * scale[None, :]
+
     if learned.context_mode == "none":
-        feats = raw_features
-        feats = feats.at[:, 2 * int(learned.Nm)].divide(k_scale)
-        feats = feats.at[:, 2 * int(learned.Nm) + 1].divide(nv_scale)
-        return feats
+        return scale_base_features(raw_features)
     if learned.context_mode == "lag1_delta":
         current = raw_features[:, :base_dim]
         previous = raw_features[:, base_dim : 2 * base_dim]
-        delta = raw_features[:, 2 * base_dim :]
-        k_col = 2 * int(learned.Nm)
-        nv_col = k_col + 1
-        current = current.at[:, k_col].divide(k_scale)
-        current = current.at[:, nv_col].divide(nv_scale)
-        previous = previous.at[:, k_col].divide(k_scale)
-        previous = previous.at[:, nv_col].divide(nv_scale)
+        current = scale_base_features(current)
+        previous = scale_base_features(previous)
         delta = current - previous
         return jnp.concatenate([current, previous, delta], axis=1)
     raise ValueError(f"Unsupported context_mode={learned.context_mode!r}")
@@ -909,6 +1089,143 @@ def learned_interface_q_hat(
         pred = clip * jnp.tanh(pred / clip)
     q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(complex_dtype)
     return q_hat.at[1:].set(q_nonzero)
+
+
+def _standardized_learned_closure_features(
+    a_hat: Array,
+    k_arr: Array,
+    Nv: int,
+    learned: LearnedInterfaceClosure,
+    *,
+    a_hat_prev: Optional[Array] = None,
+) -> Array:
+    """Return standardized nonzero-k interface-closure features."""
+    raw_features = learned_closure_raw_features(
+        a_hat,
+        k_arr,
+        int(Nv),
+        learned,
+        a_hat_prev=a_hat_prev,
+    )
+    scaled = scale_learned_closure_raw_features(raw_features, learned)
+    return learned.standardized_inputs(scaled)
+
+
+def learned_recursive_hermite_chain_lift(
+    a_hat: Array,
+    k_arr: Array,
+    learned: LearnedInterfaceClosure,
+    *,
+    n_min: int,
+    n_max: int,
+    a_hat_prev: Optional[Array] = None,
+) -> Array:
+    """Complete a Hermite tail by recursively inverting the learned q relation.
+
+    For each virtual cutoff m, the model predicts
+
+        q_m,k = -i k v_th sqrt(m) C_m,k.
+
+    This helper inverts that relation for k > 0 and appends the predicted
+    coefficient before querying the next virtual cutoff.  The k=0 tail is not
+    observable from q and is left at zero.
+    """
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    complex_dtype = a_hat.dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
+    n_min_i = int(n_min)
+    n_max_i = int(n_max)
+    base_nv = int(a_hat.shape[0])
+    if n_min_i < base_nv:
+        raise ValueError(f"n_min={n_min_i} must be >= base Nv={base_nv}")
+    if n_max_i <= n_min_i:
+        raise ValueError("n_max must exceed n_min for recursive Hermite-chain lifting")
+    if int(learned.Nm) > n_min_i:
+        raise ValueError(f"learned Nm={int(learned.Nm)} exceeds n_min={n_min_i}")
+    if k_arr.shape[0] != a_hat.shape[1]:
+        raise ValueError(f"k_arr must have shape ({a_hat.shape[1]},), got {k_arr.shape}")
+
+    lift_learned = learned
+    if learned.tail_lift_params is not None:
+        lift_learned = replace(learned, params=learned.tail_lift_params, tail_lift_params=None)
+
+    full_hat = jnp.zeros((n_max_i, a_hat.shape[1]), dtype=complex_dtype)
+    full_hat = full_hat.at[:base_nv, :].set(a_hat)
+    prev_full = None
+    if a_hat_prev is not None:
+        prev_full = jnp.zeros_like(full_hat).at[:base_nv, :].set(jnp.asarray(a_hat_prev, dtype=complex_dtype))
+
+    for m in range(n_min_i, n_max_i):
+        prev_slice = None if prev_full is None else prev_full[:m, :]
+        q_hat = learned_interface_q_hat(
+            full_hat[:m, :],
+            k_arr,
+            m,
+            lift_learned,
+            a_hat_prev=prev_slice,
+        )
+        denom = -1j * k_arr[1:] * jnp.sqrt(jnp.asarray(float(m), dtype=real_dtype))
+        coeff = q_hat[1:] / denom
+        full_hat = full_hat.at[m, 1:].set(coeff.astype(complex_dtype))
+    return full_hat
+
+
+def learned_history_hermite_lift(
+    a_hat_history: Array,
+    k_arr: Array,
+    learned: LearnedInterfaceClosure,
+    *,
+    n_min: int,
+    n_max: int,
+) -> Array:
+    """Complete a Hermite tail directly from a low-order coefficient history.
+
+    ``a_hat_history`` is chronological with the current low-order state last.
+    The lift predicts the full tail for each positive Fourier mode independently
+    from that mode's low-order history and normalized wavenumber.
+    """
+    if learned.tail_history_lift_params is None:
+        raise ValueError("learned checkpoint does not contain tail-history lift parameters")
+    history = jnp.asarray(a_hat_history)
+    if int(history.ndim) != 3:
+        raise ValueError(f"a_hat_history must have shape (T, Nv, Nk), got {history.shape}")
+    real_dtype = jnp.real(history).dtype
+    complex_dtype = history.dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
+    n_min_i = int(n_min)
+    n_max_i = int(n_max)
+    base_nv = int(history.shape[1])
+    nk = int(history.shape[2])
+    if n_min_i != base_nv:
+        raise ValueError(f"history lift expects n_min == base Nv; got n_min={n_min_i}, base Nv={base_nv}")
+    if n_max_i <= n_min_i:
+        raise ValueError("n_max must exceed n_min for history Hermite lifting")
+    if int(k_arr.shape[0]) != nk:
+        raise ValueError(f"k_arr must have shape ({nk},), got {k_arr.shape}")
+
+    tail_params = {
+        name: jnp.asarray(value, dtype=real_dtype)
+        for name, value in learned.tail_history_lift_params.items()
+    }
+    nonzero_history = jnp.swapaxes(history[:, :, 1:], 0, 2)
+    flat = nonzero_history.reshape((nk - 1, -1))
+    features = jnp.concatenate(
+        [
+            jnp.real(flat),
+            jnp.imag(flat),
+            (jnp.abs(k_arr[1:]) / jnp.maximum(jnp.asarray(float(learned.k_scale), dtype=real_dtype), 1e-12))[:, None],
+        ],
+        axis=-1,
+    )
+    pred = tail_history_lift_apply(tail_params, features, res_blocks=int(learned.res_blocks))
+    tail_modes = n_max_i - n_min_i
+    pred = pred.reshape((nk - 1, tail_modes, 2))
+    tail = (pred[..., 0] + 1j * pred[..., 1]).T.astype(complex_dtype)
+    full_hat = jnp.zeros((n_max_i, nk), dtype=complex_dtype)
+    full_hat = full_hat.at[:base_nv, :].set(history[-1])
+    full_hat = full_hat.at[n_min_i:n_max_i, 1:].set(tail)
+    return full_hat
 
 
 def learned_boundary_flux_hat(

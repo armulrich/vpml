@@ -47,8 +47,10 @@ from vpml.core import (
     LearnedInterfaceClosure,
     e_hat_history_from_a_hat_history,
     init_interface_closure_params,
+    init_tail_history_lift_params,
     irfft_x,
     learned_boundary_flux_hat,
+    learned_history_hermite_lift,
     learned_interface_q_hat,
     load_learned_interface_closure_npz,
     normalize_teacher_backend_name,
@@ -89,6 +91,10 @@ OFFLINE_TRAINING_MODE = "offline_rollout"
 EXACT_Q_ROLLOUT_TRAINING_MODE = "exact_q_rollout"
 EXACT_Q_ROLLOUT_OBJECTIVE = "q_rollout"
 EXACT_Q_ROLLOUT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout"
+EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_tail_chain"
+EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_chain_only"
+EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_recursive_lift"
+EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_history_lift"
 ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR = "fourier_hermite_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR = "fourier_hermite_closure_bidir"
@@ -1374,8 +1380,9 @@ def build_exact_q_rollout_reference_dataset(
     weak_eps: Sequence[float],
     strong_eps: Sequence[float],
     Nv_targets: Sequence[int],
+    min_projection_order: Optional[int] = None,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], int]:
-    max_projection_order = max(int(v) for v in Nv_targets) + 1
+    max_projection_order = max(max(int(v) for v in Nv_targets) + 1, int(min_projection_order or 0))
     cache_metadata = build_exact_q_rollout_cache_metadata(
         regimes=regimes,
         teacher_Nx=teacher_Nx,
@@ -1774,6 +1781,20 @@ def exact_rollout_precision_dtypes(precision: str) -> Tuple[object, object]:
     )
 
 
+def exact_rollout_numpy_complex_dtype(complex_dtype: object) -> np.dtype:
+    dtype = np.dtype(complex_dtype)
+    if dtype == np.dtype(np.complex64):
+        return np.dtype(np.complex64)
+    if dtype == np.dtype(np.complex128):
+        return np.dtype(np.complex128)
+    raise ValueError(f"unsupported exact rollout complex dtype {complex_dtype!r}")
+
+
+def exact_rollout_numpy_real_dtype(complex_dtype: object) -> np.dtype:
+    complex_np_dtype = exact_rollout_numpy_complex_dtype(complex_dtype)
+    return np.dtype(np.float32 if complex_np_dtype == np.dtype(np.complex64) else np.float64)
+
+
 def cast_learned_closure_for_rollout(
     learned: LearnedInterfaceClosure,
     *,
@@ -1783,9 +1804,21 @@ def cast_learned_closure_for_rollout(
     if str(precision) == EXACT_ROLLOUT_PRECISION_FLOAT64:
         return learned
     params = jax.tree_util.tree_map(lambda value: jnp.asarray(value, dtype=real_dtype), learned.params)
+    tail_lift_params = (
+        None
+        if learned.tail_lift_params is None
+        else jax.tree_util.tree_map(lambda value: jnp.asarray(value, dtype=real_dtype), learned.tail_lift_params)
+    )
+    tail_history_lift_params = (
+        None
+        if learned.tail_history_lift_params is None
+        else jax.tree_util.tree_map(lambda value: jnp.asarray(value, dtype=real_dtype), learned.tail_history_lift_params)
+    )
     return replace(
         learned,
         params=params,
+        tail_lift_params=tail_lift_params,
+        tail_history_lift_params=tail_history_lift_params,
         input_mean=jnp.asarray(learned.input_mean, dtype=real_dtype),
         input_std=jnp.asarray(learned.input_std, dtype=real_dtype),
         target_mean=jnp.asarray(learned.target_mean, dtype=real_dtype),
@@ -2821,6 +2854,18 @@ def build_learned_interface_closure(
     lambda_reg: float = 0.0,
     online_v_probes: int = 0,
     stability_loss_definition: Optional[str] = None,
+    tail_chain_enabled: bool = False,
+    tail_chain_nv: int = 0,
+    tail_chain_n_min: int = 0,
+    tail_chain_n_max: int = 0,
+    lambda_tail_chain: float = 0.0,
+    tail_lift_params: Optional[Dict[str, Array]] = None,
+    tail_history_lift_enabled: bool = False,
+    tail_history_nv: int = 0,
+    tail_history_n_min: int = 0,
+    tail_history_n_max: int = 0,
+    tail_history_lags: int = 0,
+    tail_history_lift_params: Optional[Dict[str, Array]] = None,
 ) -> LearnedInterfaceClosure:
     return LearnedInterfaceClosure(
         params=params,
@@ -2866,6 +2911,18 @@ def build_learned_interface_closure(
             if stability_loss_definition is None
             else str(stability_loss_definition)
         ),
+        tail_chain_enabled=bool(tail_chain_enabled),
+        tail_chain_nv=int(tail_chain_nv),
+        tail_chain_n_min=int(tail_chain_n_min),
+        tail_chain_n_max=int(tail_chain_n_max),
+        lambda_tail_chain=float(lambda_tail_chain),
+        tail_lift_params=tail_lift_params,
+        tail_history_lift_enabled=bool(tail_history_lift_enabled),
+        tail_history_nv=int(tail_history_nv),
+        tail_history_n_min=int(tail_history_n_min),
+        tail_history_n_max=int(tail_history_n_max),
+        tail_history_lags=int(tail_history_lags),
+        tail_history_lift_params=tail_history_lift_params,
     )
 
 
@@ -3152,7 +3209,7 @@ def online_trajectory_loss_terms(
     eq_probe: Array,
     tail_start_fraction: float,
     poisson_sign: float,
-) -> Tuple[Array, Array, Array, Array]:
+) -> Tuple[Array, Array]:
     pred_E_hat = e_hat_history_from_a_hat_history(
         jnp.asarray(a_hat_hist, dtype=jnp.complex128),
         jnp.asarray(k_arr, dtype=jnp.float64),
@@ -3802,6 +3859,56 @@ def rollout_anchor_closure_flux_from_anchor_stencil(
     init = (current_state, prev_state, n_prev, b_prev)
     (_, _, _, _), q_hist = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
     return q_hist
+
+
+def rollout_anchor_states_from_anchor_stencil(
+    anchor_stencil: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    explicit_n_hat_fn,
+) -> Array:
+    """Return solver states C_h for h=0..H-1 from a compact forward CNAB2 stencil."""
+    stencil = jnp.asarray(anchor_stencil)
+    if int(stencil.shape[0]) != 3:
+        raise ValueError(f"anchor_stencil must have shape (3, Nv, Nk), got {stencil.shape}")
+    current_state = stencil[0]
+    prev_state = stencil[1]
+    prev_prev_state = stencil[2]
+    n_prev = explicit_n_hat_fn(prev_state, integ=integ)
+    b_prev = learned_boundary_flux_hat(
+        prev_state,
+        integ.k_arr,
+        integ.Nv,
+        integ.vth,
+        learned,
+        a_hat_prev=prev_prev_state,
+    )
+
+    def step(carry, _):
+        state, state_prev, n_prev_step, b_prev_step = carry
+        n_hat = explicit_n_hat_fn(state, integ=integ)
+        q_hat = learned_interface_q_hat(
+            state,
+            integ.k_arr,
+            integ.Nv,
+            learned,
+            a_hat_prev=state_prev,
+        )
+        b_hat = jnp.zeros_like(state).at[int(integ.Nv) - 1].set(q_hat)
+        state_new = integ.step_cnab2(
+            state,
+            n_hat,
+            n_prev_step,
+            extra_hat=b_hat,
+            extra_hat_prev=b_prev_step,
+        )
+        return (state_new, state, n_hat, b_hat), state
+
+    init = (current_state, prev_state, n_prev, b_prev)
+    (_, _, _, _), state_hist = jax.lax.scan(step, init, xs=None, length=int(rollout_horizon))
+    return state_hist
 
 
 def rollout_closure_action_from_anchor_state(
@@ -4637,6 +4744,312 @@ def online_fourier_hermite_rollout_qloss_for_anchor_stencils(
     return loss_total / sample_count
 
 
+def exact_tail_chain_q_loss(
+    chain_input_windows: Array,
+    chain_global_features: Array,
+    chain_ref_q_windows: Array,
+    chain_n_indices: Array,
+    chain_n_mask: Optional[Array] = None,
+    *,
+    learned: LearnedInterfaceClosure,
+    k_arr: Array,
+) -> Array:
+    """Teacher-forced virtual-cutoff q loss for Hermite-chain continuation.
+
+    ``chain_input_windows`` contains the local HR stencil
+    C^{HR}_{m-Nm:m,k}(t) for each sampled virtual cutoff m and all retained
+    positive Fourier modes.  The loss keeps the all-k discipline from the exact
+    q-rollout path.  The caller may evaluate deterministic Hermite chunks and
+    aggregate them to avoid materializing the full 64:512 chain at once.
+    """
+    local = jnp.asarray(chain_input_windows)
+    ref_q = jnp.asarray(chain_ref_q_windows, dtype=local.dtype)
+    real_dtype = jnp.real(local).dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
+    n_arr = jnp.asarray(chain_n_indices, dtype=real_dtype)
+    globals_arr = jnp.asarray(chain_global_features, dtype=real_dtype)
+    if local.ndim != 5:
+        raise ValueError(
+            "chain_input_windows must have shape (B,H,M,Nm,Nk), "
+            f"got {local.shape}"
+        )
+    if int(local.shape[3]) != int(learned.Nm):
+        raise ValueError(f"chain input Nm={int(local.shape[3])} does not match learned Nm={int(learned.Nm)}")
+    if int(local.shape[-1]) != int(k_arr.shape[0]):
+        raise ValueError(f"chain input Nk={int(local.shape[-1])} does not match k_arr={int(k_arr.shape[0])}")
+    if tuple(ref_q.shape[:3]) != tuple(local.shape[:3]):
+        raise ValueError("chain_ref_q_windows must share the first three dimensions with chain_input_windows")
+
+    z = jnp.swapaxes(local[..., :, 1:], -2, -1)
+    feature_cols = [
+        jnp.real(z),
+        jnp.imag(z),
+        jnp.broadcast_to(jnp.abs(k_arr[1:])[None, None, None, :, None], z.shape[:-1] + (1,)),
+        jnp.broadcast_to(n_arr[None, None, :, None, None], z.shape[:-1] + (1,)),
+    ]
+    if bool(learned.include_global_indicators):
+        feature_cols.append(
+            jnp.broadcast_to(globals_arr[:, :, None, None, :], z.shape[:-1] + (2,))
+        )
+    raw = jnp.concatenate(feature_cols, axis=-1)
+    flat_raw = raw.reshape((-1, raw.shape[-1]))
+    scaled = scale_learned_closure_raw_features(flat_raw, learned)
+    pred_components = learned.predict_q_components(scaled).reshape(raw.shape[:-1] + (2,))
+    pred_q = pred_components[..., 0] + 1j * pred_components[..., 1]
+    ref_components = jnp.stack(
+        [jnp.real(ref_q[..., 1:]), jnp.imag(ref_q[..., 1:])],
+        axis=-1,
+    )
+    pred_components = jnp.stack([jnp.real(pred_q), jnp.imag(pred_q)], axis=-1)
+    std = jnp.maximum(jnp.asarray(learned.target_std, dtype=real_dtype), 1e-12)
+    err = ((pred_components - ref_components) / std) ** 2
+    if chain_n_mask is not None:
+        mask = jnp.asarray(chain_n_mask, dtype=real_dtype)
+        if int(mask.ndim) != 1 or int(mask.shape[0]) != int(err.shape[2]):
+            raise ValueError("chain_n_mask must have shape (M,) matching chain_n_indices")
+        err = err * mask[None, None, :, None, None]
+        denom = (
+            jnp.maximum(jnp.sum(mask), jnp.asarray(1.0, dtype=real_dtype))
+            * float(int(err.shape[0]))
+            * float(int(err.shape[1]))
+            * float(int(err.shape[3]))
+            * float(int(err.shape[4]))
+        )
+        return jnp.sum(err) / denom
+    return jnp.mean(err)
+
+
+def exact_recursive_tail_lift_coeff_loss(
+    anchor_stencils: Array,
+    tail_ref_windows: Array,
+    *,
+    base_learned: LearnedInterfaceClosure,
+    lift_learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    explicit_n_hat_fn,
+    tail_n_min: int,
+    tail_n_max: int,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    tail_n_indices: Optional[Array] = None,
+    tail_n_mask: Optional[Array] = None,
+    tail_ref_energy_mean: Optional[Array] = None,
+) -> Array:
+    """Train a copied closure as a recursive Hermite lift over a frozen low-order rollout.
+
+    The base closure advances only the deployed state, while ``lift_learned``
+    recursively predicts C_m from q_m for m in [tail_n_min, tail_n_max).  The
+    target is the HR teacher tail at matching rollout times.  This keeps the
+    stage-1 dynamics protected and makes the stage-2 objective match the fig10
+    reconstruction path.
+    """
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    anchor_stencils = jnp.asarray(anchor_stencils, dtype=complex_dtype)
+    tail_ref_windows = jnp.asarray(tail_ref_windows, dtype=complex_dtype)
+    base_rollout = cast_learned_closure_for_rollout(base_learned, precision=str(rollout_precision))
+    lift_rollout = cast_learned_closure_for_rollout(lift_learned, precision=str(rollout_precision))
+    horizon = int(rollout_horizon)
+    tail_min = int(tail_n_min)
+    tail_max = int(tail_n_max)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for recursive tail lift")
+    if tail_min != int(forward_integ.Nv):
+        raise ValueError(
+            f"recursive tail lift currently expects tail_n_min == deployment Nv; "
+            f"got n_min={tail_min}, Nv={int(forward_integ.Nv)}"
+        )
+    if tail_max <= tail_min:
+        raise ValueError("tail_n_max must exceed tail_n_min")
+    if tail_n_indices is None:
+        loss_n_indices = jnp.arange(tail_min, tail_max, dtype=jnp.int32)
+        loss_n_mask = jnp.ones((tail_max - tail_min,), dtype=real_dtype)
+        expected_modes = tail_max - tail_min
+        recursive_stop = tail_max
+    else:
+        loss_n_indices = jnp.asarray(tail_n_indices, dtype=jnp.int32)
+        if int(loss_n_indices.ndim) != 1:
+            raise ValueError("tail_n_indices must be a 1D array")
+        expected_modes = int(loss_n_indices.shape[0])
+        if tail_n_mask is None:
+            loss_n_mask = jnp.ones((expected_modes,), dtype=real_dtype)
+        else:
+            loss_n_mask = jnp.asarray(tail_n_mask, dtype=real_dtype)
+            if int(loss_n_mask.ndim) != 1 or int(loss_n_mask.shape[0]) != expected_modes:
+                raise ValueError("tail_n_mask must have shape matching tail_n_indices")
+        recursive_stop = tail_min + expected_modes
+        if recursive_stop > tail_max:
+            raise ValueError("tail_n_indices request more modes than tail_n_max permits")
+    if tuple(tail_ref_windows.shape[:3]) != (
+        int(anchor_stencils.shape[0]),
+        horizon,
+        expected_modes,
+    ):
+        raise ValueError(
+            "tail_ref_windows must have shape (B,H,M,Nk), "
+            f"got {tail_ref_windows.shape}"
+        )
+    if int(tail_ref_windows.shape[2]) != expected_modes:
+        raise ValueError(
+            f"tail_ref_windows mode axis has length {int(tail_ref_windows.shape[2])}, "
+            f"expected {expected_modes}"
+        )
+
+    low_states = jax.vmap(
+        lambda anchor_stencil: rollout_anchor_states_from_anchor_stencil(
+            anchor_stencil,
+            learned=base_rollout,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+    )(anchor_stencils)
+
+    k_arr = jnp.asarray(forward_integ.k_arr, dtype=real_dtype)
+
+    def lift_one_err_sum(state: Array, ref_modes: Array) -> Array:
+        full_hat = jnp.zeros((recursive_stop, state.shape[1]), dtype=complex_dtype)
+        full_hat = full_hat.at[:tail_min, :].set(state)
+        err_sum = jnp.asarray(0.0, dtype=real_dtype)
+        for m in range(tail_min, recursive_stop):
+            q_hat = learned_interface_q_hat(
+                full_hat[:m, :],
+                k_arr,
+                m,
+                lift_rollout,
+            )
+            denom_m = -1j * k_arr[1:] * jnp.sqrt(jnp.asarray(float(m), dtype=real_dtype))
+            coeff = q_hat[1:] / denom_m
+            full_hat = full_hat.at[m, 1:].set(coeff.astype(complex_dtype))
+            mode_offset = int(m - tail_min)
+            diff = coeff - ref_modes[mode_offset, 1:]
+            err_sum = err_sum + loss_n_mask[mode_offset] * jnp.sum(jnp.abs(diff) ** 2)
+        return err_sum
+
+    err_sum = jnp.sum(jax.vmap(jax.vmap(lift_one_err_sum))(low_states, tail_ref_windows))
+    valid_modes = jnp.maximum(jnp.sum(loss_n_mask), jnp.asarray(1.0, dtype=real_dtype))
+    count = (
+        valid_modes
+        * float(int(low_states.shape[0]))
+        * float(int(low_states.shape[1]))
+        * float(int(tail_ref_windows.shape[-1]) - 1)
+    )
+    mean_err = err_sum / count
+    if tail_ref_energy_mean is None:
+        ref_energy = jnp.abs(tail_ref_windows[..., 1:]) ** 2
+        denom = jnp.maximum(jnp.mean(ref_energy), jnp.asarray(1e-12, dtype=real_dtype))
+    else:
+        denom = jnp.maximum(jnp.asarray(tail_ref_energy_mean, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+    return mean_err / denom
+
+
+def exact_history_tail_lift_coeff_loss(
+    anchor_stencils: Array,
+    low_history_context: Array,
+    tail_ref_windows: Array,
+    *,
+    base_learned: LearnedInterfaceClosure,
+    history_learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    explicit_n_hat_fn,
+    tail_n_min: int,
+    tail_n_max: int,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    tail_ref_energy_mean: Optional[Array] = None,
+) -> Array:
+    """Direct history-conditioned Hermite-tail reconstruction over a frozen low-order rollout."""
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    anchor_stencils = jnp.asarray(anchor_stencils, dtype=complex_dtype)
+    low_history_context = jnp.asarray(low_history_context, dtype=complex_dtype)
+    tail_ref_windows = jnp.asarray(tail_ref_windows, dtype=complex_dtype)
+    base_rollout = cast_learned_closure_for_rollout(base_learned, precision=str(rollout_precision))
+    history_rollout = cast_learned_closure_for_rollout(history_learned, precision=str(rollout_precision))
+    horizon = int(rollout_horizon)
+    tail_min = int(tail_n_min)
+    tail_max = int(tail_n_max)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for history tail lift")
+    if tail_min != int(forward_integ.Nv):
+        raise ValueError(f"history tail lift expects tail_n_min == deployment Nv; got {tail_min}")
+    if tail_max <= tail_min:
+        raise ValueError("tail_n_max must exceed tail_n_min")
+    if int(low_history_context.ndim) != 4:
+        raise ValueError(
+            "low_history_context must have shape (B,lags,Nv,Nk), "
+            f"got {low_history_context.shape}"
+        )
+    if tuple(low_history_context.shape[:1]) != tuple(anchor_stencils.shape[:1]):
+        raise ValueError("low_history_context batch dimension must match anchor_stencils")
+    if int(low_history_context.shape[2]) != int(forward_integ.Nv):
+        raise ValueError("low_history_context Nv dimension must match deployment Nv")
+    expected_modes = tail_max - tail_min
+    if tuple(tail_ref_windows.shape[:3]) != (
+        int(anchor_stencils.shape[0]),
+        horizon,
+        expected_modes,
+    ):
+        raise ValueError(
+            "tail_ref_windows must have shape (B,H,M,Nk), "
+            f"got {tail_ref_windows.shape}"
+        )
+
+    low_states = jax.vmap(
+        lambda anchor_stencil: rollout_anchor_states_from_anchor_stencil(
+            anchor_stencil,
+            learned=base_rollout,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+    )(anchor_stencils)
+    lags = int(low_history_context.shape[1])
+    combined = jnp.concatenate([low_history_context, low_states], axis=1)
+
+    def one_err_sum(history_window: Array, ref_modes: Array) -> Array:
+        full_hat = learned_history_hermite_lift(
+            history_window,
+            forward_integ.k_arr,
+            history_rollout,
+            n_min=tail_min,
+            n_max=tail_max,
+        )
+        diff = full_hat[tail_min:tail_max, 1:] - ref_modes[:, 1:]
+        return jnp.sum(jnp.abs(diff) ** 2)
+
+    def anchor_err_sum(anchor_combined: Array, anchor_ref: Array) -> Array:
+        def h_step(total: Array, h_idx: Array) -> Tuple[Array, None]:
+            start = h_idx
+            zero_idx = jnp.asarray(0, dtype=h_idx.dtype)
+            history_window = jax.lax.dynamic_slice(
+                anchor_combined,
+                (start, zero_idx, zero_idx),
+                (lags + 1, int(forward_integ.Nv), int(forward_integ.Nk)),
+            )
+            return total + one_err_sum(history_window, anchor_ref[h_idx]), None
+
+        total, _ = jax.lax.scan(
+            h_step,
+            jnp.asarray(0.0, dtype=real_dtype),
+            jnp.arange(horizon, dtype=jnp.int32),
+        )
+        return total
+
+    err_sum = jnp.sum(jax.vmap(anchor_err_sum)(combined, tail_ref_windows))
+    count = (
+        float(int(anchor_stencils.shape[0]))
+        * float(horizon)
+        * float(expected_modes)
+        * float(int(tail_ref_windows.shape[-1]) - 1)
+    )
+    mean_err = err_sum / count
+    if tail_ref_energy_mean is None:
+        ref_energy = jnp.abs(tail_ref_windows[..., 1:]) ** 2
+        denom = jnp.maximum(jnp.mean(ref_energy), jnp.asarray(1e-12, dtype=real_dtype))
+    else:
+        denom = jnp.maximum(jnp.asarray(tail_ref_energy_mean, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+    return mean_err / denom
+
+
 def exact_q_rollout_loss_for_anchor_batch(
     anchor_stencils: Array,
     ref_q_windows: Array,
@@ -4647,6 +5060,14 @@ def exact_q_rollout_loss_for_anchor_batch(
     rollout_horizon: int,
     explicit_n_hat_fn,
     rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    chain_input_windows: Optional[Array] = None,
+    chain_global_features: Optional[Array] = None,
+    chain_ref_q_windows: Optional[Array] = None,
+    chain_n_indices: Optional[Array] = None,
+    chain_n_mask: Optional[Array] = None,
+    lambda_tail_chain: float = 0.0,
+    chain_only: bool = False,
+    return_components: bool = False,
 ) -> Array:
     """H-step q-loss over sampled exact full-history anchors.
 
@@ -4665,7 +5086,78 @@ def exact_q_rollout_loss_for_anchor_batch(
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for exact q-rollout")
 
-    if int(ref_q_windows.ndim) == 3:
+    chain_loss = jnp.asarray(0.0, dtype=real_dtype)
+    if (
+        bool(learned_rollout.tail_chain_enabled)
+        and chain_input_windows is not None
+        and chain_global_features is not None
+        and chain_ref_q_windows is not None
+        and chain_n_indices is not None
+        and (bool(chain_only) or float(lambda_tail_chain) > 0.0)
+    ):
+        if int(ref_q_windows.ndim) != 3:
+            raise ValueError("tail-chain exact q-rollout requires all-k q windows")
+        chain_loss = exact_tail_chain_q_loss(
+            chain_input_windows,
+            chain_global_features,
+            chain_ref_q_windows,
+            chain_n_indices,
+            chain_n_mask,
+            learned=learned_rollout,
+            k_arr=forward_integ.k_arr,
+        )
+    if bool(chain_only):
+        zero = jnp.asarray(0.0, dtype=real_dtype)
+        if bool(return_components):
+            return chain_loss, zero, chain_loss
+        return chain_loss
+
+    if (
+        bool(learned_rollout.tail_chain_enabled)
+        and float(lambda_tail_chain) > 0.0
+        and chain_input_windows is None
+    ):
+        chain_loss = jnp.asarray(0.0, dtype=real_dtype)
+
+    if (
+        bool(learned_rollout.tail_chain_enabled)
+        and chain_input_windows is not None
+        and chain_global_features is not None
+        and chain_ref_q_windows is not None
+        and chain_n_indices is not None
+        and float(lambda_tail_chain) > 0.0
+    ):
+        if horizon == 1:
+            pred_selected = jax.vmap(
+                lambda anchor_stencil: learned_interface_q_hat(
+                    anchor_stencil[0],
+                    forward_integ.k_arr,
+                    forward_integ.Nv,
+                    learned_rollout,
+                    a_hat_prev=anchor_stencil[1],
+                )[None, :]
+            )(anchor_stencils)
+        else:
+            pred_selected = jax.vmap(
+                lambda anchor_stencil: rollout_anchor_closure_flux_from_anchor_stencil(
+                    anchor_stencil,
+                    learned=learned_rollout,
+                    integ=forward_integ,
+                    rollout_horizon=horizon,
+                    explicit_n_hat_fn=explicit_n_hat_fn,
+                    selected_k_index=None,
+                )
+            )(anchor_stencils)
+        pred_components = jnp.stack(
+            [jnp.real(pred_selected[:, :, 1:]), jnp.imag(pred_selected[:, :, 1:])],
+            axis=-1,
+        )
+        ref_components = jnp.stack(
+            [jnp.real(ref_q_windows[:, :, 1:]), jnp.imag(ref_q_windows[:, :, 1:])],
+            axis=-1,
+        )
+        std_prefix = (None, None, None)
+    elif int(ref_q_windows.ndim) == 3:
         if horizon == 1:
             pred_selected = jax.vmap(
                 lambda anchor_stencil: learned_interface_q_hat(
@@ -4711,7 +5203,11 @@ def exact_q_rollout_loss_for_anchor_batch(
         ref_components = jnp.stack([jnp.real(ref_q_windows), jnp.imag(ref_q_windows)], axis=-1)
         std_prefix = (None, None)
     std = jnp.maximum(jnp.asarray(learned_rollout.target_std, dtype=real_dtype), 1e-12)
-    return jnp.mean(((pred_components - ref_components) / std[std_prefix + (slice(None),)]) ** 2)
+    q_loss = jnp.mean(((pred_components - ref_components) / std[std_prefix + (slice(None),)]) ** 2)
+    total = q_loss + jnp.asarray(float(lambda_tail_chain), dtype=real_dtype) * chain_loss
+    if bool(return_components):
+        return total, q_loss, chain_loss
+    return total
 
 
 def online_fourier_hermite_closure_action_bidir_loss_for_history(
@@ -6220,8 +6716,10 @@ def prepare_exact_q_rollout_sampling_state(
     *,
     max_projection_order: int,
     target_nvs: Sequence[int],
+    history_dtype: object = np.complex128,
 ) -> Dict[str, Dict[str, object]]:
     coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+    history_np_dtype = exact_rollout_numpy_complex_dtype(history_dtype)
     sampling_state: Dict[str, Dict[str, object]] = {}
     for regime, arrays in qpair_dataset.items():
         train_target_nvs = np.asarray(arrays["train_target_nvs"], dtype=np.int32)
@@ -6237,7 +6735,7 @@ def prepare_exact_q_rollout_sampling_state(
             for target_nv in target_nvs
         }
         sampling_state[regime] = {
-            "histories": np.asarray(exact_dataset[regime][coeff_key], dtype=np.complex128),
+            "histories": np.asarray(exact_dataset[regime][coeff_key], dtype=history_np_dtype),
             "train_case_indices": np.asarray(arrays["train_case_indices"], dtype=np.int32),
             "train_time_indices": np.asarray(arrays["train_time_indices"], dtype=np.int32),
             "train_k_indices": np.asarray(arrays["train_k_indices"], dtype=np.int32),
@@ -6253,6 +6751,31 @@ def prepare_exact_q_rollout_sampling_state(
     return sampling_state
 
 
+def select_exact_q_rollout_regime_indices(
+    sampling_state: Dict[str, Dict[str, object]],
+    *,
+    regime: str,
+    target_nv: int,
+    batch_size: int,
+    rng: np.random.Generator,
+    all_k_loss: bool = False,
+) -> np.ndarray:
+    regime_state = sampling_state[regime]
+    target_pools = (
+        regime_state["anchor_target_pools"] if bool(all_k_loss) else regime_state["target_pools"]
+    )
+    target_pool = target_pools[int(target_nv)]
+    if int(target_pool.shape[0]) <= 0:
+        raise ValueError(
+            f"Exact q-rollout regime '{regime}' has no valid q-pairs for Nv={int(target_nv)}"
+        )
+    batch_n = int(min(int(batch_size), int(target_pool.shape[0])))
+    return np.asarray(
+        target_pool[rng.integers(0, int(target_pool.shape[0]), size=batch_n, endpoint=False)],
+        dtype=np.int32,
+    )
+
+
 def sample_exact_q_rollout_regime_batch(
     sampling_state: Dict[str, Dict[str, object]],
     *,
@@ -6264,21 +6787,39 @@ def sample_exact_q_rollout_regime_batch(
     rng: np.random.Generator,
     complex_dtype: object = jnp.complex128,
     all_k_loss: bool = False,
+    selected_indices: Optional[np.ndarray] = None,
+    tail_chain_n_indices: Optional[np.ndarray] = None,
+    tail_chain_n_mask: Optional[np.ndarray] = None,
+    tail_lift_n_indices: Optional[np.ndarray] = None,
+    tail_lift_n_mask: Optional[np.ndarray] = None,
+    tail_lift_n_min: Optional[int] = None,
+    tail_lift_n_max: Optional[int] = None,
+    tail_history_n_min: Optional[int] = None,
+    tail_history_n_max: Optional[int] = None,
+    tail_history_lags: int = 0,
+    Nm: int = 0,
+    n_low: int = 2,
 ) -> Dict[str, Array]:
     regime_state = sampling_state[regime]
     histories = regime_state["histories"]
-    target_pools = (
-        regime_state["anchor_target_pools"] if bool(all_k_loss) else regime_state["target_pools"]
-    )
-    target_pool = target_pools[int(target_nv)]
-    if int(target_pool.shape[0]) <= 0:
-        raise ValueError(
-            f"Exact q-rollout regime '{regime}' has no valid q-pairs for Nv={int(target_nv)}"
+    complex_np_dtype = exact_rollout_numpy_complex_dtype(complex_dtype)
+    real_np_dtype = exact_rollout_numpy_real_dtype(complex_dtype)
+    real_jax_dtype = jnp.float32 if real_np_dtype == np.dtype(np.float32) else jnp.float64
+    k_arr_np = np.asarray(k_arr, dtype=real_np_dtype)
+    if selected_indices is None:
+        selected = select_exact_q_rollout_regime_indices(
+            sampling_state,
+            regime=regime,
+            target_nv=int(target_nv),
+            batch_size=int(batch_size),
+            rng=rng,
+            all_k_loss=bool(all_k_loss),
         )
-    batch_n = int(min(int(batch_size), int(target_pool.shape[0])))
-    selected = target_pool[
-        rng.integers(0, int(target_pool.shape[0]), size=batch_n, endpoint=False)
-    ]
+    else:
+        selected = np.asarray(selected_indices, dtype=np.int32)
+        if selected.ndim != 1 or int(selected.shape[0]) <= 0:
+            raise ValueError("selected_indices must be a nonempty 1D array")
+    batch_n = int(selected.shape[0])
     if bool(all_k_loss):
         case_idx = regime_state["train_anchor_case_indices"][selected]
         time_idx = regime_state["train_anchor_time_indices"][selected]
@@ -6306,7 +6847,7 @@ def sample_exact_q_rollout_regime_batch(
         q_coeff = histories[case_idx[:, None], window_times, target_nv_i, :]
         q_windows = (
             -1j
-            * np.asarray(k_arr, dtype=np.float64)[None, None, :]
+            * k_arr_np[None, None, :]
             * math.sqrt(float(target_nv_i))
             * q_coeff
         )
@@ -6314,15 +6855,189 @@ def sample_exact_q_rollout_regime_batch(
         q_coeff = histories[case_idx[:, None], window_times, target_nv_i, k_indices[:, None]]
         q_windows = (
             -1j
-            * np.asarray(k_arr, dtype=np.float64)[k_indices][:, None]
+            * k_arr_np[k_indices][:, None]
             * math.sqrt(float(target_nv_i))
             * q_coeff
         )
-    return {
+    batch = {
         "anchor_stencils": jnp.asarray(stencils, dtype=complex_dtype),
         "ref_q_windows": jnp.asarray(q_windows, dtype=complex_dtype),
         "k_indices": jnp.asarray(k_indices, dtype=jnp.int32),
     }
+    if tail_chain_n_indices is not None:
+        n_indices = np.asarray(tail_chain_n_indices, dtype=np.int32)
+        if n_indices.ndim != 1 or int(n_indices.shape[0]) <= 0:
+            raise ValueError("tail_chain_n_indices must be a nonempty 1D array")
+        if tail_chain_n_mask is None:
+            n_mask = np.ones((int(n_indices.shape[0]),), dtype=real_np_dtype)
+        else:
+            n_mask = np.asarray(tail_chain_n_mask, dtype=real_np_dtype)
+            if n_mask.ndim != 1 or int(n_mask.shape[0]) != int(n_indices.shape[0]):
+                raise ValueError("tail_chain_n_mask must have the same shape as tail_chain_n_indices")
+            if np.any(n_mask < 0.0):
+                raise ValueError("tail_chain_n_mask must be nonnegative")
+        if int(np.min(n_indices)) < int(0):
+            raise ValueError("tail chain Hermite indices must be nonnegative")
+        if int(np.min(n_indices)) < int(target_nv_i):
+            raise ValueError("tail chain Hermite indices must be at least target Nv")
+        if int(np.max(n_indices)) >= int(histories.shape[2]):
+            raise ValueError(
+                f"tail chain requested max n={int(np.max(n_indices))}, "
+                f"but history order is {int(histories.shape[2])}"
+            )
+        nm = int(Nm)
+        if nm <= 0:
+            raise ValueError("Nm must be positive for tail-chain sampling")
+        local_offsets = np.arange(-nm, 0, dtype=np.int32)
+        local_n = n_indices[:, None] + local_offsets[None, :]
+        if int(np.min(local_n)) < 0:
+            raise ValueError("tail chain local Hermite window would start before n=0")
+        chain_inputs = histories[
+            case_idx[:, None, None, None],
+            window_times[:, :, None, None],
+            local_n[None, None, :, :],
+            :,
+        ]
+        chain_q_coeff = histories[
+            case_idx[:, None, None],
+            window_times[:, :, None],
+            n_indices[None, None, :],
+            :,
+        ]
+        chain_q_windows = (
+            -1j
+            * k_arr_np[None, None, None, :]
+            * np.sqrt(n_indices.astype(real_np_dtype))[None, None, :, None]
+            * chain_q_coeff
+        )
+        weights = np.ones((nk,), dtype=real_np_dtype)
+        if nk > 2:
+            weights[1:-1] = 2.0
+        c0 = histories[case_idx[:, None], window_times, 0, :]
+        e_hat = np.zeros_like(c0, dtype=complex_np_dtype)
+        e_hat[..., 1:] = 1j * c0[..., 1:] / k_arr_np[None, None, 1:]
+        field_activity = np.sum(weights[None, None, 1:] * (np.abs(e_hat[..., 1:]) ** 2), axis=-1)
+        low_hi = min(max(int(n_low), 0), int(histories.shape[2]) - 1)
+        low_modes = histories[
+            case_idx[:, None, None],
+            window_times[:, :, None],
+            np.arange(low_hi + 1, dtype=np.int32)[None, None, :],
+            :,
+        ]
+        low_energy = np.sum(
+            weights[None, None, None, :] * (np.abs(low_modes) ** 2),
+            axis=(-2, -1),
+        )
+        chain_globals = np.stack([field_activity, low_energy], axis=-1)
+        batch["chain_input_windows"] = jnp.asarray(chain_inputs, dtype=complex_dtype)
+        batch["chain_global_features"] = jnp.asarray(chain_globals, dtype=real_jax_dtype)
+        batch["chain_ref_q_windows"] = jnp.asarray(chain_q_windows, dtype=complex_dtype)
+        batch["tail_chain_n_indices"] = jnp.asarray(n_indices, dtype=jnp.int32)
+        batch["tail_chain_n_mask"] = jnp.asarray(n_mask, dtype=real_jax_dtype)
+    if tail_lift_n_min is not None or tail_lift_n_max is not None:
+        if tail_lift_n_min is None or tail_lift_n_max is None:
+            raise ValueError("tail_lift_n_min and tail_lift_n_max must be provided together")
+        lift_min = int(tail_lift_n_min)
+        lift_max = int(tail_lift_n_max)
+        if lift_min < target_nv_i:
+            raise ValueError("tail lift n_min must be at least target Nv")
+        if lift_max <= lift_min:
+            raise ValueError("tail lift n_max must exceed n_min")
+        if lift_max > int(histories.shape[2]):
+            raise ValueError(
+                f"tail lift requested n_max={lift_max}, but history order is {int(histories.shape[2])}"
+            )
+        if tail_lift_n_indices is None:
+            lift_modes = np.arange(lift_min, lift_max, dtype=np.int32)
+            lift_mask = np.ones((int(lift_modes.shape[0]),), dtype=real_np_dtype)
+        else:
+            lift_modes = np.asarray(tail_lift_n_indices, dtype=np.int32)
+            if lift_modes.ndim != 1 or int(lift_modes.shape[0]) <= 0:
+                raise ValueError("tail_lift_n_indices must be a nonempty 1D array")
+            if int(np.min(lift_modes)) < lift_min:
+                raise ValueError("tail_lift_n_indices must be at least tail_lift_n_min")
+            if int(np.max(lift_modes)) >= lift_max:
+                raise ValueError("tail_lift_n_indices must be less than tail_lift_n_max")
+            if tail_lift_n_mask is None:
+                lift_mask = np.ones((int(lift_modes.shape[0]),), dtype=real_np_dtype)
+            else:
+                lift_mask = np.asarray(tail_lift_n_mask, dtype=real_np_dtype)
+                if lift_mask.ndim != 1 or int(lift_mask.shape[0]) != int(lift_modes.shape[0]):
+                    raise ValueError("tail_lift_n_mask must have the same shape as tail_lift_n_indices")
+                if np.any(lift_mask < 0.0):
+                    raise ValueError("tail_lift_n_mask must be nonnegative")
+            expected_lift_modes = np.arange(lift_min, lift_min + int(lift_modes.shape[0]), dtype=np.int32)
+            if not np.array_equal(lift_modes, expected_lift_modes):
+                raise ValueError(
+                    "recursive tail lift currently requires a contiguous Hermite prefix "
+                    "starting at tail_lift_n_min"
+                )
+        tail_ref = histories[
+            case_idx[:, None, None],
+            window_times[:, :, None],
+            lift_modes[None, None, :],
+            :,
+        ]
+        energy_sum = 0.0
+        energy_count = 0
+        for start in range(lift_min, lift_max, 64):
+            stop = min(start + 64, lift_max)
+            energy_modes = np.arange(start, stop, dtype=np.int32)
+            ref_block = histories[
+                case_idx[:, None, None],
+                window_times[:, :, None],
+                energy_modes[None, None, :],
+                1:,
+            ]
+            energy_sum += float(np.sum(np.abs(ref_block) ** 2))
+            energy_count += int(ref_block.size)
+        batch["tail_lift_ref_windows"] = jnp.asarray(tail_ref, dtype=complex_dtype)
+        batch["tail_lift_n_indices"] = jnp.asarray(lift_modes, dtype=jnp.int32)
+        batch["tail_lift_n_mask"] = jnp.asarray(lift_mask, dtype=real_jax_dtype)
+        batch["tail_lift_ref_energy_mean"] = jnp.asarray(
+            energy_sum / max(float(energy_count), 1.0),
+            dtype=real_jax_dtype,
+        )
+    if tail_history_n_min is not None or tail_history_n_max is not None:
+        if tail_history_n_min is None or tail_history_n_max is None:
+            raise ValueError("tail_history_n_min and tail_history_n_max must be provided together")
+        hist_min = int(tail_history_n_min)
+        hist_max = int(tail_history_n_max)
+        hist_lags = max(int(tail_history_lags), 0)
+        if hist_min != target_nv_i:
+            raise ValueError("tail-history lift currently expects n_min == target Nv")
+        if hist_max <= hist_min:
+            raise ValueError("tail_history_n_max must exceed tail_history_n_min")
+        if hist_max > int(histories.shape[2]):
+            raise ValueError(
+                f"tail history requested n_max={hist_max}, but history order is {int(histories.shape[2])}"
+            )
+        context_offsets = -np.arange(hist_lags, 0, -1, dtype=np.int32)
+        context_times = np.maximum(time_idx[:, None] + context_offsets[None, :], 0)
+        if hist_lags == 0:
+            low_context = np.zeros((batch_n, 0, target_nv_i, nk), dtype=complex_np_dtype)
+        else:
+            low_context = histories[
+                case_idx[:, None, None],
+                context_times[:, :, None],
+                np.arange(target_nv_i, dtype=np.int32)[None, None, :],
+                :,
+            ]
+        hist_modes = np.arange(hist_min, hist_max, dtype=np.int32)
+        hist_ref = histories[
+            case_idx[:, None, None],
+            window_times[:, :, None],
+            hist_modes[None, None, :],
+            :,
+        ]
+        ref_energy = np.abs(hist_ref[..., 1:]) ** 2
+        batch["tail_history_low_context"] = jnp.asarray(low_context, dtype=complex_dtype)
+        batch["tail_history_ref_windows"] = jnp.asarray(hist_ref, dtype=complex_dtype)
+        batch["tail_history_ref_energy_mean"] = jnp.asarray(
+            float(np.mean(ref_energy)) if ref_energy.size else 1.0,
+            dtype=real_jax_dtype,
+        )
+    return batch
 
 
 def make_exact_q_rollout_batch_loss(
@@ -6350,6 +7065,12 @@ def make_exact_q_rollout_batch_loss(
     poisson_sign: float,
     rollout_dealias_23: bool,
     rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    tail_chain_enabled: bool = False,
+    tail_chain_nv: int = 0,
+    tail_chain_n_min: Optional[int] = None,
+    tail_chain_n_max: int = 0,
+    lambda_tail_chain: float = 0.0,
+    tail_chain_only: bool = False,
 ) -> Tuple[object, Sequence[str]]:
     active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
     weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
@@ -6386,7 +7107,7 @@ def make_exact_q_rollout_batch_loss(
         for target_nv in target_nvs
     }
 
-    def make_loss_fn_for_target(target_nv: int):
+    def make_loss_fn_for_target(target_nv: int, *, chain_only: bool = False):
         linear_forward = linear_integrators[int(target_nv)]
         nonlinear_forward = nonlinear_integrators[int(target_nv)]
 
@@ -6424,7 +7145,13 @@ def make_exact_q_rollout_batch_loss(
                 context_mode=context_mode,
                 rollout_horizon=rollout_horizon,
                 rollout_anchor_samples=0,
-                loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+                loss_backend=(
+                    EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND
+                    if bool(tail_chain_only)
+                    else EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND
+                    if bool(tail_chain_enabled)
+                    else EXACT_Q_ROLLOUT_LOSS_BACKEND
+                ),
                 lambda_q=1.0,
                 lambda_E=0.0,
                 lambda_dist=0.0,
@@ -6432,12 +7159,19 @@ def make_exact_q_rollout_batch_loss(
                 lambda_neg=0.0,
                 lambda_reg=0.0,
                 online_v_probes=0,
+                tail_chain_enabled=bool(tail_chain_enabled),
+                tail_chain_nv=int(tail_chain_nv),
+                tail_chain_n_min=int(max(target_nvs) if tail_chain_n_min is None else tail_chain_n_min),
+                tail_chain_n_max=int(tail_chain_n_max),
+                lambda_tail_chain=float(lambda_tail_chain),
             )
             total_q = jnp.asarray(0.0, dtype=jnp.float64)
+            total_chain = jnp.asarray(0.0, dtype=jnp.float64)
+            chain_weight = 1.0 if bool(tail_chain_only) else float(lambda_tail_chain)
             for weight, regime in zip(weight_arr, active_regimes):
                 batch = regime_batches[regime]
                 if regime == REGIME_LINEAR:
-                    q_loss = exact_q_rollout_loss_for_anchor_batch(
+                    _, q_loss, chain_loss = exact_q_rollout_loss_for_anchor_batch(
                         batch["anchor_stencils"],
                         batch["ref_q_windows"],
                         batch["k_indices"],
@@ -6446,9 +7180,17 @@ def make_exact_q_rollout_batch_loss(
                         rollout_horizon=rollout_horizon,
                         explicit_n_hat_fn=linear_explicit,
                         rollout_precision=str(rollout_precision),
+                        chain_input_windows=batch.get("chain_input_windows"),
+                        chain_global_features=batch.get("chain_global_features"),
+                        chain_ref_q_windows=batch.get("chain_ref_q_windows"),
+                        chain_n_indices=batch.get("tail_chain_n_indices"),
+                        chain_n_mask=batch.get("tail_chain_n_mask"),
+                        lambda_tail_chain=float(chain_weight),
+                        chain_only=bool(chain_only),
+                        return_components=True,
                     )
                 else:
-                    q_loss = exact_q_rollout_loss_for_anchor_batch(
+                    _, q_loss, chain_loss = exact_q_rollout_loss_for_anchor_batch(
                         batch["anchor_stencils"],
                         batch["ref_q_windows"],
                         batch["k_indices"],
@@ -6457,18 +7199,240 @@ def make_exact_q_rollout_batch_loss(
                         rollout_horizon=rollout_horizon,
                         explicit_n_hat_fn=nonlinear_explicit,
                         rollout_precision=str(rollout_precision),
+                        chain_input_windows=batch.get("chain_input_windows"),
+                        chain_global_features=batch.get("chain_global_features"),
+                        chain_ref_q_windows=batch.get("chain_ref_q_windows"),
+                        chain_n_indices=batch.get("tail_chain_n_indices"),
+                        chain_n_mask=batch.get("tail_chain_n_mask"),
+                        lambda_tail_chain=float(chain_weight),
+                        chain_only=bool(chain_only),
+                        return_components=True,
                     )
                 total_q = total_q + weight * q_loss
+                total_chain = total_chain + weight * chain_loss
             zero = jnp.asarray(0.0, dtype=jnp.float64)
-            return total_q, {
+            total = (
+                total_chain
+                if bool(tail_chain_only)
+                else total_q + jnp.asarray(float(lambda_tail_chain), dtype=jnp.float64) * total_chain
+            )
+            return total, {
                 "q": total_q,
                 "state": zero,
                 "field": zero,
                 "dist": zero,
                 "tail": zero,
+                "dec": zero,
+                "coeff": zero,
+                "chain": total_chain,
                 "neg": zero,
                 "reg": zero,
                 "q_diag": total_q,
+            }
+
+        return loss_fn_for_target
+
+    target_loss_fns = {
+        int(target_nv): make_loss_fn_for_target(int(target_nv))
+        for target_nv in target_nvs
+    }
+    target_chain_loss_fns = {
+        int(target_nv): make_loss_fn_for_target(int(target_nv), chain_only=True)
+        for target_nv in target_nvs
+    }
+    default_target_nv = int(target_nvs[0])
+
+    def loss_fn(
+        params: Dict[str, Array],
+        regime_batches: Dict[str, Dict[str, Array]],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        return target_loss_fns[default_target_nv](params, regime_batches)
+
+    loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
+    loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    loss_fn.target_chain_loss_fns = target_chain_loss_fns  # type: ignore[attr-defined]
+    loss_fn.rollout_precision = str(rollout_precision)  # type: ignore[attr-defined]
+    loss_fn.tail_chain_enabled = bool(tail_chain_enabled)  # type: ignore[attr-defined]
+    loss_fn.tail_chain_only = bool(tail_chain_only)  # type: ignore[attr-defined]
+    loss_fn.tail_chain_n_min = (
+        None if bool(tail_chain_enabled) and tail_chain_n_min is None
+        else int(tail_chain_n_min) if bool(tail_chain_enabled)
+        else None
+    )  # type: ignore[attr-defined]
+    loss_fn.tail_chain_n_max = int(tail_chain_n_max) if bool(tail_chain_enabled) else None  # type: ignore[attr-defined]
+    loss_fn.Nm = int(Nm)  # type: ignore[attr-defined]
+    loss_fn.n_low = int(n_low)  # type: ignore[attr-defined]
+    return loss_fn, active_regimes
+
+
+def make_exact_q_rollout_recursive_lift_batch_loss(
+    *,
+    base_params: Dict[str, Array],
+    regime_weights: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    teacher_proj_Nv: Optional[int],
+    n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
+    poisson_sign: float,
+    rollout_dealias_23: bool,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    tail_chain_nv: int = 0,
+    tail_chain_n_max: int = 0,
+) -> Tuple[object, Sequence[str]]:
+    active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    target_nvs = tuple(int(v) for v in Nv_targets)
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    nonlinear_integrators = {
+        int(target_nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx),
+            Nv=int(target_nv),
+            Lx=float(teacher_Lx),
+            dt=float(teacher_dt),
+            vth=1.0,
+            dealias_23=bool(rollout_dealias_23),
+            closure=None,
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
+        )
+        for target_nv in target_nvs
+    }
+    linear_integrators = {
+        int(target_nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx),
+            Nv=int(target_nv),
+            Lx=float(teacher_Lx),
+            dt=float(teacher_dt),
+            vth=1.0,
+            dealias_23=bool(rollout_dealias_23),
+            closure=None,
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
+        )
+        for target_nv in target_nvs
+    }
+
+    def make_loss_fn_for_target(target_nv: int):
+        linear_forward = linear_integrators[int(target_nv)]
+        nonlinear_forward = nonlinear_integrators[int(target_nv)]
+
+        def linear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _linear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def nonlinear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _nonlinear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def loss_fn_for_target(
+            lift_params: Dict[str, Array],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            base_learned = build_learned_interface_closure(
+                params=base_params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=n_low,
+                training_mode=EXACT_Q_ROLLOUT_TRAINING_MODE,
+                train_objective=EXACT_Q_ROLLOUT_OBJECTIVE,
+                context_mode=context_mode,
+                rollout_horizon=rollout_horizon,
+                loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+            )
+            lift_learned = build_learned_interface_closure(
+                params=lift_params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=n_low,
+                training_mode=EXACT_Q_ROLLOUT_TRAINING_MODE,
+                train_objective=EXACT_Q_ROLLOUT_OBJECTIVE,
+                context_mode=context_mode,
+                rollout_horizon=rollout_horizon,
+                loss_backend=EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND,
+                tail_chain_enabled=True,
+                tail_chain_nv=int(tail_chain_nv),
+                tail_chain_n_min=int(target_nv),
+                tail_chain_n_max=int(tail_chain_n_max),
+                lambda_tail_chain=1.0,
+            )
+            total_chain = jnp.asarray(0.0, dtype=jnp.float64)
+            for weight, regime in zip(weight_arr, active_regimes):
+                batch = regime_batches[regime]
+                integ = linear_forward if regime == REGIME_LINEAR else nonlinear_forward
+                explicit_fn = linear_explicit if regime == REGIME_LINEAR else nonlinear_explicit
+                chain_loss = exact_recursive_tail_lift_coeff_loss(
+                    batch["anchor_stencils"],
+                    batch["tail_lift_ref_windows"],
+                    base_learned=base_learned,
+                    lift_learned=lift_learned,
+                    forward_integ=integ,
+                    rollout_horizon=rollout_horizon,
+                    explicit_n_hat_fn=explicit_fn,
+                    tail_n_min=int(target_nv),
+                    tail_n_max=int(tail_chain_n_max),
+                    rollout_precision=str(rollout_precision),
+                    tail_n_indices=batch.get("tail_lift_n_indices"),
+                    tail_n_mask=batch.get("tail_lift_n_mask"),
+                    tail_ref_energy_mean=batch.get("tail_lift_ref_energy_mean"),
+                )
+                total_chain = total_chain + weight * chain_loss
+            zero = jnp.asarray(0.0, dtype=jnp.float64)
+            return total_chain, {
+                "q": zero,
+                "state": zero,
+                "field": zero,
+                "dist": zero,
+                "tail": zero,
+                "dec": zero,
+                "coeff": zero,
+                "chain": total_chain,
+                "xv": zero,
+                "neg": zero,
+                "reg": zero,
+                "q_diag": zero,
             }
 
         return loss_fn_for_target
@@ -6487,7 +7451,216 @@ def make_exact_q_rollout_batch_loss(
 
     loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
     loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    loss_fn.target_chain_loss_fns = target_loss_fns  # type: ignore[attr-defined]
     loss_fn.rollout_precision = str(rollout_precision)  # type: ignore[attr-defined]
+    loss_fn.tail_chain_enabled = True  # type: ignore[attr-defined]
+    loss_fn.tail_chain_only = True  # type: ignore[attr-defined]
+    loss_fn.tail_chain_n_min = None  # type: ignore[attr-defined]
+    loss_fn.tail_chain_n_max = int(tail_chain_n_max)  # type: ignore[attr-defined]
+    loss_fn.tail_recursive_lift_enabled = True  # type: ignore[attr-defined]
+    loss_fn.tail_lift_n_max = int(tail_chain_n_max)  # type: ignore[attr-defined]
+    loss_fn.Nm = int(Nm)  # type: ignore[attr-defined]
+    loss_fn.n_low = int(n_low)  # type: ignore[attr-defined]
+    return loss_fn, active_regimes
+
+
+def make_exact_q_rollout_history_lift_batch_loss(
+    *,
+    base_params: Dict[str, Array],
+    regime_weights: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    teacher_proj_Nv: Optional[int],
+    n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
+    poisson_sign: float,
+    rollout_dealias_23: bool,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    tail_history_nv: int = 0,
+    tail_history_n_max: int = 0,
+    tail_history_lags: int = 8,
+) -> Tuple[object, Sequence[str]]:
+    active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    target_nvs = tuple(int(v) for v in Nv_targets)
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    nonlinear_integrators = {
+        int(target_nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx),
+            Nv=int(target_nv),
+            Lx=float(teacher_Lx),
+            dt=float(teacher_dt),
+            vth=1.0,
+            dealias_23=bool(rollout_dealias_23),
+            closure=None,
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
+        )
+        for target_nv in target_nvs
+    }
+    linear_integrators = {
+        int(target_nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx),
+            Nv=int(target_nv),
+            Lx=float(teacher_Lx),
+            dt=float(teacher_dt),
+            vth=1.0,
+            dealias_23=bool(rollout_dealias_23),
+            closure=None,
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
+        )
+        for target_nv in target_nvs
+    }
+
+    def make_loss_fn_for_target(target_nv: int):
+        linear_forward = linear_integrators[int(target_nv)]
+        nonlinear_forward = nonlinear_integrators[int(target_nv)]
+
+        def linear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _linear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def nonlinear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+            return _nonlinear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+        def loss_fn_for_target(
+            history_params: Dict[str, Array],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            base_learned = build_learned_interface_closure(
+                params=base_params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=n_low,
+                training_mode=EXACT_Q_ROLLOUT_TRAINING_MODE,
+                train_objective=EXACT_Q_ROLLOUT_OBJECTIVE,
+                context_mode=context_mode,
+                rollout_horizon=rollout_horizon,
+                loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+            )
+            history_learned = build_learned_interface_closure(
+                params=base_params,
+                Nm=Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=hidden_width,
+                res_blocks=res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=train_regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx,
+                teacher_Nv=teacher_Nv,
+                teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax,
+                teacher_dt=teacher_dt,
+                teacher_proj_Nv=teacher_proj_Nv,
+                n_low=n_low,
+                training_mode=EXACT_Q_ROLLOUT_TRAINING_MODE,
+                train_objective=EXACT_Q_ROLLOUT_OBJECTIVE,
+                context_mode=context_mode,
+                rollout_horizon=rollout_horizon,
+                loss_backend=EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND,
+                tail_history_lift_enabled=True,
+                tail_history_nv=int(tail_history_nv),
+                tail_history_n_min=int(target_nv),
+                tail_history_n_max=int(tail_history_n_max),
+                tail_history_lags=int(tail_history_lags),
+                tail_history_lift_params=history_params,
+            )
+            total_hist = jnp.asarray(0.0, dtype=jnp.float64)
+            for weight, regime in zip(weight_arr, active_regimes):
+                batch = regime_batches[regime]
+                integ = linear_forward if regime == REGIME_LINEAR else nonlinear_forward
+                explicit_fn = linear_explicit if regime == REGIME_LINEAR else nonlinear_explicit
+                hist_loss = exact_history_tail_lift_coeff_loss(
+                    batch["anchor_stencils"],
+                    batch["tail_history_low_context"],
+                    batch["tail_history_ref_windows"],
+                    base_learned=base_learned,
+                    history_learned=history_learned,
+                    forward_integ=integ,
+                    rollout_horizon=rollout_horizon,
+                    explicit_n_hat_fn=explicit_fn,
+                    tail_n_min=int(target_nv),
+                    tail_n_max=int(tail_history_n_max),
+                    rollout_precision=str(rollout_precision),
+                    tail_ref_energy_mean=batch.get("tail_history_ref_energy_mean"),
+                )
+                total_hist = total_hist + weight * hist_loss
+            zero = jnp.asarray(0.0, dtype=jnp.float64)
+            return total_hist, {
+                "q": zero,
+                "state": zero,
+                "field": zero,
+                "dist": zero,
+                "tail": zero,
+                "dec": zero,
+                "coeff": zero,
+                "chain": zero,
+                "hist": total_hist,
+                "xv": zero,
+                "neg": zero,
+                "reg": zero,
+                "q_diag": zero,
+            }
+
+        return loss_fn_for_target
+
+    target_loss_fns = {
+        int(target_nv): make_loss_fn_for_target(int(target_nv))
+        for target_nv in target_nvs
+    }
+    default_target_nv = int(target_nvs[0])
+
+    def loss_fn(
+        params: Dict[str, Array],
+        regime_batches: Dict[str, Dict[str, Array]],
+    ) -> Tuple[Array, Dict[str, Array]]:
+        return target_loss_fns[default_target_nv](params, regime_batches)
+
+    loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
+    loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    loss_fn.target_chain_loss_fns = {}  # type: ignore[attr-defined]
+    loss_fn.rollout_precision = str(rollout_precision)  # type: ignore[attr-defined]
+    loss_fn.tail_chain_enabled = False  # type: ignore[attr-defined]
+    loss_fn.tail_chain_only = False  # type: ignore[attr-defined]
+    loss_fn.tail_history_lift_enabled = True  # type: ignore[attr-defined]
+    loss_fn.tail_history_n_max = int(tail_history_n_max)  # type: ignore[attr-defined]
+    loss_fn.tail_history_lags = int(tail_history_lags)  # type: ignore[attr-defined]
+    loss_fn.Nm = int(Nm)  # type: ignore[attr-defined]
+    loss_fn.n_low = int(n_low)  # type: ignore[attr-defined]
     return loss_fn, active_regimes
 
 
@@ -6745,6 +7918,14 @@ def online_training_log_components(
     if str(train_objective) == "trajectory_q_hybrid":
         return ("q", "field", "dist", "tail", "neg", "reg")
     if str(train_objective) == EXACT_Q_ROLLOUT_OBJECTIVE:
+        if str(online_loss_backend) == EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND:
+            return ("hist",)
+        if str(online_loss_backend) == EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND:
+            return ("chain",)
+        if str(online_loss_backend) == EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND:
+            return ("chain",)
+        if str(online_loss_backend) == EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND:
+            return ("q", "chain")
         return ("q",)
     return ()
 
@@ -6800,7 +7981,7 @@ def train_with_online_trajectory_minibatch_loss(
     state = adam_init(params)
     history = {
         key: np.zeros((int(epochs),), dtype=np.float64)
-        for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
+        for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
     }
 
     def make_train_step(target_batch_loss_fn):
@@ -6834,6 +8015,7 @@ def train_with_online_trajectory_minibatch_loss(
 
     target_nvs = tuple(int(v) for v in getattr(batch_loss_fn, "target_nvs", ()))
     target_loss_fns = getattr(batch_loss_fn, "target_loss_fns", None)
+    target_chain_loss_fns = getattr(batch_loss_fn, "target_chain_loss_fns", None)
     if target_nvs and isinstance(target_loss_fns, dict):
         train_steps = {
             int(target_nv): make_train_step(target_loss_fns[int(target_nv)])
@@ -6870,7 +8052,7 @@ def train_with_online_trajectory_minibatch_loss(
     for epoch in range(int(epochs)):
         running = {
             key: jnp.asarray(0.0, dtype=jnp.float64)
-            for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
+            for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
         }
         for step_idx in range(int(steps_per_epoch)):
             regime_batches: Dict[str, Dict[str, Array]] = {}
@@ -6939,6 +8121,8 @@ def train_with_exact_q_rollout_minibatch_loss(
     profile_trace_dir: Optional[Path] = None,
     profile_train_steps: int = 0,
     profile_skip_steps: int = 1,
+    tail_chain_chunk_size: int = 16,
+    tail_chain_lift_horizons: Sequence[int] = (),
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray]]:
     if int(batch_size) <= 0:
         raise ValueError("batch_size must be positive for exact q-rollout training")
@@ -6953,7 +8137,7 @@ def train_with_exact_q_rollout_minibatch_loss(
     state = adam_init(params)
     history = {
         key: np.zeros((int(epochs),), dtype=np.float64)
-        for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
+        for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
     }
 
     def make_train_step(target_batch_loss_fn):
@@ -6985,24 +8169,83 @@ def train_with_exact_q_rollout_minibatch_loss(
 
         return train_step
 
+    def make_grad_step(target_batch_loss_fn):
+        @jax.jit
+        def grad_step(
+            current_params: Dict[str, Array],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Dict[str, Array], Dict[str, Array], Array]:
+            (loss, aux), grads = jax.value_and_grad(target_batch_loss_fn, has_aux=True)(current_params, regime_batches)
+            aux = dict(aux)
+            aux["total"] = loss
+            all_finite = _tree_all_finite(aux) & _tree_all_finite(grads)
+            return grads, aux, all_finite
+
+        return grad_step
+
+    @jax.jit
+    def apply_accumulated_grads(
+        current_params: Dict[str, Array],
+        current_state: Dict[str, object],
+        grads: Dict[str, Array],
+    ) -> Tuple[Dict[str, Array], Dict[str, object]]:
+        return adam_step(
+            current_params,
+            grads,
+            current_state,
+            learning_rate,
+            grad_clip=grad_clip,
+        )
+
     target_nvs = tuple(int(v) for v in getattr(batch_loss_fn, "target_nvs", ()))
     target_loss_fns = getattr(batch_loss_fn, "target_loss_fns", None)
+    target_chain_loss_fns = getattr(batch_loss_fn, "target_chain_loss_fns", None)
     if target_nvs and isinstance(target_loss_fns, dict):
         train_steps = {
             int(target_nv): make_train_step(target_loss_fns[int(target_nv)])
             for target_nv in target_nvs
         }
+        grad_steps = {
+            int(target_nv): make_grad_step(target_loss_fns[int(target_nv)])
+            for target_nv in target_nvs
+        }
+        chain_grad_steps = (
+            {
+                int(target_nv): make_grad_step(target_chain_loss_fns[int(target_nv)])
+                for target_nv in target_nvs
+            }
+            if isinstance(target_chain_loss_fns, dict)
+            and all(int(target_nv) in target_chain_loss_fns for target_nv in target_nvs)
+            else {}
+        )
     else:
         train_steps = {0: make_train_step(batch_loss_fn)}
+        grad_steps = {0: make_grad_step(batch_loss_fn)}
+        chain_grad_steps = {}
 
     rng = np.random.default_rng(int(seed))
     rollout_precision = str(getattr(batch_loss_fn, "rollout_precision", EXACT_ROLLOUT_PRECISION_FLOAT64))
     _, batch_complex_dtype = exact_rollout_precision_dtypes(rollout_precision)
+    history_complex_dtype = exact_rollout_numpy_complex_dtype(batch_complex_dtype)
+    tail_chain_enabled = bool(getattr(batch_loss_fn, "tail_chain_enabled", False))
+    tail_chain_only = bool(getattr(batch_loss_fn, "tail_chain_only", False))
+    tail_recursive_lift_enabled = bool(getattr(batch_loss_fn, "tail_recursive_lift_enabled", False))
+    tail_history_lift_enabled = bool(getattr(batch_loss_fn, "tail_history_lift_enabled", False))
+    tail_chain_n_min = getattr(batch_loss_fn, "tail_chain_n_min", None)
+    tail_chain_n_max = getattr(batch_loss_fn, "tail_chain_n_max", None)
+    tail_lift_n_max = getattr(batch_loss_fn, "tail_lift_n_max", None)
+    tail_history_n_max = getattr(batch_loss_fn, "tail_history_n_max", None)
+    tail_history_lags = int(getattr(batch_loss_fn, "tail_history_lags", 0))
+    tail_chain_chunk_size_i = max(int(tail_chain_chunk_size), 1)
+    lift_horizons = tuple(int(value) for value in tail_chain_lift_horizons if int(value) > 0)
+    exact_nm = int(getattr(batch_loss_fn, "Nm", 0))
+    exact_n_low = int(getattr(batch_loss_fn, "n_low", 2))
     sampling_state = prepare_exact_q_rollout_sampling_state(
         exact_dataset,
         qpair_dataset,
         max_projection_order=int(max_projection_order),
         target_nvs=target_nvs,
+        history_dtype=history_complex_dtype,
     )
     all_k_rollout_loss = True
     profile_steps = max(int(profile_train_steps), 0)
@@ -7018,7 +8261,7 @@ def train_with_exact_q_rollout_minibatch_loss(
     for epoch in range(int(epochs)):
         running = {
             key: jnp.asarray(0.0, dtype=jnp.float64)
-            for key in ("total", "q", "state", "field", "dist", "tail", "neg", "reg", "q_diag")
+            for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
         }
         for step_idx in range(int(steps_per_epoch)):
             if target_nvs:
@@ -7029,40 +8272,182 @@ def train_with_exact_q_rollout_minibatch_loss(
                     target_nv = int(target_nvs[int(rng.integers(0, len(target_nvs)))])
             else:
                 target_nv = 0
-            regime_batches = {
-                regime: sample_exact_q_rollout_regime_batch(
+            global_step = int(epoch) * int(steps_per_epoch) + int(step_idx)
+            chain_n_indices = None
+            chain_chunks: Sequence[Tuple[np.ndarray, np.ndarray, float]] = ()
+            if tail_chain_enabled:
+                if tail_chain_n_max is None:
+                    raise ValueError("tail-chain training requires n_max")
+                if tail_chain_n_min is None:
+                    chain_min = int(target_nv) if tail_recursive_lift_enabled else int(target_nv) + 1
+                else:
+                    chain_min = int(tail_chain_n_min)
+                chain_max = int(tail_chain_n_max)
+                chain_span = int(chain_max - chain_min)
+                if chain_span <= 0:
+                    raise ValueError("tail-chain training requires n_max > n_min")
+                if tail_recursive_lift_enabled:
+                    if lift_horizons:
+                        schedule_idx = int(global_step) % int(len(lift_horizons))
+                        active_chain_span = min(int(lift_horizons[schedule_idx]), chain_span)
+                    else:
+                        active_chain_span = chain_span
+                    active_chain_max = int(chain_min + active_chain_span)
+                    chain_n_indices = np.arange(chain_min, active_chain_max, dtype=np.int32)
+                    chain_chunks = (
+                        (
+                            chain_n_indices,
+                            np.ones((int(chain_n_indices.shape[0]),), dtype=np.float32),
+                            1.0,
+                        ),
+                    )
+                else:
+                    chain_n_indices = np.arange(chain_min, chain_max, dtype=np.int32)
+                    padded_chunks: List[Tuple[np.ndarray, np.ndarray, float]] = []
+                    for start in range(0, int(chain_n_indices.shape[0]), tail_chain_chunk_size_i):
+                        chunk = np.asarray(
+                            chain_n_indices[start : start + tail_chain_chunk_size_i],
+                            dtype=np.int32,
+                        )
+                        valid_n = int(chunk.shape[0])
+                        if valid_n <= 0:
+                            continue
+                        padded = np.empty((tail_chain_chunk_size_i,), dtype=np.int32)
+                        padded[:valid_n] = chunk
+                        if valid_n < tail_chain_chunk_size_i:
+                            padded[valid_n:] = int(chunk[-1])
+                        mask = np.zeros((tail_chain_chunk_size_i,), dtype=np.float32)
+                        mask[:valid_n] = 1.0
+                        padded_chunks.append((padded, mask, float(valid_n) / float(chain_span)))
+                    chain_chunks = tuple(padded_chunks)
+            selected_by_regime = {
+                regime: select_exact_q_rollout_regime_indices(
                     sampling_state,
                     regime=regime,
                     target_nv=int(target_nv),
-                    rollout_horizon=int(rollout_horizon),
                     batch_size=int(batch_size),
-                    k_arr=np.asarray(k_arr, dtype=np.float64),
                     rng=rng,
-                    complex_dtype=batch_complex_dtype,
                     all_k_loss=bool(all_k_rollout_loss),
                 )
                 for regime in active_regimes
             }
-            global_step = int(epoch) * int(steps_per_epoch) + int(step_idx)
-            should_profile = (
-                profile_dir is not None
-                and profile_skip <= global_step < profile_skip + profile_steps
-            )
-            t0 = time.perf_counter() if should_profile else 0.0
-            if should_profile:
-                with jax.profiler.trace(str(profile_dir)):
-                    params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
-                    jax.block_until_ready(aux["total"])
-            else:
-                params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
-            if should_profile:
-                profiled_seconds.append(time.perf_counter() - t0)
-            if not bool(all_finite):
-                raise FloatingPointError(
-                    "exact q-rollout produced non-finite loss/gradients at "
-                    f"epoch {epoch + 1}, step {step_idx + 1}; "
-                    "reduce TRAIN_LR, TRAIN_BATCH_SIZE, TRAIN_ROLLOUT_HORIZON, or TRAIN_GRAD_CLIP."
+
+            def make_regime_batches(
+                chunk_n_indices: Optional[np.ndarray],
+                chunk_n_mask: Optional[np.ndarray] = None,
+            ) -> Dict[str, Dict[str, Array]]:
+                recursive_lift_n_max = (
+                    int(np.asarray(chunk_n_indices, dtype=np.int32)[-1]) + 1
+                    if tail_recursive_lift_enabled and chunk_n_indices is not None
+                    else int(tail_lift_n_max) if tail_recursive_lift_enabled else None
                 )
+                return {
+                    regime: sample_exact_q_rollout_regime_batch(
+                        sampling_state,
+                        regime=regime,
+                        target_nv=int(target_nv),
+                        rollout_horizon=int(rollout_horizon),
+                        batch_size=int(batch_size),
+                        k_arr=np.asarray(k_arr, dtype=np.float64),
+                        rng=rng,
+                        complex_dtype=batch_complex_dtype,
+                        all_k_loss=bool(all_k_rollout_loss),
+                        selected_indices=selected_by_regime[regime],
+                        tail_chain_n_indices=(
+                            chunk_n_indices if tail_chain_enabled and not tail_recursive_lift_enabled else None
+                        ),
+                        tail_chain_n_mask=(
+                            chunk_n_mask if tail_chain_enabled and not tail_recursive_lift_enabled else None
+                        ),
+                        tail_lift_n_indices=chunk_n_indices if tail_recursive_lift_enabled else None,
+                        tail_lift_n_mask=chunk_n_mask if tail_recursive_lift_enabled else None,
+                        tail_lift_n_min=int(target_nv) if tail_recursive_lift_enabled else None,
+                        tail_lift_n_max=recursive_lift_n_max,
+                        tail_history_n_min=int(target_nv) if tail_history_lift_enabled else None,
+                        tail_history_n_max=int(tail_history_n_max) if tail_history_lift_enabled else None,
+                        tail_history_lags=tail_history_lags if tail_history_lift_enabled else 0,
+                        Nm=exact_nm,
+                        n_low=exact_n_low,
+                    )
+                    for regime in active_regimes
+                }
+
+            if tail_chain_enabled and chain_n_indices is not None:
+                if int(target_nv) not in chain_grad_steps:
+                    raise RuntimeError("tail-chain training requires per-target chain-only loss functions")
+                should_profile = (
+                    profile_dir is not None
+                    and profile_skip <= global_step < profile_skip + profile_steps
+                )
+                t0 = time.perf_counter() if should_profile else 0.0
+                if tail_chain_only:
+                    accum_grads = None
+                    accum_aux = None
+                    all_finite = jnp.asarray(True)
+                else:
+                    q_batches = make_regime_batches(None)
+                    if should_profile:
+                        with jax.profiler.trace(str(profile_dir)):
+                            accum_grads, accum_aux, all_finite = grad_steps[target_nv](params, q_batches)
+                            jax.block_until_ready(accum_aux["total"])
+                    else:
+                        accum_grads, accum_aux, all_finite = grad_steps[target_nv](params, q_batches)
+                for chunk_n_indices, chunk_n_mask, weight in chain_chunks:
+                    regime_batches = make_regime_batches(chunk_n_indices, chunk_n_mask)
+                    if should_profile:
+                        with jax.profiler.trace(str(profile_dir)):
+                            grads, aux_part, finite_part = chain_grad_steps[target_nv](params, regime_batches)
+                            jax.block_until_ready(aux_part["total"])
+                    else:
+                        grads, aux_part, finite_part = chain_grad_steps[target_nv](params, regime_batches)
+                    all_finite = all_finite & finite_part
+                    if accum_grads is None:
+                        accum_grads = jax.tree_util.tree_map(lambda g: weight * g, grads)
+                        accum_aux = jax.tree_util.tree_map(lambda value: weight * value, aux_part)
+                    else:
+                        accum_grads = jax.tree_util.tree_map(
+                            lambda a, g: a + weight * g,
+                            accum_grads,
+                            grads,
+                        )
+                        accum_aux = jax.tree_util.tree_map(
+                            lambda a, value: a + weight * value,
+                            accum_aux,
+                            aux_part,
+                        )
+                if should_profile:
+                    profiled_seconds.append(time.perf_counter() - t0)
+                if accum_grads is None or accum_aux is None:
+                    raise RuntimeError("tail-chain training produced no Hermite chunks")
+                if not bool(all_finite):
+                    raise FloatingPointError(
+                        "exact q-rollout produced non-finite loss/gradients at "
+                        f"epoch {epoch + 1}, step {step_idx + 1}; "
+                        "reduce TRAIN_LR, TRAIN_BATCH_SIZE, TRAIN_ROLLOUT_HORIZON, or TRAIN_GRAD_CLIP."
+                    )
+                params, state = apply_accumulated_grads(params, state, accum_grads)
+                aux = accum_aux
+            else:
+                regime_batches = make_regime_batches(None)
+                should_profile = (
+                    profile_dir is not None
+                    and profile_skip <= global_step < profile_skip + profile_steps
+                )
+                t0 = time.perf_counter() if should_profile else 0.0
+                if should_profile:
+                    with jax.profiler.trace(str(profile_dir)):
+                        params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
+                        jax.block_until_ready(aux["total"])
+                else:
+                    params, state, aux, all_finite = train_steps[target_nv](params, state, regime_batches)
+                if should_profile:
+                    profiled_seconds.append(time.perf_counter() - t0)
+                if not bool(all_finite):
+                    raise FloatingPointError(
+                        "exact q-rollout produced non-finite loss/gradients at "
+                        f"epoch {epoch + 1}, step {step_idx + 1}; "
+                        "reduce TRAIN_LR, TRAIN_BATCH_SIZE, TRAIN_ROLLOUT_HORIZON, or TRAIN_GRAD_CLIP."
+                    )
             for key in running:
                 if key in aux:
                     running[key] = running[key] + aux[key]
@@ -7344,7 +8729,7 @@ def evaluate_regime_metrics(
     return metrics
 
 
-def _load_init_checkpoint_for_online_trajectory(
+def _load_init_checkpoint_for_interface_closure(
     init_checkpoint: Path,
     *,
     Nm: int,
@@ -7352,11 +8737,12 @@ def _load_init_checkpoint_for_online_trajectory(
     res_blocks: int,
     Nv_targets: Sequence[int],
     context_mode: str,
+    allow_target_mismatch: bool = False,
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray], float, float]:
     learned = load_learned_interface_closure_npz(init_checkpoint)
     expected_targets = tuple(int(v) for v in Nv_targets)
     actual_targets = tuple(int(v) for v in learned.Nv_targets)
-    if actual_targets != expected_targets:
+    if actual_targets != expected_targets and not bool(allow_target_mismatch):
         raise ValueError(
             f"--init-checkpoint Nv_targets={actual_targets} does not match requested Nv-targets={expected_targets}"
         )
@@ -7394,7 +8780,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--init-checkpoint",
         type=Path,
         default=None,
-        help="Optional learned-closure checkpoint used to initialize online trajectory training.",
+        help="Optional learned-closure checkpoint used to initialize supported continued-training modes.",
     )
     parser.add_argument("--dataset-cache", type=Path, default=None)
     parser.add_argument("--loss-plot", type=Path, default=None)
@@ -7447,6 +8833,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exact-rollout-precision", type=str, default=EXACT_ROLLOUT_PRECISION_FLOAT64, choices=ALL_EXACT_ROLLOUT_PRECISIONS)
     parser.add_argument("--exact-target-sampling", type=str, default=EXACT_TARGET_SAMPLING_CYCLE, choices=ALL_EXACT_TARGET_SAMPLING_MODES)
     parser.add_argument("--exact-store-train-qpairs", action="store_true")
+    parser.add_argument("--tail-chain", "--tail-decoder", dest="tail_chain", action="store_true")
+    parser.add_argument("--tail-chain-Nv", "--tail-decoder-Nv", dest="tail_chain_Nv", type=int, default=512)
+    parser.add_argument("--tail-chain-n-min", "--tail-decoder-n-min", dest="tail_chain_n_min", type=int, default=None)
+    parser.add_argument("--tail-chain-n-max", "--tail-decoder-n-max", dest="tail_chain_n_max", type=int, default=None)
+    parser.add_argument("--tail-chain-chunk-size", type=int, default=16)
+    parser.add_argument("--tail-chain-lift-horizons", type=str, default="")
+    parser.add_argument("--tail-chain-recursive-lift", action="store_true")
+    parser.add_argument("--lambda-tail-chain", "--lambda-tail-decoder", dest="lambda_tail_chain", type=float, default=1.0)
+    parser.add_argument("--tail-history-lift", action="store_true")
+    parser.add_argument("--tail-history-Nv", type=int, default=512)
+    parser.add_argument("--tail-history-n-max", type=int, default=None)
+    parser.add_argument("--tail-history-lags", type=int, default=8)
     parser.add_argument("--profile-trace-dir", type=Path, default=None)
     parser.add_argument("--profile-train-steps", type=int, default=0)
     parser.add_argument("--profile-skip-steps", type=int, default=1)
@@ -7514,9 +8912,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     online_loss_backend = str(args.online_loss_backend)
     teacher_proj_Nv: Optional[int] = None
     online_reference_cache = args.dataset_cache
+    tail_chain_enabled = bool(args.tail_chain)
+    tail_chain_train_n_min = (
+        int(args.tail_chain_n_min) if args.tail_chain_n_min is not None else None
+    )
+    tail_chain_eval_n_min = int(tail_chain_train_n_min) if tail_chain_train_n_min is not None else max(Nv_targets)
+    tail_chain_n_max = int(args.tail_chain_n_max) if args.tail_chain_n_max is not None else int(args.tail_chain_Nv)
+    tail_chain_lift_horizons = parse_int_tuple(str(args.tail_chain_lift_horizons))
+    tail_history_lift_enabled = bool(args.tail_history_lift)
+    tail_history_n_max = int(args.tail_history_n_max) if args.tail_history_n_max is not None else int(args.tail_history_Nv)
+    tail_chain_only = False
+    exact_active_loss_backend = EXACT_Q_ROLLOUT_LOSS_BACKEND
     if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE:
-        if args.init_checkpoint is not None:
-            raise ValueError("--init-checkpoint is not supported for exact_q_rollout")
+        if args.init_checkpoint is not None and bool(args.build_dataset_only):
+            raise ValueError("--init-checkpoint is not used with --build-dataset-only")
+        if args.init_checkpoint is not None and not args.init_checkpoint.exists():
+            raise ValueError(f"--init-checkpoint does not exist: {args.init_checkpoint}")
         if args.online_reference_cache is not None:
             raise ValueError("exact_q_rollout does not use --online-reference-cache")
         if bool(args.allow_dataset_cache_nv_superset):
@@ -7537,6 +8948,56 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             raise ValueError("exact_q_rollout does not use --rollout-anchor-pool-size; it samples from the full dense anchor set")
         if int(args.batch_size) <= 0 and not bool(args.build_dataset_only):
             raise ValueError("exact_q_rollout requires --batch-size > 0")
+        if bool(args.tail_chain):
+            if int(args.tail_chain_Nv) <= max(int(v) for v in Nv_targets):
+                raise ValueError("--tail-chain-Nv must exceed the deployment target Nv for tail-chain lifting")
+            if tail_chain_train_n_min is not None and tail_chain_train_n_min < max(int(v) for v in Nv_targets):
+                raise ValueError("--tail-chain-n-min must be at least the deployment target Nv when explicitly set")
+            min_chain_start = (
+                max(int(v) for v in Nv_targets) + 1
+                if tail_chain_train_n_min is None
+                else int(tail_chain_train_n_min)
+            )
+            if tail_chain_n_max <= min_chain_start:
+                raise ValueError("--tail-chain-n-max must exceed the active tail-chain lower bound")
+            if tail_chain_n_max > int(args.tail_chain_Nv):
+                raise ValueError("--tail-chain-n-max must not exceed --tail-chain-Nv")
+            if tail_chain_n_max > int(args.teacher_Nv):
+                raise ValueError("--tail-chain-n-max must not exceed --teacher-Nv")
+            if int(args.tail_chain_chunk_size) <= 0:
+                raise ValueError("--tail-chain-chunk-size must be positive")
+            if float(args.lambda_tail_chain) < 0.0:
+                raise ValueError("--lambda-tail-chain must be nonnegative")
+            if any(int(value) <= 0 for value in tail_chain_lift_horizons):
+                raise ValueError("--tail-chain-lift-horizons values must be positive")
+        if bool(args.tail_chain_recursive_lift):
+            if not bool(args.tail_chain):
+                raise ValueError("--tail-chain-recursive-lift requires --tail-chain")
+            if args.init_checkpoint is None:
+                raise ValueError("--tail-chain-recursive-lift requires --init-checkpoint")
+            if len(Nv_targets) != 1:
+                raise ValueError("--tail-chain-recursive-lift expects one deployment Nv target")
+            tail_span = int(tail_chain_n_max) - int(max(Nv_targets))
+            if tail_chain_lift_horizons and min(tail_chain_lift_horizons) > tail_span:
+                raise ValueError("--tail-chain-lift-horizons must include at least one horizon within the active tail span")
+        if tail_history_lift_enabled:
+            if bool(args.tail_chain):
+                raise ValueError("--tail-history-lift is a separate stage-2 mode; do not combine it with --tail-chain")
+            if args.init_checkpoint is None:
+                raise ValueError("--tail-history-lift requires --init-checkpoint for the frozen base dynamics")
+            if len(Nv_targets) != 1:
+                raise ValueError("--tail-history-lift expects one deployment Nv target")
+            if int(args.tail_history_Nv) <= max(int(v) for v in Nv_targets):
+                raise ValueError("--tail-history-Nv must exceed the deployment target Nv")
+            if tail_history_n_max <= max(int(v) for v in Nv_targets):
+                raise ValueError("--tail-history-n-max must exceed the deployment target Nv")
+            if tail_history_n_max > int(args.tail_history_Nv):
+                raise ValueError("--tail-history-n-max must not exceed --tail-history-Nv")
+            if tail_history_n_max > int(args.teacher_Nv):
+                raise ValueError("--tail-history-n-max must not exceed --teacher-Nv")
+            if int(args.tail_history_lags) < 0:
+                raise ValueError("--tail-history-lags must be nonnegative")
+        tail_chain_only = bool(tail_chain_enabled and args.init_checkpoint is not None and not bool(args.tail_chain_recursive_lift))
         teacher_proj_Nv = max(Nv_targets) + 1
     elif training_mode == ONLINE_TRAINING_MODE:
         if args.init_checkpoint is not None and args.train_objective != "trajectory":
@@ -7816,6 +9277,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         val_metrics = evaluate_regime_metrics(learned, prepared)
     elif training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE:
+        exact_aux_projection_order = (
+            tail_history_n_max
+            if tail_history_lift_enabled
+            else tail_chain_n_max
+            if tail_chain_enabled
+            else None
+        )
         exact_dataset, max_projection_order = build_exact_q_rollout_reference_dataset(
             dataset_cache=args.dataset_cache,
             regimes=regimes,
@@ -7837,7 +9305,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             weak_eps=weak_eps,
             strong_eps=strong_eps,
             Nv_targets=Nv_targets,
+            min_projection_order=exact_aux_projection_order,
         )
+        teacher_proj_Nv = int(max_projection_order)
         coeff_key = exact_q_rollout_coeff_key(max_projection_order)
         for regime in regimes:
             if regime not in exact_dataset:
@@ -7865,8 +9335,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ).k_arr,
             dtype=np.float64,
         )
-        k_scale = float(args.k_scale) if args.k_scale is not None else default_exact_k_scale(k_arr)
-        nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(max(Nv_targets))
+        init_params: Optional[Dict[str, Array]] = None
+        init_stats: Optional[Dict[str, np.ndarray]] = None
+        init_k_scale: Optional[float] = None
+        init_nv_scale: Optional[float] = None
+        if args.init_checkpoint is not None:
+            init_params, init_stats, init_k_scale, init_nv_scale = _load_init_checkpoint_for_interface_closure(
+                args.init_checkpoint,
+                Nm=args.Nm,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                context_mode=args.context_mode,
+                allow_target_mismatch=bool(args.tail_chain_recursive_lift) or tail_history_lift_enabled,
+            )
+            if args.k_scale is not None and not math.isclose(float(args.k_scale), float(init_k_scale), rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError("--k-scale must match --init-checkpoint k_scale when warm-starting exact q-rollout")
+            if args.nv_scale is not None and not math.isclose(float(args.nv_scale), float(init_nv_scale), rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError("--nv-scale must match --init-checkpoint nv_scale when warm-starting exact q-rollout")
+            print(f"[train] initialized exact q-rollout parameters from {args.init_checkpoint}")
+        k_scale = (
+            float(args.k_scale)
+            if args.k_scale is not None
+            else float(init_k_scale) if init_k_scale is not None
+            else default_exact_k_scale(k_arr)
+        )
+        nv_scale = (
+            float(args.nv_scale)
+            if args.nv_scale is not None
+            else float(init_nv_scale) if init_nv_scale is not None
+            else float(max(Nv_targets))
+        )
         store_exact_train_pairs = bool(args.exact_store_train_qpairs)
         dataset_base, precomputed_stats = build_exact_q_rollout_qpair_dataset(
             exact_dataset,
@@ -7884,7 +9383,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             k_scale=k_scale,
             nv_scale=nv_scale,
         )
-        if store_exact_train_pairs:
+        if init_stats is not None:
+            stats = init_stats
+            prepared = prepare_validation_dataset_from_stats(
+                dataset_base,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                context_mode=args.context_mode,
+                stats=stats,
+            )
+        elif store_exact_train_pairs:
             prepared, stats = prepare_training_dataset(
                 dataset_base,
                 Nm=args.Nm,
@@ -7910,36 +9419,163 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             feature_note = "stored q samples" if store_exact_train_pairs else "stored q samples skipped"
             print(f"[data] {regime}: {count} {feature_note}; {q_windows} exact rollout anchors")
 
-        params = init_interface_closure_params(
-            jax.random.PRNGKey(args.seed),
-            input_dim=int(stats["input_mean"].shape[0]),
-            hidden_width=int(args.hidden_width),
-            res_blocks=int(args.res_blocks),
+        if tail_chain_enabled:
+            display_chain_min = (
+                ("auto(target Nv)" if bool(args.tail_chain_recursive_lift) else "auto(target Nv+1)")
+                if tail_chain_train_n_min is None
+                else str(int(tail_chain_train_n_min))
+            )
+            if bool(args.tail_chain_recursive_lift):
+                horizon_note = (
+                    f" lift_horizons=step-cycle({','.join(str(int(v)) for v in tail_chain_lift_horizons)})"
+                    if tail_chain_lift_horizons
+                    else " lift_horizons=full"
+                )
+                print(
+                    "[data] exact q-rollout recursive tail lift: "
+                    f"n_range={display_chain_min}:{tail_chain_n_max} "
+                    "base dynamics=frozen init checkpoint"
+                    f"{horizon_note}"
+                )
+            else:
+                print(
+                    "[data] exact q-rollout virtual tail chain: "
+                    f"n_range={display_chain_min}:{tail_chain_n_max} "
+                    f"n_batch=all chunk_size={int(args.tail_chain_chunk_size)}"
+                )
+            if tail_chain_only:
+                print("[train] exact q-rollout stage: chain-only continuation from init checkpoint")
+        if tail_history_lift_enabled:
+            print(
+                "[data] exact q-rollout history tail lift: "
+                f"n_range=target Nv:{tail_history_n_max} "
+                f"history_lags={int(args.tail_history_lags)} "
+                "base dynamics=frozen init checkpoint"
+            )
+
+        params = (
+            init_tail_history_lift_params(
+                jax.random.PRNGKey(args.seed + 29),
+                input_dim=2 * (int(args.tail_history_lags) + 1) * int(max(Nv_targets)) + 1,
+                output_modes=int(tail_history_n_max) - int(max(Nv_targets)),
+                hidden_width=int(args.hidden_width),
+                res_blocks=int(args.res_blocks),
+            )
+            if tail_history_lift_enabled
+            else init_params
+            if init_params is not None
+            else init_interface_closure_params(
+                jax.random.PRNGKey(args.seed),
+                input_dim=int(stats["input_mean"].shape[0]),
+                hidden_width=int(args.hidden_width),
+                res_blocks=int(args.res_blocks),
+            )
         )
-        batch_loss_fn, active_regimes = make_exact_q_rollout_batch_loss(
-            regime_weights=regime_weights,
-            Nm=args.Nm,
-            k_scale=k_scale,
-            nv_scale=nv_scale,
-            stats=stats,
-            hidden_width=args.hidden_width,
-            res_blocks=args.res_blocks,
-            Nv_targets=Nv_targets,
-            train_regimes=regimes,
-            teacher_backend=teacher_backend,
-            teacher_Lx=args.teacher_L,
-            teacher_Nx=args.teacher_Nx,
-            teacher_Nv=args.teacher_Nv,
-            teacher_vmin=args.teacher_vmin,
-            teacher_vmax=args.teacher_vmax,
-            teacher_dt=args.teacher_dt,
-            teacher_proj_Nv=max_projection_order,
-            n_low=args.n_low,
-            context_mode=args.context_mode,
-            rollout_horizon=args.rollout_horizon,
-            poisson_sign=args.teacher_poisson_sign,
-            rollout_dealias_23=bool(args.rollout_dealias_23),
-            rollout_precision=args.exact_rollout_precision,
+        if tail_history_lift_enabled:
+            if init_params is None:
+                raise RuntimeError("history tail lift requires initialized base params")
+            batch_loss_fn, active_regimes = make_exact_q_rollout_history_lift_batch_loss(
+                base_params=init_params,
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=max_projection_order,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=args.rollout_horizon,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+                rollout_precision=args.exact_rollout_precision,
+                tail_history_nv=int(args.tail_history_Nv),
+                tail_history_n_max=int(tail_history_n_max),
+                tail_history_lags=int(args.tail_history_lags),
+            )
+        elif bool(args.tail_chain_recursive_lift):
+            if init_params is None:
+                raise RuntimeError("recursive tail lift requires initialized base params")
+            batch_loss_fn, active_regimes = make_exact_q_rollout_recursive_lift_batch_loss(
+                base_params=init_params,
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=max_projection_order,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=args.rollout_horizon,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+                rollout_precision=args.exact_rollout_precision,
+                tail_chain_nv=int(args.tail_chain_Nv),
+                tail_chain_n_max=tail_chain_n_max,
+            )
+        else:
+            batch_loss_fn, active_regimes = make_exact_q_rollout_batch_loss(
+                regime_weights=regime_weights,
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=max_projection_order,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=args.rollout_horizon,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+                rollout_precision=args.exact_rollout_precision,
+                tail_chain_enabled=tail_chain_enabled,
+                tail_chain_nv=int(args.tail_chain_Nv),
+                tail_chain_n_min=tail_chain_train_n_min,
+                tail_chain_n_max=tail_chain_n_max,
+                lambda_tail_chain=float(args.lambda_tail_chain if tail_chain_enabled else 0.0),
+                tail_chain_only=tail_chain_only,
+            )
+        exact_active_loss_backend = (
+            EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND
+            if tail_history_lift_enabled
+            else EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND
+            if bool(args.tail_chain_recursive_lift)
+            else EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND
+            if tail_chain_only
+            else EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND
+            if tail_chain_enabled
+            else EXACT_Q_ROLLOUT_LOSS_BACKEND
         )
         steps_per_epoch = int(args.steps_per_epoch)
         if steps_per_epoch <= 0:
@@ -7966,16 +9602,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             seed=args.seed,
             log_components=online_training_log_components(
                 train_objective=args.train_objective,
-                online_loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+                online_loss_backend=(
+                    exact_active_loss_backend
+                ),
             ),
             target_sampling=args.exact_target_sampling,
             profile_trace_dir=args.profile_trace_dir,
             profile_train_steps=args.profile_train_steps,
             profile_skip_steps=args.profile_skip_steps,
+            tail_chain_chunk_size=int(args.tail_chain_chunk_size),
+            tail_chain_lift_horizons=tail_chain_lift_horizons if bool(args.tail_chain_recursive_lift) else (),
         )
         loss_history = online_component_history["total"]
         learned = build_learned_interface_closure(
-            params=params,
+            params=(
+                init_params
+                if (tail_history_lift_enabled or bool(args.tail_chain_recursive_lift)) and init_params is not None
+                else params
+            ),
             Nm=args.Nm,
             k_scale=k_scale,
             nv_scale=nv_scale,
@@ -7999,7 +9643,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             rollout_horizon=args.rollout_horizon,
             rollout_anchor_samples=0,
             tail_start_fraction=args.tail_start_fraction,
-            loss_backend=EXACT_Q_ROLLOUT_LOSS_BACKEND,
+            loss_backend=(
+                exact_active_loss_backend
+            ),
             lambda_q=1.0,
             lambda_E=0.0,
             lambda_dist=0.0,
@@ -8008,6 +9654,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             lambda_reg=0.0,
             online_v_probes=0,
             stability_loss_definition=None,
+            tail_chain_enabled=tail_chain_enabled,
+            tail_chain_nv=int(args.tail_chain_Nv if tail_chain_enabled else 0),
+            tail_chain_n_min=int(tail_chain_eval_n_min if tail_chain_enabled else 0),
+            tail_chain_n_max=int(tail_chain_n_max if tail_chain_enabled else 0),
+            lambda_tail_chain=(
+                1.0
+                if bool(args.tail_chain_recursive_lift)
+                else 0.0
+                if tail_chain_only
+                else float(args.lambda_tail_chain if tail_chain_enabled else 0.0)
+            ),
+            tail_lift_params=params if bool(args.tail_chain_recursive_lift) else None,
+            tail_history_lift_enabled=tail_history_lift_enabled,
+            tail_history_nv=int(args.tail_history_Nv if tail_history_lift_enabled else 0),
+            tail_history_n_min=int(max(Nv_targets) if tail_history_lift_enabled else 0),
+            tail_history_n_max=int(tail_history_n_max if tail_history_lift_enabled else 0),
+            tail_history_lags=int(args.tail_history_lags if tail_history_lift_enabled else 0),
+            tail_history_lift_params=params if tail_history_lift_enabled else None,
         )
         val_metrics = evaluate_regime_metrics(learned, prepared)
     else:
@@ -8221,7 +9885,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             k_scale = float(args.k_scale) if args.k_scale is not None else float(jnp.max(jnp.asarray(integ.k_arr[1:], dtype=jnp.float64)))
             nv_scale = float(args.nv_scale) if args.nv_scale is not None else float(target_nv_max)
             if args.init_checkpoint is not None:
-                params, stats, k_scale, nv_scale = _load_init_checkpoint_for_online_trajectory(
+                params, stats, k_scale, nv_scale = _load_init_checkpoint_for_interface_closure(
                     args.init_checkpoint,
                     Nm=args.Nm,
                     hidden_width=args.hidden_width,
@@ -8536,8 +10200,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "loss_backend": np.array(
             []
             if training_mode == OFFLINE_TRAINING_MODE
-            else [
-                EXACT_Q_ROLLOUT_LOSS_BACKEND
+                else [
+                (
+                    exact_active_loss_backend
+                )
                 if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
                 else args.online_loss_backend
             ],
@@ -8565,6 +10231,33 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "lambda_tail": np.array([used_lambda_tail], dtype=np.float64),
         "lambda_neg": np.array([used_lambda_neg], dtype=np.float64),
         "lambda_reg": np.array([used_lambda_reg], dtype=np.float64),
+        "tail_chain_enabled": np.array([tail_chain_enabled], dtype=np.bool_),
+        "tail_chain_Nv": np.array([int(args.tail_chain_Nv if tail_chain_enabled else 0)], dtype=np.int32),
+        "tail_chain_n_min": np.array([int(tail_chain_eval_n_min if tail_chain_enabled else 0)], dtype=np.int32),
+        "tail_chain_n_max": np.array([int(tail_chain_n_max if tail_chain_enabled else 0)], dtype=np.int32),
+        "tail_chain_chunk_size": np.array([int(args.tail_chain_chunk_size if tail_chain_enabled else 0)], dtype=np.int32),
+        "tail_chain_lift_horizons": np.asarray(
+            tuple(int(value) for value in tail_chain_lift_horizons)
+            if tail_chain_enabled and bool(args.tail_chain_recursive_lift)
+            else (),
+            dtype=np.int32,
+        ),
+        "tail_chain_only": np.array([tail_chain_only], dtype=np.bool_),
+        "tail_chain_recursive_lift": np.array([bool(args.tail_chain_recursive_lift)], dtype=np.bool_),
+        "tail_history_lift_enabled": np.array([tail_history_lift_enabled], dtype=np.bool_),
+        "tail_history_Nv": np.array([int(args.tail_history_Nv if tail_history_lift_enabled else 0)], dtype=np.int32),
+        "tail_history_n_max": np.array([int(tail_history_n_max if tail_history_lift_enabled else 0)], dtype=np.int32),
+        "tail_history_lags": np.array([int(args.tail_history_lags if tail_history_lift_enabled else 0)], dtype=np.int32),
+        "lambda_tail_chain": np.array(
+            [
+                1.0
+                if bool(args.tail_chain_recursive_lift)
+                else 0.0
+                if tail_chain_only
+                else float(args.lambda_tail_chain if tail_chain_enabled else 0.0)
+            ],
+            dtype=np.float64,
+        ),
         "online_v_probes": np.array(
             [
                 args.online_v_probes
@@ -8581,7 +10274,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         logged_components = online_training_log_components(
             train_objective=args.train_objective,
             online_loss_backend=(
-                EXACT_Q_ROLLOUT_LOSS_BACKEND
+                (
+                    exact_active_loss_backend
+                )
                 if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
                 else online_loss_backend
             ),
@@ -8603,16 +10298,61 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     np.savez(metrics_path, **metrics_payload)
 
     loss_plot_path = args.loss_plot if args.loss_plot is not None else args.checkpoint.with_suffix(".loss.png")
+    exact_loss_backend_for_plot = (
+        exact_active_loss_backend
+        if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
+        else EXACT_Q_ROLLOUT_LOSS_BACKEND
+    )
+    exact_loss_annotation = None
+    if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and tail_history_lift_enabled:
+        exact_loss_annotation = (
+            r"$\mathcal{L}^{H}_{\mathrm{hist}}="
+            r"\frac{1}{BH|\mathcal{M}||\mathcal{K}^{+}|}"
+            r"\sum_{i,h,n,k>0}|S_C(\widehat C^\theta_{n,k})-S_C(C^{HR}_{n,k})|^2$"
+            + "\n"
+            + rf"$C^{{\theta}}_{{< {max(Nv_targets)}}}$ frozen, "
+            + rf"$\mathcal{{M}}=[{max(Nv_targets)},{tail_history_n_max})$, "
+            + rf"lags={int(args.tail_history_lags)}"
+        )
+    elif training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and tail_chain_enabled:
+        display_chain_min = (
+            (r"\mathrm{target}\ N_v" if bool(args.tail_chain_recursive_lift) else r"\mathrm{target}\ N_v+1")
+            if tail_chain_train_n_min is None
+            else str(int(tail_chain_train_n_min))
+        )
+        if bool(args.tail_chain_recursive_lift):
+            exact_loss_annotation = (
+                r"$\mathcal{L}^{H}=\mathcal{L}_{\mathrm{recursive\ lift}}^{H}$"
+                + "\n"
+                + rf"$C^{{\theta}}_{{<64}}\ \mathrm{{frozen}},\ "
+                + rf"\mathcal{{M}}=[{display_chain_min},{tail_chain_n_max})$"
+            )
+        elif tail_chain_only:
+            exact_loss_annotation = (
+                r"$\mathcal{L}^{H}=\mathcal{L}_{\mathrm{chain}}$"
+                + "\n"
+                + rf"$\mathcal{{M}}=[{display_chain_min},{tail_chain_n_max})$, "
+                + r"$m$ batch=all"
+            )
+        else:
+            exact_loss_annotation = (
+                r"$\mathcal{L}^{H}=\mathcal{L}_{\mathrm{dyn}}^{H}+\lambda_{\mathrm{chain}}\mathcal{L}_{\mathrm{chain}}$"
+                + "\n"
+                + rf"$\lambda_{{\mathrm{{chain}}}}={float(args.lambda_tail_chain):.3g}$, "
+                + rf"$\mathcal{{M}}=[{display_chain_min},{tail_chain_n_max})$, "
+                + r"$m$ batch=all"
+            )
     save_training_loss_plot(
         np.asarray(loss_history, dtype=np.float64),
         loss_plot_path,
         val_metrics=val_metrics,
         train_objective=args.train_objective,
         loss_backend=(
-            EXACT_Q_ROLLOUT_LOSS_BACKEND
+            exact_loss_backend_for_plot
             if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
             else (args.online_loss_backend if training_mode == ONLINE_TRAINING_MODE else None)
         ),
+        loss_annotation=exact_loss_annotation,
     )
     q_diag_plot_path: Optional[Path] = None
     if (
