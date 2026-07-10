@@ -204,52 +204,6 @@ def _learned_nonlinear_payload_from_raw(
     }
 
 
-def _reconstructed_nonlinear_payload_from_raw(
-    raw: Dict[str, np.ndarray | jnp.ndarray],
-    params: NonlinearLandauParams,
-    reduced_payload: Dict[str, np.ndarray],
-) -> Optional[Dict[str, np.ndarray]]:
-    """Return the Metric 1/2 payload implied by a reconstructed state, if present.
-
-    History-lift and recursive-lift checkpoints currently reconstruct high Hermite
-    coefficients for phase-space visualization.  Metric 1/2 are electric-field
-    metrics and depend only on the density coefficient C_0.  When the
-    reconstruction starts above the deployment Nv, C_0 is unchanged, so the
-    reconstructed electric-field metrics are exactly the reduced-solver metrics.
-    If a future reconstruction path returns a full reconstructed Fourier-Hermite
-    history, prefer that directly.
-    """
-
-    if "recon_a_hat_hist" in raw:
-        a_hat_hist = np.asarray(raw["recon_a_hat_hist"], dtype=np.complex128)
-        times = np.asarray(raw.get("recon_a_hat_hist_times", raw["a_hat_hist_times"]), dtype=np.float64)
-        k_arr = np.asarray(raw["k_arr"], dtype=np.float64)
-        E_hat_hist = np.asarray(
-            e_hat_history_from_a_hat_history(
-                jnp.asarray(a_hat_hist, dtype=jnp.complex128),
-                jnp.asarray(k_arr, dtype=jnp.float64),
-                poisson_sign=float(params.poisson_sign),
-            ),
-            dtype=np.complex128,
-        )
-        return {
-            "times": times,
-            "E_hat_hist": E_hat_hist,
-            "energy": _electric_energy_from_ehat_history(E_hat_hist, Nx=int(params.Nx), Lx=float(params.L)),
-            "k_arr": k_arr,
-            "source": np.asarray(["recon_a_hat_hist"], dtype=np.str_),
-        }
-    if "snapshot_recon_a_phys" not in raw:
-        return None
-    return {
-        "times": np.asarray(reduced_payload["times"], dtype=np.float64),
-        "E_hat_hist": np.asarray(reduced_payload["E_hat_hist"], dtype=np.complex128),
-        "energy": np.asarray(reduced_payload["energy"], dtype=np.float64),
-        "k_arr": np.asarray(reduced_payload["k_arr"], dtype=np.float64),
-        "source": np.asarray(["density_unchanged_high_hermite_recon"], dtype=np.str_),
-    }
-
-
 def _phase_l2_errors(
     reference_phase: Dict[str, np.ndarray],
     candidate_phase: Dict[str, np.ndarray],
@@ -415,8 +369,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     growth_cases: List[GrowthSweepCase] = []
     field_cases: List[FieldSweepCase] = []
-    reconstructed_growth_cases: List[GrowthSweepCase] = []
-    reconstructed_field_cases: List[FieldSweepCase] = []
     phase_reconstruction_cases: List[Dict[str, object]] = []
     summary_cases: List[Dict[str, object]] = []
     phase_payload: Dict[str, np.ndarray] = {}
@@ -478,7 +430,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             history_stride=1,
         )
         theta_payload = _learned_nonlinear_payload_from_raw(learned_raw, params)
-        reconstructed_payload = _reconstructed_nonlinear_payload_from_raw(learned_raw, params, theta_payload)
         growth = growth_metric.compare(
             theta_payload["times"],
             theta_payload["energy"],
@@ -512,32 +463,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         phase_error_learned_reconstructed: Optional[np.ndarray] = None
         phase_error_truncation: Optional[np.ndarray] = None
 
-        reconstructed_growth = None
-        reconstructed_field_comparison = None
-        reconstructed_field = None
-        if reconstructed_payload is not None:
-            reconstructed_growth = growth_metric.compare(
-                reconstructed_payload["times"],
-                reconstructed_payload["energy"],
-                hr_payload["times"],
-                hr_payload["energy"],
-            )
-            reconstructed_field_comparison = field_metric.prepare_fourier_comparison(
-                reconstructed_payload["times"],
-                reconstructed_payload["E_hat_hist"],
-                reconstructed_payload["k_arr"],
-                hr_payload["times"],
-                hr_payload["E_hat_hist"],
-                hr_payload["k_arr"],
-            )
-            reconstructed_field = field_metric.evaluate_fourier(
-                reconstructed_payload["times"],
-                reconstructed_payload["E_hat_hist"],
-                reconstructed_payload["k_arr"],
-                hr_payload["times"],
-                hr_payload["E_hat_hist"],
-                hr_payload["k_arr"],
-            )
+        if "snapshot_recon_a_phys" in learned_raw:
             phase_error_learned_reconstructed = _phase_l2_errors(reference_phase, learned_phase, snapshot_times)
             phase_error_truncation = _phase_l2_errors(reference_phase, truncation_phase, snapshot_times)
 
@@ -591,33 +517,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 beyond_training_range=beyond_training_range,
             )
         )
-        if reconstructed_payload is not None:
-            assert reconstructed_growth is not None
-            assert reconstructed_field is not None
-            assert reconstructed_field_comparison is not None
-            reconstructed_growth_cases.append(
-                GrowthSweepCase(
-                    Nv=int(Nv),
-                    times_theta=np.asarray(reconstructed_payload["times"], dtype=np.float64),
-                    energy_theta=np.asarray(reconstructed_payload["energy"], dtype=np.float64),
-                    comparison=reconstructed_growth,
-                    in_training_targets=in_training_targets,
-                    beyond_training_range=beyond_training_range,
-                )
-            )
-            reconstructed_field_cases.append(
-                FieldSweepCase(
-                    Nv=int(Nv),
-                    comparison=reconstructed_field_comparison,
-                    epsilon_E=float(reconstructed_field.epsilon_E),
-                    baseline_comparison=truncation_field_comparison,
-                    baseline_epsilon_E=float(truncation_field.epsilon_E),
-                    baseline_label="truncation",
-                    theta_label="learned reconstruction",
-                    in_training_targets=in_training_targets,
-                    beyond_training_range=beyond_training_range,
-                )
-            )
+        if phase_error_learned_reconstructed is not None:
             assert phase_error_learned_reconstructed is not None
             assert phase_error_truncation is not None
             phase_reconstruction_cases.append(
@@ -654,50 +554,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "x": np.asarray(learned_phase["x"], dtype=np.float64),
             "v": np.asarray(learned_phase["v"], dtype=np.float64),
         }
-        if reconstructed_payload is not None:
-            assert reconstructed_growth is not None
-            assert reconstructed_field is not None
-            assert reconstructed_field_comparison is not None
+        if phase_error_learned_reconstructed is not None:
             assert phase_error_learned_reconstructed is not None
             assert phase_error_truncation is not None
             case_payload.update(
                 {
-                    "times_theta_reconstructed": np.asarray(
-                        reconstructed_payload["times"],
-                        dtype=np.float64,
-                    ),
-                    "energy_theta_reconstructed": np.asarray(
-                        reconstructed_payload["energy"],
-                        dtype=np.float64,
-                    ),
-                    "E_hat_theta_reconstructed": np.asarray(
-                        reconstructed_payload["E_hat_hist"],
-                        dtype=np.complex128,
-                    ),
-                    "k_theta_reconstructed": np.asarray(
-                        reconstructed_payload["k_arr"],
-                        dtype=np.float64,
-                    ),
-                    "field_E_hat_theta_reconstructed": np.asarray(
-                        reconstructed_field_comparison.E_hat_theta,
-                        dtype=np.complex128,
-                    ),
-                    "epsilon_grow_reconstructed": np.array(
-                        [reconstructed_growth.epsilon_grow],
-                        dtype=np.float64,
-                    ),
-                    "gamma_grow_theta_reconstructed": np.array(
-                        [reconstructed_growth.gamma_grow_theta],
-                        dtype=np.float64,
-                    ),
-                    "epsilon_E_reconstructed": np.array(
-                        [reconstructed_field.epsilon_E],
-                        dtype=np.float64,
-                    ),
-                    "reconstructed_metric_source": np.asarray(
-                        reconstructed_payload["source"],
-                        dtype=np.str_,
-                    ),
                     "phase_error_learned_reconstructed": np.asarray(
                         phase_error_learned_reconstructed,
                         dtype=np.float64,
@@ -743,22 +604,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "case_npz": str(case_path),
             }
         )
-        if reconstructed_payload is not None:
-            assert reconstructed_growth is not None
-            assert reconstructed_field is not None
+        if phase_error_learned_reconstructed is not None:
             assert phase_error_learned_reconstructed is not None
             assert phase_error_truncation is not None
             summary_cases[-1].update(
                 {
-                    "has_reconstructed_metrics": True,
-                    "reconstructed_metric_source": [
-                        str(v) for v in np.asarray(reconstructed_payload["source"]).reshape(-1)
-                    ],
-                    "epsilon_grow_reconstructed": _json_scalar(reconstructed_growth.epsilon_grow),
-                    "gamma_grow_theta_reconstructed": _json_scalar(
-                        reconstructed_growth.gamma_grow_theta
-                    ),
-                    "epsilon_E_reconstructed": _json_scalar(reconstructed_field.epsilon_E),
                     "phase_error_reconstructed": [
                         _json_scalar(v) for v in np.asarray(phase_error_learned_reconstructed)
                     ],
@@ -767,22 +617,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     ],
                 }
             )
-        else:
-            summary_cases[-1]["has_reconstructed_metrics"] = False
         print(
             f"[nv-sweep] Nv={int(Nv)}: epsilon_grow={growth.epsilon_grow:.4e} "
             f"gamma_hr={growth.gamma_grow_hr:.4e} gamma_theta={growth.gamma_grow_theta:.4e} "
             f"epsilon_E_truncation={truncation_field.epsilon_E:.4e} "
             f"epsilon_E_learned={field.epsilon_E:.4e}"
         )
-        if reconstructed_payload is not None:
-            assert reconstructed_growth is not None
-            assert reconstructed_field is not None
+        if phase_error_learned_reconstructed is not None:
             assert phase_error_learned_reconstructed is not None
             print(
                 f"[nv-sweep] Nv={int(Nv)} reconstructed: "
-                f"epsilon_grow={reconstructed_growth.epsilon_grow:.4e} "
-                f"epsilon_E={reconstructed_field.epsilon_E:.4e} "
                 f"phase_err_mean={float(np.mean(phase_error_learned_reconstructed)):.4e}"
             )
 
