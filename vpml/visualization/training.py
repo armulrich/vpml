@@ -67,6 +67,15 @@ def _training_loss_ylabel(train_objective: str, loss_backend: str | None = None)
                 r"\left|S_C(\widehat C_{n,k}^{\theta}(\mathcal{H}_{<N_v}))-"
                 r"S_C(C_{n,k}^{\mathrm{HR}}(t_s+h\Delta t))\right|^2$"
             )
+        if str(loss_backend) == "exact_fourier_hermite_q_rollout_history_lift_xv_res":
+            return (
+                r"$\mathcal{L}_{xv\mathrm{-res}}^{H}(\theta)="
+                r"\frac{\sum_{s,h}\int\!\int"
+                r"\left|\widehat f_{\mathrm{tail}}^{\theta}(x,v,t_s+h\Delta t)-"
+                r"f_{\mathrm{tail}}^{\mathrm{HR}}(x,v,t_s+h\Delta t)\right|^2\,dv\,dx}"
+                r"{\sum_{s,h}\int\!\int"
+                r"\left|f_{\mathrm{tail}}^{\mathrm{HR}}(x,v,t_s+h\Delta t)\right|^2\,dv\,dx}$"
+            )
         if str(loss_backend) == "exact_fourier_hermite_q_rollout_chain_only":
             return (
                 r"$\mathcal{L}_{\mathrm{chain}}(\theta)="

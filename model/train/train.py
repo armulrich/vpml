@@ -95,6 +95,13 @@ EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_tail_
 EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_chain_only"
 EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_recursive_lift"
 EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_history_lift"
+EXACT_Q_ROLLOUT_HISTORY_LIFT_XV_RES_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_history_lift_xv_res"
+TAIL_HISTORY_LOSS_COEFF = "coeff"
+TAIL_HISTORY_LOSS_XV_RES = "xv_res"
+ALL_TAIL_HISTORY_LOSSES = (
+    TAIL_HISTORY_LOSS_COEFF,
+    TAIL_HISTORY_LOSS_XV_RES,
+)
 ONLINE_LOSS_BACKEND_FIELD_DISTRIBUTION_V1 = "field_distribution_v1"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_BIDIR = "fourier_hermite_bidir"
 ONLINE_LOSS_BACKEND_FOURIER_HERMITE_CLOSURE_BIDIR = "fourier_hermite_closure_bidir"
@@ -5050,6 +5057,129 @@ def exact_history_tail_lift_coeff_loss(
     return mean_err / denom
 
 
+def exact_history_tail_lift_xv_res_loss(
+    anchor_stencils: Array,
+    low_history_context: Array,
+    tail_ref_windows: Array,
+    *,
+    base_learned: LearnedInterfaceClosure,
+    history_learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    explicit_n_hat_fn,
+    tail_n_min: int,
+    tail_n_max: int,
+    v_grid: Array,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+) -> Array:
+    """Deterministic x-v residual loss for the learned Hermite-tail lift.
+
+    The frozen low-order solver supplies the history. The trainable history head
+    predicts only the tail, and the loss compares predicted tail distribution
+    against the HR tail distribution on a fixed x-v grid.
+    """
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    anchor_stencils = jnp.asarray(anchor_stencils, dtype=complex_dtype)
+    low_history_context = jnp.asarray(low_history_context, dtype=complex_dtype)
+    tail_ref_windows = jnp.asarray(tail_ref_windows, dtype=complex_dtype)
+    v_grid = jnp.asarray(v_grid, dtype=real_dtype)
+    base_rollout = cast_learned_closure_for_rollout(base_learned, precision=str(rollout_precision))
+    history_rollout = cast_learned_closure_for_rollout(history_learned, precision=str(rollout_precision))
+    horizon = int(rollout_horizon)
+    tail_min = int(tail_n_min)
+    tail_max = int(tail_n_max)
+    if horizon <= 0:
+        raise ValueError("rollout_horizon must be positive for history tail lift")
+    if tail_min != int(forward_integ.Nv):
+        raise ValueError(f"history tail lift expects tail_n_min == deployment Nv; got {tail_min}")
+    if tail_max <= tail_min:
+        raise ValueError("tail_n_max must exceed tail_n_min")
+    if int(v_grid.ndim) != 1 or int(v_grid.shape[0]) < 2:
+        raise ValueError("x-v residual history lift requires a one-dimensional v grid with at least two points")
+    if int(low_history_context.ndim) != 4:
+        raise ValueError(
+            "low_history_context must have shape (B,lags,Nv,Nk), "
+            f"got {low_history_context.shape}"
+        )
+    if tuple(low_history_context.shape[:1]) != tuple(anchor_stencils.shape[:1]):
+        raise ValueError("low_history_context batch dimension must match anchor_stencils")
+    if int(low_history_context.shape[2]) != int(forward_integ.Nv):
+        raise ValueError("low_history_context Nv dimension must match deployment Nv")
+    expected_modes = tail_max - tail_min
+    if tuple(tail_ref_windows.shape[:3]) != (
+        int(anchor_stencils.shape[0]),
+        horizon,
+        expected_modes,
+    ):
+        raise ValueError(
+            "tail_ref_windows must have shape (B,H,M,Nk), "
+            f"got {tail_ref_windows.shape}"
+        )
+
+    low_states = jax.vmap(
+        lambda anchor_stencil: rollout_anchor_states_from_anchor_stencil(
+            anchor_stencil,
+            learned=base_rollout,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+    )(anchor_stencils)
+    lags = int(low_history_context.shape[1])
+    combined = jnp.concatenate([low_history_context, low_states], axis=1)
+    phi_tail = jax_hermite_basis_phi_scaled(
+        tail_max,
+        v_grid,
+        vth=float(forward_integ.vth),
+    )[tail_min:tail_max].astype(real_dtype)
+
+    def tail_f_vx(tail_hat: Array) -> Array:
+        tail_phys = irfft_x(tail_hat, int(forward_integ.Nx))
+        return jnp.einsum("nx,nv->vx", tail_phys, phi_tail).astype(real_dtype)
+
+    def one_err_pair(history_window: Array, ref_modes: Array) -> Tuple[Array, Array]:
+        full_hat = learned_history_hermite_lift(
+            history_window,
+            forward_integ.k_arr,
+            history_rollout,
+            n_min=tail_min,
+            n_max=tail_max,
+        )
+        pred_tail = full_hat[tail_min:tail_max, :]
+        ref_modes = ref_modes.at[:, 0].set(0.0)
+        pred_f = tail_f_vx(pred_tail)
+        ref_f = tail_f_vx(ref_modes)
+        diff = pred_f - ref_f
+        return jnp.sum(diff * diff), jnp.sum(ref_f * ref_f)
+
+    def anchor_err_pair(anchor_combined: Array, anchor_ref: Array) -> Tuple[Array, Array]:
+        def h_step(carry: Tuple[Array, Array], h_idx: Array) -> Tuple[Tuple[Array, Array], None]:
+            err_total, ref_total = carry
+            start = h_idx
+            zero_idx = jnp.asarray(0, dtype=h_idx.dtype)
+            history_window = jax.lax.dynamic_slice(
+                anchor_combined,
+                (start, zero_idx, zero_idx),
+                (lags + 1, int(forward_integ.Nv), int(forward_integ.Nk)),
+            )
+            err, ref = one_err_pair(history_window, anchor_ref[h_idx])
+            return (err_total + err, ref_total + ref), None
+
+        (err_sum, ref_sum), _ = jax.lax.scan(
+            h_step,
+            (
+                jnp.asarray(0.0, dtype=real_dtype),
+                jnp.asarray(0.0, dtype=real_dtype),
+            ),
+            jnp.arange(horizon, dtype=jnp.int32),
+        )
+        return err_sum, ref_sum
+
+    err_sums, ref_sums = jax.vmap(anchor_err_pair)(combined, tail_ref_windows)
+    denom = jnp.maximum(jnp.sum(ref_sums), jnp.asarray(1e-12, dtype=real_dtype))
+    return jnp.sum(err_sums) / denom
+
+
 def exact_q_rollout_loss_for_anchor_batch(
     anchor_stencils: Array,
     ref_q_windows: Array,
@@ -7493,13 +7623,28 @@ def make_exact_q_rollout_history_lift_batch_loss(
     tail_history_nv: int = 0,
     tail_history_n_max: int = 0,
     tail_history_lags: int = 8,
+    tail_history_loss: str = TAIL_HISTORY_LOSS_COEFF,
+    tail_history_xv_grid: int = 512,
 ) -> Tuple[object, Sequence[str]]:
+    tail_history_loss_mode = str(tail_history_loss)
+    if tail_history_loss_mode not in ALL_TAIL_HISTORY_LOSSES:
+        raise ValueError(
+            f"tail_history_loss must be one of {ALL_TAIL_HISTORY_LOSSES!r}, got {tail_history_loss!r}"
+        )
+    if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES and int(tail_history_xv_grid) < 2:
+        raise ValueError("tail_history_xv_grid must be at least 2 for x-v residual history lift")
     active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
     weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
     weights = weights / np.sum(weights)
     weight_arr = jnp.asarray(weights, dtype=jnp.float64)
     target_nvs = tuple(int(v) for v in Nv_targets)
     real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    tail_history_v_grid = jnp.linspace(
+        float(teacher_vmin),
+        float(teacher_vmax),
+        int(tail_history_xv_grid),
+        dtype=real_dtype,
+    )
     nonlinear_integrators = {
         int(target_nv): FourierHermiteIMEX(
             Nx=int(teacher_Nx),
@@ -7604,20 +7749,36 @@ def make_exact_q_rollout_history_lift_batch_loss(
                 batch = regime_batches[regime]
                 integ = linear_forward if regime == REGIME_LINEAR else nonlinear_forward
                 explicit_fn = linear_explicit if regime == REGIME_LINEAR else nonlinear_explicit
-                hist_loss = exact_history_tail_lift_coeff_loss(
-                    batch["anchor_stencils"],
-                    batch["tail_history_low_context"],
-                    batch["tail_history_ref_windows"],
-                    base_learned=base_learned,
-                    history_learned=history_learned,
-                    forward_integ=integ,
-                    rollout_horizon=rollout_horizon,
-                    explicit_n_hat_fn=explicit_fn,
-                    tail_n_min=int(target_nv),
-                    tail_n_max=int(tail_history_n_max),
-                    rollout_precision=str(rollout_precision),
-                    tail_ref_energy_mean=batch.get("tail_history_ref_energy_mean"),
-                )
+                if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES:
+                    hist_loss = exact_history_tail_lift_xv_res_loss(
+                        batch["anchor_stencils"],
+                        batch["tail_history_low_context"],
+                        batch["tail_history_ref_windows"],
+                        base_learned=base_learned,
+                        history_learned=history_learned,
+                        forward_integ=integ,
+                        rollout_horizon=rollout_horizon,
+                        explicit_n_hat_fn=explicit_fn,
+                        tail_n_min=int(target_nv),
+                        tail_n_max=int(tail_history_n_max),
+                        v_grid=tail_history_v_grid,
+                        rollout_precision=str(rollout_precision),
+                    )
+                else:
+                    hist_loss = exact_history_tail_lift_coeff_loss(
+                        batch["anchor_stencils"],
+                        batch["tail_history_low_context"],
+                        batch["tail_history_ref_windows"],
+                        base_learned=base_learned,
+                        history_learned=history_learned,
+                        forward_integ=integ,
+                        rollout_horizon=rollout_horizon,
+                        explicit_n_hat_fn=explicit_fn,
+                        tail_n_min=int(target_nv),
+                        tail_n_max=int(tail_history_n_max),
+                        rollout_precision=str(rollout_precision),
+                        tail_ref_energy_mean=batch.get("tail_history_ref_energy_mean"),
+                    )
                 total_hist = total_hist + weight * hist_loss
             zero = jnp.asarray(0.0, dtype=jnp.float64)
             return total_hist, {
@@ -7659,6 +7820,8 @@ def make_exact_q_rollout_history_lift_batch_loss(
     loss_fn.tail_history_lift_enabled = True  # type: ignore[attr-defined]
     loss_fn.tail_history_n_max = int(tail_history_n_max)  # type: ignore[attr-defined]
     loss_fn.tail_history_lags = int(tail_history_lags)  # type: ignore[attr-defined]
+    loss_fn.tail_history_loss = tail_history_loss_mode  # type: ignore[attr-defined]
+    loss_fn.tail_history_xv_grid = int(tail_history_xv_grid)  # type: ignore[attr-defined]
     loss_fn.Nm = int(Nm)  # type: ignore[attr-defined]
     loss_fn.n_low = int(n_low)  # type: ignore[attr-defined]
     return loss_fn, active_regimes
@@ -7918,7 +8081,10 @@ def online_training_log_components(
     if str(train_objective) == "trajectory_q_hybrid":
         return ("q", "field", "dist", "tail", "neg", "reg")
     if str(train_objective) == EXACT_Q_ROLLOUT_OBJECTIVE:
-        if str(online_loss_backend) == EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND:
+        if str(online_loss_backend) in {
+            EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND,
+            EXACT_Q_ROLLOUT_HISTORY_LIFT_XV_RES_LOSS_BACKEND,
+        }:
             return ("hist",)
         if str(online_loss_backend) == EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND:
             return ("chain",)
@@ -8845,6 +9011,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tail-history-Nv", type=int, default=512)
     parser.add_argument("--tail-history-n-max", type=int, default=None)
     parser.add_argument("--tail-history-lags", type=int, default=8)
+    parser.add_argument("--tail-history-loss", type=str, choices=ALL_TAIL_HISTORY_LOSSES, default=TAIL_HISTORY_LOSS_COEFF)
+    parser.add_argument("--tail-history-xv-grid", type=int, default=512)
     parser.add_argument("--profile-trace-dir", type=Path, default=None)
     parser.add_argument("--profile-train-steps", type=int, default=0)
     parser.add_argument("--profile-skip-steps", type=int, default=1)
@@ -8921,6 +9089,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     tail_chain_lift_horizons = parse_int_tuple(str(args.tail_chain_lift_horizons))
     tail_history_lift_enabled = bool(args.tail_history_lift)
     tail_history_n_max = int(args.tail_history_n_max) if args.tail_history_n_max is not None else int(args.tail_history_Nv)
+    tail_history_loss_mode = str(args.tail_history_loss)
     tail_chain_only = False
     exact_active_loss_backend = EXACT_Q_ROLLOUT_LOSS_BACKEND
     if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE:
@@ -8997,6 +9166,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 raise ValueError("--tail-history-n-max must not exceed --teacher-Nv")
             if int(args.tail_history_lags) < 0:
                 raise ValueError("--tail-history-lags must be nonnegative")
+            if tail_history_loss_mode not in ALL_TAIL_HISTORY_LOSSES:
+                raise ValueError(f"--tail-history-loss must be one of {ALL_TAIL_HISTORY_LOSSES!r}")
+            if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES and int(args.tail_history_xv_grid) < 2:
+                raise ValueError("--tail-history-xv-grid must be at least 2 for --tail-history-loss=xv_res")
         tail_chain_only = bool(tail_chain_enabled and args.init_checkpoint is not None and not bool(args.tail_chain_recursive_lift))
         teacher_proj_Nv = max(Nv_targets) + 1
     elif training_mode == ONLINE_TRAINING_MODE:
@@ -9446,11 +9619,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             if tail_chain_only:
                 print("[train] exact q-rollout stage: chain-only continuation from init checkpoint")
         if tail_history_lift_enabled:
+            hist_loss_note = (
+                f" loss=xv_res xv_grid={int(args.tail_history_xv_grid)}"
+                if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES
+                else " loss=coeff"
+            )
             print(
                 "[data] exact q-rollout history tail lift: "
                 f"n_range=target Nv:{tail_history_n_max} "
                 f"history_lags={int(args.tail_history_lags)} "
                 "base dynamics=frozen init checkpoint"
+                f"{hist_loss_note}"
             )
 
         params = (
@@ -9502,6 +9681,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 tail_history_nv=int(args.tail_history_Nv),
                 tail_history_n_max=int(tail_history_n_max),
                 tail_history_lags=int(args.tail_history_lags),
+                tail_history_loss=tail_history_loss_mode,
+                tail_history_xv_grid=int(args.tail_history_xv_grid),
             )
         elif bool(args.tail_chain_recursive_lift):
             if init_params is None:
@@ -9567,7 +9748,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 tail_chain_only=tail_chain_only,
             )
         exact_active_loss_backend = (
-            EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND
+            (
+                EXACT_Q_ROLLOUT_HISTORY_LIFT_XV_RES_LOSS_BACKEND
+                if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES
+                else EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND
+            )
             if tail_history_lift_enabled
             else EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND
             if bool(args.tail_chain_recursive_lift)
@@ -10248,6 +10433,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "tail_history_Nv": np.array([int(args.tail_history_Nv if tail_history_lift_enabled else 0)], dtype=np.int32),
         "tail_history_n_max": np.array([int(tail_history_n_max if tail_history_lift_enabled else 0)], dtype=np.int32),
         "tail_history_lags": np.array([int(args.tail_history_lags if tail_history_lift_enabled else 0)], dtype=np.int32),
+        "tail_history_loss": np.array([tail_history_loss_mode if tail_history_lift_enabled else ""], dtype=np.str_),
+        "tail_history_xv_grid": np.array(
+            [int(args.tail_history_xv_grid if tail_history_lift_enabled else 0)],
+            dtype=np.int32,
+        ),
         "lambda_tail_chain": np.array(
             [
                 1.0
@@ -10305,15 +10495,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     exact_loss_annotation = None
     if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and tail_history_lift_enabled:
-        exact_loss_annotation = (
-            r"$\mathcal{L}^{H}_{\mathrm{hist}}="
-            r"\frac{1}{BH|\mathcal{M}||\mathcal{K}^{+}|}"
-            r"\sum_{i,h,n,k>0}|S_C(\widehat C^\theta_{n,k})-S_C(C^{HR}_{n,k})|^2$"
-            + "\n"
-            + rf"$C^{{\theta}}_{{< {max(Nv_targets)}}}$ frozen, "
-            + rf"$\mathcal{{M}}=[{max(Nv_targets)},{tail_history_n_max})$, "
-            + rf"lags={int(args.tail_history_lags)}"
-        )
+        if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES:
+            exact_loss_annotation = (
+                r"$\mathcal{L}^{H}_{xv\mathrm{-res}}="
+                r"\frac{\sum_{i,h}\|\widehat f^\theta_{\mathrm{tail}}-f^{HR}_{\mathrm{tail}}\|_2^2}"
+                r"{\sum_{i,h}\|f^{HR}_{\mathrm{tail}}\|_2^2}$"
+                + "\n"
+                + rf"$C^{{\theta}}_{{< {max(Nv_targets)}}}$ frozen, "
+                + rf"$\mathcal{{M}}=[{max(Nv_targets)},{tail_history_n_max})$, "
+                + rf"lags={int(args.tail_history_lags)}, "
+                + rf"$N_v^{{grid}}={int(args.tail_history_xv_grid)}$"
+            )
+        else:
+            exact_loss_annotation = (
+                r"$\mathcal{L}^{H}_{\mathrm{hist}}="
+                r"\frac{1}{BH|\mathcal{M}||\mathcal{K}^{+}|}"
+                r"\sum_{i,h,n,k>0}|S_C(\widehat C^\theta_{n,k})-S_C(C^{HR}_{n,k})|^2$"
+                + "\n"
+                + rf"$C^{{\theta}}_{{< {max(Nv_targets)}}}$ frozen, "
+                + rf"$\mathcal{{M}}=[{max(Nv_targets)},{tail_history_n_max})$, "
+                + rf"lags={int(args.tail_history_lags)}"
+            )
     elif training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and tail_chain_enabled:
         display_chain_min = (
             (r"\mathrm{target}\ N_v" if bool(args.tail_chain_recursive_lift) else r"\mathrm{target}\ N_v+1")

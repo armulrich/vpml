@@ -103,6 +103,8 @@ TRAIN_TAIL_HISTORY_LIFT="${TRAIN_TAIL_HISTORY_LIFT:-0}"
 TRAIN_TAIL_HISTORY_NV="${TRAIN_TAIL_HISTORY_NV:-512}"
 TRAIN_TAIL_HISTORY_N_MAX="${TRAIN_TAIL_HISTORY_N_MAX:-${TRAIN_TAIL_HISTORY_NV}}"
 TRAIN_TAIL_HISTORY_LAGS="${TRAIN_TAIL_HISTORY_LAGS:-8}"
+TRAIN_TAIL_HISTORY_LOSS="${TRAIN_TAIL_HISTORY_LOSS:-coeff}"
+TRAIN_TAIL_HISTORY_XV_GRID="${TRAIN_TAIL_HISTORY_XV_GRID:-512}"
 if [[ "${TRAIN_TAIL_CHAIN}" != "0" && -n "${INIT_CHECKPOINT_ROOT}${INIT_CHECKPOINT_PATH}" && "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" == "0" ]]; then
   TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE="1"
 fi
@@ -359,6 +361,8 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
         --tail-history-Nv "${TRAIN_TAIL_HISTORY_NV}"
         --tail-history-n-max "${TRAIN_TAIL_HISTORY_N_MAX}"
         --tail-history-lags "${TRAIN_TAIL_HISTORY_LAGS}"
+        --tail-history-loss "${TRAIN_TAIL_HISTORY_LOSS}"
+        --tail-history-xv-grid "${TRAIN_TAIL_HISTORY_XV_GRID}"
       )
     fi
     if [[ -n "${TRAIN_PROFILE_TRACE_DIR}" && "${TRAIN_PROFILE_STEPS}" != "0" ]]; then
@@ -445,6 +449,8 @@ Defaults:
   hist lift Nv:   ${TRAIN_TAIL_HISTORY_NV}
   hist n range:   target Nv..${TRAIN_TAIL_HISTORY_N_MAX}
   hist lags:      ${TRAIN_TAIL_HISTORY_LAGS}
+  hist loss:      ${TRAIN_TAIL_HISTORY_LOSS}
+  hist xv grid:   ${TRAIN_TAIL_HISTORY_XV_GRID}
   context:        none
   Nv list:        ${NV_LIST}
 EOF
