@@ -105,6 +105,10 @@ TRAIN_TAIL_HISTORY_N_MAX="${TRAIN_TAIL_HISTORY_N_MAX:-${TRAIN_TAIL_HISTORY_NV}}"
 TRAIN_TAIL_HISTORY_LAGS="${TRAIN_TAIL_HISTORY_LAGS:-8}"
 TRAIN_TAIL_HISTORY_LOSS="${TRAIN_TAIL_HISTORY_LOSS:-coeff}"
 TRAIN_TAIL_HISTORY_XV_GRID="${TRAIN_TAIL_HISTORY_XV_GRID:-512}"
+RUN_ORACLE_FIG10_DECOMPOSITION="${RUN_ORACLE_FIG10_DECOMPOSITION:-${TRAIN_TAIL_HISTORY_LIFT}}"
+ORACLE_FIG10_OUTDIR="${ORACLE_FIG10_OUTDIR:-${OUTDIR}/oracle_fig10_decomposition}"
+ORACLE_FIG10_NV="${ORACLE_FIG10_NV:-}"
+ORACLE_FIG10_OVERWRITE="${ORACLE_FIG10_OVERWRITE:-0}"
 if [[ "${TRAIN_TAIL_CHAIN}" != "0" && -n "${INIT_CHECKPOINT_ROOT}${INIT_CHECKPOINT_PATH}" && "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" == "0" ]]; then
   TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE="1"
 fi
@@ -403,6 +407,51 @@ else
   echo "[fh-exact-qloss-rollout] [3/3] Skipping nonlinear Nv sweep because RUN_EVAL=${RUN_EVAL}"
 fi
 
+ORACLE_FIG10_ARTIFACT=""
+if [[ "${RUN_ORACLE_FIG10_DECOMPOSITION}" != "0" ]]; then
+  if [[ "${TRAIN_TAIL_HISTORY_LIFT}" == "0" ]]; then
+    echo "RUN_ORACLE_FIG10_DECOMPOSITION requires TRAIN_TAIL_HISTORY_LIFT=1." >&2
+    exit 1
+  fi
+  if [[ -z "${ORACLE_FIG10_NV}" ]]; then
+    if [[ "${TOTAL_NV}" != "1" ]]; then
+      echo "RUN_ORACLE_FIG10_DECOMPOSITION requires one deployment Nv or ORACLE_FIG10_NV." >&2
+      exit 1
+    fi
+    ORACLE_FIG10_NV="$(echo "${NV_VALUES[0]}" | tr -d '[:space:]')"
+  fi
+  ORACLE_CHECKPOINT="${CHECKPOINT_ROOT}/nv${ORACLE_FIG10_NV}/interface_closure.npz"
+  ORACLE_HISTORY_CACHE="${CHECKPOINT_ROOT}/nv${ORACLE_FIG10_NV}/interface_closure_exact_q_rollout_histories.npz"
+  if [[ ! -f "${ORACLE_CHECKPOINT}" || ! -f "${ORACLE_HISTORY_CACHE}" ]]; then
+    echo "Oracle Fig10 diagnostic requires checkpoint and history cache for Nv=${ORACLE_FIG10_NV}." >&2
+    exit 1
+  fi
+  ORACLE_ARGS=(
+    --checkpoint "${ORACLE_CHECKPOINT}"
+    --history-cache "${ORACLE_HISTORY_CACHE}"
+    --outdir "${ORACLE_FIG10_OUTDIR}"
+    --Nx "${NX}"
+    --deploy-Nv "${ORACLE_FIG10_NV}"
+    --teacher-Nx "${TEACHER_NX}"
+    --teacher-Nv "${TEACHER_NV}"
+    --dt "${DT}"
+    --teacher-dt "${TEACHER_DT}"
+    --T "${T_FINAL}"
+    --eps "${EPS}"
+    --k0 "${K0}"
+    --snapshot-times "${SNAPSHOT_TIMES}"
+    --history-lags "${TRAIN_TAIL_HISTORY_LAGS}"
+    "--v-range=${PHASE_VRANGE}"
+    --Nv-plot "${NV_PLOT}"
+  )
+  if [[ "${ORACLE_FIG10_OVERWRITE}" != "0" ]]; then
+    ORACLE_ARGS+=(--overwrite)
+  fi
+  echo "[fh-exact-qloss-rollout] Running oracle Fig10 decomposition for Nv=${ORACLE_FIG10_NV}"
+  "${PYTHON_BIN}" -m model.diagnostics.oracle_fig10_decomposition "${ORACLE_ARGS[@]}"
+  ORACLE_FIG10_ARTIFACT="${ORACLE_FIG10_OUTDIR}/fig10_oracle_decomposition.png"
+fi
+
 cat <<EOF
 
 Done.
@@ -417,6 +466,7 @@ Artifacts:
   metric 2:       ${OUTDIR}/nv_sweep_metric2.png
   phase space:    ${OUTDIR}/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png
   phase payload:  ${OUTDIR}/nv_sweep_phase_space_payload.npz
+  oracle Fig10:   ${ORACLE_FIG10_ARTIFACT:-<not run>}
 
 Defaults:
   objective:      q_rollout
@@ -451,6 +501,7 @@ Defaults:
   hist lags:      ${TRAIN_TAIL_HISTORY_LAGS}
   hist loss:      ${TRAIN_TAIL_HISTORY_LOSS}
   hist xv grid:   ${TRAIN_TAIL_HISTORY_XV_GRID}
+  oracle Fig10:   ${RUN_ORACLE_FIG10_DECOMPOSITION}
   context:        none
   Nv list:        ${NV_LIST}
 EOF
