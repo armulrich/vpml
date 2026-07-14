@@ -132,6 +132,15 @@ TRAIN_NONLINEAR_K0="${TRAIN_NONLINEAR_K0:-${K0}}"
 TRAIN_NONLINEAR_HISTORY_STRIDE="${TRAIN_NONLINEAR_HISTORY_STRIDE:-20}"
 TRAIN_WEAK_EPS="${TRAIN_WEAK_EPS:-0.03,0.05,0.07,0.1,0.15}"
 TRAIN_STRONG_EPS="${TRAIN_STRONG_EPS:-0.15,0.25,0.35,0.5,0.65}"
+EVAL_TRAINING_CASES="${EVAL_TRAINING_CASES:-0}"
+EVAL_CASE_REGIMES="${EVAL_CASE_REGIMES:-${TRAIN_REGIMES}}"
+EVAL_PHASE_REFERENCE_MODE="${EVAL_PHASE_REFERENCE_MODE:-projected}"
+EVAL_LINEAR_EPS="${EVAL_LINEAR_EPS:-${TRAIN_LINEAR_EPS}}"
+EVAL_LINEAR_MODES="${EVAL_LINEAR_MODES:-${TRAIN_LINEAR_MODES}}"
+EVAL_LINEAR_NUM_SAMPLES="${EVAL_LINEAR_NUM_SAMPLES:-${TRAIN_LINEAR_NUM_SAMPLES}}"
+EVAL_LINEAR_SEED="${EVAL_LINEAR_SEED:-${TRAIN_LINEAR_SEED}}"
+EVAL_WEAK_EPS="${EVAL_WEAK_EPS:-${TRAIN_WEAK_EPS}}"
+EVAL_STRONG_EPS="${EVAL_STRONG_EPS:-${TRAIN_STRONG_EPS}}"
 
 if [[ "${TRAIN_CONTEXT_MODE}" != "none" ]]; then
   echo "run_fh_exact_qloss_rollout.sh only supports TRAIN_CONTEXT_MODE=none; got '${TRAIN_CONTEXT_MODE}'." >&2
@@ -400,9 +409,57 @@ else
 fi
 
 ARGS+=(--checkpoint-dir "${CHECKPOINT_ROOT}")
+EVAL_CASE_SUMMARY=""
 if [[ "${RUN_EVAL}" != "0" ]]; then
-  echo "[fh-exact-qloss-rollout] [3/3] Running nonlinear Nv sweep with HR/truncation/learned evaluation panels"
-  "${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
+  if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then
+    EVAL_CASE_OUTDIR="${OUTDIR}/evaluation_cases"
+    EVAL_CASE_ARGS=(
+      --checkpoint-dir "${CHECKPOINT_ROOT}"
+      --outdir "${EVAL_CASE_OUTDIR}"
+      --nv-list "${NV_LIST}"
+      --Nx "${NX}"
+      --dt "${DT}"
+      --T "${T_FINAL}"
+      --k0 "${K0}"
+      --snapshot-times "${SNAPSHOT_TIMES}"
+      --Nv-plot "${NV_PLOT}"
+      --phase-vmin "${PHASE_VMIN}"
+      --phase-vmax "${PHASE_VMAX}"
+      "--phase-vrange=${PHASE_VRANGE}"
+      --phase-reference-mode "${EVAL_PHASE_REFERENCE_MODE}"
+      --nonlocal-mu "${NONLOCAL_MU}"
+      --teacher-Nx "${TEACHER_NX}"
+      --teacher-Nv "${TEACHER_NV}"
+      --teacher-dt "${TEACHER_DT}"
+      --teacher-vmin "${TEACHER_VMIN}"
+      --teacher-vmax "${TEACHER_VMAX}"
+      --regimes "${EVAL_CASE_REGIMES}"
+      --linear-eps "${EVAL_LINEAR_EPS}"
+      --linear-modes "${EVAL_LINEAR_MODES}"
+      --linear-num-samples "${EVAL_LINEAR_NUM_SAMPLES}"
+      --linear-seed "${EVAL_LINEAR_SEED}"
+      --weak-eps "${EVAL_WEAK_EPS}"
+      --strong-eps "${EVAL_STRONG_EPS}"
+    )
+    if [[ "${DEALIAS_23}" != "0" ]]; then
+      EVAL_CASE_ARGS+=(--dealias-23)
+    fi
+    if [[ -n "${FIELD_NUM_LOW_MODES}" ]]; then
+      EVAL_CASE_ARGS+=(--field-num-low-modes "${FIELD_NUM_LOW_MODES}")
+    fi
+    if [[ -n "${FIELD_K_MAX}" ]]; then
+      EVAL_CASE_ARGS+=(--field-k-max "${FIELD_K_MAX}")
+    fi
+    if [[ -n "${PHASE_REFERENCE_NV}" ]]; then
+      EVAL_CASE_ARGS+=(--phase-reference-Nv "${PHASE_REFERENCE_NV}")
+    fi
+    echo "[fh-exact-qloss-rollout] [3/3] Evaluating every configured training IC"
+    "${PYTHON_BIN}" -m model.eval_training_cases "${EVAL_CASE_ARGS[@]}"
+    EVAL_CASE_SUMMARY="${EVAL_CASE_OUTDIR}/summary.json"
+  else
+    echo "[fh-exact-qloss-rollout] [3/3] Running nonlinear Nv sweep with HR/truncation/learned evaluation panels"
+    "${PYTHON_BIN}" -m model.eval_nv_sweep "${ARGS[@]}"
+  fi
 else
   echo "[fh-exact-qloss-rollout] [3/3] Skipping nonlinear Nv sweep because RUN_EVAL=${RUN_EVAL}"
 fi
@@ -477,6 +534,8 @@ Defaults:
   eval dt:        ${DT}
   eval teacher dt:${TEACHER_DT}
   phase ref Nv:  ${PHASE_REFERENCE_NV:-deployment}
+  eval cases:    ${EVAL_TRAINING_CASES}
+  eval ref mode: ${EVAL_PHASE_REFERENCE_MODE}
   train teacher dt:${TRAIN_TEACHER_DT}
   train linear T: ${TRAIN_LINEAR_T}
   train nonlin T: ${TRAIN_NONLINEAR_T}

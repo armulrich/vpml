@@ -132,6 +132,51 @@ def _resample_periodic_x(f_vx: np.ndarray, *, Lx: float, target_nx: int) -> np.n
     return out
 
 
+def _resample_v(f_vx: np.ndarray, *, source_v: np.ndarray, target_v: np.ndarray) -> np.ndarray:
+    f_vx = np.asarray(f_vx, dtype=np.float64)
+    source_v = np.asarray(source_v, dtype=np.float64)
+    target_v = np.asarray(target_v, dtype=np.float64)
+    if f_vx.shape[0] != source_v.shape[0]:
+        raise ValueError("source_v length must match the velocity dimension of f_vx")
+    if source_v.shape == target_v.shape and np.array_equal(source_v, target_v):
+        return f_vx.copy()
+    out = np.empty((target_v.shape[0], f_vx.shape[1]), dtype=np.float64)
+    for x_idx in range(f_vx.shape[1]):
+        out[:, x_idx] = np.interp(target_v, source_v, f_vx[:, x_idx])
+    return out
+
+
+def _raw_hr_reference_phase_payload(
+    hr_payload: Dict[str, np.ndarray],
+    params: NonlinearLandauParams,
+) -> Dict[str, np.ndarray]:
+    """Use spline/grid HR snapshots directly, resampling only to the plot grid."""
+    if "snapshot_f" not in hr_payload:
+        raise ValueError("Raw HR phase payload requires HR reference snapshot_f")
+    source_v = np.asarray(hr_payload["v"], dtype=np.float64)
+    snapshot_times = np.asarray(hr_payload["snapshot_times"], dtype=np.float64)
+    snapshot_f = np.asarray(hr_payload["snapshot_f"], dtype=np.float64)
+    x = np.linspace(0.0, float(params.L), int(params.Nx), endpoint=False, dtype=np.float64)
+    v_plot = np.linspace(params.v_range[0], params.v_range[1], int(params.Nv_plot), dtype=np.float64)
+    payload: Dict[str, np.ndarray] = {
+        "x": x,
+        "v": v_plot,
+        "times": np.asarray(params.snapshot_times, dtype=np.float64),
+    }
+    for t in params.snapshot_times:
+        matches = np.flatnonzero(np.isclose(snapshot_times, float(t), rtol=0.0, atol=1e-10))
+        if matches.size == 0:
+            raise ValueError(f"HR reference is missing snapshot time t={float(t):g}")
+        f_hr = snapshot_f[int(matches[0])]
+        f_on_solver_x = _resample_periodic_x(f_hr, Lx=float(params.L), target_nx=int(params.Nx))
+        payload[f"f_{_time_key(float(t))}"] = _resample_v(
+            f_on_solver_x,
+            source_v=source_v,
+            target_v=v_plot,
+        )
+    return payload
+
+
 def _projected_hr_reference_phase_payload(
     hr_payload: Dict[str, np.ndarray],
     params: NonlinearLandauParams,
@@ -272,6 +317,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Project the HR phase-space reference with this Hermite order instead of each deployment Nv.",
     )
+    parser.add_argument(
+        "--phase-reference-mode",
+        choices=("projected", "raw_hr_grid"),
+        default="projected",
+        help="Use a Hermite-projected or direct spline/grid HR left Fig10 column.",
+    )
+    parser.add_argument(
+        "--initial-perturbation-npy",
+        type=Path,
+        default=None,
+        help="Optional 1D perturbation sampled on the reduced solver x grid.",
+    )
+    parser.add_argument(
+        "--teacher-initial-perturbation-npy",
+        type=Path,
+        default=None,
+        help="Optional 1D perturbation sampled on the HR teacher x grid.",
+    )
+    parser.add_argument(
+        "--case-label",
+        type=str,
+        default=None,
+        help="Optional label recorded in the per-case evaluation summary.",
+    )
     parser.add_argument("--dealias-23", action="store_true")
     parser.add_argument("--nonlocal-mu", type=float, default=-1.017234)
 
@@ -305,6 +374,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     phase_vrange = parse_float_tuple(args.phase_vrange)
     if len(phase_vrange) != 2:
         raise ValueError("phase-vrange must contain exactly two values")
+    initial_perturbation_x: Optional[np.ndarray] = None
+    if args.initial_perturbation_npy is not None:
+        initial_perturbation_x = np.asarray(np.load(args.initial_perturbation_npy), dtype=np.float64)
+        if initial_perturbation_x.shape != (int(args.Nx),):
+            raise ValueError(
+                "--initial-perturbation-npy must contain shape "
+                f"({int(args.Nx)},), got {initial_perturbation_x.shape}"
+            )
+    initial_perturbation_teacher_x: Optional[np.ndarray] = None
+    if args.teacher_initial_perturbation_npy is not None:
+        initial_perturbation_teacher_x = np.asarray(
+            np.load(args.teacher_initial_perturbation_npy), dtype=np.float64
+        )
+        if initial_perturbation_teacher_x.shape != (int(args.teacher_nx),):
+            raise ValueError(
+                "--teacher-initial-perturbation-npy must contain shape "
+                f"({int(args.teacher_nx)},), got {initial_perturbation_teacher_x.shape}"
+            )
 
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
@@ -354,7 +441,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     x_hr = np.linspace(0.0, Lx, int(args.teacher_nx), endpoint=False, dtype=np.float64)
-    perturb_hr = float(args.eps) * np.cos(float(args.k0) * x_hr)
+    if initial_perturbation_teacher_x is not None:
+        perturb_hr = initial_perturbation_teacher_x
+    elif initial_perturbation_x is None:
+        perturb_hr = float(args.eps) * np.cos(float(args.k0) * x_hr)
+    else:
+        perturb_hr = _resample_periodic_x(
+            initial_perturbation_x[None, :],
+            Lx=Lx,
+            target_nx=int(args.teacher_nx),
+        )[0]
     hr_payload = run_physical_landau_reference(
         Nx=int(args.teacher_nx),
         Nv=int(args.teacher_nv),
@@ -396,6 +492,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             Nv_plot=int(args.nv_plot),
             vmin=float(args.phase_vmin),
             vmax=float(args.phase_vmax),
+            initial_perturbation_x=initial_perturbation_x,
         )
 
         truncation_raw = run_nonlinear_landau_rollout_raw(
@@ -453,10 +550,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             hr_payload["k_arr"],
         )
 
-        reference_phase = _projected_hr_reference_phase_payload(
-            hr_payload,
-            params,
-            reference_Nv=args.phase_reference_nv,
+        reference_phase = (
+            _raw_hr_reference_phase_payload(hr_payload, params)
+            if args.phase_reference_mode == "raw_hr_grid"
+            else _projected_hr_reference_phase_payload(
+                hr_payload,
+                params,
+                reference_Nv=args.phase_reference_nv,
+            )
         )
         truncation_phase = _phase_space_payload_from_raw(truncation_raw, params)
         learned_phase = _phase_space_payload_from_raw(learned_raw, params)
@@ -662,7 +763,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         times=snapshot_times,
         row_labels=row_labels,
         reference_title=(
-            "Projected HR Reference"
+            "HR Grid Reference"
+            if args.phase_reference_mode == "raw_hr_grid"
+            else "Projected HR Reference"
             if args.phase_reference_nv is None
             else rf"Projected HR Reference ($N_v^{{ref}}={int(args.phase_reference_nv)}$)"
         ),
@@ -699,6 +802,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "vmax": float(args.teacher_vmax),
         },
         "phase_reference_Nv": None if args.phase_reference_nv is None else int(args.phase_reference_nv),
+        "phase_reference_mode": str(args.phase_reference_mode),
+        "case_label": args.case_label,
+        "initial_perturbation_npy": (
+            None if args.initial_perturbation_npy is None else str(args.initial_perturbation_npy)
+        ),
+        "teacher_initial_perturbation_npy": (
+            None
+            if args.teacher_initial_perturbation_npy is None
+            else str(args.teacher_initial_perturbation_npy)
+        ),
         "nonlinear_case": {
             "Nx": int(args.Nx),
             "dt": float(args.dt),

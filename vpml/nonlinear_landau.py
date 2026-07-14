@@ -52,6 +52,7 @@ class NonlinearLandauParams:
     Nv_plot: int = 1000
     vmin: float = 0.0
     vmax: float = 0.5
+    initial_perturbation_x: Optional[np.ndarray] = None
 
 
 def _snapshot_indices(snapshot_times: Sequence[float], dt: float) -> np.ndarray:
@@ -126,8 +127,18 @@ def run_nonlinear_landau_rollout_raw(
         tail_n_max = int(getattr(learned_closure, "tail_chain_n_max", tail_chain_nv)) if tail_chain_enabled else int(params.Nv)
         tail_history_lags = 0
     m_eq_recon = jnp.zeros((tail_n_max,), dtype=jnp.float64).at[0].set(1.0)
+    if params.initial_perturbation_x is None:
+        initial_perturbation_x = float(params.eps) * jnp.cos(float(params.k0) * integ.x)
+    else:
+        initial_perturbation_np = np.asarray(params.initial_perturbation_x, dtype=np.float64)
+        if initial_perturbation_np.shape != (int(params.Nx),):
+            raise ValueError(
+                "initial_perturbation_x must have shape "
+                f"({int(params.Nx)},), got {initial_perturbation_np.shape}"
+            )
+        initial_perturbation_x = jnp.asarray(initial_perturbation_np, dtype=jnp.float64)
     a_phys0 = jnp.zeros((int(params.Nv), int(params.Nx)), dtype=jnp.float64)
-    a_phys0 = a_phys0.at[0].set(float(params.eps) * jnp.cos(float(params.k0) * integ.x))
+    a_phys0 = a_phys0.at[0].set(initial_perturbation_x)
     a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
 
     damping_rates = None
@@ -149,6 +160,13 @@ def run_nonlinear_landau_rollout_raw(
 
     nsteps = int(round(float(params.T) / float(params.dt)))
     snap_steps = _snapshot_indices(params.snapshot_times, params.dt)
+    if snap_steps.size != np.unique(snap_steps).size:
+        raise ValueError("snapshot_times must map to distinct time steps")
+    if np.any(snap_steps < 0) or np.any(snap_steps > nsteps):
+        raise ValueError("snapshot_times must lie within [0, T]")
+    snap_slot_by_step = np.full((nsteps + 1,), -1, dtype=np.int32)
+    snap_slot_by_step[snap_steps] = np.arange(len(snap_steps), dtype=np.int32)
+    snap_slot_by_step_jax = jnp.asarray(snap_slot_by_step)
     snaps0 = jnp.zeros((len(snap_steps), int(params.Nv), int(params.Nx)), dtype=jnp.float64)
     recon_snaps0 = jnp.zeros((len(snap_steps), tail_n_max, int(params.Nx)), dtype=jnp.float64)
 
@@ -186,8 +204,8 @@ def run_nonlinear_landau_rollout_raw(
             )
         return irfft_x(full_hat, int(params.Nx))
 
-    if 0 in snap_steps:
-        snap0_idx = int(np.where(snap_steps == 0)[0][0])
+    snap0_idx = int(snap_slot_by_step[0])
+    if snap0_idx >= 0:
         snaps0 = snaps0.at[snap0_idx].set(irfft_x(a_hat0, int(params.Nx)))
         if recon_enabled:
             recon_snaps0 = recon_snaps0.at[snap0_idx].set(
@@ -210,14 +228,13 @@ def run_nonlinear_landau_rollout_raw(
 
     def maybe_store(snaps: Array, step_i: Array, a_hat_new: Array) -> Array:
         a_phys_new = irfft_x(a_hat_new, int(params.Nx))
-        for j, snap_step in enumerate(snap_steps):
-            snaps = jax.lax.cond(
-                step_i == int(snap_step),
-                lambda s, arr=a_phys_new, idx=j: s.at[idx].set(arr),
-                lambda s: s,
-                snaps,
-            )
-        return snaps
+        snap_slot = snap_slot_by_step_jax[step_i]
+        return jax.lax.cond(
+            snap_slot >= 0,
+            lambda s: s.at[snap_slot].set(a_phys_new),
+            lambda s: s,
+            snaps,
+        )
 
     def maybe_store_recon(
         recon_snaps: Array,
@@ -228,16 +245,15 @@ def run_nonlinear_landau_rollout_raw(
     ) -> Array:
         if not recon_enabled:
             return recon_snaps
-        for j, snap_step in enumerate(snap_steps):
-            recon_snaps = jax.lax.cond(
-                step_i == int(snap_step),
-                lambda s, idx=j: s.at[idx].set(
-                    decode_reconstruction(a_hat_new, a_hat_prev=a_hat_prev, low_history=low_history_new)
-                ),
-                lambda s: s,
-                recon_snaps,
-            )
-        return recon_snaps
+        snap_slot = snap_slot_by_step_jax[step_i]
+        return jax.lax.cond(
+            snap_slot >= 0,
+            lambda s: s.at[snap_slot].set(
+                decode_reconstruction(a_hat_new, a_hat_prev=a_hat_prev, low_history=low_history_new)
+            ),
+            lambda s: s,
+            recon_snaps,
+        )
 
     def maybe_store_history(history: Array, step_i: Array, a_hat_new: Array) -> Array:
         if not return_state_history:
