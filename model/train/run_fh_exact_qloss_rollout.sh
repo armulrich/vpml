@@ -109,6 +109,12 @@ RUN_ORACLE_FIG10_DECOMPOSITION="${RUN_ORACLE_FIG10_DECOMPOSITION:-${TRAIN_TAIL_H
 ORACLE_FIG10_OUTDIR="${ORACLE_FIG10_OUTDIR:-${OUTDIR}/oracle_fig10_decomposition}"
 ORACLE_FIG10_NV="${ORACLE_FIG10_NV:-}"
 ORACLE_FIG10_OVERWRITE="${ORACLE_FIG10_OVERWRITE:-0}"
+RUN_PHASE_SPACE_VIDEO="${RUN_PHASE_SPACE_VIDEO:-0}"
+PHASE_SPACE_VIDEO_OUTDIR="${PHASE_SPACE_VIDEO_OUTDIR:-${OUTDIR}/diagnostics/phase_space_video_$(date +%Y%m%d_%H%M%S)}"
+PHASE_SPACE_VIDEO_FRAME_DT="${PHASE_SPACE_VIDEO_FRAME_DT:-0.5}"
+PHASE_SPACE_VIDEO_FPS="${PHASE_SPACE_VIDEO_FPS:-24}"
+PHASE_SPACE_VIDEO_V_POINTS="${PHASE_SPACE_VIDEO_V_POINTS:-512}"
+PHASE_SPACE_VIDEO_SAVE_FRAMES="${PHASE_SPACE_VIDEO_SAVE_FRAMES:-0}"
 if [[ "${TRAIN_TAIL_CHAIN}" != "0" && -n "${INIT_CHECKPOINT_ROOT}${INIT_CHECKPOINT_PATH}" && "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" == "0" ]]; then
   TRAIN_TAIL_CHAIN_ONLY_EFFECTIVE="1"
 fi
@@ -509,6 +515,44 @@ if [[ "${RUN_ORACLE_FIG10_DECOMPOSITION}" != "0" ]]; then
   ORACLE_FIG10_ARTIFACT="${ORACLE_FIG10_OUTDIR}/fig10_oracle_decomposition.png"
 fi
 
+PHASE_SPACE_VIDEO_ARTIFACT=""
+if [[ "${RUN_PHASE_SPACE_VIDEO}" != "0" ]]; then
+  if [[ "${TRAIN_TAIL_HISTORY_LIFT}" == "0" ]]; then
+    echo "RUN_PHASE_SPACE_VIDEO requires TRAIN_TAIL_HISTORY_LIFT=1." >&2
+    exit 1
+  fi
+  if [[ "${TOTAL_NV}" != "1" ]]; then
+    echo "RUN_PHASE_SPACE_VIDEO requires one deployment Nv." >&2
+    exit 1
+  fi
+  VIDEO_NV="$(echo "${NV_VALUES[0]}" | tr -d '[:space:]')"
+  VIDEO_CHECKPOINT="${CHECKPOINT_ROOT}/nv${VIDEO_NV}/interface_closure.npz"
+  VIDEO_HISTORY_CACHE="${CHECKPOINT_ROOT}/nv${VIDEO_NV}/interface_closure_exact_q_rollout_histories.npz"
+  VIDEO_ARGS=(
+    --run-root "${OUTDIR}"
+    --checkpoint "${VIDEO_CHECKPOINT}"
+    --history-cache "${VIDEO_HISTORY_CACHE}"
+    --outdir "${PHASE_SPACE_VIDEO_OUTDIR}"
+    --case-eps "${EPS}"
+    --Nx "${NX}"
+    --teacher-Nx "${TEACHER_NX}"
+    --dt "${DT}"
+    --teacher-dt "${TEACHER_DT}"
+    --T "${T_FINAL}"
+    --k0 "${K0}"
+    --frame-dt "${PHASE_SPACE_VIDEO_FRAME_DT}"
+    --fps "${PHASE_SPACE_VIDEO_FPS}"
+    "--v-range=${PHASE_VRANGE}"
+    --v-points "${PHASE_SPACE_VIDEO_V_POINTS}"
+  )
+  if [[ "${PHASE_SPACE_VIDEO_SAVE_FRAMES}" != "0" ]]; then
+    VIDEO_ARGS+=(--save-frames)
+  fi
+  echo "[fh-exact-qloss-rollout] Rendering HR/closure/uplift phase-space video for Nv=${VIDEO_NV}"
+  "${PYTHON_BIN}" -m model.diagnostics.render_phase_space_triptych_video "${VIDEO_ARGS[@]}"
+  PHASE_SPACE_VIDEO_ARTIFACT="${PHASE_SPACE_VIDEO_OUTDIR}/phase_space_triptych.mp4"
+fi
+
 cat <<EOF
 
 Done.
@@ -561,6 +605,7 @@ Defaults:
   hist loss:      ${TRAIN_TAIL_HISTORY_LOSS}
   hist xv grid:   ${TRAIN_TAIL_HISTORY_XV_GRID}
   oracle Fig10:   ${RUN_ORACLE_FIG10_DECOMPOSITION}
+  phase video:    ${RUN_PHASE_SPACE_VIDEO}
   context:        none
   Nv list:        ${NV_LIST}
 EOF
