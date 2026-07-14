@@ -90,6 +90,12 @@ if [[ -z "${TRAIN_EXACT_ROLLOUT_PRECISION:-}" ]]; then
 fi
 TRAIN_EXACT_TARGET_SAMPLING="${TRAIN_EXACT_TARGET_SAMPLING:-cycle}"
 TRAIN_EXACT_STORE_TRAIN_QPAIRS="${TRAIN_EXACT_STORE_TRAIN_QPAIRS:-0}"
+TRAIN_EXACT_ROLLOUT_OBJECTIVE="${TRAIN_EXACT_ROLLOUT_OBJECTIVE:-q_rollout}"
+if [[ "${TRAIN_EXACT_ROLLOUT_OBJECTIVE}" == "f_rollout" ]]; then
+  TRAIN_EXACT_HISTORY_CACHE_NAME="interface_closure_exact_f_rollout_histories.npz"
+else
+  TRAIN_EXACT_HISTORY_CACHE_NAME="interface_closure_exact_q_rollout_histories.npz"
+fi
 TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE="${TRAIN_EXACT_STORE_TRAIN_QPAIRS}"
 TRAIN_TAIL_CHAIN="${TRAIN_TAIL_CHAIN:-${TRAIN_TAIL_DECODER:-0}}"
 TRAIN_TAIL_CHAIN_NV="${TRAIN_TAIL_CHAIN_NV:-${TRAIN_TAIL_DECODER_NV:-512}}"
@@ -274,7 +280,7 @@ IFS=',' read -r -a NV_VALUES <<< "${NV_LIST}"
 TOTAL_NV="${#NV_VALUES[@]}"
 
 if [[ "${RUN_TRAIN}" != "0" ]]; then
-  echo "[fh-exact-qloss-rollout] [1/3] Training exact q-rollout checkpoints with full-history caches and no anchor pool"
+  echo "[fh-exact-qloss-rollout] [1/3] Training exact ${TRAIN_EXACT_ROLLOUT_OBJECTIVE} checkpoints with full-history caches and no anchor pool"
   for idx in "${!NV_VALUES[@]}"; do
     NV_RAW="${NV_VALUES[idx]}"
     NV="$(echo "${NV_RAW}" | tr -d '[:space:]')"
@@ -289,7 +295,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     MODEL_DIR="${CHECKPOINT_ROOT}/nv${NV}"
     CHECKPOINT_NV="${MODEL_DIR}/interface_closure.npz"
     LOSS_PLOT_NV="${MODEL_DIR}/interface_closure.loss.png"
-    DATASET_CACHE_NV="${MODEL_DIR}/interface_closure_exact_q_rollout_histories.npz"
+    DATASET_CACHE_NV="${MODEL_DIR}/${TRAIN_EXACT_HISTORY_CACHE_NAME}"
     mkdir -p "${MODEL_DIR}"
 
     TRAIN_ARGS=(
@@ -297,7 +303,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
       --dataset-cache "${DATASET_CACHE_NV}"
       --loss-plot "${LOSS_PLOT_NV}"
       --training-mode exact_q_rollout
-      --train-objective q_rollout
+      --train-objective "${TRAIN_EXACT_ROLLOUT_OBJECTIVE}"
       --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
       --exact-rollout-precision "${TRAIN_EXACT_ROLLOUT_PRECISION}"
       --exact-target-sampling "${TRAIN_EXACT_TARGET_SAMPLING}"
@@ -561,16 +567,18 @@ Artifacts:
   mode:           exact_q_rollout_${TRAIN_NV_LADDER_MODE}_grid_teacher
   checkpoint dir: ${CHECKPOINT_ROOT}
   init checkpoints:${INIT_CHECKPOINT_PATH:-${INIT_CHECKPOINT_ROOT:-<none>}}
-  history caches: ${CHECKPOINT_ROOT}/nv*/interface_closure_exact_q_rollout_histories.npz
-  summary:        ${OUTDIR}/summary.json
-  metric 1:       ${OUTDIR}/nv_sweep_metric1.png
-  metric 2:       ${OUTDIR}/nv_sweep_metric2.png
-  phase space:    ${OUTDIR}/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png
-  phase payload:  ${OUTDIR}/nv_sweep_phase_space_payload.npz
+  history caches: ${CHECKPOINT_ROOT}/nv*/${TRAIN_EXACT_HISTORY_CACHE_NAME}
+  summary:        $(if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then echo "${EVAL_CASE_SUMMARY:-<not run>}"; else echo "${OUTDIR}/summary.json"; fi)
+  metric 1:       $(if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then echo "${OUTDIR}/evaluation_cases/<case>/nv_sweep_metric1.png"; else echo "${OUTDIR}/nv_sweep_metric1.png"; fi)
+  metric 2:       $(if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then echo "${OUTDIR}/evaluation_cases/<case>/nv_sweep_metric2.png"; else echo "${OUTDIR}/nv_sweep_metric2.png"; fi)
+  phase space:    $(if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then echo "${OUTDIR}/evaluation_cases/<case>/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png"; else echo "${OUTDIR}/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png"; fi)
+  phase payload:  $(if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then echo "${OUTDIR}/evaluation_cases/<case>/nv_sweep_phase_space_payload.npz"; else echo "${OUTDIR}/nv_sweep_phase_space_payload.npz"; fi)
+  per-IC eval:    ${EVAL_CASE_SUMMARY:-<not run>}
   oracle Fig10:   ${ORACLE_FIG10_ARTIFACT:-<not run>}
+  phase video:    ${PHASE_SPACE_VIDEO_ARTIFACT:-<not run>}
 
 Defaults:
-  objective:      q_rollout
+  objective:      ${TRAIN_EXACT_ROLLOUT_OBJECTIVE}
   ladder mode:    ${TRAIN_NV_LADDER_MODE}
   fixed ratio:    ${TRAIN_FIXED_RATIO}
   rollout horiz:  ${TRAIN_ROLLOUT_HORIZON}

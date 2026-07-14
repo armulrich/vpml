@@ -58,6 +58,13 @@ def _training_loss_ylabel(train_objective: str, loss_backend: str | None = None)
             r"\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+"
             r"\lambda_{\mathrm{reg}}\|\theta\|_2^2$"
         )
+    if str(train_objective) == "f_rollout":
+        return (
+            r"$\mathcal{L}_{f}^{H}(\theta)="
+            r"\frac{1}{BH\sigma_f^2}\sum_{s,h}"
+            r"\int\!\int\left|f_{<N_v}^{\theta}(x,v,t_s+h\Delta t)-"
+            r"\left(f_{\mathrm{HR}}(x,v,t_s+h\Delta t)-f_0(v)\right)\right|^2\,dv\,dx$"
+        )
     if str(train_objective) == "q_rollout":
         if str(loss_backend) == "exact_fourier_hermite_q_rollout_history_lift":
             return (

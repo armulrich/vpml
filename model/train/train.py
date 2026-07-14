@@ -85,12 +85,15 @@ ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CACHE_FORMAT = "landau_interface_dataset_teacher_v6"
 ONLINE_REFERENCE_CACHE_FORMAT = "landau_interface_online_reference_v4"
 EXACT_Q_ROLLOUT_CACHE_FORMAT = "landau_interface_exact_q_rollout_reference_v1"
+EXACT_F_ROLLOUT_CACHE_FORMAT = "landau_interface_exact_f_rollout_reference_v1"
 ONLINE_HYBRID_LOSS_DEFINITION = "q_trajectory_field_distribution_v1"
 ONLINE_TRAINING_MODE = "online_rollout"
 OFFLINE_TRAINING_MODE = "offline_rollout"
 EXACT_Q_ROLLOUT_TRAINING_MODE = "exact_q_rollout"
 EXACT_Q_ROLLOUT_OBJECTIVE = "q_rollout"
+EXACT_F_ROLLOUT_OBJECTIVE = "f_rollout"
 EXACT_Q_ROLLOUT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout"
+EXACT_F_ROLLOUT_LOSS_BACKEND = "exact_fourier_hermite_f_rollout"
 EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_tail_chain"
 EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_chain_only"
 EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND = "exact_fourier_hermite_q_rollout_recursive_lift"
@@ -171,6 +174,14 @@ def online_reference_coeff_key(target_nv: int) -> str:
 
 def exact_q_rollout_coeff_key(projection_order: int) -> str:
     return f"a_hat_ref_order{int(projection_order)}"
+
+
+def exact_f_rollout_cross_key(target_nv: int) -> str:
+    return f"direct_f_cross_nv{int(target_nv)}"
+
+
+def exact_f_rollout_norm_key(target_nv: int) -> str:
+    return f"direct_f_norm_nv{int(target_nv)}"
 
 
 def online_reference_anchor_coeff_key(target_nv: int) -> str:
@@ -424,6 +435,18 @@ def build_exact_q_rollout_cache_metadata(
         "Nv_targets": np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32),
         "max_projection_order": np.array([int(max_projection_order)], dtype=np.int32),
     }
+
+
+def build_exact_f_rollout_cache_metadata(
+    *,
+    direct_f_target_nv: int,
+    **kwargs,
+) -> Dict[str, np.ndarray]:
+    """Metadata for the raw-grid direct-distribution rollout reference cache."""
+    metadata = build_exact_q_rollout_cache_metadata(**kwargs)
+    metadata["dataset_format"] = np.array([EXACT_F_ROLLOUT_CACHE_FORMAT], dtype=np.str_)
+    metadata["direct_f_target_nv"] = np.array([int(direct_f_target_nv)], dtype=np.int32)
+    return metadata
 
 
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
@@ -1108,6 +1131,40 @@ def load_exact_q_rollout_reference_cache(
         return dataset
 
 
+def load_exact_f_rollout_reference_cache(
+    path: Path,
+    *,
+    expected_metadata: Dict[str, np.ndarray],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Load coefficients plus raw-grid inner products for direct-f rollout."""
+    with np.load(path) as data:
+        for key, expected in expected_metadata.items():
+            if key not in data.files:
+                raise ValueError(f"Exact f-rollout cache {path} is missing metadata field '{key}'.")
+            if _cache_value_mismatch(np.asarray(data[key]), np.asarray(expected)):
+                raise ValueError(
+                    f"Exact f-rollout cache {path} metadata mismatch for '{key}'. "
+                    "Rebuilding with the current teacher configuration is required."
+                )
+        max_projection_order = int(np.asarray(data["max_projection_order"], dtype=np.int32).reshape(-1)[0])
+        target_nv = int(np.asarray(data["direct_f_target_nv"], dtype=np.int32).reshape(-1)[0])
+        coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+        cross_key = exact_f_rollout_cross_key(target_nv)
+        norm_key = exact_f_rollout_norm_key(target_nv)
+        dataset: Dict[str, Dict[str, np.ndarray]] = {}
+        for regime in tuple(str(v) for v in np.asarray(data["regimes"], dtype=np.str_).tolist()):
+            required = (coeff_key, cross_key, norm_key)
+            for key in required:
+                if f"{regime}_{key}" not in data.files:
+                    raise ValueError(f"Exact f-rollout cache {path} is missing '{regime}_{key}'.")
+            dataset[regime] = {
+                coeff_key: np.asarray(data[f"{regime}_{coeff_key}"], dtype=np.complex64),
+                cross_key: np.asarray(data[f"{regime}_{cross_key}"], dtype=np.float32),
+                norm_key: np.asarray(data[f"{regime}_{norm_key}"], dtype=np.float32),
+            }
+        return dataset
+
+
 def save_dataset_cache(
     path: Path,
     dataset: Dict[str, Dict[str, np.ndarray]],
@@ -1134,6 +1191,20 @@ def save_exact_q_rollout_reference_cache(
     for regime, arrays in dataset.items():
         for key, value in arrays.items():
             payload[f"{regime}_{key}"] = np.asarray(value, dtype=np.complex128)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **payload)
+
+
+def save_exact_f_rollout_reference_cache(
+    path: Path,
+    dataset: Dict[str, Dict[str, np.ndarray]],
+    *,
+    metadata: Dict[str, np.ndarray],
+) -> None:
+    payload: Dict[str, np.ndarray] = dict(metadata)
+    for regime, arrays in dataset.items():
+        for key, value in arrays.items():
+            payload[f"{regime}_{key}"] = np.asarray(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **payload)
 
@@ -1363,6 +1434,188 @@ def _run_exact_q_rollout_projected_history(
         history_stride=1,
     )
     return np.asarray(coeff_histories[int(max_projection_order)], dtype=np.complex128)
+
+
+def _run_exact_f_rollout_reference_history(
+    config: PhysicalGridVlasovPoissonConfig,
+    perturbation_x: np.ndarray,
+    *,
+    target_nv: int,
+) -> Dict[str, np.ndarray]:
+    """Run one spline teacher case and retain exact N_v-target raw-grid loss data.
+
+    The stored cross term is the velocity integral of phi_n(v) [f^HR-f_0] at every x. Together
+    with the stored HR norm and the fixed Hermite Gram matrix, it evaluates the
+    full physical-grid L2 loss without retaining raw f(x,v,t) histories.
+    """
+    projection_order = int(target_nv) + 1
+    v = jnp.asarray(config.v, dtype=jnp.float64)
+    equilibrium = maxwellian_equilibrium(v)
+    dual_basis = hermite_dual_basis_scaled(projection_order, v, vth=1.0)
+    phi = jax_hermite_basis_phi_scaled(int(target_nv), v, vth=1.0)
+    nx = int(config.Nx)
+    nk = nx // 2 + 1
+    coeff_size = projection_order * nk
+    cross_size = int(target_nv) * nx
+    dx = jnp.asarray(float(config.Lx) / float(config.Nx), dtype=jnp.float64)
+
+    def projector(f_state: Array) -> Array:
+        coeff = project_distribution_snapshot_to_fourier_hermite(
+            f_state,
+            v,
+            projection_order,
+            vth=1.0,
+            equilibrium=equilibrium,
+            dual_basis=dual_basis,
+        )
+        delta_f = f_state - equilibrium[:, None]
+        cross = jnp.trapezoid(delta_f[None, :, :] * phi[:, :, None], x=v, axis=1)
+        norm = dx * jnp.sum(jnp.trapezoid(delta_f * delta_f, x=v, axis=0))
+        return jnp.concatenate(
+            [
+                jnp.ravel(jnp.real(coeff)),
+                jnp.ravel(jnp.imag(coeff)),
+                jnp.ravel(cross),
+                jnp.asarray([norm], dtype=jnp.float64),
+            ],
+            axis=0,
+        ).astype(jnp.float32)
+
+    f0 = equilibrium[:, None] * (1.0 + jnp.asarray(perturbation_x, dtype=jnp.float64)[None, :])
+    raw = run_semilagrangian_vlasov_poisson(
+        config,
+        f0,
+        history_stride=1,
+        return_state_history=True,
+        history_projector=projector,
+    )
+    packed = np.asarray(raw["state_history"], dtype=np.float32)
+    expected_width = 2 * coeff_size + cross_size + 1
+    if packed.ndim != 2 or int(packed.shape[1]) != expected_width:
+        raise RuntimeError(
+            f"Exact f-rollout teacher packing shape mismatch: got {packed.shape}, expected (*,{expected_width})"
+        )
+    coeff_real = packed[:, :coeff_size].reshape((-1, projection_order, nk))
+    coeff_imag = packed[:, coeff_size : 2 * coeff_size].reshape((-1, projection_order, nk))
+    return {
+        exact_q_rollout_coeff_key(projection_order): (coeff_real + 1j * coeff_imag).astype(np.complex64),
+        exact_f_rollout_cross_key(target_nv): packed[:, 2 * coeff_size : 2 * coeff_size + cross_size].reshape(
+            (-1, int(target_nv), nx)
+        ),
+        exact_f_rollout_norm_key(target_nv): packed[:, -1],
+    }
+
+
+def build_exact_f_rollout_reference_dataset(
+    *,
+    dataset_cache: Optional[Path],
+    regimes: Sequence[str],
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_L: float,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    linear_T: float,
+    linear_eps: float,
+    linear_modes: Sequence[float],
+    linear_num_samples: int,
+    linear_seed: int,
+    linear_poisson_sign: float,
+    nonlinear_T: float,
+    nonlinear_k0: float,
+    nonlinear_poisson_sign: float,
+    weak_eps: Sequence[float],
+    strong_eps: Sequence[float],
+    target_nv: int,
+) -> Tuple[Dict[str, Dict[str, np.ndarray]], int]:
+    """Build a single-cutoff exact rollout cache with raw spline f targets."""
+    target_nv = int(target_nv)
+    projection_order = target_nv + 1
+    metadata = build_exact_f_rollout_cache_metadata(
+        direct_f_target_nv=target_nv,
+        regimes=regimes,
+        teacher_Nx=teacher_Nx,
+        teacher_Nv=teacher_Nv,
+        teacher_L=teacher_L,
+        teacher_vmin=teacher_vmin,
+        teacher_vmax=teacher_vmax,
+        teacher_dt=teacher_dt,
+        linear_T=linear_T,
+        linear_eps=linear_eps,
+        linear_modes=linear_modes,
+        linear_num_samples=linear_num_samples,
+        linear_seed=linear_seed,
+        linear_poisson_sign=linear_poisson_sign,
+        nonlinear_T=nonlinear_T,
+        nonlinear_k0=nonlinear_k0,
+        nonlinear_poisson_sign=nonlinear_poisson_sign,
+        weak_eps=weak_eps,
+        strong_eps=strong_eps,
+        Nv_targets=(target_nv,),
+        max_projection_order=projection_order,
+    )
+    if dataset_cache is not None and dataset_cache.exists():
+        try:
+            return load_exact_f_rollout_reference_cache(dataset_cache, expected_metadata=metadata), projection_order
+        except ValueError as exc:
+            print(f"[cache] ignoring exact f-rollout cache {dataset_cache}: {exc}")
+
+    dataset: Dict[str, Dict[str, np.ndarray]] = {}
+    active = tuple(regimes)
+    if REGIME_LINEAR in active:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(teacher_Nx), Nv=int(teacher_Nv), Lx=float(teacher_L),
+            vmin=float(teacher_vmin), vmax=float(teacher_vmax), dt=float(teacher_dt),
+            T=float(linear_T), poisson_sign=float(linear_poisson_sign), snapshot_times=(),
+        )
+        rng = np.random.default_rng(int(linear_seed))
+        cases = [
+            _run_exact_f_rollout_reference_history(
+                config,
+                sample_initial_condition(rng, np.asarray(config.x, dtype=np.float64), modes=linear_modes, eps=float(linear_eps)),
+                target_nv=target_nv,
+            )
+            for _ in range(int(linear_num_samples))
+        ]
+        dataset[REGIME_LINEAR] = {key: np.stack([case[key] for case in cases], axis=0) for key in cases[0]}
+
+    nonlinear_config = PhysicalGridVlasovPoissonConfig(
+        Nx=int(teacher_Nx), Nv=int(teacher_Nv), Lx=float(teacher_L),
+        vmin=float(teacher_vmin), vmax=float(teacher_vmax), dt=float(teacher_dt),
+        T=float(nonlinear_T), poisson_sign=float(nonlinear_poisson_sign), snapshot_times=(),
+    )
+    perturb_template = np.cos(float(nonlinear_k0) * np.asarray(nonlinear_config.x, dtype=np.float64))
+    for regime, eps_values in ((REGIME_WEAK, weak_eps), (REGIME_STRONG, strong_eps)):
+        if regime not in active:
+            continue
+        cases = [
+            _run_exact_f_rollout_reference_history(
+                nonlinear_config,
+                float(eps) * perturb_template,
+                target_nv=target_nv,
+            )
+            for eps in eps_values
+        ]
+        dataset[regime] = {key: np.stack([case[key] for case in cases], axis=0) for key in cases[0]}
+
+    if dataset_cache is not None:
+        save_exact_f_rollout_reference_cache(dataset_cache, dataset, metadata=metadata)
+    return dataset, projection_order
+
+
+def exact_f_rollout_reference_scales(
+    exact_dataset: Dict[str, Dict[str, np.ndarray]],
+    *,
+    target_nv: int,
+) -> Dict[str, float]:
+    """Fixed per-regime HR energy scales for direct-f rollout normalization."""
+    norm_key = exact_f_rollout_norm_key(int(target_nv))
+    scales: Dict[str, float] = {}
+    for regime, arrays in exact_dataset.items():
+        mean_norm = float(np.mean(np.asarray(arrays[norm_key], dtype=np.float64)))
+        scales[regime] = max(mean_norm, 1e-12)
+    return scales
 
 
 def build_exact_q_rollout_reference_dataset(
@@ -5340,6 +5593,191 @@ def exact_q_rollout_loss_for_anchor_batch(
     return total
 
 
+def exact_f_rollout_loss_for_anchor_batch(
+    anchor_stencils: Array,
+    ref_cross_windows: Array,
+    ref_norm_windows: Array,
+    *,
+    learned: LearnedInterfaceClosure,
+    forward_integ: FourierHermiteIMEX,
+    rollout_horizon: int,
+    explicit_n_hat_fn,
+    hermite_gram: Array,
+    reference_scale: Array,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+) -> Array:
+    """Exact H-step physical-grid f loss for one fixed deployment cutoff.
+
+    ``ref_cross_windows`` and ``ref_norm_windows`` are computed directly from
+    the spline teacher state. They are sufficient statistics for the full-grid
+    L2 discrepancy, avoiding raw f history materialization in the JAX step.
+    """
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    anchor_stencils = jnp.asarray(anchor_stencils, dtype=complex_dtype)
+    ref_cross_windows = jnp.asarray(ref_cross_windows, dtype=real_dtype)
+    ref_norm_windows = jnp.asarray(ref_norm_windows, dtype=real_dtype)
+    horizon = int(rollout_horizon)
+    target_nv = int(forward_integ.Nv)
+    if tuple(ref_cross_windows.shape[:3]) != (
+        int(anchor_stencils.shape[0]),
+        horizon,
+        target_nv,
+    ):
+        raise ValueError(
+            "ref_cross_windows must have shape (B,H,Nv,Nx), "
+            f"got {ref_cross_windows.shape}"
+        )
+    if tuple(ref_norm_windows.shape) != tuple(ref_cross_windows.shape[:2]):
+        raise ValueError("ref_norm_windows must have shape (B,H)")
+    gram = jnp.asarray(hermite_gram, dtype=real_dtype)
+    if tuple(gram.shape) != (target_nv, target_nv):
+        raise ValueError("hermite_gram must have shape (Nv,Nv)")
+    learned_rollout = cast_learned_closure_for_rollout(learned, precision=str(rollout_precision))
+    states = jax.vmap(
+        lambda anchor_stencil: rollout_anchor_states_from_anchor_stencil(
+            anchor_stencil,
+            learned=learned_rollout,
+            integ=forward_integ,
+            rollout_horizon=horizon,
+            explicit_n_hat_fn=explicit_n_hat_fn,
+        )
+    )(anchor_stencils)
+    states_phys = jax.vmap(jax.vmap(lambda a_hat: irfft_x(a_hat, int(forward_integ.Nx))))(states)
+    dx = jnp.asarray(float(forward_integ.Lx) / float(forward_integ.Nx), dtype=real_dtype)
+    pred_norm = dx * jnp.einsum("bhnx,nm,bhmx->bh", states_phys, gram, states_phys)
+    cross = dx * jnp.einsum("bhnx,bhnx->bh", states_phys, ref_cross_windows)
+    residual = pred_norm - 2.0 * cross + ref_norm_windows
+    # Roundoff can make an exact quadratic residual slightly negative.
+    residual = jnp.maximum(residual, jnp.asarray(0.0, dtype=real_dtype))
+    scale = jnp.maximum(jnp.asarray(reference_scale, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+    return jnp.mean(residual) / scale
+
+
+def make_exact_f_rollout_batch_loss(
+    *,
+    regime_weights: Dict[str, float],
+    direct_f_reference_scales: Dict[str, float],
+    Nm: int,
+    k_scale: float,
+    nv_scale: float,
+    stats: Dict[str, np.ndarray],
+    hidden_width: int,
+    res_blocks: int,
+    Nv_targets: Sequence[int],
+    train_regimes: Sequence[str],
+    teacher_backend: str,
+    teacher_Lx: float,
+    teacher_Nx: int,
+    teacher_Nv: int,
+    teacher_vmin: float,
+    teacher_vmax: float,
+    teacher_dt: float,
+    teacher_proj_Nv: Optional[int],
+    n_low: int,
+    context_mode: str,
+    rollout_horizon: int,
+    poisson_sign: float,
+    rollout_dealias_23: bool,
+    rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+) -> Tuple[object, Sequence[str]]:
+    target_nvs = tuple(int(v) for v in Nv_targets)
+    active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
+    weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
+    weights = weights / np.sum(weights)
+    weight_arr = jnp.asarray(weights, dtype=jnp.float64)
+    real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    v_grid = jnp.linspace(float(teacher_vmin), float(teacher_vmax), int(teacher_Nv), dtype=real_dtype)
+    max_target_nv = max(target_nvs)
+    phi = jax_hermite_basis_phi_scaled(max_target_nv, v_grid, vth=1.0).astype(real_dtype)
+    full_hermite_gram = jnp.trapezoid(phi[:, None, :] * phi[None, :, :], x=v_grid, axis=2)
+    full_hermite_gram = 0.5 * (full_hermite_gram + full_hermite_gram.T)
+    linear_integrators = {
+        int(target_nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx), Nv=int(target_nv), Lx=float(teacher_Lx), dt=float(teacher_dt), vth=1.0,
+            dealias_23=bool(rollout_dealias_23), closure=None, real_dtype=real_dtype, complex_dtype=complex_dtype,
+        )
+        for target_nv in target_nvs
+    }
+    nonlinear_integrators = {
+        int(target_nv): FourierHermiteIMEX(
+            Nx=int(teacher_Nx), Nv=int(target_nv), Lx=float(teacher_Lx), dt=float(teacher_dt), vth=1.0,
+            dealias_23=bool(rollout_dealias_23), closure=None, real_dtype=real_dtype, complex_dtype=complex_dtype,
+        )
+        for target_nv in target_nvs
+    }
+
+    def linear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+        return _linear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+    def nonlinear_explicit(a_hat: Array, *, integ: FourierHermiteIMEX) -> Array:
+        return _nonlinear_explicit_n_hat_for_state(a_hat, integ=integ, poisson_sign=float(poisson_sign))
+
+    def make_loss_fn_for_target(target_nv: int):
+        target_nv_i = int(target_nv)
+        linear_forward = linear_integrators[target_nv_i]
+        nonlinear_forward = nonlinear_integrators[target_nv_i]
+        hermite_gram = full_hermite_gram[:target_nv_i, :target_nv_i]
+
+        def loss_fn_for_target(
+            params: Dict[str, Array],
+            regime_batches: Dict[str, Dict[str, Array]],
+        ) -> Tuple[Array, Dict[str, Array]]:
+            learned = build_learned_interface_closure(
+                params=params, Nm=Nm, k_scale=k_scale, nv_scale=nv_scale, stats=stats,
+                hidden_width=hidden_width, res_blocks=res_blocks, Nv_targets=Nv_targets,
+                train_regimes=train_regimes, teacher_backend=teacher_backend, teacher_Lx=teacher_Lx,
+                teacher_Nx=teacher_Nx, teacher_Nv=teacher_Nv, teacher_vmin=teacher_vmin,
+                teacher_vmax=teacher_vmax, teacher_dt=teacher_dt, teacher_proj_Nv=teacher_proj_Nv,
+                n_low=n_low, training_mode=EXACT_Q_ROLLOUT_TRAINING_MODE,
+                train_objective=EXACT_F_ROLLOUT_OBJECTIVE, context_mode=context_mode,
+                rollout_horizon=rollout_horizon, rollout_anchor_samples=0,
+                loss_backend=EXACT_F_ROLLOUT_LOSS_BACKEND,
+                lambda_q=0.0, lambda_E=0.0, lambda_dist=0.0, lambda_tail=0.0,
+                lambda_neg=0.0, lambda_reg=0.0,
+            )
+            total_f = jnp.asarray(0.0, dtype=jnp.float64)
+            for weight, regime in zip(weight_arr, active_regimes):
+                batch = regime_batches[regime]
+                integ = linear_forward if regime == REGIME_LINEAR else nonlinear_forward
+                explicit_fn = linear_explicit if regime == REGIME_LINEAR else nonlinear_explicit
+                f_loss = exact_f_rollout_loss_for_anchor_batch(
+                    batch["anchor_stencils"], batch["direct_f_cross_windows"], batch["direct_f_norm_windows"],
+                    learned=learned, forward_integ=integ, rollout_horizon=rollout_horizon,
+                    explicit_n_hat_fn=explicit_fn, hermite_gram=hermite_gram,
+                    reference_scale=jnp.asarray(direct_f_reference_scales[regime], dtype=real_dtype),
+                    rollout_precision=str(rollout_precision),
+                )
+                total_f = total_f + weight * f_loss
+            zero = jnp.asarray(0.0, dtype=jnp.float64)
+            return total_f, {
+                "q": zero, "f": total_f, "state": zero, "field": zero, "dist": zero,
+                "tail": zero, "dec": zero, "coeff": zero, "chain": zero, "hist": zero,
+                "xv": zero, "neg": zero, "reg": zero, "q_diag": zero,
+            }
+
+        return loss_fn_for_target
+
+    target_loss_fns = {
+        int(target_nv): make_loss_fn_for_target(int(target_nv))
+        for target_nv in target_nvs
+    }
+    default_target_nv = int(target_nvs[0])
+    def loss_fn(params: Dict[str, Array], regime_batches: Dict[str, Dict[str, Array]]) -> Tuple[Array, Dict[str, Array]]:
+        return target_loss_fns[default_target_nv](params, regime_batches)
+
+    loss_fn.target_nvs = target_nvs  # type: ignore[attr-defined]
+    loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
+    loss_fn.target_chain_loss_fns = {}  # type: ignore[attr-defined]
+    loss_fn.rollout_precision = str(rollout_precision)  # type: ignore[attr-defined]
+    loss_fn.direct_f_enabled = True  # type: ignore[attr-defined]
+    loss_fn.direct_f_target_nv = max_target_nv  # type: ignore[attr-defined]
+    loss_fn.tail_chain_enabled = False  # type: ignore[attr-defined]
+    loss_fn.tail_chain_only = False  # type: ignore[attr-defined]
+    loss_fn.Nm = int(Nm)  # type: ignore[attr-defined]
+    loss_fn.n_low = int(n_low)  # type: ignore[attr-defined]
+    return loss_fn, active_regimes
+
+
 def online_fourier_hermite_closure_action_bidir_loss_for_history(
     ref_hist: Array,
     *,
@@ -6847,6 +7285,7 @@ def prepare_exact_q_rollout_sampling_state(
     max_projection_order: int,
     target_nvs: Sequence[int],
     history_dtype: object = np.complex128,
+    direct_f_target_nv: Optional[int] = None,
 ) -> Dict[str, Dict[str, object]]:
     coeff_key = exact_q_rollout_coeff_key(max_projection_order)
     history_np_dtype = exact_rollout_numpy_complex_dtype(history_dtype)
@@ -6864,7 +7303,7 @@ def prepare_exact_q_rollout_sampling_state(
             )
             for target_nv in target_nvs
         }
-        sampling_state[regime] = {
+        state: Dict[str, object] = {
             "histories": np.asarray(exact_dataset[regime][coeff_key], dtype=history_np_dtype),
             "train_case_indices": np.asarray(arrays["train_case_indices"], dtype=np.int32),
             "train_time_indices": np.asarray(arrays["train_time_indices"], dtype=np.int32),
@@ -6878,6 +7317,13 @@ def prepare_exact_q_rollout_sampling_state(
             ),
             "anchor_target_pools": anchor_target_pools,
         }
+        if direct_f_target_nv is not None:
+            target_nv = int(direct_f_target_nv)
+            cross_key = exact_f_rollout_cross_key(target_nv)
+            norm_key = exact_f_rollout_norm_key(target_nv)
+            state["direct_f_cross"] = np.asarray(exact_dataset[regime][cross_key], dtype=np.float32)
+            state["direct_f_norm"] = np.asarray(exact_dataset[regime][norm_key], dtype=np.float32)
+        sampling_state[regime] = state
     return sampling_state
 
 
@@ -6929,6 +7375,7 @@ def sample_exact_q_rollout_regime_batch(
     tail_history_lags: int = 0,
     Nm: int = 0,
     n_low: int = 2,
+    direct_f_enabled: bool = False,
 ) -> Dict[str, Array]:
     regime_state = sampling_state[regime]
     histories = regime_state["histories"]
@@ -6994,6 +7441,24 @@ def sample_exact_q_rollout_regime_batch(
         "ref_q_windows": jnp.asarray(q_windows, dtype=complex_dtype),
         "k_indices": jnp.asarray(k_indices, dtype=jnp.int32),
     }
+    if bool(direct_f_enabled):
+        if "direct_f_cross" not in regime_state or "direct_f_norm" not in regime_state:
+            raise ValueError("Direct f-rollout sampling state is missing raw-grid target statistics")
+        direct_cross = np.asarray(regime_state["direct_f_cross"], dtype=real_np_dtype)
+        direct_norm = np.asarray(regime_state["direct_f_norm"], dtype=real_np_dtype)
+        # The rollout returns states after each solver step, so direct-f targets
+        # begin at t_i + dt rather than reusing the fixed anchor at t_i.
+        direct_window_times = time_idx[:, None] + np.arange(1, int(rollout_horizon) + 1, dtype=np.int32)[None, :]
+        if int(np.max(direct_window_times)) >= int(direct_cross.shape[1]):
+            raise ValueError("Direct f-rollout window exceeds the stored teacher history")
+        batch["direct_f_cross_windows"] = jnp.asarray(
+            direct_cross[case_idx[:, None], direct_window_times, :target_nv_i, :],
+            dtype=real_jax_dtype,
+        )
+        batch["direct_f_norm_windows"] = jnp.asarray(
+            direct_norm[case_idx[:, None], direct_window_times],
+            dtype=real_jax_dtype,
+        )
     if tail_chain_n_indices is not None:
         n_indices = np.asarray(tail_chain_n_indices, dtype=np.int32)
         if n_indices.ndim != 1 or int(n_indices.shape[0]) <= 0:
@@ -8080,6 +8545,8 @@ def online_training_log_components(
         return ("field", "dist", "tail", "neg", "reg")
     if str(train_objective) == "trajectory_q_hybrid":
         return ("q", "field", "dist", "tail", "neg", "reg")
+    if str(train_objective) == EXACT_F_ROLLOUT_OBJECTIVE:
+        return ("f",)
     if str(train_objective) == EXACT_Q_ROLLOUT_OBJECTIVE:
         if str(online_loss_backend) in {
             EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND,
@@ -8147,7 +8614,7 @@ def train_with_online_trajectory_minibatch_loss(
     state = adam_init(params)
     history = {
         key: np.zeros((int(epochs),), dtype=np.float64)
-        for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
+        for key in ("total", "q", "f", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
     }
 
     def make_train_step(target_batch_loss_fn):
@@ -8303,7 +8770,7 @@ def train_with_exact_q_rollout_minibatch_loss(
     state = adam_init(params)
     history = {
         key: np.zeros((int(epochs),), dtype=np.float64)
-        for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
+        for key in ("total", "q", "f", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
     }
 
     def make_train_step(target_batch_loss_fn):
@@ -8397,6 +8864,8 @@ def train_with_exact_q_rollout_minibatch_loss(
     tail_chain_only = bool(getattr(batch_loss_fn, "tail_chain_only", False))
     tail_recursive_lift_enabled = bool(getattr(batch_loss_fn, "tail_recursive_lift_enabled", False))
     tail_history_lift_enabled = bool(getattr(batch_loss_fn, "tail_history_lift_enabled", False))
+    direct_f_enabled = bool(getattr(batch_loss_fn, "direct_f_enabled", False))
+    direct_f_target_nv = getattr(batch_loss_fn, "direct_f_target_nv", None)
     tail_chain_n_min = getattr(batch_loss_fn, "tail_chain_n_min", None)
     tail_chain_n_max = getattr(batch_loss_fn, "tail_chain_n_max", None)
     tail_lift_n_max = getattr(batch_loss_fn, "tail_lift_n_max", None)
@@ -8412,6 +8881,7 @@ def train_with_exact_q_rollout_minibatch_loss(
         max_projection_order=int(max_projection_order),
         target_nvs=target_nvs,
         history_dtype=history_complex_dtype,
+        direct_f_target_nv=int(direct_f_target_nv) if direct_f_enabled else None,
     )
     all_k_rollout_loss = True
     profile_steps = max(int(profile_train_steps), 0)
@@ -8427,7 +8897,7 @@ def train_with_exact_q_rollout_minibatch_loss(
     for epoch in range(int(epochs)):
         running = {
             key: jnp.asarray(0.0, dtype=jnp.float64)
-            for key in ("total", "q", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
+            for key in ("total", "q", "f", "state", "field", "dist", "tail", "dec", "coeff", "chain", "hist", "xv", "neg", "reg", "q_diag")
         }
         for step_idx in range(int(steps_per_epoch)):
             if target_nvs:
@@ -8534,6 +9004,7 @@ def train_with_exact_q_rollout_minibatch_loss(
                         tail_history_lags=tail_history_lags if tail_history_lift_enabled else 0,
                         Nm=exact_nm,
                         n_low=exact_n_low,
+                        direct_f_enabled=direct_f_enabled,
                     )
                     for regime in active_regimes
                 }
@@ -8978,7 +9449,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--train-objective",
         type=str,
         default="q_only",
-        choices=("q_only", EXACT_Q_ROLLOUT_OBJECTIVE, "trajectory", "trajectory_q_hybrid"),
+        choices=("q_only", EXACT_Q_ROLLOUT_OBJECTIVE, EXACT_F_ROLLOUT_OBJECTIVE, "trajectory", "trajectory_q_hybrid"),
     )
     parser.add_argument("--context-mode", type=str, default="none", choices=("none", "lag1_delta"))
     parser.add_argument("--tail-start-fraction", type=float, default=2.0 / 3.0)
@@ -9107,8 +9578,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             raise ValueError("exact_q_rollout only supports teacher_backend=grid_cubic_spline")
         if args.teacher_proj_Nv is not None:
             raise ValueError("exact_q_rollout computes max(Nv-targets)+1 internally; do not pass --teacher-proj-Nv")
-        if args.train_objective != EXACT_Q_ROLLOUT_OBJECTIVE:
-            raise ValueError("exact_q_rollout requires --train-objective q_rollout")
+        if args.train_objective not in {EXACT_Q_ROLLOUT_OBJECTIVE, EXACT_F_ROLLOUT_OBJECTIVE}:
+            raise ValueError("exact_q_rollout requires --train-objective q_rollout or f_rollout")
+        if args.train_objective == EXACT_F_ROLLOUT_OBJECTIVE:
+            if bool(args.tail_chain) or bool(args.tail_history_lift):
+                raise ValueError("exact f-rollout is a pure closure objective; tail lifting is not supported")
         if int(args.rollout_horizon) <= 0:
             raise ValueError("exact_q_rollout requires --rollout-horizon > 0")
         if int(args.rollout_anchor_samples) != 0:
@@ -9450,6 +9924,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         val_metrics = evaluate_regime_metrics(learned, prepared)
     elif training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE:
+        exact_f_rollout = args.train_objective == EXACT_F_ROLLOUT_OBJECTIVE
         exact_aux_projection_order = (
             tail_history_n_max
             if tail_history_lift_enabled
@@ -9457,29 +9932,53 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             if tail_chain_enabled
             else None
         )
-        exact_dataset, max_projection_order = build_exact_q_rollout_reference_dataset(
-            dataset_cache=args.dataset_cache,
-            regimes=regimes,
-            teacher_Nx=args.teacher_Nx,
-            teacher_Nv=args.teacher_Nv,
-            teacher_L=args.teacher_L,
-            teacher_vmin=args.teacher_vmin,
-            teacher_vmax=args.teacher_vmax,
-            teacher_dt=args.teacher_dt,
-            linear_T=args.linear_T,
-            linear_eps=args.linear_eps,
-            linear_modes=linear_modes,
-            linear_num_samples=args.linear_num_samples,
-            linear_seed=args.linear_seed,
-            linear_poisson_sign=args.teacher_poisson_sign,
-            nonlinear_T=args.nonlinear_T,
-            nonlinear_k0=args.nonlinear_k0,
-            nonlinear_poisson_sign=args.teacher_poisson_sign,
-            weak_eps=weak_eps,
-            strong_eps=strong_eps,
-            Nv_targets=Nv_targets,
-            min_projection_order=exact_aux_projection_order,
-        )
+        if exact_f_rollout:
+            exact_dataset, max_projection_order = build_exact_f_rollout_reference_dataset(
+                dataset_cache=args.dataset_cache,
+                regimes=regimes,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_L=args.teacher_L,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                linear_T=args.linear_T,
+                linear_eps=args.linear_eps,
+                linear_modes=linear_modes,
+                linear_num_samples=args.linear_num_samples,
+                linear_seed=args.linear_seed,
+                linear_poisson_sign=args.teacher_poisson_sign,
+                nonlinear_T=args.nonlinear_T,
+                nonlinear_k0=args.nonlinear_k0,
+                nonlinear_poisson_sign=args.teacher_poisson_sign,
+                weak_eps=weak_eps,
+                strong_eps=strong_eps,
+                target_nv=int(max(Nv_targets)),
+            )
+        else:
+            exact_dataset, max_projection_order = build_exact_q_rollout_reference_dataset(
+                dataset_cache=args.dataset_cache,
+                regimes=regimes,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_L=args.teacher_L,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                linear_T=args.linear_T,
+                linear_eps=args.linear_eps,
+                linear_modes=linear_modes,
+                linear_num_samples=args.linear_num_samples,
+                linear_seed=args.linear_seed,
+                linear_poisson_sign=args.teacher_poisson_sign,
+                nonlinear_T=args.nonlinear_T,
+                nonlinear_k0=args.nonlinear_k0,
+                nonlinear_poisson_sign=args.teacher_poisson_sign,
+                weak_eps=weak_eps,
+                strong_eps=strong_eps,
+                Nv_targets=Nv_targets,
+                min_projection_order=exact_aux_projection_order,
+            )
         teacher_proj_Nv = int(max_projection_order)
         coeff_key = exact_q_rollout_coeff_key(max_projection_order)
         for regime in regimes:
@@ -9487,12 +9986,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 continue
             cases = np.asarray(exact_dataset[regime][coeff_key])
             print(
-                f"[data] exact q-rollout {regime}: "
+                f"[data] exact {'f' if exact_f_rollout else 'q'}-rollout {regime}: "
                 f"cases={int(cases.shape[0])} history={int(cases.shape[1])} "
                 f"order={int(cases.shape[2])}"
             )
         if bool(args.build_dataset_only):
-            cache_msg = f"Saved exact q-rollout reference cache to {args.dataset_cache}" if args.dataset_cache is not None else "Built exact q-rollout reference cache in memory"
+            cache_msg = (
+                f"Saved exact {'f' if exact_f_rollout else 'q'}-rollout reference cache to {args.dataset_cache}"
+                if args.dataset_cache is not None
+                else f"Built exact {'f' if exact_f_rollout else 'q'}-rollout reference cache in memory"
+            )
             print(cache_msg)
             return
 
@@ -9540,6 +10043,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             else float(max(Nv_targets))
         )
         store_exact_train_pairs = bool(args.exact_store_train_qpairs)
+        # The shared feature/output normalization is estimated from the local
+        # interface scale. In f_rollout this calibrates the closure head only;
+        # no q target appears in the optimized loss.
         dataset_base, precomputed_stats = build_exact_q_rollout_qpair_dataset(
             exact_dataset,
             max_projection_order=max_projection_order,
@@ -9549,7 +10055,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             val_fraction=args.val_fraction,
             linear_history_stride=args.linear_history_stride,
             nonlinear_history_stride=args.nonlinear_history_stride,
-            rollout_horizon=args.rollout_horizon,
+            rollout_horizon=(int(args.rollout_horizon) + 1 if exact_f_rollout else int(args.rollout_horizon)),
             n_low=args.n_low,
             context_mode=args.context_mode,
             store_training_pairs=store_exact_train_pairs,
@@ -9589,8 +10095,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         for regime in dataset_base:
             count = int(dataset_base[regime]["train_inputs_base"].shape[0])
             q_windows = int(dataset_base[regime]["train_anchor_time_indices"].shape[0])
-            feature_note = "stored q samples" if store_exact_train_pairs else "stored q samples skipped"
-            print(f"[data] {regime}: {count} {feature_note}; {q_windows} exact rollout anchors")
+            feature_note = (
+                "stored q samples"
+                if store_exact_train_pairs
+                else "stored q samples skipped"
+            )
+            objective_note = "direct f target" if exact_f_rollout else feature_note
+            print(f"[data] {regime}: {count} {objective_note}; {q_windows} exact rollout anchors")
 
         if tail_chain_enabled:
             display_chain_min = (
@@ -9715,6 +10226,36 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 tail_chain_nv=int(args.tail_chain_Nv),
                 tail_chain_n_max=tail_chain_n_max,
             )
+        elif exact_f_rollout:
+            batch_loss_fn, active_regimes = make_exact_f_rollout_batch_loss(
+                regime_weights=regime_weights,
+                direct_f_reference_scales=exact_f_rollout_reference_scales(
+                    exact_dataset,
+                    target_nv=int(max(Nv_targets)),
+                ),
+                Nm=args.Nm,
+                k_scale=k_scale,
+                nv_scale=nv_scale,
+                stats=stats,
+                hidden_width=args.hidden_width,
+                res_blocks=args.res_blocks,
+                Nv_targets=Nv_targets,
+                train_regimes=regimes,
+                teacher_backend=teacher_backend,
+                teacher_Lx=args.teacher_L,
+                teacher_Nx=args.teacher_Nx,
+                teacher_Nv=args.teacher_Nv,
+                teacher_vmin=args.teacher_vmin,
+                teacher_vmax=args.teacher_vmax,
+                teacher_dt=args.teacher_dt,
+                teacher_proj_Nv=max_projection_order,
+                n_low=args.n_low,
+                context_mode=args.context_mode,
+                rollout_horizon=args.rollout_horizon,
+                poisson_sign=args.teacher_poisson_sign,
+                rollout_dealias_23=bool(args.rollout_dealias_23),
+                rollout_precision=args.exact_rollout_precision,
+            )
         else:
             batch_loss_fn, active_regimes = make_exact_q_rollout_batch_loss(
                 regime_weights=regime_weights,
@@ -9747,21 +10288,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 lambda_tail_chain=float(args.lambda_tail_chain if tail_chain_enabled else 0.0),
                 tail_chain_only=tail_chain_only,
             )
-        exact_active_loss_backend = (
-            (
+        if exact_f_rollout:
+            exact_active_loss_backend = EXACT_F_ROLLOUT_LOSS_BACKEND
+        elif tail_history_lift_enabled:
+            exact_active_loss_backend = (
                 EXACT_Q_ROLLOUT_HISTORY_LIFT_XV_RES_LOSS_BACKEND
                 if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES
                 else EXACT_Q_ROLLOUT_HISTORY_LIFT_LOSS_BACKEND
             )
-            if tail_history_lift_enabled
-            else EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND
-            if bool(args.tail_chain_recursive_lift)
-            else EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND
-            if tail_chain_only
-            else EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND
-            if tail_chain_enabled
-            else EXACT_Q_ROLLOUT_LOSS_BACKEND
-        )
+        elif bool(args.tail_chain_recursive_lift):
+            exact_active_loss_backend = EXACT_Q_ROLLOUT_RECURSIVE_LIFT_LOSS_BACKEND
+        elif tail_chain_only:
+            exact_active_loss_backend = EXACT_Q_ROLLOUT_CHAIN_ONLY_LOSS_BACKEND
+        elif tail_chain_enabled:
+            exact_active_loss_backend = EXACT_Q_ROLLOUT_TAIL_CHAIN_LOSS_BACKEND
+        else:
+            exact_active_loss_backend = EXACT_Q_ROLLOUT_LOSS_BACKEND
         steps_per_epoch = int(args.steps_per_epoch)
         if steps_per_epoch <= 0:
             qpair_counts = [
@@ -9831,7 +10373,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             loss_backend=(
                 exact_active_loss_backend
             ),
-            lambda_q=1.0,
+            lambda_q=0.0 if exact_f_rollout else 1.0,
             lambda_E=0.0,
             lambda_dist=0.0,
             lambda_tail=0.0,
@@ -10494,7 +11036,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         else EXACT_Q_ROLLOUT_LOSS_BACKEND
     )
     exact_loss_annotation = None
-    if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and tail_history_lift_enabled:
+    if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and args.train_objective == EXACT_F_ROLLOUT_OBJECTIVE:
+        exact_loss_annotation = (
+            r"$\mathcal{L}_{f}^{H}=\frac{1}{BH\sigma_f^2}"
+            r"\sum_{i,h}\|f_{<N_v}^{\theta}-[f^{\mathrm{HR}}-f_0]\|_{x,v}^2$"
+            + "\n"
+            + rf"$N_v\in\{{{','.join(str(int(v)) for v in Nv_targets)}\}}$ step-cycle, raw spline-grid target, all retained $k$"
+        )
+    elif training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE and tail_history_lift_enabled:
         if tail_history_loss_mode == TAIL_HISTORY_LOSS_XV_RES:
             exact_loss_annotation = (
                 r"$\mathcal{L}^{H}_{xv\mathrm{-res}}="
