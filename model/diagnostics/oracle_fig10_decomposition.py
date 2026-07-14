@@ -13,7 +13,6 @@ import math
 import os
 from pathlib import Path
 from typing import Dict, Tuple
-from zipfile import ZipFile
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MPLCONFIG = _REPO_ROOT / ".mplconfig"
@@ -28,16 +27,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from vpml.core import (
-    hermite_basis_phi,
     learned_history_hermite_lift,
     load_learned_interface_closure_npz,
 )
 from vpml.nonlinear_landau import NonlinearLandauParams, _time_key, run_nonlinear_landau_rollout_raw
+from model.diagnostics.phase_space import (
+    FourierHermiteHistoryReader,
+    phase_space_from_hermite_phys,
+    resample_periodic_rows,
+    select_nearest_case,
+)
 
 
 CHECKPOINT = Path()
 HISTORY_CACHE = Path()
 HISTORY_ARRAY = ""
+HISTORY_READER: FourierHermiteHistoryReader | None = None
 
 NX_TEACHER = 256
 NX_DEPLOY = 200
@@ -55,59 +60,16 @@ NV_PLOT = 1000
 Lx = 4.0 * math.pi
 
 
-def _read_npy_header_from_npz(zf: ZipFile, member: str):
-    fp = zf.open(member, "r")
-    version = np.lib.format.read_magic(fp)
-    if version == (1, 0):
-        shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(fp)
-    elif version == (2, 0):
-        shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(fp)
-    else:
-        raise ValueError(f"Unsupported npy version {version} for {member}")
-    if fortran_order:
-        raise ValueError(f"{member} is Fortran ordered; this script expects C order")
-    return fp, shape, dtype, fp.tell()
-
-
 def _read_history_slice(case_idx: int, time_idx: int, n_min: int = 0, n_max: int = NV_REF) -> np.ndarray:
-    """Read one (Hermite, k) slice from the uncompressed npy stored in the npz."""
-    with ZipFile(HISTORY_CACHE) as zf:
-        fp, shape, dtype, data_start = _read_npy_header_from_npz(zf, HISTORY_ARRAY)
-        if len(shape) != 4:
-            raise ValueError(f"{HISTORY_ARRAY} must have shape (cases,time,Nv,Nk), got {shape}")
-        itemsize = np.dtype(dtype).itemsize
-        ncase, nt, nv, nk = (int(value) for value in shape)
-        if not 0 <= int(case_idx) < ncase:
-            raise IndexError(f"case index {case_idx} is outside [0,{ncase})")
-        if not 0 <= int(time_idx) < nt:
-            raise IndexError(f"time index {time_idx} is outside [0,{nt})")
-        if not 0 <= int(n_min) < int(n_max) <= nv:
-            raise ValueError(f"Hermite range [{n_min},{n_max}) is outside [0,{nv})")
-        offset_items = (((int(case_idx) * nt + int(time_idx)) * nv + int(n_min)) * nk)
-        count = (int(n_max) - int(n_min)) * nk
-        fp.seek(data_start + offset_items * itemsize)
-        data = fp.read(count * itemsize)
-    return np.frombuffer(data, dtype=dtype).reshape((int(n_max) - int(n_min), nk)).astype(np.complex128)
-
-
-def _resample_periodic_rows(rows: np.ndarray, source_nx: int, target_nx: int) -> np.ndarray:
-    rows = np.asarray(rows, dtype=np.float64)
-    if int(source_nx) == int(target_nx):
-        return rows.copy()
-    x_source = np.linspace(0.0, Lx, int(source_nx), endpoint=False, dtype=np.float64)
-    x_target = np.linspace(0.0, Lx, int(target_nx), endpoint=False, dtype=np.float64)
-    x_ext = np.concatenate([x_source, np.asarray([Lx])])
-    values_ext = np.concatenate([rows, rows[:, :1]], axis=1)
-    out = np.empty((rows.shape[0], int(target_nx)), dtype=np.float64)
-    for row_idx in range(rows.shape[0]):
-        out[row_idx] = np.interp(x_target, x_ext, values_ext[row_idx])
-    return out
+    if HISTORY_READER is None:
+        raise RuntimeError("history reader is not configured")
+    return HISTORY_READER.read_slice(case_idx, time_idx, n_min, n_max)
 
 
 def _hr_phys_at(case_idx: int, time_idx: int) -> np.ndarray:
     a_hat = _read_history_slice(case_idx, time_idx, 0, NV_REF)
     a_phys_teacher = np.fft.irfft(a_hat, n=NX_TEACHER, axis=1).real.astype(np.float64)
-    return _resample_periodic_rows(a_phys_teacher, NX_TEACHER, NX_DEPLOY)
+    return resample_periodic_rows(a_phys_teacher, Lx=Lx, target_nx=NX_DEPLOY)
 
 
 def _hr_low_history(case_idx: int, time_idx: int, lags: int) -> np.ndarray:
@@ -116,16 +78,13 @@ def _hr_low_history(case_idx: int, time_idx: int, lags: int) -> np.ndarray:
         idx = max(idx, 0)
         low_hat_teacher = _read_history_slice(case_idx, idx, 0, NV_DEPLOY)
         low_phys_teacher = np.fft.irfft(low_hat_teacher, n=NX_TEACHER, axis=1).real.astype(np.float64)
-        low_phys_deploy = _resample_periodic_rows(low_phys_teacher, NX_TEACHER, NX_DEPLOY)
+        low_phys_deploy = resample_periodic_rows(low_phys_teacher, Lx=Lx, target_nx=NX_DEPLOY)
         hist.append(np.fft.rfft(low_phys_deploy, axis=1).astype(np.complex128))
     return np.asarray(hist, dtype=np.complex128)
 
 
 def _field_from_coeffs(a_phys: np.ndarray, v_plot: np.ndarray) -> np.ndarray:
-    phi = np.asarray(hermite_basis_phi(int(a_phys.shape[0]), v_plot), dtype=np.float64)
-    m_eq = np.zeros((int(a_phys.shape[0]),), dtype=np.float64)
-    m_eq[0] = 1.0
-    return ((a_phys + m_eq[:, None]).T @ phi).T.astype(np.float64)
+    return phase_space_from_hermite_phys(a_phys, v_plot)
 
 
 def _rel_l2(candidate: np.ndarray, reference: np.ndarray) -> float:
@@ -232,7 +191,7 @@ def _resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
 
 
 def main(argv: Tuple[str, ...] | None = None) -> None:
-    global CHECKPOINT, HISTORY_CACHE, HISTORY_ARRAY
+    global CHECKPOINT, HISTORY_CACHE, HISTORY_ARRAY, HISTORY_READER
     global NX_TEACHER, NX_DEPLOY, NV_DEPLOY, NV_REF, LAGS
     global DT, DT_TEACHER, T_FINAL, TIMES, EPS, K0, V_RANGE, NV_PLOT
 
@@ -267,6 +226,7 @@ def main(argv: Tuple[str, ...] | None = None) -> None:
     V_RANGE = _parse_v_range(args.v_range)
     NV_PLOT = int(args.Nv_plot)
     HISTORY_ARRAY = args.history_array or f"nonlinear_landau_strong_a_hat_ref_order{NV_REF}.npy"
+    HISTORY_READER = FourierHermiteHistoryReader(HISTORY_CACHE, HISTORY_ARRAY)
     if NX_TEACHER <= 0 or NX_DEPLOY <= 0 or NV_PLOT <= 1:
         raise ValueError("Nx, teacher-Nx, and Nv-plot must be positive")
     if DT <= 0.0 or DT_TEACHER <= 0.0 or T_FINAL <= 0.0:
@@ -298,11 +258,8 @@ def main(argv: Tuple[str, ...] | None = None) -> None:
     learned_pred = np.asarray(learned_raw["snapshot_recon_a_phys"], dtype=np.float64)
     k_arr = np.asarray(learned_raw["k_arr"], dtype=np.float64)
 
-    strong_eps = None
-    with np.load(HISTORY_CACHE, allow_pickle=True) as z:
-        strong_eps = np.asarray(z["strong_eps"], dtype=np.float64)
-    case_idx = int(np.argmin(np.abs(strong_eps - EPS)))
-    print(f"[oracle] using nonlinear_landau_strong case {case_idx} with eps={strong_eps[case_idx]:g}")
+    case_idx, case_eps = select_nearest_case(HISTORY_CACHE, eps=EPS)
+    print(f"[oracle] using nonlinear_landau_strong case {case_idx} with eps={case_eps:g}")
 
     v_plot = np.linspace(V_RANGE[0], V_RANGE[1], NV_PLOT, dtype=np.float64)
     x = np.linspace(0.0, Lx, NX_DEPLOY, endpoint=False, dtype=np.float64)
@@ -311,7 +268,7 @@ def main(argv: Tuple[str, ...] | None = None) -> None:
         "checkpoint": str(CHECKPOINT),
         "history_cache": str(HISTORY_CACHE),
         "case_idx": case_idx,
-        "case_eps": float(strong_eps[case_idx]),
+        "case_eps": case_eps,
         "history_lags": int(LAGS),
         "times": list(TIMES),
         "relative_l2_vs_hr_true": {},
