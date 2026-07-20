@@ -7407,6 +7407,44 @@ def select_exact_q_rollout_regime_indices(
     )
 
 
+def translate_exact_q_rollout_anchor_batch(
+    anchor_stencils: np.ndarray,
+    ref_q_windows: np.ndarray,
+    *,
+    k_arr: np.ndarray,
+    shifts: np.ndarray,
+    k_indices: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Translate complete exact-q anchors using the repository rFFT convention."""
+    stencils = np.asarray(anchor_stencils)
+    q_windows = np.asarray(ref_q_windows)
+    k_values = np.asarray(k_arr, dtype=np.float64)
+    shift_values = np.asarray(shifts, dtype=np.float64)
+    if stencils.ndim != 4:
+        raise ValueError("anchor_stencils must have shape (B,S,Nv,Nk)")
+    if shift_values.shape != (int(stencils.shape[0]),):
+        raise ValueError("shifts must have shape (B,) matching anchor_stencils")
+    if k_values.shape != (int(stencils.shape[-1]),):
+        raise ValueError("k_arr must have shape (Nk,) matching anchor_stencils")
+
+    phases = np.exp(-1j * shift_values[:, None] * k_values[None, :])
+    translated_stencils = stencils * phases[:, None, None, :]
+    if q_windows.ndim == 3:
+        if tuple(q_windows.shape[::2]) != (int(stencils.shape[0]), int(stencils.shape[-1])):
+            raise ValueError("all-k ref_q_windows must have shape (B,H,Nk)")
+        translated_q = q_windows * phases[:, None, :]
+    elif q_windows.ndim == 2:
+        if k_indices is None:
+            raise ValueError("selected-k ref_q_windows require k_indices")
+        selected_k = np.asarray(k_indices, dtype=np.int32)
+        if selected_k.shape != (int(stencils.shape[0]),):
+            raise ValueError("k_indices must have shape (B,)")
+        translated_q = q_windows * phases[np.arange(int(stencils.shape[0])), selected_k][:, None]
+    else:
+        raise ValueError("ref_q_windows must have shape (B,H) or (B,H,Nk)")
+    return translated_stencils, translated_q
+
+
 def sample_exact_q_rollout_regime_batch(
     sampling_state: Dict[str, Dict[str, object]],
     *,
@@ -7431,6 +7469,8 @@ def sample_exact_q_rollout_regime_batch(
     Nm: int = 0,
     n_low: int = 2,
     direct_f_enabled: bool = False,
+    translation_augmentation: bool = False,
+    domain_length: Optional[float] = None,
 ) -> Dict[str, Array]:
     regime_state = sampling_state[regime]
     histories = regime_state["histories"]
@@ -7490,6 +7530,17 @@ def sample_exact_q_rollout_regime_batch(
             * k_arr_np[k_indices][:, None]
             * math.sqrt(float(target_nv_i))
             * q_coeff
+        )
+    if bool(translation_augmentation):
+        if domain_length is None or float(domain_length) <= 0.0:
+            raise ValueError("translation augmentation requires a positive domain_length")
+        shifts = rng.uniform(0.0, float(domain_length), size=batch_n)
+        stencils, q_windows = translate_exact_q_rollout_anchor_batch(
+            stencils,
+            q_windows,
+            k_arr=k_arr_np,
+            shifts=shifts,
+            k_indices=k_indices,
         )
     batch = {
         "anchor_stencils": jnp.asarray(stencils, dtype=complex_dtype),
@@ -7909,6 +7960,13 @@ def make_exact_q_rollout_batch_loss(
     loss_fn.target_loss_fns = target_loss_fns  # type: ignore[attr-defined]
     loss_fn.target_chain_loss_fns = target_chain_loss_fns  # type: ignore[attr-defined]
     loss_fn.rollout_precision = str(rollout_precision)  # type: ignore[attr-defined]
+    loss_fn.translation_augmented = bool(translation_augmented)  # type: ignore[attr-defined]
+    loss_fn.regime_q_loss_stds = (
+        {}
+        if regime_q_loss_stds is None
+        else {str(key): float(value) for key, value in regime_q_loss_stds.items()}
+    )  # type: ignore[attr-defined]
+    loss_fn.teacher_Lx = float(teacher_Lx)  # type: ignore[attr-defined]
     loss_fn.tail_chain_enabled = bool(tail_chain_enabled)  # type: ignore[attr-defined]
     loss_fn.tail_chain_only = bool(tail_chain_only)  # type: ignore[attr-defined]
     loss_fn.tail_chain_n_min = (
@@ -8928,6 +8986,8 @@ def train_with_exact_q_rollout_minibatch_loss(
     tail_history_lift_enabled = bool(getattr(batch_loss_fn, "tail_history_lift_enabled", False))
     direct_f_enabled = bool(getattr(batch_loss_fn, "direct_f_enabled", False))
     direct_f_target_nv = getattr(batch_loss_fn, "direct_f_target_nv", None)
+    translation_augmented = bool(getattr(batch_loss_fn, "translation_augmented", False))
+    translation_domain_length = getattr(batch_loss_fn, "teacher_Lx", None)
     tail_chain_n_min = getattr(batch_loss_fn, "tail_chain_n_min", None)
     tail_chain_n_max = getattr(batch_loss_fn, "tail_chain_n_max", None)
     tail_lift_n_max = getattr(batch_loss_fn, "tail_lift_n_max", None)
@@ -9067,6 +9127,12 @@ def train_with_exact_q_rollout_minibatch_loss(
                         Nm=exact_nm,
                         n_low=exact_n_low,
                         direct_f_enabled=direct_f_enabled,
+                        translation_augmentation=translation_augmented,
+                        domain_length=(
+                            float(translation_domain_length)
+                            if translation_augmented and translation_domain_length is not None
+                            else None
+                        ),
                     )
                     for regime in active_regimes
                 }
