@@ -90,6 +90,10 @@ if [[ -z "${TRAIN_EXACT_ROLLOUT_PRECISION:-}" ]]; then
 fi
 TRAIN_EXACT_TARGET_SAMPLING="${TRAIN_EXACT_TARGET_SAMPLING:-cycle}"
 TRAIN_EXACT_STORE_TRAIN_QPAIRS="${TRAIN_EXACT_STORE_TRAIN_QPAIRS:-0}"
+TRAIN_EXACT_Q_REGIME_BALANCED_LOSS="${TRAIN_EXACT_Q_REGIME_BALANCED_LOSS:-0}"
+TRAIN_EQUILIBRIUM_CENTERED_CLOSURE="${TRAIN_EQUILIBRIUM_CENTERED_CLOSURE:-0}"
+TRAIN_COMPLEX_ISOTROPIC_NORMALIZATION="${TRAIN_COMPLEX_ISOTROPIC_NORMALIZATION:-0}"
+TRAIN_EXACT_TRANSLATION_AUGMENTATION="${TRAIN_EXACT_TRANSLATION_AUGMENTATION:-0}"
 TRAIN_EXACT_ROLLOUT_OBJECTIVE="${TRAIN_EXACT_ROLLOUT_OBJECTIVE:-q_rollout}"
 if [[ "${TRAIN_EXACT_ROLLOUT_OBJECTIVE}" == "f_rollout" ]]; then
   TRAIN_EXACT_HISTORY_CACHE_NAME="interface_closure_exact_f_rollout_histories.npz"
@@ -341,6 +345,18 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     )
     if [[ "${TRAIN_EXACT_STORE_TRAIN_QPAIRS}" != "0" ]]; then
       TRAIN_ARGS+=(--exact-store-train-qpairs)
+    fi
+    if [[ "${TRAIN_EXACT_Q_REGIME_BALANCED_LOSS}" != "0" ]]; then
+      TRAIN_ARGS+=(--exact-q-regime-balanced-loss)
+    fi
+    if [[ "${TRAIN_EQUILIBRIUM_CENTERED_CLOSURE}" != "0" ]]; then
+      TRAIN_ARGS+=(--equilibrium-centered-closure)
+    fi
+    if [[ "${TRAIN_COMPLEX_ISOTROPIC_NORMALIZATION}" != "0" ]]; then
+      TRAIN_ARGS+=(--complex-isotropic-normalization)
+    fi
+    if [[ "${TRAIN_EXACT_TRANSLATION_AUGMENTATION}" != "0" ]]; then
+      TRAIN_ARGS+=(--exact-translation-augmentation)
     fi
     if [[ -n "${INIT_CHECKPOINT_PATH}" ]]; then
       INIT_CHECKPOINT_NV="${INIT_CHECKPOINT_PATH}"
@@ -598,6 +614,10 @@ Defaults:
   precision:      ${TRAIN_EXACT_ROLLOUT_PRECISION}
   target sampling:${TRAIN_EXACT_TARGET_SAMPLING}
   store q-pairs:  ${TRAIN_EXACT_STORE_TRAIN_QPAIRS_EFFECTIVE}
+  regime q scale: ${TRAIN_EXACT_Q_REGIME_BALANCED_LOSS}
+  eq centered:    ${TRAIN_EQUILIBRIUM_CENTERED_CLOSURE}
+  complex norm:   $(if [[ "${TRAIN_COMPLEX_ISOTROPIC_NORMALIZATION}" != "0" ]]; then echo "phase_isotropic"; else echo "componentwise"; fi)
+  translation aug:${TRAIN_EXACT_TRANSLATION_AUGMENTATION}
   tail chain:     ${TRAIN_TAIL_CHAIN}
   tail chain Nv:  ${TRAIN_TAIL_CHAIN_NV}
   chain n range:  $(if [[ "${TRAIN_TAIL_CHAIN_RECURSIVE_LIFT}" != "0" ]]; then echo "${TRAIN_TAIL_CHAIN_N_MIN:-auto(target Nv)}"; else echo "${TRAIN_TAIL_CHAIN_N_MIN:-auto(target Nv+1)}"; fi)..${TRAIN_TAIL_CHAIN_N_MAX:-tail_Nv}

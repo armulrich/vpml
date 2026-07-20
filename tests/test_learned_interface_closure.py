@@ -157,6 +157,42 @@ def _make_closure(
 
 
 class LearnedInterfaceClosureTests(unittest.TestCase):
+    def test_symmetry_cli_options_are_opt_in(self) -> None:
+        parser = train_mod.build_arg_parser()
+        legacy = parser.parse_args([])
+        self.assertFalse(legacy.equilibrium_centered_closure)
+        self.assertFalse(legacy.complex_isotropic_normalization)
+        self.assertFalse(legacy.exact_translation_augmentation)
+        self.assertFalse(legacy.exact_q_regime_balanced_loss)
+
+        enabled = parser.parse_args(
+            [
+                "--equilibrium-centered-closure",
+                "--complex-isotropic-normalization",
+                "--exact-translation-augmentation",
+                "--exact-q-regime-balanced-loss",
+            ]
+        )
+        self.assertTrue(enabled.equilibrium_centered_closure)
+        self.assertTrue(enabled.complex_isotropic_normalization)
+        self.assertTrue(enabled.exact_translation_augmentation)
+        self.assertTrue(enabled.exact_q_regime_balanced_loss)
+
+    def test_balanced_symmetry_wrapper_enables_all_constraints(self) -> None:
+        wrapper = (
+            Path(__file__).resolve().parents[1]
+            / "model/train/run_fh_exact_qloss_rollout_nv64_teacher512_balanced_symmetry.sh"
+        )
+        text = wrapper.read_text(encoding="utf-8")
+        self.assertIn('TRAIN_EXACT_Q_REGIME_BALANCED_LOSS:-1', text)
+        self.assertIn('TRAIN_EQUILIBRIUM_CENTERED_CLOSURE:-1', text)
+        self.assertIn('TRAIN_COMPLEX_ISOTROPIC_NORMALIZATION:-1', text)
+        self.assertIn('TRAIN_EXACT_TRANSLATION_AUGMENTATION:-1', text)
+        self.assertIn('TRAIN_ROLLOUT_HORIZON:-128', text)
+        self.assertIn('TRAIN_BATCH_SIZE:-64', text)
+        self.assertIn('TRAIN_STEPS_PER_EPOCH:-30', text)
+        self.assertIn('run_fh_exact_qloss_rollout_nv64_teacher512_balanced_regimes.sh', text)
+
     def test_jax_runtime_plan_prefers_cpu_on_macos_auto(self) -> None:
         plan = plan_jax_runtime({}, system="Darwin")
         self.assertEqual(plan.requested_backend, "auto")
