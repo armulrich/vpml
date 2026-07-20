@@ -2029,6 +2029,55 @@ def safe_feature_std(values: np.ndarray) -> np.ndarray:
     return np.where(std > 1e-12, std, 1.0)
 
 
+def phase_isotropic_complex_training_stats(
+    stats: Dict[str, np.ndarray],
+    *,
+    Nm: int,
+    context_mode: str,
+) -> Dict[str, np.ndarray]:
+    """Return phase-isotropic normalization for complex closure features and q."""
+    input_mean = np.asarray(stats["input_mean"], dtype=np.float64).copy()
+    input_std = np.asarray(stats["input_std"], dtype=np.float64).copy()
+    target_mean = np.asarray(stats["target_mean"], dtype=np.float64).copy()
+    target_std = np.asarray(stats["target_std"], dtype=np.float64).copy()
+    base_dim = 2 * int(Nm) + 4
+    if str(context_mode) == "none":
+        block_offsets = (0,)
+    elif str(context_mode) == "lag1_delta":
+        block_offsets = (0, base_dim, 2 * base_dim)
+    else:
+        raise ValueError(f"Unsupported context_mode={context_mode!r}")
+
+    for offset in block_offsets:
+        for mode_idx in range(int(Nm)):
+            real_idx = int(offset + mode_idx)
+            imag_idx = int(offset + int(Nm) + mode_idx)
+            second_moment = 0.5 * (
+                input_std[real_idx] ** 2
+                + input_mean[real_idx] ** 2
+                + input_std[imag_idx] ** 2
+                + input_mean[imag_idx] ** 2
+            )
+            shared_std = float(safe_feature_std(np.array([math.sqrt(second_moment)]))[0])
+            input_mean[[real_idx, imag_idx]] = 0.0
+            input_std[[real_idx, imag_idx]] = shared_std
+
+    target_second_moment = 0.5 * float(
+        np.sum(target_std * target_std + target_mean * target_mean)
+    )
+    shared_target_std = float(
+        safe_feature_std(np.array([math.sqrt(target_second_moment)]))[0]
+    )
+    target_mean[:] = 0.0
+    target_std[:] = shared_target_std
+    return {
+        "input_mean": input_mean,
+        "input_std": input_std,
+        "target_mean": target_mean,
+        "target_std": target_std,
+    }
+
+
 def exact_rollout_precision_dtypes(precision: str) -> Tuple[object, object]:
     mode = str(precision)
     if mode == EXACT_ROLLOUT_PRECISION_FLOAT64:
@@ -10152,10 +10201,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 nv_scale=nv_scale,
                 context_mode=args.context_mode,
             )
+            if complex_normalization_mode == "phase_isotropic":
+                stats = phase_isotropic_complex_training_stats(
+                    stats,
+                    Nm=args.Nm,
+                    context_mode=args.context_mode,
+                )
+                prepared = prepare_validation_dataset_from_stats(
+                    dataset_base,
+                    Nm=args.Nm,
+                    k_scale=k_scale,
+                    nv_scale=nv_scale,
+                    context_mode=args.context_mode,
+                    stats=stats,
+                )
         else:
             if precomputed_stats is None:
                 raise RuntimeError("exact q-rollout expected precomputed stats for index-only training")
             stats = precomputed_stats
+            if complex_normalization_mode == "phase_isotropic":
+                stats = phase_isotropic_complex_training_stats(
+                    stats,
+                    Nm=args.Nm,
+                    context_mode=args.context_mode,
+                )
             prepared = prepare_validation_dataset_from_stats(
                 dataset_base,
                 Nm=args.Nm,
