@@ -1995,6 +1995,78 @@ def build_exact_q_rollout_qpair_dataset(
     return dataset, computed_stats
 
 
+def exact_q_rollout_regime_loss_stds(
+    exact_dataset: Dict[str, Dict[str, np.ndarray]],
+    qpair_dataset: Dict[str, Dict[str, np.ndarray]],
+    *,
+    max_projection_order: int,
+    target_nvs: Sequence[int],
+    k_arr: np.ndarray,
+    rollout_horizon: int,
+    chunk_size: int = 64,
+) -> Dict[str, float]:
+    """Compute fixed phase-isotropic q-loss scales for each training regime."""
+    coeff_key = exact_q_rollout_coeff_key(max_projection_order)
+    k_values = np.asarray(k_arr, dtype=np.float64)
+    if int(k_values.shape[0]) <= 1:
+        raise ValueError("Exact q-rollout regime scaling requires positive Fourier modes")
+    horizon = int(rollout_horizon)
+    if horizon <= 0:
+        raise ValueError("Exact q-rollout regime scaling requires rollout_horizon > 0")
+    chunk_n = max(int(chunk_size), 1)
+    offsets = np.arange(horizon, dtype=np.int32)
+    positive_k_sq = k_values[1:] ** 2
+    scales: Dict[str, float] = {}
+
+    for regime, arrays in qpair_dataset.items():
+        if regime not in exact_dataset:
+            continue
+        histories = np.asarray(exact_dataset[regime][coeff_key])
+        anchor_cases = np.asarray(arrays["train_anchor_case_indices"], dtype=np.int32)
+        anchor_times = np.asarray(arrays["train_anchor_time_indices"], dtype=np.int32)
+        anchor_targets = np.asarray(arrays["train_anchor_target_nvs"], dtype=np.int32)
+        sum_abs_sq = 0.0
+        value_count = 0
+
+        for target_nv in target_nvs:
+            selected = np.flatnonzero(anchor_targets == int(target_nv)).astype(np.int32)
+            for start in range(0, int(selected.shape[0]), chunk_n):
+                chunk = selected[start : start + chunk_n]
+                if int(chunk.shape[0]) == 0:
+                    continue
+                case_idx = anchor_cases[chunk]
+                time_idx = anchor_times[chunk]
+                window_times = time_idx[:, None] + offsets[None, :]
+                if int(np.max(window_times)) >= int(histories.shape[1]):
+                    raise ValueError(
+                        f"Exact q-rollout regime scale window exceeds history for {regime}"
+                    )
+                coeff = histories[
+                    case_idx[:, None],
+                    window_times,
+                    int(target_nv),
+                    1:,
+                ]
+                q_abs_sq = (
+                    float(target_nv)
+                    * positive_k_sq[None, None, :]
+                    * np.abs(coeff) ** 2
+                )
+                sum_abs_sq += float(np.sum(q_abs_sq, dtype=np.float64))
+                value_count += int(q_abs_sq.size)
+
+        if value_count <= 0:
+            raise ValueError(f"Exact q-rollout regime '{regime}' has no q targets for scaling")
+        component_variance = 0.5 * sum_abs_sq / float(value_count)
+        component_std = math.sqrt(max(component_variance, 0.0))
+        if not math.isfinite(component_std) or component_std <= 1e-12:
+            raise ValueError(
+                f"Exact q-rollout regime '{regime}' has invalid q-loss scale {component_std}"
+            )
+        scales[str(regime)] = float(component_std)
+    return scales
+
+
 def build_model_inputs(
     inputs_base: np.ndarray,
     *,
@@ -5498,6 +5570,7 @@ def exact_q_rollout_loss_for_anchor_batch(
     rollout_horizon: int,
     explicit_n_hat_fn,
     rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    loss_target_std: Optional[Array] = None,
     chain_input_windows: Optional[Array] = None,
     chain_global_features: Optional[Array] = None,
     chain_ref_q_windows: Optional[Array] = None,
@@ -5640,7 +5713,12 @@ def exact_q_rollout_loss_for_anchor_batch(
         pred_components = jnp.stack([jnp.real(pred_selected), jnp.imag(pred_selected)], axis=-1)
         ref_components = jnp.stack([jnp.real(ref_q_windows), jnp.imag(ref_q_windows)], axis=-1)
         std_prefix = (None, None)
-    std = jnp.maximum(jnp.asarray(learned_rollout.target_std, dtype=real_dtype), 1e-12)
+    std_source = (
+        learned_rollout.target_std
+        if loss_target_std is None
+        else loss_target_std
+    )
+    std = jnp.maximum(jnp.asarray(std_source, dtype=real_dtype), 1e-12)
     q_loss = jnp.mean(((pred_components - ref_components) / std[std_prefix + (slice(None),)]) ** 2)
     total = q_loss + jnp.asarray(float(lambda_tail_chain), dtype=real_dtype) * chain_loss
     if bool(return_components):
@@ -7783,6 +7861,19 @@ def make_exact_q_rollout_batch_loss(
     weight_arr = jnp.asarray(weights, dtype=jnp.float64)
     target_nvs = tuple(int(v) for v in Nv_targets)
     real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
+    q_loss_stds = {
+        regime: jnp.full(
+            (2,),
+            float(regime_q_loss_stds[regime]),
+            dtype=real_dtype,
+        )
+        for regime in active_regimes
+        if regime_q_loss_stds is not None
+    }
+    if regime_q_loss_stds is not None:
+        missing = tuple(regime for regime in active_regimes if regime not in q_loss_stds)
+        if missing:
+            raise ValueError(f"Missing exact q-rollout regime loss scales for {missing!r}")
     linear_integrators = {
         int(target_nv): FourierHermiteIMEX(
             Nx=int(teacher_Nx),
@@ -7888,6 +7979,7 @@ def make_exact_q_rollout_batch_loss(
                         rollout_horizon=rollout_horizon,
                         explicit_n_hat_fn=linear_explicit,
                         rollout_precision=str(rollout_precision),
+                        loss_target_std=q_loss_stds.get(regime),
                         chain_input_windows=batch.get("chain_input_windows"),
                         chain_global_features=batch.get("chain_global_features"),
                         chain_ref_q_windows=batch.get("chain_ref_q_windows"),
@@ -7907,6 +7999,7 @@ def make_exact_q_rollout_batch_loss(
                         rollout_horizon=rollout_horizon,
                         explicit_n_hat_fn=nonlinear_explicit,
                         rollout_precision=str(rollout_precision),
+                        loss_target_std=q_loss_stds.get(regime),
                         chain_input_windows=batch.get("chain_input_windows"),
                         chain_global_features=batch.get("chain_global_features"),
                         chain_ref_q_windows=batch.get("chain_ref_q_windows"),
@@ -9946,6 +10039,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     }
     val_metrics: Dict[str, np.ndarray] = {}
     online_component_history: Optional[Dict[str, np.ndarray]] = None
+    exact_q_regime_loss_stds: Dict[str, float] = {}
 
     if training_mode == OFFLINE_TRAINING_MODE:
         dataset_base = build_mixed_landau_dataset(
@@ -10309,6 +10403,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             objective_note = "direct f target" if exact_f_rollout else feature_note
             print(f"[data] {regime}: {count} {objective_note}; {q_windows} exact rollout anchors")
+        if exact_q_regime_balanced_loss:
+            exact_q_regime_loss_stds = exact_q_rollout_regime_loss_stds(
+                exact_dataset,
+                dataset_base,
+                max_projection_order=max_projection_order,
+                target_nvs=Nv_targets,
+                k_arr=k_arr,
+                rollout_horizon=int(args.rollout_horizon),
+            )
+            scale_note = " ".join(
+                f"{regime}={exact_q_regime_loss_stds[regime]:.6e}"
+                for regime in regimes
+                if regime in exact_q_regime_loss_stds
+            )
+            print(f"[data] exact q-rollout regime-balanced loss scales: {scale_note}")
+        if equilibrium_centered or complex_normalization_mode == "phase_isotropic" or translation_augmented:
+            print(
+                "[data] exact q-rollout symmetry constraints: "
+                f"equilibrium_centered={int(equilibrium_centered)} "
+                f"complex_normalization={complex_normalization_mode} "
+                f"translation_augmentation={int(translation_augmented)}"
+            )
 
         if tail_chain_enabled:
             display_chain_min = (
@@ -11169,6 +11285,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 else False
             ],
             dtype=np.bool_,
+        ),
+        "exact_q_regime_balanced_loss": np.array(
+            [
+                exact_q_regime_balanced_loss
+                if training_mode == EXACT_Q_ROLLOUT_TRAINING_MODE
+                else False
+            ],
+            dtype=np.bool_,
+        ),
+        "exact_q_regime_loss_regimes": np.asarray(
+            tuple(regime for regime in regimes if regime in exact_q_regime_loss_stds),
+            dtype=np.str_,
+        ),
+        "exact_q_regime_loss_stds": np.asarray(
+            tuple(
+                exact_q_regime_loss_stds[regime]
+                for regime in regimes
+                if regime in exact_q_regime_loss_stds
+            ),
+            dtype=np.float64,
         ),
         "lambda_q": np.array([used_lambda_q], dtype=np.float64),
         "lambda_E": np.array([used_lambda_E], dtype=np.float64),

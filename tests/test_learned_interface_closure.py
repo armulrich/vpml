@@ -472,6 +472,212 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         expected = np.array([2.0 + 0.5 * 4.0 + 0.25, -1.0 - 3.0 - 0.75], dtype=np.float64)
         np.testing.assert_allclose(pred, expected, rtol=1e-12, atol=1e-12)
 
+    def test_equilibrium_centering_makes_zero_state_flux_exactly_zero(self) -> None:
+        params = _zero_interface_params(6)
+        params["W_lin"] = params["W_lin"].at[0, 0].set(2.0)
+        params["b_lin"] = jnp.array([3.0, -4.0], dtype=jnp.float64)
+        params["b_out"] = jnp.array([-1.5, 2.5], dtype=jnp.float64)
+        closure = _make_closure(
+            params=params,
+            target_bias=(7.0, -9.0),
+            equilibrium_centered=True,
+            complex_normalization_mode="phase_isotropic",
+        )
+        k_arr = jnp.array([0.0, 0.5, 1.0], dtype=jnp.float64)
+        zero_state = jnp.zeros((4, 3), dtype=jnp.complex128)
+        zero_q = np.asarray(learned_interface_q_hat(zero_state, k_arr, 4, closure))
+        np.testing.assert_array_equal(zero_q, np.zeros_like(zero_q))
+
+        nonzero_state = zero_state.at[3, 1].set(0.25 + 0.0j)
+        nonzero_q = np.asarray(learned_interface_q_hat(nonzero_state, k_arr, 4, closure))
+        self.assertGreater(abs(nonzero_q[1]), 0.0)
+
+    def test_phase_isotropic_stats_pair_phase_rotated_complex_components(self) -> None:
+        rng = np.random.default_rng(19)
+        phases = rng.uniform(-math.pi, math.pi, size=(64, 2))
+        amplitudes = np.column_stack(
+            [rng.uniform(0.5, 1.5, size=64), rng.uniform(1.5, 2.5, size=64)]
+        )
+        coeff = amplitudes * np.exp(1j * phases)
+        invariant_features = rng.normal(size=(64, 4))
+        inputs = np.concatenate([coeff.real, coeff.imag, invariant_features], axis=1)
+        q = rng.uniform(0.25, 1.25, size=64) * np.exp(
+            1j * rng.uniform(-math.pi, math.pi, size=64)
+        )
+        targets = np.column_stack([q.real, q.imag])
+        stats = {
+            "input_mean": np.mean(inputs, axis=0),
+            "input_std": np.std(inputs, axis=0),
+            "target_mean": np.mean(targets, axis=0),
+            "target_std": np.std(targets, axis=0),
+        }
+        result = train_mod.phase_isotropic_complex_training_stats(
+            stats,
+            Nm=2,
+            context_mode="none",
+        )
+        expected = np.sqrt(0.5 * np.mean(np.abs(coeff) ** 2, axis=0))
+        expected_q = math.sqrt(0.5 * float(np.mean(np.abs(q) ** 2)))
+        np.testing.assert_allclose(result["input_mean"][:4], 0.0)
+        np.testing.assert_allclose(result["input_std"][:4], [expected[0], expected[1], expected[0], expected[1]])
+        np.testing.assert_allclose(result["input_mean"][4:], stats["input_mean"][4:])
+        np.testing.assert_allclose(result["input_std"][4:], stats["input_std"][4:])
+        np.testing.assert_allclose(result["target_mean"], 0.0)
+        np.testing.assert_allclose(result["target_std"], expected_q)
+
+    def test_exact_q_regime_loss_std_uses_full_rollout_and_ladder(self) -> None:
+        histories = np.zeros((1, 4, 3, 3), dtype=np.complex128)
+        histories[0, :2, 1, 1:] = np.array([[1.0, 2.0], [3.0, 4.0]])
+        histories[0, :2, 2, 1:] = np.array([[2.0, 1.0], [4.0, 3.0]])
+        exact_dataset = {
+            train_mod.REGIME_LINEAR: {
+                train_mod.exact_q_rollout_coeff_key(2): histories,
+            }
+        }
+        qpair_dataset = {
+            train_mod.REGIME_LINEAR: {
+                "train_anchor_case_indices": np.array([0, 0], dtype=np.int32),
+                "train_anchor_time_indices": np.array([0, 0], dtype=np.int32),
+                "train_anchor_target_nvs": np.array([1, 2], dtype=np.int32),
+            }
+        }
+        k_arr = np.array([0.0, 0.5, 1.0], dtype=np.float64)
+        scales = train_mod.exact_q_rollout_regime_loss_stds(
+            exact_dataset,
+            qpair_dataset,
+            max_projection_order=2,
+            target_nvs=(1, 2),
+            k_arr=k_arr,
+            rollout_horizon=2,
+            chunk_size=1,
+        )
+        q_abs_sq = []
+        for target_nv in (1, 2):
+            coeff = histories[0, :2, target_nv, 1:]
+            q_abs_sq.extend(
+                (
+                    float(target_nv)
+                    * k_arr[1:][None, :] ** 2
+                    * np.abs(coeff) ** 2
+                ).reshape(-1)
+            )
+        expected = math.sqrt(0.5 * float(np.mean(q_abs_sq)))
+        self.assertAlmostEqual(scales[train_mod.REGIME_LINEAR], expected)
+
+    def test_exact_q_loss_scale_override_changes_only_error_denominator(self) -> None:
+        closure = _make_closure(
+            training_mode=train_mod.EXACT_Q_ROLLOUT_TRAINING_MODE,
+            train_objective=train_mod.EXACT_Q_ROLLOUT_OBJECTIVE,
+            rollout_horizon=1,
+        )
+        integ = FourierHermiteIMEX(
+            Nx=4,
+            Nv=4,
+            Lx=4.0 * math.pi,
+            dt=0.05,
+            vth=1.0,
+            dealias_23=False,
+            closure=None,
+        )
+        anchors = jnp.zeros((1, 3, 4, 3), dtype=jnp.complex128)
+        ref_q = jnp.array(
+            [[[0.0 + 0.0j, 1.0 + 2.0j, 3.0 + 4.0j]]],
+            dtype=jnp.complex128,
+        )
+        common = {
+            "learned": closure,
+            "forward_integ": integ,
+            "rollout_horizon": 1,
+            "explicit_n_hat_fn": lambda state, *, integ: jnp.zeros_like(state),
+            "rollout_precision": train_mod.EXACT_ROLLOUT_PRECISION_FLOAT64,
+        }
+        default_loss = train_mod.exact_q_rollout_loss_for_anchor_batch(
+            anchors,
+            ref_q,
+            jnp.zeros((1,), dtype=jnp.int32),
+            **common,
+        )
+        scaled_loss = train_mod.exact_q_rollout_loss_for_anchor_batch(
+            anchors,
+            ref_q,
+            jnp.zeros((1,), dtype=jnp.int32),
+            loss_target_std=jnp.full((2,), 2.0, dtype=jnp.float64),
+            **common,
+        )
+        self.assertAlmostEqual(float(scaled_loss), float(default_loss) / 4.0)
+
+    def test_exact_q_translation_uses_one_phase_for_full_anchor(self) -> None:
+        rng = np.random.default_rng(7)
+        stencils = rng.normal(size=(2, 3, 4, 5)) + 1j * rng.normal(size=(2, 3, 4, 5))
+        q_windows = rng.normal(size=(2, 6, 5)) + 1j * rng.normal(size=(2, 6, 5))
+        k_arr = np.arange(5, dtype=np.float64) * 0.5
+        shifts = np.array([0.3, 1.1], dtype=np.float64)
+        translated_stencils, translated_q = train_mod.translate_exact_q_rollout_anchor_batch(
+            stencils,
+            q_windows,
+            k_arr=k_arr,
+            shifts=shifts,
+        )
+        phases = np.exp(-1j * shifts[:, None] * k_arr[None, :])
+        np.testing.assert_allclose(translated_stencils, stencils * phases[:, None, None, :])
+        np.testing.assert_allclose(translated_q, q_windows * phases[:, None, :])
+
+    def test_exact_q_translation_matches_periodic_grid_shift(self) -> None:
+        nx = 16
+        length = 4.0 * math.pi
+        x = np.arange(nx, dtype=np.float64) * length / float(nx)
+        values = np.cos(0.5 * x) + 0.3 * np.sin(1.5 * x)
+        shift_cells = 3
+        shift = shift_cells * length / float(nx)
+        coeff = np.fft.rfft(values)
+        stencils = coeff[None, None, None, :]
+        q_windows = coeff[None, None, :]
+        k_arr = 2.0 * math.pi * np.fft.rfftfreq(nx, d=length / float(nx))
+        translated, _ = train_mod.translate_exact_q_rollout_anchor_batch(
+            stencils,
+            q_windows,
+            k_arr=k_arr,
+            shifts=np.array([shift]),
+        )
+        expected = np.fft.rfft(np.roll(values, shift_cells))
+        np.testing.assert_allclose(translated[0, 0, 0], expected, rtol=1e-12, atol=1e-12)
+
+    def test_seeded_exact_q_translation_sampling_is_reproducible(self) -> None:
+        histories = np.arange(1 * 6 * 3 * 3, dtype=np.float64).reshape(1, 6, 3, 3)
+        histories = histories.astype(np.complex128) * (1.0 + 0.25j)
+        sampling_state = {
+            train_mod.REGIME_LINEAR: {
+                "histories": histories,
+                "train_case_indices": np.array([0], dtype=np.int32),
+                "train_time_indices": np.array([2], dtype=np.int32),
+                "train_k_indices": np.array([1], dtype=np.int32),
+                "target_pools": {2: np.array([0], dtype=np.int32)},
+                "train_anchor_case_indices": np.array([0], dtype=np.int32),
+                "train_anchor_time_indices": np.array([2], dtype=np.int32),
+                "anchor_target_pools": {2: np.array([0], dtype=np.int32)},
+            }
+        }
+
+        def sample(seed: int):
+            return train_mod.sample_exact_q_rollout_regime_batch(
+                sampling_state,
+                regime=train_mod.REGIME_LINEAR,
+                target_nv=2,
+                rollout_horizon=2,
+                batch_size=1,
+                k_arr=np.array([0.0, 0.5, 1.0]),
+                rng=np.random.default_rng(seed),
+                all_k_loss=True,
+                selected_indices=np.array([0], dtype=np.int32),
+                translation_augmentation=True,
+                domain_length=4.0 * math.pi,
+            )
+
+        first = sample(11)
+        second = sample(11)
+        np.testing.assert_array_equal(first["anchor_stencils"], second["anchor_stencils"])
+        np.testing.assert_array_equal(first["ref_q_windows"], second["ref_q_windows"])
+
     def test_extract_interface_pairs_matches_exact_q_target(self) -> None:
         a_hat_hist = np.zeros((2, 6, 3), dtype=np.complex128)
         a_hat_hist[:, 3, 1] = 1.0 + 2.0j
