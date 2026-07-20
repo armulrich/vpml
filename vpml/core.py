@@ -286,6 +286,9 @@ class LearnedInterfaceClosure:
     target_std: Array
     hidden_width: int = 128
     res_blocks: int = 2
+    equilibrium_centered: bool = False
+    complex_normalization_mode: str = "componentwise"
+    translation_augmented: bool = False
     Nv_targets: Optional[Tuple[int, ...]] = None
     train_regimes: Optional[Tuple[str, ...]] = None
     teacher_backend: Optional[str] = None
@@ -335,6 +338,10 @@ class LearnedInterfaceClosure:
             raise ValueError("hidden_width must be positive")
         if int(self.res_blocks) < 0:
             raise ValueError("res_blocks must be nonnegative")
+        if str(self.complex_normalization_mode) not in {"componentwise", "phase_isotropic"}:
+            raise ValueError(
+                "complex_normalization_mode must be 'componentwise' or 'phase_isotropic'"
+            )
         if float(self.k_scale) <= 0.0:
             raise ValueError("k_scale must be positive")
         if float(self.nv_scale) <= 0.0:
@@ -425,7 +432,7 @@ class LearnedInterfaceClosure:
 
     def predict_standardized_components(self, raw_features: Array) -> Array:
         feats = self.standardized_inputs(raw_features)
-        return jax.vmap(
+        pred = jax.vmap(
             lambda z: interface_closure_apply(
                 self.params,
                 z,
@@ -433,11 +440,45 @@ class LearnedInterfaceClosure:
                 res_blocks=int(self.res_blocks),
             )
         )(feats)
+        if not bool(self.equilibrium_centered):
+            return pred
+
+        zero_raw = jnp.zeros_like(jnp.asarray(raw_features))
+        base_dim = int(self.raw_base_dim)
+        k_col = 2 * int(self.Nm)
+        nv_col = k_col + 1
+        if self.context_mode == "none":
+            zero_raw = zero_raw.at[:, k_col : nv_col + 1].set(
+                jnp.asarray(raw_features)[:, k_col : nv_col + 1]
+            )
+        elif self.context_mode == "lag1_delta":
+            for offset in (0, base_dim):
+                zero_raw = zero_raw.at[:, offset + k_col : offset + nv_col + 1].set(
+                    jnp.asarray(raw_features)[:, offset + k_col : offset + nv_col + 1]
+                )
+        else:
+            raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
+        zero_feats = self.standardized_inputs(zero_raw)
+        zero_pred = jax.vmap(
+            lambda z: interface_closure_apply(
+                self.params,
+                z,
+                hidden_width=int(self.hidden_width),
+                res_blocks=int(self.res_blocks),
+            )
+        )(zero_feats)
+        return pred - zero_pred
 
     def predict_q_components(self, raw_features: Array) -> Array:
-        return self.unstandardized_targets(
-            self.predict_standardized_components(raw_features)
-        )
+        pred = self.predict_standardized_components(raw_features)
+        if bool(self.equilibrium_centered):
+            real_dtype = jnp.asarray(self.target_std).dtype
+            std = jnp.maximum(
+                jnp.asarray(self.target_std, dtype=real_dtype),
+                jnp.asarray(1e-12, dtype=real_dtype),
+            )
+            return jnp.asarray(pred, dtype=real_dtype) * std
+        return self.unstandardized_targets(pred)
 
 
 def _xavier_normal(key: Array, shape: Tuple[int, int]) -> Array:
@@ -566,6 +607,9 @@ def save_learned_interface_closure_npz(
         "target_std": np.asarray(learned.target_std, dtype=np.float64),
         "hidden_width": np.array([int(learned.hidden_width)], dtype=np.int32),
         "res_blocks": np.array([int(learned.res_blocks)], dtype=np.int32),
+        "equilibrium_centered": np.array([int(bool(learned.equilibrium_centered))], dtype=np.int32),
+        "complex_normalization_mode": np.array([str(learned.complex_normalization_mode)], dtype=np.str_),
+        "translation_augmented": np.array([int(bool(learned.translation_augmented))], dtype=np.int32),
         "Nv_targets": np.array(
             [] if learned.Nv_targets is None else learned.Nv_targets,
             dtype=np.int32,
@@ -683,6 +727,21 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         target_std = jnp.asarray(data["target_std"], dtype=jnp.float64)
         hidden_width = int(np.asarray(data["hidden_width"]).reshape(-1)[0])
         res_blocks = int(np.asarray(data["res_blocks"]).reshape(-1)[0])
+        equilibrium_centered = (
+            bool(np.asarray(data["equilibrium_centered"]).reshape(-1)[0])
+            if "equilibrium_centered" in data.files and data["equilibrium_centered"].size
+            else False
+        )
+        complex_normalization_mode = (
+            str(np.asarray(data["complex_normalization_mode"], dtype=np.str_).reshape(-1)[0])
+            if "complex_normalization_mode" in data.files and data["complex_normalization_mode"].size
+            else "componentwise"
+        )
+        translation_augmented = (
+            bool(np.asarray(data["translation_augmented"]).reshape(-1)[0])
+            if "translation_augmented" in data.files and data["translation_augmented"].size
+            else False
+        )
 
         Nv_targets = None
         if "Nv_targets" in data.files and data["Nv_targets"].size:
@@ -862,6 +921,9 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         target_std=target_std,
         hidden_width=hidden_width,
         res_blocks=res_blocks,
+        equilibrium_centered=equilibrium_centered,
+        complex_normalization_mode=complex_normalization_mode,
+        translation_augmented=translation_augmented,
         Nv_targets=Nv_targets,
         train_regimes=train_regimes,
         teacher_backend=teacher_backend,

@@ -3088,6 +3088,9 @@ def build_learned_interface_closure(
     stats: Dict[str, np.ndarray],
     hidden_width: int,
     res_blocks: int,
+    equilibrium_centered: bool = False,
+    complex_normalization_mode: str = "componentwise",
+    translation_augmented: bool = False,
     Nv_targets: Sequence[int],
     train_regimes: Sequence[str],
     teacher_backend: str,
@@ -3138,6 +3141,9 @@ def build_learned_interface_closure(
         target_std=jnp.asarray(stats["target_std"], dtype=jnp.float64),
         hidden_width=int(hidden_width),
         res_blocks=int(res_blocks),
+        equilibrium_centered=bool(equilibrium_centered),
+        complex_normalization_mode=str(complex_normalization_mode),
+        translation_augmented=bool(translation_augmented),
         Nv_targets=tuple(int(v) for v in Nv_targets),
         train_regimes=tuple(str(v) for v in train_regimes),
         teacher_backend=str(normalize_teacher_backend_name(teacher_backend)),
@@ -7660,6 +7666,10 @@ def make_exact_q_rollout_batch_loss(
     poisson_sign: float,
     rollout_dealias_23: bool,
     rollout_precision: str = EXACT_ROLLOUT_PRECISION_FLOAT64,
+    regime_q_loss_stds: Optional[Dict[str, float]] = None,
+    equilibrium_centered: bool = False,
+    complex_normalization_mode: str = "componentwise",
+    translation_augmented: bool = False,
     tail_chain_enabled: bool = False,
     tail_chain_nv: int = 0,
     tail_chain_n_min: Optional[int] = None,
@@ -7724,6 +7734,9 @@ def make_exact_q_rollout_batch_loss(
                 stats=stats,
                 hidden_width=hidden_width,
                 res_blocks=res_blocks,
+                equilibrium_centered=bool(equilibrium_centered),
+                complex_normalization_mode=str(complex_normalization_mode),
+                translation_augmented=bool(translation_augmented),
                 Nv_targets=Nv_targets,
                 train_regimes=train_regimes,
                 teacher_backend=teacher_backend,
@@ -9375,6 +9388,8 @@ def _load_init_checkpoint_for_interface_closure(
     Nv_targets: Sequence[int],
     context_mode: str,
     allow_target_mismatch: bool = False,
+    equilibrium_centered: Optional[bool] = None,
+    complex_normalization_mode: Optional[str] = None,
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray], float, float]:
     learned = load_learned_interface_closure_npz(init_checkpoint)
     expected_targets = tuple(int(v) for v in Nv_targets)
@@ -9396,6 +9411,20 @@ def _load_init_checkpoint_for_interface_closure(
     if str(learned.context_mode) != str(context_mode):
         raise ValueError(
             f"--init-checkpoint context_mode={learned.context_mode!r} does not match requested context_mode={context_mode!r}"
+        )
+    if (
+        equilibrium_centered is not None
+        and bool(learned.equilibrium_centered) != bool(equilibrium_centered)
+    ):
+        raise ValueError(
+            "--init-checkpoint equilibrium_centered metadata does not match the requested closure behavior"
+        )
+    if (
+        complex_normalization_mode is not None
+        and str(learned.complex_normalization_mode) != str(complex_normalization_mode)
+    ):
+        raise ValueError(
+            "--init-checkpoint complex_normalization_mode metadata does not match the requested normalization"
         )
     params = {
         key: jnp.asarray(value, dtype=jnp.float64)
@@ -9470,6 +9499,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exact-rollout-precision", type=str, default=EXACT_ROLLOUT_PRECISION_FLOAT64, choices=ALL_EXACT_ROLLOUT_PRECISIONS)
     parser.add_argument("--exact-target-sampling", type=str, default=EXACT_TARGET_SAMPLING_CYCLE, choices=ALL_EXACT_TARGET_SAMPLING_MODES)
     parser.add_argument("--exact-store-train-qpairs", action="store_true")
+    parser.add_argument("--exact-q-regime-balanced-loss", action="store_true")
+    parser.add_argument("--equilibrium-centered-closure", action="store_true")
+    parser.add_argument("--complex-isotropic-normalization", action="store_true")
+    parser.add_argument("--exact-translation-augmentation", action="store_true")
     parser.add_argument("--tail-chain", "--tail-decoder", dest="tail_chain", action="store_true")
     parser.add_argument("--tail-chain-Nv", "--tail-decoder-Nv", dest="tail_chain_Nv", type=int, default=512)
     parser.add_argument("--tail-chain-n-min", "--tail-decoder-n-min", dest="tail_chain_n_min", type=int, default=None)
@@ -9549,6 +9582,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     teacher_backend = normalize_teacher_backend_name(args.teacher_backend)
     online_loss_backend = str(args.online_loss_backend)
+    equilibrium_centered = bool(args.equilibrium_centered_closure)
+    complex_normalization_mode = (
+        "phase_isotropic" if bool(args.complex_isotropic_normalization) else "componentwise"
+    )
+    translation_augmented = bool(args.exact_translation_augmentation)
+    exact_q_regime_balanced_loss = bool(args.exact_q_regime_balanced_loss)
     teacher_proj_Nv: Optional[int] = None
     online_reference_cache = args.dataset_cache
     tail_chain_enabled = bool(args.tail_chain)
@@ -9583,6 +9622,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if args.train_objective == EXACT_F_ROLLOUT_OBJECTIVE:
             if bool(args.tail_chain) or bool(args.tail_history_lift):
                 raise ValueError("exact f-rollout is a pure closure objective; tail lifting is not supported")
+            if (
+                equilibrium_centered
+                or bool(args.complex_isotropic_normalization)
+                or translation_augmented
+                or exact_q_regime_balanced_loss
+            ):
+                raise ValueError(
+                    "symmetry and regime-balanced loss options currently support exact q-rollout only"
+                )
+        if translation_augmented and (bool(args.tail_chain) or bool(args.tail_history_lift)):
+            raise ValueError(
+                "--exact-translation-augmentation is not supported with tail-chain or history-lift training"
+            )
         if int(args.rollout_horizon) <= 0:
             raise ValueError("exact_q_rollout requires --rollout-horizon > 0")
         if int(args.rollout_anchor_samples) != 0:
@@ -9647,6 +9699,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         tail_chain_only = bool(tail_chain_enabled and args.init_checkpoint is not None and not bool(args.tail_chain_recursive_lift))
         teacher_proj_Nv = max(Nv_targets) + 1
     elif training_mode == ONLINE_TRAINING_MODE:
+        if (
+            equilibrium_centered
+            or bool(args.complex_isotropic_normalization)
+            or translation_augmented
+            or exact_q_regime_balanced_loss
+        ):
+            raise ValueError(
+                "symmetry and regime-balanced loss options currently require exact_q_rollout"
+            )
         if args.init_checkpoint is not None and args.train_objective != "trajectory":
             raise ValueError("--init-checkpoint is only supported for online_rollout trajectory training")
         if args.init_checkpoint is not None and bool(args.build_dataset_only):
@@ -9736,6 +9797,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ):
             raise ValueError("online_rollout requires lambda_E > 0 or lambda_dist > 0")
     else:
+        if (
+            equilibrium_centered
+            or bool(args.complex_isotropic_normalization)
+            or translation_augmented
+            or exact_q_regime_balanced_loss
+        ):
+            raise ValueError(
+                "symmetry and regime-balanced loss options currently require exact_q_rollout"
+            )
         if args.init_checkpoint is not None:
             raise ValueError("--init-checkpoint is only supported for online_rollout trajectory training")
         if args.train_objective != "q_only":
@@ -10024,6 +10094,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 Nv_targets=Nv_targets,
                 context_mode=args.context_mode,
                 allow_target_mismatch=bool(args.tail_chain_recursive_lift) or tail_history_lift_enabled,
+                equilibrium_centered=equilibrium_centered,
+                complex_normalization_mode=complex_normalization_mode,
             )
             if args.k_scale is not None and not math.isclose(float(args.k_scale), float(init_k_scale), rel_tol=1e-12, abs_tol=1e-12):
                 raise ValueError("--k-scale must match --init-checkpoint k_scale when warm-starting exact q-rollout")
@@ -10281,6 +10353,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 poisson_sign=args.teacher_poisson_sign,
                 rollout_dealias_23=bool(args.rollout_dealias_23),
                 rollout_precision=args.exact_rollout_precision,
+                regime_q_loss_stds=(
+                    exact_q_regime_loss_stds
+                    if exact_q_regime_balanced_loss
+                    else None
+                ),
+                equilibrium_centered=equilibrium_centered,
+                complex_normalization_mode=complex_normalization_mode,
+                translation_augmented=translation_augmented,
                 tail_chain_enabled=tail_chain_enabled,
                 tail_chain_nv=int(args.tail_chain_Nv),
                 tail_chain_n_min=tail_chain_train_n_min,
@@ -10353,6 +10433,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             stats=stats,
             hidden_width=args.hidden_width,
             res_blocks=args.res_blocks,
+            equilibrium_centered=equilibrium_centered,
+            complex_normalization_mode=complex_normalization_mode,
+            translation_augmented=translation_augmented,
             Nv_targets=Nv_targets,
             train_regimes=regimes,
             teacher_backend=teacher_backend,

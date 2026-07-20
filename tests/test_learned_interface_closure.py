@@ -25,6 +25,7 @@ from vpml.core import (
     FourierHermiteIMEX,
     LearnedInterfaceClosure,
     learned_boundary_flux_hat,
+    learned_interface_q_hat,
     load_learned_interface_closure_npz,
     save_learned_interface_closure_npz,
 )
@@ -101,6 +102,9 @@ def _make_closure(
     loss_backend: str | None = None,
     online_v_probes: int = 0,
     stability_loss_definition: str | None = None,
+    equilibrium_centered: bool = False,
+    complex_normalization_mode: str = "componentwise",
+    translation_augmented: bool = False,
 ) -> LearnedInterfaceClosure:
     raw_base_dim = 2 * Nm + (4 if include_global_indicators else 2)
     input_dim = raw_base_dim if context_mode == "none" else 3 * raw_base_dim
@@ -118,6 +122,9 @@ def _make_closure(
         target_std=jnp.ones((2,), dtype=jnp.float64),
         hidden_width=hidden_width,
         res_blocks=res_blocks,
+        equilibrium_centered=equilibrium_centered,
+        complex_normalization_mode=complex_normalization_mode,
+        translation_augmented=translation_augmented,
         Nv_targets=(4,),
         train_regimes=("linear_landau",),
         teacher_backend="grid_cubic_spline",
@@ -168,7 +175,12 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertIsNone(plan.jax_platforms)
 
     def test_checkpoint_round_trip(self) -> None:
-        closure = _make_closure(target_bias=(1.5, -0.25))
+        closure = _make_closure(
+            target_bias=(1.5, -0.25),
+            equilibrium_centered=True,
+            complex_normalization_mode="phase_isotropic",
+            translation_augmented=True,
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "interface_closure.npz"
             save_learned_interface_closure_npz(path, closure)
@@ -180,9 +192,70 @@ class LearnedInterfaceClosureTests(unittest.TestCase):
         self.assertEqual(loaded.teacher_proj_Nv, 5)
         self.assertTrue(loaded.include_global_indicators)
         self.assertEqual(loaded.n_low, 2)
+        self.assertTrue(loaded.equilibrium_centered)
+        self.assertEqual(loaded.complex_normalization_mode, "phase_isotropic")
+        self.assertTrue(loaded.translation_augmented)
         np.testing.assert_allclose(np.asarray(loaded.input_mean), np.asarray(closure.input_mean))
         np.testing.assert_allclose(np.asarray(loaded.target_mean), np.asarray(closure.target_mean))
         np.testing.assert_allclose(np.asarray(loaded.params["W_lin"]), np.asarray(closure.params["W_lin"]))
+
+    def test_checkpoint_loader_defaults_new_symmetry_metadata_for_legacy_npz(self) -> None:
+        params = _zero_interface_params(6)
+        params["W_lin"] = params["W_lin"].at[0, 0].set(0.75).at[1, 1].set(-0.5)
+        params["b_lin"] = jnp.array([0.25, -0.125], dtype=jnp.float64)
+        closure = _make_closure(params=params, target_bias=(1.0, -2.0))
+        features = jnp.array([[0.4, -0.3, 0.5, 0.25, 0.1, 0.2]], dtype=jnp.float64)
+        expected = np.asarray(closure.predict_q_components(features))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "interface_closure.npz"
+            save_learned_interface_closure_npz(path, closure)
+            with np.load(path) as data:
+                payload = {
+                    name: np.asarray(data[name])
+                    for name in data.files
+                    if name
+                    not in {
+                        "equilibrium_centered",
+                        "complex_normalization_mode",
+                        "translation_augmented",
+                    }
+                }
+            np.savez(path, **payload)
+            loaded = load_learned_interface_closure_npz(path)
+        self.assertFalse(loaded.equilibrium_centered)
+        self.assertEqual(loaded.complex_normalization_mode, "componentwise")
+        self.assertFalse(loaded.translation_augmented)
+        np.testing.assert_array_equal(np.asarray(loaded.predict_q_components(features)), expected)
+
+    def test_warm_start_rejects_symmetry_metadata_mismatch(self) -> None:
+        closure = _make_closure(
+            equilibrium_centered=True,
+            complex_normalization_mode="phase_isotropic",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "interface_closure.npz"
+            save_learned_interface_closure_npz(path, closure)
+            common = {
+                "Nm": closure.Nm,
+                "hidden_width": closure.hidden_width,
+                "res_blocks": closure.res_blocks,
+                "Nv_targets": closure.Nv_targets,
+                "context_mode": closure.context_mode,
+            }
+            with self.assertRaisesRegex(ValueError, "equilibrium_centered metadata"):
+                train_mod._load_init_checkpoint_for_interface_closure(
+                    path,
+                    equilibrium_centered=False,
+                    complex_normalization_mode="phase_isotropic",
+                    **common,
+                )
+            with self.assertRaisesRegex(ValueError, "complex_normalization_mode metadata"):
+                train_mod._load_init_checkpoint_for_interface_closure(
+                    path,
+                    equilibrium_centered=True,
+                    complex_normalization_mode="componentwise",
+                    **common,
+                )
 
     def test_checkpoint_loader_normalizes_legacy_teacher_backend_name(self) -> None:
         closure = _make_closure(target_bias=(1.5, -0.25))
