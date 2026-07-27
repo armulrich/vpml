@@ -11898,9 +11898,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     save_training_loss_plot(
         loss_history,
         loss_plot_path,
+        loss_metadata=metrics_payload,
         val_metrics=val_metrics,
-        train_objective=INTERFACE_FLUX_ROLLOUT_OBJECTIVE,
-        loss_backend=INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
     )
     print(f"Saved checkpoint to {args.checkpoint}")
     print(f"Saved metrics to {metrics_path}")

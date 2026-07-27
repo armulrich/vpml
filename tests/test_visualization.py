@@ -32,51 +32,55 @@ from vpml.visualization.nonlinear import (
     save_bump_on_tail_energy_comparison,
     save_snapshot_panel,
 )
-from vpml.visualization.training import plot_training_loss, save_training_loss_plot
+from vpml.visualization.training import (
+    CANONICAL_LOSS_BACKEND,
+    CANONICAL_OBJECTIVE,
+    CANONICAL_TRAINING_MODE,
+    plot_training_loss,
+    save_training_loss_plot,
+    save_training_loss_plot_from_metrics,
+)
 from vpml.metrics import FourierFieldComparison, GrowthComparisonResult, GrowthFitResult
 
 
 class VisualizationTests(unittest.TestCase):
-    def test_training_loss_plot_uses_objective_specific_ylabel(self) -> None:
-        fig_q = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="q_only")
-        fig_traj = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="trajectory")
-        fig_fh_state = plot_training_loss(
+    @staticmethod
+    def _canonical_loss_metadata():
+        return {
+            "training_mode": np.array([CANONICAL_TRAINING_MODE]),
+            "train_objective": np.array([CANONICAL_OBJECTIVE]),
+            "loss_backend": np.array([CANONICAL_LOSS_BACKEND]),
+            "interface_flux_regime_loss_regimes": np.array(
+                [
+                    "linear_landau",
+                    "nonlinear_landau_weak",
+                    "nonlinear_landau_strong",
+                ]
+            ),
+            "interface_flux_regime_loss_stds": np.array(
+                [0.01208, 0.29172, 3.27331], dtype=np.float64
+            ),
+        }
+
+    def test_training_loss_plot_renders_complete_equation_inside_canvas(self) -> None:
+        fig = plot_training_loss(
             np.array([1.0, 0.5], dtype=np.float64),
-            train_objective="trajectory",
-            loss_backend="fourier_hermite_bidir",
+            loss_metadata=self._canonical_loss_metadata(),
         )
-        fig_fh_q = plot_training_loss(
-            np.array([1.0, 0.5], dtype=np.float64),
-            train_objective="trajectory",
-            loss_backend="fourier_hermite_closure_bidir",
-        )
-        fig_fh_xv = plot_training_loss(
-            np.array([1.0, 0.5], dtype=np.float64),
-            train_objective="trajectory",
-            loss_backend="fourier_hermite_projected_xv_bidir",
-        )
-        fig_hybrid = plot_training_loss(np.array([1.0, 0.5], dtype=np.float64), train_objective="trajectory_q_hybrid")
-        self.assertEqual(
-            fig_q.axes[0].get_ylabel(),
-            r"$\mathcal{L}(\theta)=\mathbb{E}_{\mathrm{regime}}\mathbb{E}_{t,k>0}\left[\left|q_k^\theta-q_k^\star\right|^2\right]$",
-        )
-        self.assertEqual(
-            fig_traj.axes[0].get_ylabel(),
-            r"$\mathcal{L}_{\mathrm{traj}}(\theta)=\lambda_E\mathcal{L}_E+\lambda_{\mathrm{dist}}\mathcal{L}_{\delta f}+\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail}}+\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+\lambda_{\mathrm{reg}}\|\theta\|_2^2$",
-        )
-        self.assertEqual(
-            fig_hybrid.axes[0].get_ylabel(),
-            r"$\mathcal{L}_{\mathrm{traj+q}}(\theta)=\lambda_q\mathcal{L}_q+\lambda_E\mathcal{L}_E+\lambda_{\mathrm{dist}}\mathcal{L}_{\delta f}+\lambda_{\mathrm{tail}}\mathcal{L}_{\mathrm{tail}}+\lambda_{\mathrm{neg}}\mathcal{L}_{\mathrm{neg}}+\lambda_{\mathrm{reg}}\|\theta\|_2^2$",
-        )
-        self.assertIn(r"\mathrm{FH-state}", fig_fh_state.axes[0].get_ylabel())
-        self.assertIn(r"\mathrm{FH-q}", fig_fh_q.axes[0].get_ylabel())
-        self.assertIn(r"\mathcal{L}_{xv}^{N_v}", fig_fh_xv.axes[0].get_ylabel())
-        plt.close(fig_q)
-        plt.close(fig_traj)
-        plt.close(fig_fh_state)
-        plt.close(fig_fh_q)
-        plt.close(fig_fh_xv)
-        plt.close(fig_hybrid)
+        label = fig.axes[0].get_ylabel()
+        self.assertIn(r"\sum_{r\in", label)
+        self.assertIn(r"2BH|\mathcal{K}_{+}|", label)
+        self.assertIn(r"w_r=\frac{1}{3}", label)
+        self.assertIn(r"\sigma_{\mathrm{lin}}", label)
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        label_box = fig.axes[0].yaxis.label.get_window_extent(renderer)
+        canvas_box = fig.bbox
+        self.assertGreaterEqual(label_box.x0, canvas_box.x0)
+        self.assertLessEqual(label_box.x1, canvas_box.x1)
+        self.assertGreaterEqual(label_box.y0, canvas_box.y0)
+        self.assertLessEqual(label_box.y1, canvas_box.y1)
+        plt.close(fig)
 
     def test_training_and_nonlinear_visualizations_save(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -85,9 +89,34 @@ class VisualizationTests(unittest.TestCase):
             loss_path = save_training_loss_plot(
                 np.array([1.0, 0.5, 0.25], dtype=np.float64),
                 tmp / "loss.png",
+                loss_metadata=self._canonical_loss_metadata(),
                 val_metrics={"val_q_mse_linear_landau": np.array([1e-3], dtype=np.float64)},
             )
             self.assertTrue(loss_path.exists())
+
+            legacy_metrics = tmp / "legacy.metrics.npz"
+            np.savez(
+                legacy_metrics,
+                train_loss=np.array([1.0, 0.5], dtype=np.float64),
+                training_mode=np.array(["exact_q_rollout"]),
+                train_objective=np.array(["q_rollout"]),
+                loss_backend=np.array(["exact_fourier_hermite_q_rollout"]),
+                exact_q_regime_loss_regimes=np.array(
+                    [
+                        "linear_landau",
+                        "nonlinear_landau_weak",
+                        "nonlinear_landau_strong",
+                    ]
+                ),
+                exact_q_regime_loss_stds=np.array(
+                    [0.01208, 0.29172, 3.27331], dtype=np.float64
+                ),
+            )
+            regenerated = save_training_loss_plot_from_metrics(
+                legacy_metrics,
+                tmp / "legacy.loss.png",
+            )
+            self.assertTrue(regenerated.exists())
 
             x = np.linspace(0.0, 1.0, 4)
             v = np.linspace(-1.0, 1.0, 3)
