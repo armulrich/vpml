@@ -215,6 +215,7 @@ def _save_convergence_plot(
         axis.grid(True, which="both", alpha=0.25)
     axes[0].set_ylabel(r"Relative refinement change $\delta_M^C$")
     axes[1].set_ylabel(r"Relative refinement change $\delta_M^q$")
+    axes[1].tick_params(axis="y", labelleft=True)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
