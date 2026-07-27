@@ -84,6 +84,32 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         ]
         self.assertEqual(observed, [6, 7, 12, 20, 36, 64, 6, 7])
 
+    def test_zero_validation_fraction_uses_every_sampled_time_for_training(self) -> None:
+        max_projection_order = 4
+        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        coeff_history = np.zeros((1, 5, max_projection_order + 1, 3), dtype=np.complex128)
+        coeff_history[:, :, 3:, 1:] = 0.25 + 0.1j
+        dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
+            {trainer.REGIME_LINEAR: {coeff_key: coeff_history}},
+            max_projection_order=max_projection_order,
+            Nv_targets=(4,),
+            Nm=2,
+            k_arr=np.array([0.0, 0.5, 1.0], dtype=np.float64),
+            val_fraction=0.0,
+            linear_history_stride=2,
+            nonlinear_history_stride=2,
+            rollout_horizon=1,
+            n_low=2,
+            context_mode="none",
+        )
+        linear = dataset[trainer.REGIME_LINEAR]
+        np.testing.assert_array_equal(
+            linear["train_anchor_time_indices"],
+            np.array([0, 2, 4], dtype=np.int32),
+        )
+        self.assertEqual(linear["val_anchor_time_indices"].size, 0)
+        self.assertEqual(linear["val_targets"].shape[0], 0)
+
     def test_h1_target_matches_direct_interface_flux_prediction(self) -> None:
         params = _zero_params(6)
         params["W_lin"] = params["W_lin"].at[0, 0].set(2.0)

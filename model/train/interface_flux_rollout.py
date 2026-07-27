@@ -609,6 +609,8 @@ def build_interface_flux_rollout_qpair_dataset(
         sampled = np.arange(0, nsteps + 1, max(int(stride), 1), dtype=np.int32)
         if sampled.size == 0 or int(sampled[-1]) != nsteps:
             sampled = np.concatenate([sampled, np.array([nsteps], dtype=np.int32)])
+        if float(val_fraction) <= 0.0:
+            return sampled, np.zeros((0,), dtype=np.int32)
         if sampled.shape[0] <= 1:
             return sampled, sampled
         n_val = max(1, int(round(int(sampled.shape[0]) * float(val_fraction))))

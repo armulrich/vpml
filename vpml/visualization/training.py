@@ -154,7 +154,16 @@ def plot_training_loss(
         for key in sorted(val_metrics):
             if key.startswith("val_q_mse_"):
                 regime = key.removeprefix("val_q_mse_")
-                lines.append(f"{regime}: {float(np.asarray(val_metrics[key]).reshape(-1)[0]):.3e}")
+                sample_key = f"val_num_samples_{regime}"
+                sample_count = (
+                    int(np.asarray(val_metrics[sample_key]).reshape(-1)[0])
+                    if sample_key in val_metrics
+                    else None
+                )
+                value = float(np.asarray(val_metrics[key]).reshape(-1)[0])
+                if sample_count == 0 or not np.isfinite(value):
+                    continue
+                lines.append(f"{regime}: {value:.3e}")
         if lines:
             ax.text(
                 0.98,

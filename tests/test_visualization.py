@@ -82,6 +82,20 @@ class VisualizationTests(unittest.TestCase):
         self.assertLessEqual(label_box.y1, canvas_box.y1)
         plt.close(fig)
 
+    def test_training_loss_plot_omits_empty_validation_metrics(self) -> None:
+        fig = plot_training_loss(
+            np.array([1.0, 0.5], dtype=np.float64),
+            loss_metadata=self._canonical_loss_metadata(),
+            val_metrics={
+                "val_q_mse_linear_landau": np.array([np.nan], dtype=np.float64),
+                "val_num_samples_linear_landau": np.array([0], dtype=np.int32),
+            },
+        )
+        self.assertFalse(
+            any("Validation MSE" in text.get_text() for text in fig.axes[0].texts)
+        )
+        plt.close(fig)
+
     def test_training_and_nonlinear_visualizations_save(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
