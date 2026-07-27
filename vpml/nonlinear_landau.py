@@ -24,8 +24,6 @@ from .core import (
     hermite_damping_term,
     irfft_x,
     learned_boundary_flux_hat,
-    learned_history_hermite_lift,
-    learned_recursive_hermite_chain_lift,
     rfft_x,
 )
 
@@ -109,24 +107,6 @@ def run_nonlinear_landau_rollout_raw(
         closure=closure,
     )
     m_eq = jnp.zeros((int(params.Nv),), dtype=jnp.float64).at[0].set(1.0)
-    tail_chain_enabled = bool(
-        learned_closure is not None and getattr(learned_closure, "tail_chain_enabled", False)
-    )
-    tail_history_enabled = bool(
-        learned_closure is not None and getattr(learned_closure, "tail_history_lift_enabled", False)
-    )
-    recon_enabled = bool(tail_chain_enabled or tail_history_enabled)
-    if tail_history_enabled:
-        tail_chain_nv = int(getattr(learned_closure, "tail_history_nv", int(params.Nv)))
-        tail_n_min = int(getattr(learned_closure, "tail_history_n_min", int(params.Nv)))
-        tail_n_max = int(getattr(learned_closure, "tail_history_n_max", tail_chain_nv))
-        tail_history_lags = int(getattr(learned_closure, "tail_history_lags", 0))
-    else:
-        tail_chain_nv = int(getattr(learned_closure, "tail_chain_nv", int(params.Nv))) if tail_chain_enabled else int(params.Nv)
-        tail_n_min = int(getattr(learned_closure, "tail_chain_n_min", int(params.Nv))) if tail_chain_enabled else int(params.Nv)
-        tail_n_max = int(getattr(learned_closure, "tail_chain_n_max", tail_chain_nv)) if tail_chain_enabled else int(params.Nv)
-        tail_history_lags = 0
-    m_eq_recon = jnp.zeros((tail_n_max,), dtype=jnp.float64).at[0].set(1.0)
     if params.initial_perturbation_x is None:
         initial_perturbation_x = float(params.eps) * jnp.cos(float(params.k0) * integ.x)
     else:
@@ -168,49 +148,10 @@ def run_nonlinear_landau_rollout_raw(
     snap_slot_by_step[snap_steps] = np.arange(len(snap_steps), dtype=np.int32)
     snap_slot_by_step_jax = jnp.asarray(snap_slot_by_step)
     snaps0 = jnp.zeros((len(snap_steps), int(params.Nv), int(params.Nx)), dtype=jnp.float64)
-    recon_snaps0 = jnp.zeros((len(snap_steps), tail_n_max, int(params.Nx)), dtype=jnp.float64)
-
-    low_history0 = jnp.repeat(a_hat0[None, :, :], tail_history_lags + 1, axis=0)
-
-    def update_low_history(low_history: Array, a_hat_new: Array) -> Array:
-        if tail_history_lags <= 0:
-            return a_hat_new[None, :, :]
-        return jnp.concatenate([low_history[1:], a_hat_new[None, :, :]], axis=0)
-
-    def decode_reconstruction(
-        a_hat: Array,
-        a_hat_prev: Optional[Array] = None,
-        low_history: Optional[Array] = None,
-    ) -> Array:
-        if not recon_enabled:
-            return jnp.zeros((tail_n_max, int(params.Nx)), dtype=jnp.float64)
-        if tail_history_enabled:
-            history_window = low_history if low_history is not None else low_history0
-            full_hat = learned_history_hermite_lift(
-                history_window,
-                integ.k_arr,
-                learned_closure,
-                n_min=tail_n_min,
-                n_max=tail_n_max,
-            )
-        else:
-            full_hat = learned_recursive_hermite_chain_lift(
-                a_hat,
-                integ.k_arr,
-                learned_closure,
-                n_min=tail_n_min,
-                n_max=tail_n_max,
-                a_hat_prev=a_hat_prev,
-            )
-        return irfft_x(full_hat, int(params.Nx))
 
     snap0_idx = int(snap_slot_by_step[0])
     if snap0_idx >= 0:
         snaps0 = snaps0.at[snap0_idx].set(irfft_x(a_hat0, int(params.Nx)))
-        if recon_enabled:
-            recon_snaps0 = recon_snaps0.at[snap0_idx].set(
-                decode_reconstruction(a_hat0, a_hat_prev=a_hat0, low_history=low_history0)
-            )
 
     hist_steps = np.arange(0, nsteps + 1, history_stride, dtype=np.int32)
     if hist_steps[-1] != nsteps:
@@ -227,6 +168,8 @@ def run_nonlinear_landau_rollout_raw(
         b0 = learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned_closure)
 
     def maybe_store(snaps: Array, step_i: Array, a_hat_new: Array) -> Array:
+        if len(snap_steps) == 0:
+            return snaps
         a_phys_new = irfft_x(a_hat_new, int(params.Nx))
         snap_slot = snap_slot_by_step_jax[step_i]
         return jax.lax.cond(
@@ -234,25 +177,6 @@ def run_nonlinear_landau_rollout_raw(
             lambda s: s.at[snap_slot].set(a_phys_new),
             lambda s: s,
             snaps,
-        )
-
-    def maybe_store_recon(
-        recon_snaps: Array,
-        step_i: Array,
-        a_hat_new: Array,
-        a_hat_prev: Array,
-        low_history_new: Array,
-    ) -> Array:
-        if not recon_enabled:
-            return recon_snaps
-        snap_slot = snap_slot_by_step_jax[step_i]
-        return jax.lax.cond(
-            snap_slot >= 0,
-            lambda s: s.at[snap_slot].set(
-                decode_reconstruction(a_hat_new, a_hat_prev=a_hat_prev, low_history=low_history_new)
-            ),
-            lambda s: s,
-            recon_snaps,
         )
 
     def maybe_store_history(history: Array, step_i: Array, a_hat_new: Array) -> Array:
@@ -274,7 +198,7 @@ def run_nonlinear_landau_rollout_raw(
         return history
 
     def step(carry, i):
-        a_hat, a_hat_prev, n_prev, b_prev, snaps, recon_snaps, history, low_history = carry
+        a_hat, a_hat_prev, n_prev, b_prev, snaps, history = carry
         n_hat = explicit_n_hat(a_hat)
         if learned_closure is None:
             b_hat = jnp.zeros_like(a_hat)
@@ -287,18 +211,16 @@ def run_nonlinear_landau_rollout_raw(
             extra_hat=b_hat,
             extra_hat_prev=b_prev,
         )
-        low_history_new = update_low_history(low_history, a_new)
         snaps = maybe_store(snaps, i, a_new)
-        recon_snaps = maybe_store_recon(recon_snaps, i, a_new, a_hat, low_history_new)
         history = maybe_store_history(history, i, a_new)
-        return (a_new, a_hat, n_hat, b_hat, snaps, recon_snaps, history, low_history_new), 0.0
+        return (a_new, a_hat, n_hat, b_hat, snaps, history), 0.0
 
-    (a_last, a_prev_last, n_last, b_last, snaps_out, recon_snaps_out, hist_out, low_history_last), _ = jax.lax.scan(
+    (a_last, a_prev_last, n_last, b_last, snaps_out, hist_out), _ = jax.lax.scan(
         step,
-        (a_hat0, a_hat0, n0, b0, snaps0, recon_snaps0, hist0, low_history0),
+        (a_hat0, a_hat0, n0, b0, snaps0, hist0),
         jnp.arange(1, nsteps + 1, dtype=jnp.int32),
     )
-    del a_last, a_prev_last, n_last, b_last, low_history_last
+    del a_last, a_prev_last, n_last, b_last
 
     raw: Dict[str, np.ndarray | Array] = {
         "x": np.asarray(integ.x),
@@ -307,10 +229,6 @@ def run_nonlinear_landau_rollout_raw(
         "m_eq": np.asarray(m_eq),
         "k_arr": np.asarray(integ.k_arr, dtype=float),
     }
-    if recon_enabled:
-        raw["snapshot_recon_a_phys"] = np.asarray(recon_snaps_out)
-        raw["snapshot_recon_Nv"] = np.array([tail_n_max], dtype=np.int32)
-        raw["snapshot_recon_m_eq"] = np.asarray(m_eq_recon)
     if return_state_history and hist_out is not None:
         raw["a_hat_hist"] = hist_out
         raw["a_hat_hist_times"] = hist_steps.astype(float) * float(params.dt)

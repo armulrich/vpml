@@ -20,7 +20,6 @@ bootstrap_jax_runtime()
 
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 
 from model.eval import run_physical_landau_reference
@@ -95,15 +94,9 @@ def _phase_space_payload_from_raw(
 ) -> Dict[str, np.ndarray]:
     x = np.asarray(raw["x"], dtype=np.float64)
     v = np.linspace(params.v_range[0], params.v_range[1], int(params.Nv_plot), dtype=np.float64)
-    if "snapshot_recon_a_phys" in raw:
-        snaps_phys = np.asarray(raw["snapshot_recon_a_phys"], dtype=np.float64)
-        recon_nv = int(np.asarray(raw.get("snapshot_recon_Nv", [snaps_phys.shape[1]])).reshape(-1)[0])
-        phi = np.asarray(hermite_basis_phi(recon_nv, v), dtype=np.float64)
-        m_eq = np.asarray(raw.get("snapshot_recon_m_eq", np.zeros((recon_nv,), dtype=np.float64)), dtype=np.float64)
-    else:
-        phi = np.asarray(hermite_basis_phi(int(params.Nv), v), dtype=np.float64)
-        snaps_phys = np.asarray(raw["snapshot_a_phys"], dtype=np.float64)
-        m_eq = np.asarray(raw["m_eq"], dtype=np.float64)
+    phi = np.asarray(hermite_basis_phi(int(params.Nv), v), dtype=np.float64)
+    snaps_phys = np.asarray(raw["snapshot_a_phys"], dtype=np.float64)
+    m_eq = np.asarray(raw["m_eq"], dtype=np.float64)
 
     payload: Dict[str, np.ndarray] = {
         "x": x,
@@ -247,45 +240,6 @@ def _learned_nonlinear_payload_from_raw(
         "energy": _electric_energy_from_ehat_history(E_hat_hist, Nx=int(params.Nx), Lx=float(params.L)),
         "k_arr": k_arr,
     }
-
-
-def _phase_l2_errors(
-    reference_phase: Dict[str, np.ndarray],
-    candidate_phase: Dict[str, np.ndarray],
-    times: Sequence[float],
-) -> np.ndarray:
-    errors = []
-    for t in times:
-        key = _time_key(float(t))
-        ref = np.asarray(reference_phase[f"f_{key}"], dtype=np.float64)
-        candidate = np.asarray(candidate_phase[f"f_{key}"], dtype=np.float64)
-        denom = float(np.linalg.norm(ref.reshape(-1)))
-        errors.append(float(np.linalg.norm((candidate - ref).reshape(-1)) / max(denom, 1e-30)))
-    return np.asarray(errors, dtype=np.float64)
-
-
-def _plot_phase_reconstruction_metric(
-    cases: Sequence[Dict[str, object]],
-    *,
-    title: str,
-) -> plt.Figure:
-    if not cases:
-        raise ValueError("cases must be nonempty")
-    fig, ax = plt.subplots(figsize=(9.0, 4.8), constrained_layout=True)
-    colors = plt.cm.viridis(np.linspace(0.15, 0.9, len(cases)))
-    for color, case in zip(colors, cases):
-        times = np.asarray(case["times"], dtype=np.float64)
-        learned = np.asarray(case["learned"], dtype=np.float64)
-        truncation = np.asarray(case["truncation"], dtype=np.float64)
-        nv = int(case["Nv"])
-        ax.plot(times, learned, marker="o", color=color, lw=2.0, label=rf"$N_v={nv}$ learned recon")
-        ax.plot(times, truncation, marker="x", color="#6b7280", lw=1.4, ls="--", alpha=0.75, label=rf"$N_v={nv}$ truncation")
-    ax.set_xlabel("t")
-    ax.set_ylabel(r"$\|f^{HR}-f^\theta\|_2 / \|f^{HR}\|_2$")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
-    return fig
 
 
 def _write_summary(path: Path, payload: Dict[str, object]) -> None:
@@ -465,7 +419,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     growth_cases: List[GrowthSweepCase] = []
     field_cases: List[FieldSweepCase] = []
-    phase_reconstruction_cases: List[Dict[str, object]] = []
     summary_cases: List[Dict[str, object]] = []
     phase_payload: Dict[str, np.ndarray] = {}
     row_labels: List[str] = []
@@ -561,12 +514,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         truncation_phase = _phase_space_payload_from_raw(truncation_raw, params)
         learned_phase = _phase_space_payload_from_raw(learned_raw, params)
-        phase_error_learned_reconstructed: Optional[np.ndarray] = None
-        phase_error_truncation: Optional[np.ndarray] = None
-
-        if "snapshot_recon_a_phys" in learned_raw:
-            phase_error_learned_reconstructed = _phase_l2_errors(reference_phase, learned_phase, snapshot_times)
-            phase_error_truncation = _phase_l2_errors(reference_phase, truncation_phase, snapshot_times)
 
         if not phase_payload:
             phase_payload["x"] = np.asarray(learned_phase["x"], dtype=np.float64)
@@ -618,18 +565,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 beyond_training_range=beyond_training_range,
             )
         )
-        if phase_error_learned_reconstructed is not None:
-            assert phase_error_learned_reconstructed is not None
-            assert phase_error_truncation is not None
-            phase_reconstruction_cases.append(
-                {
-                    "Nv": int(Nv),
-                    "times": np.asarray(snapshot_times, dtype=np.float64),
-                    "learned": phase_error_learned_reconstructed,
-                    "truncation": phase_error_truncation,
-                }
-            )
-
         case_path = case_npz_dir / f"nv{int(Nv)}_nonlinear_sweep_case.npz"
         case_payload = {
             "times_hr": np.asarray(hr_payload["times"], dtype=np.float64),
@@ -655,21 +590,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "x": np.asarray(learned_phase["x"], dtype=np.float64),
             "v": np.asarray(learned_phase["v"], dtype=np.float64),
         }
-        if phase_error_learned_reconstructed is not None:
-            assert phase_error_learned_reconstructed is not None
-            assert phase_error_truncation is not None
-            case_payload.update(
-                {
-                    "phase_error_learned_reconstructed": np.asarray(
-                        phase_error_learned_reconstructed,
-                        dtype=np.float64,
-                    ),
-                    "phase_error_truncation": np.asarray(
-                        phase_error_truncation,
-                        dtype=np.float64,
-                    ),
-                }
-            )
         for snap_idx, snap_t in enumerate(snapshot_times):
             snap_key = _time_key(float(snap_t))
             for prefix, phase in (
@@ -705,32 +625,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "case_npz": str(case_path),
             }
         )
-        if phase_error_learned_reconstructed is not None:
-            assert phase_error_learned_reconstructed is not None
-            assert phase_error_truncation is not None
-            summary_cases[-1].update(
-                {
-                    "phase_error_reconstructed": [
-                        _json_scalar(v) for v in np.asarray(phase_error_learned_reconstructed)
-                    ],
-                    "phase_error_truncation": [
-                        _json_scalar(v) for v in np.asarray(phase_error_truncation)
-                    ],
-                }
-            )
         print(
             f"[nv-sweep] Nv={int(Nv)}: epsilon_grow={growth.epsilon_grow:.4e} "
             f"gamma_hr={growth.gamma_grow_hr:.4e} gamma_theta={growth.gamma_grow_theta:.4e} "
             f"epsilon_E_truncation={truncation_field.epsilon_E:.4e} "
             f"epsilon_E_learned={field.epsilon_E:.4e}"
         )
-        if phase_error_learned_reconstructed is not None:
-            assert phase_error_learned_reconstructed is not None
-            print(
-                f"[nv-sweep] Nv={int(Nv)} reconstructed: "
-                f"phase_err_mean={float(np.mean(phase_error_learned_reconstructed)):.4e}"
-            )
-
     growth_fig = plot_growth_metric_sweep(
         np.asarray(hr_payload["times"], dtype=np.float64),
         np.asarray(hr_payload["energy"], dtype=np.float64),
@@ -744,18 +644,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         title=r"Nonlinear Landau Metric 2 sweep across deployment $N_v$",
     )
     field_png = save_figure(field_fig, outdir / "nv_sweep_metric2.png", dpi=220)
-
-    phase_reconstruction_png: Optional[Path] = None
-    if phase_reconstruction_cases:
-        phase_reconstruction_fig = _plot_phase_reconstruction_metric(
-            phase_reconstruction_cases,
-            title=r"Fig10 reconstruction error vs HR phase-space reference",
-        )
-        phase_reconstruction_png = save_figure(
-            phase_reconstruction_fig,
-            outdir / "nv_sweep_metric3_phase_reconstruction.png",
-            dpi=220,
-        )
 
     phase_path = save_fig10_learned_comparison_nv_sweep_phase_space(
         phase_payload,
@@ -783,8 +671,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "phase_space_png": str(phase_path),
         "phase_space_npz": str(phase_npz),
     }
-    if phase_reconstruction_png is not None:
-        artifacts["phase_reconstruction_metric_png"] = str(phase_reconstruction_png)
 
     summary = {
         "checkpoint": None if shared_checkpoint is None else str(shared_checkpoint),

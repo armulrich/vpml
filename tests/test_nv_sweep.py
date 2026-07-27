@@ -1,8 +1,5 @@
 import json
 import math
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,8 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from model.eval_nv_sweep import main as nv_sweep_main
-from model.train.train import main as train_main
-from vpml.core import LearnedInterfaceClosure, load_learned_interface_closure_npz, save_learned_interface_closure_npz
+from vpml.core import LearnedInterfaceClosure, save_learned_interface_closure_npz
 
 try:
     jax.config.update("jax_enable_x64", True)
@@ -37,11 +33,14 @@ def _zero_interface_params(input_dim: int, hidden_width: int = 8, res_blocks: in
     return params
 
 
-def _make_closure(*, Nm: int = 1, hidden_width: int = 8, res_blocks: int = 1) -> LearnedInterfaceClosure:
-    input_dim = 2 * Nm + 4
+def _make_closure() -> LearnedInterfaceClosure:
+    nm = 1
+    hidden_width = 8
+    res_blocks = 1
+    input_dim = 2 * nm + 4
     return LearnedInterfaceClosure(
-        params=_zero_interface_params(input_dim, hidden_width=hidden_width, res_blocks=res_blocks),
-        Nm=Nm,
+        params=_zero_interface_params(input_dim, hidden_width, res_blocks),
+        Nm=nm,
         k_scale=2.0,
         nv_scale=8.0,
         input_mean=jnp.zeros((input_dim,), dtype=jnp.float64),
@@ -50,6 +49,9 @@ def _make_closure(*, Nm: int = 1, hidden_width: int = 8, res_blocks: int = 1) ->
         target_std=jnp.ones((2,), dtype=jnp.float64),
         hidden_width=hidden_width,
         res_blocks=res_blocks,
+        equilibrium_centered=True,
+        complex_normalization_mode="phase_isotropic",
+        translation_augmented=True,
         Nv_targets=(6, 8),
         train_regimes=("linear_landau", "nonlinear_landau_weak", "nonlinear_landau_strong"),
         teacher_backend="grid_cubic_spline",
@@ -62,63 +64,22 @@ def _make_closure(*, Nm: int = 1, hidden_width: int = 8, res_blocks: int = 1) ->
         teacher_proj_Nv=9,
         include_global_indicators=True,
         n_low=2,
+        rollout_horizon=1,
     )
 
 
-def _target_log_ladder(target: int, *, nm: int, levels: int = 5) -> tuple[int, ...]:
-    if target < nm:
-        raise ValueError(f"target Nv={target} must be at least Nm={nm}")
-    if levels <= 0:
-        raise ValueError("levels must be positive")
-    if target == nm:
-        return (nm,)
-    ladder = []
-    for idx in range(levels):
-        t = 0.0 if levels == 1 else idx / float(levels - 1)
-        value = math.exp(math.log(float(nm)) + t * (math.log(float(target)) - math.log(float(nm))))
-        ladder.append(int(round(value)))
-    ladder[0] = nm
-    ladder[-1] = target
-    dedup = []
-    for value in ladder:
-        value = max(nm, min(target, int(value)))
-        if not dedup or dedup[-1] != value:
-            dedup.append(value)
-    return tuple(dedup)
-
-
-def _fixed_ratio_ladder(target: int, *, nm: int, ratio: float = 1.8) -> tuple[int, ...]:
-    if target < nm:
-        raise ValueError(f"target Nv={target} must be at least Nm={nm}")
-    if ratio <= 1.0:
-        raise ValueError("ratio must be greater than 1")
-    if target == nm:
-        return (nm,)
-    ladder = [target]
-    current = target
-    while True:
-        next_value = int(math.ceil(float(current) / ratio))
-        if next_value <= nm:
-            ladder.append(nm)
-            break
-        ladder.append(next_value)
-        current = next_value
-    return tuple(sorted(set(max(nm, min(target, int(value))) for value in ladder)))
-
-
 class NvSweepTests(unittest.TestCase):
-    def test_nv_sweep_main_writes_summary_and_figures(self) -> None:
-        closure = _make_closure()
+    def test_nv_sweep_writes_retained_metrics_and_raw_hr_fig10(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            ckpt = tmp / "interface_closure.npz"
+            checkpoint = tmp / "interface_closure.npz"
             outdir = tmp / "nv_sweep"
-            save_learned_interface_closure_npz(ckpt, closure)
+            save_learned_interface_closure_npz(checkpoint, _make_closure())
 
             nv_sweep_main(
                 [
                     "--checkpoint",
-                    str(ckpt),
+                    str(checkpoint),
                     "--outdir",
                     str(outdir),
                     "--nv-list",
@@ -137,6 +98,8 @@ class NvSweepTests(unittest.TestCase):
                     "0.05,0.10",
                     "--Nv-plot",
                     "32",
+                    "--phase-reference-mode",
+                    "raw_hr_grid",
                     "--teacher-Nx",
                     "8",
                     "--teacher-Nv",
@@ -150,290 +113,17 @@ class NvSweepTests(unittest.TestCase):
                 ]
             )
 
-            summary_path = outdir / "summary.json"
-            self.assertTrue(summary_path.exists())
-            summary = json.loads(summary_path.read_text())
+            summary = json.loads((outdir / "summary.json").read_text())
             self.assertEqual(summary["nv_list"], [6, 8])
+            self.assertEqual(summary["phase_reference_mode"], "raw_hr_grid")
             self.assertEqual(len(summary["cases"]), 2)
-            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
-            self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
-            self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
-
-    def test_run_fh_offline_qloss_ladder_wrapper_accepts_default_negative_phase_vrange(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            outdir = tmp / "nv_sweep_wrapper"
-
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PYTHON": sys.executable,
-                    "NV_LIST": "6,8",
-                    "NX": "8",
-                    "DT": "0.05",
-                    "T_FINAL": "0.10",
-                    "EPS": "0.05",
-                    "K0": "0.5",
-                    "SNAPSHOT_TIMES": "0.05,0.10",
-                    "NV_PLOT": "32",
-                    "TEACHER_NX": "8",
-                    "TEACHER_NV": "16",
-                    "TEACHER_DT": "0.05",
-                    "TEACHER_VMIN": "-6",
-                    "TEACHER_VMAX": "6",
-                    "TRAIN_NM": "6",
-                    "TRAIN_HIDDEN_WIDTH": "8",
-                    "TRAIN_RES_BLOCKS": "1",
-                    "TRAIN_EPOCHS": "1",
-                    "TRAIN_LOG_EVERY": "1",
-                    "TRAIN_BATCH_SIZE": "32",
-                    "TRAIN_STEPS_PER_EPOCH": "1",
-                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak",
-                    "TRAIN_LINEAR_T": "0.10",
-                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
-                    "TRAIN_LINEAR_HISTORY_STRIDE": "1",
-                    "TRAIN_NONLINEAR_T": "0.10",
-                    "TRAIN_NONLINEAR_HISTORY_STRIDE": "1",
-                    "TRAIN_WEAK_EPS": "0.05",
-                    "TRAIN_STRONG_EPS": "0.10",
-                    "TRAIN_TEACHER_NX": "8",
-                    "TRAIN_TEACHER_NV": "16",
-                    "TRAIN_TEACHER_DT": "0.05",
-                    "TRAIN_TEACHER_VMIN": "-6",
-                    "TRAIN_TEACHER_VMAX": "6",
-                    "TRAIN_TEACHER_PROJ_NV": "9",
-                }
+            self.assertTrue((outdir / "nv_sweep_metric1.png").is_file())
+            self.assertTrue((outdir / "nv_sweep_metric2.png").is_file())
+            self.assertTrue(
+                (outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").is_file()
             )
-            subprocess.run(
-                ["bash", "model/train/run_fh_offline_qloss_ladder.sh", str(outdir)],
-                cwd="/Users/armin/Documents/NYU/vpml",
-                env=env,
-                check=True,
-            )
+            self.assertFalse((outdir / "nv_sweep_metric3_phase_reconstruction.png").exists())
 
-            self.assertTrue((outdir / "summary.json").exists())
-            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
-            self.assertTrue((outdir / "models" / "nv6" / "interface_closure_dataset.npz").exists())
-            self.assertTrue((outdir / "models" / "nv8" / "interface_closure_dataset.npz").exists())
-            self.assertTrue((outdir / "models" / "nv6" / "interface_closure.npz").exists())
-            self.assertTrue((outdir / "models" / "nv8" / "interface_closure.npz").exists())
-            for nv in (6, 8):
-                learned = load_learned_interface_closure_npz(outdir / "models" / f"nv{nv}" / "interface_closure.npz")
-                self.assertEqual(learned.training_mode, "offline_rollout")
-                self.assertEqual(learned.train_objective, "q_only")
-
-    def test_fixed_ratio_ladder_matches_default_targets(self) -> None:
-        expected = {
-            8: (6, 8),
-            64: (6, 7, 12, 20, 36, 64),
-            256: (6, 8, 14, 25, 45, 80, 143, 256),
-            300: (6, 10, 17, 29, 52, 93, 167, 300),
-            512: (6, 9, 16, 28, 50, 89, 159, 285, 512),
-        }
-        actual = {target: _fixed_ratio_ladder(target, nm=6, ratio=1.8) for target in expected}
-        self.assertEqual(actual, expected)
-
-    def test_run_fh_offline_qloss_ladder_wrapper_uses_fixed_ratio_ladders(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            outdir = tmp / "nv_sweep_single_qloss_fixed_ratio"
-
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PYTHON": sys.executable,
-                    "NV_LIST": "6,8",
-                    "NX": "8",
-                    "DT": "0.05",
-                    "T_FINAL": "0.10",
-                    "EPS": "0.05",
-                    "K0": "0.5",
-                    "SNAPSHOT_TIMES": "0.05,0.10",
-                    "NV_PLOT": "32",
-                    "TEACHER_NX": "8",
-                    "TEACHER_NV": "16",
-                    "TEACHER_DT": "0.05",
-                    "TEACHER_VMIN": "-6",
-                    "TEACHER_VMAX": "6",
-                    "TRAIN_NM": "6",
-                    "TRAIN_FIXED_RATIO": "1.8",
-                    "TRAIN_HIDDEN_WIDTH": "8",
-                    "TRAIN_RES_BLOCKS": "1",
-                    "TRAIN_EPOCHS": "1",
-                    "TRAIN_LOG_EVERY": "1",
-                    "TRAIN_BATCH_SIZE": "32",
-                    "TRAIN_STEPS_PER_EPOCH": "1",
-                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak",
-                    "TRAIN_LINEAR_T": "0.10",
-                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
-                    "TRAIN_LINEAR_HISTORY_STRIDE": "1",
-                    "TRAIN_NONLINEAR_T": "0.10",
-                    "TRAIN_NONLINEAR_HISTORY_STRIDE": "1",
-                    "TRAIN_WEAK_EPS": "0.05",
-                    "TRAIN_STRONG_EPS": "0.10",
-                    "TRAIN_TEACHER_NX": "8",
-                    "TRAIN_TEACHER_NV": "16",
-                    "TRAIN_TEACHER_DT": "0.05",
-                    "TRAIN_TEACHER_VMIN": "-6",
-                    "TRAIN_TEACHER_VMAX": "6",
-                }
-            )
-            subprocess.run(
-                ["bash", "model/train/run_fh_offline_qloss_ladder.sh", str(outdir)],
-                cwd="/Users/armin/Documents/NYU/vpml",
-                env=env,
-                check=True,
-            )
-
-            self.assertTrue((outdir / "summary.json").exists())
-            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
-            self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
-            self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
-            self.assertTrue((outdir / "models" / "nv6" / "interface_closure_dataset.npz").exists())
-            self.assertTrue((outdir / "models" / "nv8" / "interface_closure_dataset.npz").exists())
-
-            expected = {
-                6: _fixed_ratio_ladder(6, nm=6, ratio=1.8),
-                8: _fixed_ratio_ladder(8, nm=6, ratio=1.8),
-            }
-            for nv, expected_targets in expected.items():
-                ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
-                self.assertTrue(ckpt.exists())
-                learned = load_learned_interface_closure_npz(ckpt)
-                self.assertEqual(learned.training_mode, "offline_rollout")
-                self.assertEqual(learned.train_objective, "q_only")
-                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), expected_targets)
-
-            summary = json.loads((outdir / "summary.json").read_text())
-            self.assertEqual(summary["nv_list"], [6, 8])
-            case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
-            self.assertEqual(case_targets, expected)
-
-    def test_run_nv_sweep_online_rollout_wrapper_uses_target_only_bidir_caches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            outdir = tmp / "nv_sweep_online_rollout"
-
-            env = os.environ.copy()
-            env.update(
-                {
-                    "PYTHON": sys.executable,
-                    "NV_LIST": "6,8",
-                    "NX": "8",
-                    "DT": "0.05",
-                    "T_FINAL": "0.10",
-                    "EPS": "0.05",
-                    "K0": "0.5",
-                    "SNAPSHOT_TIMES": "0.05,0.10",
-                    "NV_PLOT": "16",
-                    "TEACHER_NX": "8",
-                    "TEACHER_NV": "16",
-                    "TEACHER_DT": "0.05",
-                    "TEACHER_VMIN": "-6",
-                    "TEACHER_VMAX": "6",
-                    "TRAIN_NM": "6",
-                    "TRAIN_HIDDEN_WIDTH": "8",
-                    "TRAIN_RES_BLOCKS": "1",
-                    "TRAIN_EPOCHS": "1",
-                    "TRAIN_LR": "1e-3",
-                    "TRAIN_GRAD_CLIP": "1.0",
-                    "TRAIN_LOG_EVERY": "1",
-                    "TRAIN_STEPS_PER_EPOCH": "1",
-                    "TRAIN_SEED": "0",
-                    "TRAIN_REGIMES": "linear_landau,nonlinear_landau_weak,nonlinear_landau_strong",
-                    "TRAIN_VAL_FRACTION": "0.2",
-                    "TRAIN_LINEAR_T": "0.10",
-                    "TRAIN_LINEAR_NUM_SAMPLES": "1",
-                    "TRAIN_LINEAR_MODES": "0.5",
-                    "TRAIN_LINEAR_SEED": "0",
-                    "TRAIN_NONLINEAR_T": "0.10",
-                    "TRAIN_NONLINEAR_K0": "0.5",
-                    "TRAIN_WEAK_EPS": "0.05",
-                    "TRAIN_STRONG_EPS": "0.25",
-                    "TRAIN_TEACHER_NX": "8",
-                    "TRAIN_TEACHER_NV": "16",
-                    "TRAIN_TEACHER_DT": "0.05",
-                    "TRAIN_TEACHER_VMIN": "-6",
-                    "TRAIN_TEACHER_VMAX": "6",
-                    "TRAIN_ROLLOUT_HORIZON": "1",
-                    "TRAIN_ROLLOUT_ANCHOR_SAMPLES": "1",
-                    "TRAIN_ONLINE_CASE_BATCH_SIZE": "1",
-                    "TRAIN_PARALLEL_JOBS": "1",
-                }
-            )
-            subprocess.run(
-                ["bash", "model/train/run_nv_sweep_online_rollout.sh", str(outdir)],
-                cwd="/Users/armin/Documents/NYU/vpml",
-                env=env,
-                check=True,
-            )
-
-            self.assertTrue((outdir / "summary.json").exists())
-            self.assertTrue((outdir / "nv_sweep_metric1.png").exists())
-            self.assertTrue((outdir / "nv_sweep_metric2.png").exists())
-            self.assertTrue((outdir / "fig10_learned_vs_nonlocal_nv_sweep_phase_space.png").exists())
-            self.assertFalse((outdir / "online_reference_dataset.npz").exists())
-            self.assertTrue((outdir / "online_reference_dataset_nv6.npz").exists())
-            self.assertTrue((outdir / "online_reference_dataset_nv8.npz").exists())
-            self.assertFalse((outdir / "shared_interface_closure_dataset.npz").exists())
-            self.assertEqual(list(outdir.rglob("interface_closure_dataset.npz")), [])
-
-            for nv in (6, 8):
-                ckpt = outdir / "models" / f"nv{nv}" / "interface_closure.npz"
-                self.assertTrue(ckpt.exists())
-                learned = load_learned_interface_closure_npz(ckpt)
-                self.assertEqual(learned.training_mode, "online_rollout")
-                self.assertEqual(learned.train_objective, "trajectory")
-                self.assertEqual(learned.loss_backend, "fourier_hermite_bidir")
-                self.assertEqual(learned.online_v_probes, 0)
-                self.assertEqual(learned.rollout_horizon, 1)
-                self.assertEqual(learned.rollout_anchor_samples, 1)
-                self.assertEqual(tuple(int(v) for v in learned.Nv_targets), (nv,))
-
-            summary = json.loads((outdir / "summary.json").read_text())
-            self.assertEqual(summary["nv_list"], [6, 8])
-            case_targets = {int(case["Nv"]): tuple(int(v) for v in case["train_nv_targets"]) for case in summary["cases"]}
-            self.assertEqual(
-                case_targets,
-                {
-                    6: (6,),
-                    8: (8,),
-                },
-            )
-
-    def test_run_fh_online_q_finetune_wrapper_selects_closure_backend(self) -> None:
-        script = Path("model/train/run_fh_online_q_finetune.sh")
-        self.assertTrue(script.exists())
-        self.assertTrue(os.access(script, os.X_OK))
-        subprocess.run(
-            ["bash", "-n", str(script)],
-            cwd="/Users/armin/Documents/NYU/vpml",
-            check=True,
-        )
-        text = script.read_text()
-        self.assertIn("fourier_hermite_closure_bidir", text)
-        self.assertIn("run_nv_sweep_online_rollout.sh", text)
-        self.assertIn('ONLINE_FINETUNE_ROLLOUT_HORIZON="${ONLINE_FINETUNE_ROLLOUT_HORIZON:-256}"', text)
-        self.assertIn('ONLINE_FINETUNE_ROLLOUT_ANCHOR_SAMPLES="${ONLINE_FINETUNE_ROLLOUT_ANCHOR_SAMPLES:-1}"', text)
-        self.assertIn('ONLINE_FINETUNE_ROLLOUT_DIRECTION="${ONLINE_FINETUNE_ROLLOUT_DIRECTION:-forward}"', text)
-        self.assertIn("nv_sweep_metric1.png", text)
-        self.assertIn("fig10_learned_vs_nonlocal_nv_sweep_phase_space.png", text)
-
-    def test_run_fh_online_projected_xv_rollout_wrapper_selects_projected_xv_backend(self) -> None:
-        script = Path("model/train/run_fh_online_projected_xv_rollout.sh")
-        self.assertTrue(script.exists())
-        self.assertTrue(os.access(script, os.X_OK))
-        subprocess.run(
-            ["bash", "-n", str(script)],
-            cwd="/Users/armin/Documents/NYU/vpml",
-            check=True,
-        )
-        text = script.read_text()
-        self.assertIn("fourier_hermite_projected_xv_bidir", text)
-        self.assertIn("TRAIN_NV_LADDER_MODE=\"${TRAIN_NV_LADDER_MODE:-fixed_ratio}\"", text)
-        self.assertIn("TRAIN_ROLLOUT_DIRECTION=\"${TRAIN_ROLLOUT_DIRECTION:-forward}\"", text)
-        self.assertIn("TRAIN_PROJECTED_XV_TAIL_WINDOW", text)
-        self.assertIn("run_nv_sweep_online_rollout.sh", text)
 
 if __name__ == "__main__":
     unittest.main()

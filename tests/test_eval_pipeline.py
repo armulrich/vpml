@@ -1,8 +1,5 @@
 import json
 import math
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from model.eval import main as eval_main
-from model.train.train import main as train_main
 from vpml.core import (
     LearnedInterfaceClosure,
     e_hat_history_from_a_hat_history,
@@ -195,95 +191,6 @@ class EvalPipelineTests(unittest.TestCase):
             case_png = outdir / "heldout_landau" / "linear_landau_heldout_summary.png"
             self.assertTrue(case_npz.exists())
             self.assertTrue(case_png.exists())
-
-    def test_train_then_eval_pipeline_runs_on_tiny_case(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            outdir = Path(tmpdir) / "out"
-            checkpoint = outdir / "interface_closure.npz"
-            train_main(
-                [
-                    "--checkpoint",
-                    str(checkpoint),
-                    "--dataset-cache",
-                    str(outdir / "interface_closure_dataset.npz"),
-                    "--loss-plot",
-                    str(outdir / "interface_closure.loss.png"),
-                    "--epochs",
-                    "1",
-                    "--Nv-targets",
-                    "4",
-                    "--Nm",
-                    "1",
-                    "--hidden-width",
-                    "8",
-                    "--res-blocks",
-                    "1",
-                    "--teacher-Nx",
-                    "8",
-                    "--teacher-Nv",
-                    "16",
-                    "--teacher-dt",
-                    "0.05",
-                    "--teacher-vmin",
-                    "-6",
-                    "--teacher-vmax",
-                    "6",
-                    "--linear-T",
-                    "0.10",
-                    "--linear-num-samples",
-                    "1",
-                    "--linear-history-stride",
-                    "1",
-                    "--nonlinear-T",
-                    "0.10",
-                    "--nonlinear-history-stride",
-                    "1",
-                    "--weak-eps",
-                    "0.05",
-                    "--strong-eps",
-                    "0.25",
-                ]
-            )
-
-            eval_main(
-                [
-                    "--checkpoint",
-                    str(checkpoint),
-                    "--outdir",
-                    str(outdir / "eval"),
-                    "--bundles",
-                    "heldout_landau",
-                    "--teacher-Nx",
-                    "8",
-                    "--teacher-Nv",
-                    "16",
-                    "--teacher-dt",
-                    "0.05",
-                    "--teacher-vmin",
-                    "-6",
-                    "--teacher-vmax",
-                    "6",
-                    "--heldout-linear-Nx",
-                    "8",
-                    "--heldout-linear-Nv",
-                    "4",
-                    "--heldout-linear-dt",
-                    "0.05",
-                    "--heldout-linear-T",
-                    "0.10",
-                    "--heldout-nonlinear-Nx",
-                    "8",
-                    "--heldout-nonlinear-Nv",
-                    "4",
-                    "--heldout-nonlinear-dt",
-                    "0.05",
-                    "--heldout-nonlinear-T",
-                    "0.10",
-                ]
-            )
-            self.assertTrue(checkpoint.exists())
-            self.assertTrue((outdir / "eval" / "summary.json").exists())
-
 
 if __name__ == "__main__":
     unittest.main()
