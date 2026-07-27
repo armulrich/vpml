@@ -21,10 +21,10 @@ closure) are included so that results from **Palisso et al.,
 
 **At a glance**
 
-- Python ≥ 3.10 · JAX / `jax.numpy` · `float64` throughout
+- Python ≥ 3.10 · JAX / `jax.numpy` · JAX x64 enabled, selectable rollout precision
 - CPU by default (including on macOS); CUDA is opt-in
 - Three sibling packages: `vpml/` (library), `benchmarks/` (paper figures), `model/` (learned closure)
-- CLI entry points: `fh-nonlinear-sim`, `fh-benchmarks-2412-07073`, `fh-ml-tail-closure-train`, `fh-learned-closure-eval`
+- CLI entry points: `fh-nonlinear-sim`, `fh-benchmarks-2412-07073`, `fh-interface-flux-train`, `fh-learned-closure-eval`
 
 ---
 
@@ -112,65 +112,96 @@ fixed modified-Hermite matrix.
 
 ---
 
-## Learned Closure Workflow
+## Interface-Flux Closure Workflow
 
-### Train
+The canonical trainer advances the reduced Fourier--Hermite solver
+autonomously and minimizes error in its complex boundary flux \(q\). It uses all
+positive Fourier modes, equal weights for the linear, weakly nonlinear, and
+strongly nonlinear regimes, fixed phase-isotropic scales, equilibrium
+centering, spatial-translation augmentation, and the per-step cutoff cycle
+`6,7,12,20,36,64`.
 
-```bash
-python -m model.train.train \
-  --checkpoint     out_model/interface_closure.npz \
-  --dataset-cache  out_model/interface_closure_dataset.npz
-```
+For batch size \(B\), rollout horizon \(H\), positive-mode set
+\(\mathcal K_+\), and regime weight \(w_r=1/3\), the retained objective is
 
-Writes:
+\[
+\mathcal L_{\mathrm{IF}}^H(\theta)
+=
+\sum_r \frac{w_r}{2BH|\mathcal K_+|}
+\sum_{i=1}^{B}\sum_{h=0}^{H-1}\sum_{k\in\mathcal K_+}
+\frac{|q^\theta_{r,i,h,k}-q^\star_{r,i,h,k}|^2}{\sigma_r^2}.
+\]
 
-- `out_model/interface_closure.npz`
-- `out_model/interface_closure.metrics.npz`
-- `out_model/interface_closure_dataset.npz`
-- `out_model/interface_closure.loss.png` (if `--loss-plot` is passed)
-
-The main offline lane is `q_only`; the pure-online lane is kept separate as `online_rollout`.
-
-### Evaluate
-
-```bash
-python -m model.eval \
-  --checkpoint out_model/interface_closure.npz \
-  --outdir     out_model/eval
-```
-
-Writes `summary.json`, per-case `*.npz` rollouts, and `*_summary.png` plots
-under `heldout_landau/` and `benchmark_rollouts/`.
-
-### Sweep deployment `N_v`
-
-| Wrapper                                                         | What it sweeps                             |
-| --------------------------------------------------------------- | ------------------------------------------ |
-| `run_fh_offline_qloss_ladder.sh`                                | Fourier--Hermite offline fixed-ratio `q_only` baseline |
-| `run_fh_online_q_finetune.sh`                                   | Offline `q_only` pretraining plus online `q` fine-tuning |
-| `run_fh_online_projected_xv_rollout.sh`                         | Fourier--Hermite projected `x,v` online rollout loss |
-| `run_spline_grid_online_residual_rollout.sh`                    | Physical spline-grid online residual rollout loss |
-| `run_nv_sweep_online_rollout.sh`                                | Shared online-rollout driver used by wrappers |
-
-Example:
+### Train and evaluate
 
 ```bash
-./model/train/run_fh_offline_qloss_ladder.sh out_bench/fh_offline_qloss_ladder
+TRAIN_ROLLOUT_HORIZON=128 \
+TRAIN_T_FINAL=60 \
+./model/train/run_fh_interface_flux_rollout.sh \
+  out_bench/interface_flux_H128_T60
 ```
 
-The Fourier--Hermite wrappers train one checkpoint per deployment `N_v` and then
-call `python -m model.eval_nv_sweep ...`, emitting the same evaluation layout:
-Metric 1 plots HR against learned rollouts, while Metric 2 and Fig. 10 include
-the truncation (`q=0`) baseline beside the learned closure.
+The wrapper trains the canonical `Nv=64` model and evaluates every configured
+training IC by default. Its principal artifacts are:
 
-- `summary.json`
-- `nv_sweep_metric1.png`, `nv_sweep_metric2.png`
-- `fig10_learned_vs_nonlocal_nv_sweep_phase_space.png`
-- `cases/*.npz`
+- `models/nv64/interface_closure.npz`
+- `models/nv64/interface_closure.metrics.npz`
+- `models/nv64/interface_closure.loss.png`
+- `models/nv64/interface_closure_interface_flux_histories.npz`
+- `evaluation_cases/<case>/nv_sweep_metric1.png`
+- `evaluation_cases/<case>/nv_sweep_metric2.png`
+- `evaluation_cases/<case>/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png`
 
-For the offline wrapper, per-`N_v` dataset caches live under
-`models/nv*/interface_closure_dataset.npz`. The spline-grid wrapper writes its
-own spline-grid metrics and phase-space plots under its output directory.
+Set `EVAL_TRAINING_CASES=0` to produce one Metric 1/2 and raw-grid HR Fig. 10
+comparison at the output root. Reuse an existing checkpoint without training:
+
+```bash
+RUN_TRAIN=0 \
+./model/train/run_fh_interface_flux_rollout.sh \
+  out_bench/interface_flux_H128_T60
+```
+
+The configurable numerical controls include `TRAIN_ROLLOUT_HORIZON`,
+`TRAIN_T_FINAL`, `TRAIN_BATCH_SIZE`, `TRAIN_STEPS_PER_EPOCH`, `TRAIN_EPOCHS`,
+`TRAIN_LR`, `TRAIN_PRECISION`, and `TRAIN_SEED`. The canonical physical and
+normalization constraints are not exposed as competing training modes.
+
+### Horizon sweep
+
+Use the controlled sweep wrapper when \(H\) is the only intended difference:
+
+```bash
+./model/train/run_fh_interface_flux_horizon_sweep.sh \
+  1,128,256 \
+  out_bench/interface_flux_horizon_sweep
+```
+
+Each horizon is written to a separate `H<horizon>` directory.
+
+### Plot-only regeneration
+
+Regenerate a training-loss figure from saved metrics without retraining:
+
+```bash
+python -m model.diagnostics.plot_training_loss \
+  --metrics out_bench/interface_flux_H128_T60/models/nv64/interface_closure.metrics.npz \
+  --output out_bench/interface_flux_H128_T60/models/nv64/interface_closure.loss.regenerated.png
+```
+
+The figure derives its complete loss equation and scales from checkpoint
+metadata. Retained solver-embedded exact-q checkpoints are mapped to the
+canonical identifiers when loaded; checkpoints from removed trainer families
+are intentionally unsupported.
+
+### Phase-space video
+
+Create a reusable raw-HR, unclosed `Nv=64`, and learned-interface-flux
+triptych:
+
+```bash
+python -m model.diagnostics.render_phase_space_triptych_video \
+  --run-root out_bench/interface_flux_H128_T60
+```
 
 ---
 
@@ -190,14 +221,14 @@ own spline-grid metrics and phase-space plots under its output directory.
 - `benchmarks/run_linear_landau_suite.sh` — linear Landau benchmark shell entrypoint
 - `benchmarks/fh_nonlinear_sim_jax.py` — standalone nonlinear physical-grid simulations
 - `model/model.py` — thin learned-model surface built on top of `vpml`
-- `model/train/train.py` — learned interface-closure training entrypoint
-- `model/train/data.py` — dataset / cache / reference-building surface for learned-closure workflows
+- `model/train/interface_flux_rollout.py` — canonical solver-embedded interface-flux trainer
+- `model/train/run_fh_interface_flux_rollout.sh` — canonical training and evaluation wrapper
+- `model/train/run_fh_interface_flux_horizon_sweep.sh` — controlled rollout-horizon sweep
 - `model/eval.py` — post-train learned-model evaluation
 - `model/eval_nv_sweep.py` — learned-model nonlinear `N_v` sweep evaluation
-- `model/train/run_fh_offline_qloss_ladder.sh` — per-`N_v` fixed-ratio offline `q_only` baseline wrapper
-- `model/train/run_fh_online_q_finetune.sh` — offline `q_only` pretraining followed by online `q` fine-tuning wrapper
-- `model/train/run_fh_online_projected_xv_rollout.sh` — projected `x,v` online rollout wrapper
-- `model/train/run_spline_grid_online_residual_rollout.sh` — physical spline-grid online residual rollout wrapper
-- `model/train/run_nv_sweep_online_rollout.sh` — shared per-`N_v` online rollout driver used by the Fourier--Hermite online wrappers
-  Default recipe: denser nonlinear amplitude coverage, `TEACHER_NX=256`, `TEACHER_DT=0.005`, and `TRAIN_ONLINE_V_PROBES=256` for the top-end `N_v` comparison lane
-  Runtime note: the wrapper prebuilds a shared `online_reference_dataset.npz`, reuses it across `N_v`, and enables bounded per-`N_v` parallel training on larger CPU boxes
+- `model/eval_training_cases.py` — per-IC Metric 1/2 and raw-HR Fig. 10 evaluation
+- `model/diagnostics/plot_training_loss.py` — metadata-driven plot-only loss regeneration
+- `model/diagnostics/render_phase_space_triptych_video.py` — raw-HR/truncation/learned phase-space video
+- `model/diagnostics/plot_hermite_spectrum.py` — Hermite-spectrum diagnostics
+
+</details>
