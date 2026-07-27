@@ -157,7 +157,6 @@ def _max_finite(values: Iterable[float]) -> float:
 def _save_convergence_plot(
     *,
     refinement_summary_by_case: Dict[str, Dict[str, Dict[str, float]]],
-    teacher_nv: int,
     figure_path: Path,
 ) -> None:
     display = {
@@ -174,7 +173,7 @@ def _save_convergence_plot(
             }
         )
     )
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 6.0))
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5), sharey=True)
     for case_name, by_refined_grid in refinement_summary_by_case.items():
         refined_grids = tuple(sorted(int(value) for value in by_refined_grid))
         c_values = [
@@ -211,54 +210,21 @@ def _save_convergence_plot(
     ):
         axis.set_title(title)
         axis.set_xlabel(r"Projection quadrature points $M$")
-        axis.set_ylabel(
-            "Relative refinement change\n"
-            r"$\delta_M(Y)=\|Y^{(M)}-Y^{(M/2)}\|_2/\|Y^{(M)}\|_2$"
-        )
         axis.set_xticks(all_refined_grids)
         axis.set_xticklabels([f"{grid:,}" for grid in all_refined_grids])
         axis.grid(True, which="both", alpha=0.25)
+    axes[0].set_ylabel(r"Relative refinement change $\delta_M^C$")
+    axes[1].set_ylabel(r"Relative refinement change $\delta_M^q$")
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.suptitle(
-        "Spline-to-Hermite projection-quadrature self-convergence",
-        fontsize=14,
-        y=0.98,
-    )
     fig.legend(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.91),
-        ncol=4,
+        bbox_to_anchor=(0.5, 0.995),
+        ncol=3,
         frameon=False,
     )
-    fig.text(
-        0.5,
-        0.82,
-        (
-            rf"$f_{{\rm spline}}^{{[N_v={teacher_nv}]}}$ denotes the cubic-spline "
-            rf"reconstruction of the $N_v={teacher_nv}$ solver state, held unchanged as $M$ varies."
-        ),
-        ha="center",
-        fontsize=10,
-    )
-    fig.text(
-        0.5,
-        0.75,
-        (
-            r"$C_{n,k}^{(M)}=\mathcal{F}_x\!\left["
-            rf"\sum_{{j=1}}^{{M}}w_j(f_{{\rm spline}}^{{[N_v={teacher_nv}]}}"
-            r"-f_{\rm eq})(x,v_j,t)"
-            r"\widetilde{H}_n(v_j)\right]_k"
-            r"\ \approx\ "
-            r"\mathcal{F}_x\!\left[\int_{v_{\min}}^{v_{\max}}"
-            rf"(f_{{\rm spline}}^{{[N_v={teacher_nv}]}}"
-            r"-f_{\rm eq})\widetilde{H}_n\,dv\right]_k$"
-        ),
-        ha="center",
-        fontsize=10,
-    )
-    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.11, top=0.61, wspace=0.30)
+    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.14, top=0.82, wspace=0.18)
     fig.savefig(figure_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
@@ -577,7 +543,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     figure_path = outdir / "projection_quadrature_convergence.png"
     _save_convergence_plot(
         refinement_summary_by_case=refinement_summary_by_case,
-        teacher_nv=int(args.teacher_Nv),
         figure_path=figure_path,
     )
 
