@@ -116,13 +116,7 @@ statistical invariants are fixed:
 For batch size $B$, rollout horizon $H$, positive-mode set
 $\mathcal K_+$, and regime weights $w_r=1/3$, the objective is
 
-$$
-\mathcal L_{\mathrm{IF}}^H(\theta)
-=
-\sum_r \frac{w_r}{2BH|\mathcal K_+|}
-\sum_{i=1}^{B}\sum_{h=0}^{H-1}\sum_{k\in\mathcal K_+}
-\frac{|q^\theta_{r,i,h,k}-q^\star_{r,i,h,k}|^2}{\sigma_r^2}.
-$$
+$\displaystyle \mathcal L_{\mathrm{IF}}^H(\theta) = \sum_r \frac{w_r}{2BH|\mathcal K_+|} \sum_{i=1}^{B}\sum_{h=0}^{H-1}\sum_{k\in\mathcal K_+} \frac{|q^\theta_{r,i,h,k}-q^\star_{r,i,h,k}|^2}{\sigma_r^2}.$
 
 ### Train and evaluate
 
