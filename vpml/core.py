@@ -69,6 +69,16 @@ Array = jnp.ndarray
 LEGACY_GRID_CUBIC_TEACHER_BACKEND = "physical_grid_cubic_v1"
 GRID_CUBIC_SPLINE_TEACHER_BACKEND = "grid_cubic_spline"
 HIGHER_ORDER_HERMITE_TEACHER_BACKEND = "higher_order_hermite"
+INTERFACE_FLUX_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
+INTERFACE_FLUX_OBJECTIVE = "interface_flux_rollout"
+INTERFACE_FLUX_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
+INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 1
+
+_LEGACY_INTERFACE_FLUX_TRIPLE = (
+    "exact_q_rollout",
+    "q_rollout",
+    "exact_fourier_hermite_q_rollout",
+)
 
 
 def normalize_teacher_backend_name(name: Optional[str]) -> Optional[str]:
@@ -301,8 +311,8 @@ class LearnedInterfaceClosure:
     teacher_proj_Nv: Optional[int] = None
     include_global_indicators: bool = True
     n_low: int = 2
-    training_mode: str = "offline_rollout"
-    train_objective: str = "q_only"
+    training_mode: str = INTERFACE_FLUX_TRAINING_MODE
+    train_objective: str = INTERFACE_FLUX_OBJECTIVE
     context_mode: str = "none"
     context_lags: int = 0
     base_input_dim: Optional[int] = None
@@ -348,7 +358,7 @@ class LearnedInterfaceClosure:
             raise ValueError("nv_scale must be positive")
         if int(self.n_low) < 0:
             raise ValueError("n_low must be nonnegative")
-        if str(self.training_mode) not in {"offline_rollout", "online_rollout", "exact_q_rollout"}:
+        if str(self.training_mode) != INTERFACE_FLUX_TRAINING_MODE:
             raise ValueError(f"Unsupported training_mode={self.training_mode!r}")
         if str(self.context_mode) not in {"none", "lag1_delta"}:
             raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
@@ -360,7 +370,7 @@ class LearnedInterfaceClosure:
             raise ValueError("rollout_anchor_samples must be nonnegative")
         if not (0.0 < float(self.tail_start_fraction) <= 1.0):
             raise ValueError("tail_start_fraction must lie in (0, 1]")
-        if str(self.train_objective) not in {"q_only", "q_rollout", "f_rollout", "trajectory", "trajectory_q_hybrid"}:
+        if str(self.train_objective) != INTERFACE_FLUX_OBJECTIVE:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
         if int(self.online_v_probes) < 0:
             raise ValueError("online_v_probes must be nonnegative")
@@ -598,6 +608,9 @@ def save_learned_interface_closure_npz(
     """Save a learned interface-closure checkpoint in NPZ format."""
     payload: Dict[str, np.ndarray] = {
         "closure_kind": np.array(["interface_closure"], dtype=np.str_),
+        "metadata_schema_version": np.array(
+            [INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION], dtype=np.int32
+        ),
         "Nm": np.array([int(learned.Nm)], dtype=np.int32),
         "k_scale": np.array([float(learned.k_scale)], dtype=np.float64),
         "nv_scale": np.array([float(learned.nv_scale)], dtype=np.float64),
@@ -690,6 +703,17 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             raise ValueError(
                 f"Incompatible learned-closure checkpoint at {path}: expected interface_closure. "
                 "Legacy mu-tail checkpoints are no longer supported and must be retrained."
+            )
+        schema_version = (
+            int(np.asarray(data["metadata_schema_version"]).reshape(-1)[0])
+            if "metadata_schema_version" in data.files
+            and data["metadata_schema_version"].size
+            else 0
+        )
+        if schema_version > INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Checkpoint schema {schema_version} is newer than supported schema "
+                f"{INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION}"
             )
 
         params = {
@@ -819,6 +843,21 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "loss_backend" in data.files and data["loss_backend"].size
             else None
         )
+        metadata_triple = (training_mode, train_objective, loss_backend)
+        if metadata_triple == _LEGACY_INTERFACE_FLUX_TRIPLE:
+            training_mode = INTERFACE_FLUX_TRAINING_MODE
+            train_objective = INTERFACE_FLUX_OBJECTIVE
+            loss_backend = INTERFACE_FLUX_LOSS_BACKEND
+        elif metadata_triple != (
+            INTERFACE_FLUX_TRAINING_MODE,
+            INTERFACE_FLUX_OBJECTIVE,
+            INTERFACE_FLUX_LOSS_BACKEND,
+        ):
+            raise ValueError(
+                "Unsupported learned-closure trainer metadata "
+                f"{metadata_triple!r}; only canonical interface-flux and legacy "
+                "solver-embedded exact-q checkpoints are supported"
+            )
         lambda_q = (
             float(np.asarray(data["lambda_q"]).reshape(-1)[0])
             if "lambda_q" in data.files and data["lambda_q"].size
