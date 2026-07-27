@@ -57,6 +57,7 @@ def _closure(*, params=None, centered: bool = True) -> LearnedInterfaceClosure:
         teacher_vmax=8.0,
         teacher_dt=0.05,
         teacher_proj_Nv=5,
+        projection_quadrature_Nv=64,
         training_mode=trainer.INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
         train_objective=trainer.INTERFACE_FLUX_ROLLOUT_OBJECTIVE,
         rollout_horizon=1,
@@ -139,6 +140,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             teacher_vmax=8.0,
             teacher_dt=0.05,
             teacher_proj_Nv=5,
+            projection_quadrature_Nv=64,
             n_low=2,
             context_mode="none",
             rollout_horizon=1,
@@ -224,6 +226,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
                 loaded.loss_backend,
                 trainer.INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
             )
+            self.assertEqual(loaded.projection_quadrature_Nv, 64)
             np.testing.assert_allclose(
                 np.asarray(learned_interface_q_hat(state, k_arr, 4, loaded)),
                 expected,

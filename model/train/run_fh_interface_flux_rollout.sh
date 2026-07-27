@@ -27,6 +27,7 @@ TRAIN_INIT_CHECKPOINT="${TRAIN_INIT_CHECKPOINT:-}"
 
 TEACHER_NX="${TEACHER_NX:-256}"
 TEACHER_NV="${TEACHER_NV:-512}"
+TEACHER_PROJECTION_NV="${TEACHER_PROJECTION_NV:-4096}"
 TEACHER_DT="${TEACHER_DT:-0.01}"
 TEACHER_VMIN="${TEACHER_VMIN:--8.0}"
 TEACHER_VMAX="${TEACHER_VMAX:-8.0}"
@@ -76,6 +77,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     --history-stride "${TRAIN_HISTORY_STRIDE}"
     --teacher-Nx "${TEACHER_NX}"
     --teacher-Nv "${TEACHER_NV}"
+    --projection-quadrature-Nv "${TEACHER_PROJECTION_NV}"
     --teacher-dt "${TEACHER_DT}"
     --teacher-vmin "${TEACHER_VMIN}"
     --teacher-vmax "${TEACHER_VMAX}"
@@ -150,6 +152,8 @@ Canonical interface-flux run complete.
   loss plot:  ${LOSS_PLOT}
   H:          ${TRAIN_ROLLOUT_HORIZON}
   T final:    ${TRAIN_T_FINAL}
+  teacher Nv: ${TEACHER_NV}
+  projection: ${TEACHER_PROJECTION_NV}
   precision:  ${TRAIN_PRECISION}
   backend:    regime_balanced_all_k_interface_flux
 EOF

@@ -72,7 +72,7 @@ HIGHER_ORDER_HERMITE_TEACHER_BACKEND = "higher_order_hermite"
 INTERFACE_FLUX_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
 INTERFACE_FLUX_OBJECTIVE = "interface_flux_rollout"
 INTERFACE_FLUX_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
-INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 1
+INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 2
 
 _LEGACY_INTERFACE_FLUX_TRIPLE = (
     "exact_q_rollout",
@@ -295,6 +295,7 @@ class LearnedInterfaceClosure:
     teacher_vmax: Optional[float] = None
     teacher_dt: Optional[float] = None
     teacher_proj_Nv: Optional[int] = None
+    projection_quadrature_Nv: Optional[int] = None
     include_global_indicators: bool = True
     n_low: int = 2
     training_mode: str = INTERFACE_FLUX_TRAINING_MODE
@@ -322,6 +323,8 @@ class LearnedInterfaceClosure:
             raise ValueError("nv_scale must be positive")
         if int(self.n_low) < 0:
             raise ValueError("n_low must be nonnegative")
+        if self.projection_quadrature_Nv is not None and int(self.projection_quadrature_Nv) <= 3:
+            raise ValueError("projection_quadrature_Nv must exceed three when provided")
         if str(self.training_mode) != INTERFACE_FLUX_TRAINING_MODE:
             raise ValueError(f"Unsupported training_mode={self.training_mode!r}")
         if str(self.context_mode) not in {"none", "lag1_delta"}:
@@ -547,6 +550,10 @@ def save_learned_interface_closure_npz(
         payload["teacher_dt"] = np.array([float(learned.teacher_dt)], dtype=np.float64)
     if learned.teacher_proj_Nv is not None:
         payload["teacher_proj_Nv"] = np.array([int(learned.teacher_proj_Nv)], dtype=np.int32)
+    if learned.projection_quadrature_Nv is not None:
+        payload["projection_quadrature_Nv"] = np.array(
+            [int(learned.projection_quadrature_Nv)], dtype=np.int32
+        )
     for name, value in learned.params.items():
         payload[name] = np.asarray(value, dtype=np.float64)
     np.savez(path, **payload)
@@ -633,6 +640,12 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         teacher_vmax = None if "teacher_vmax" not in data.files or not data["teacher_vmax"].size else float(np.asarray(data["teacher_vmax"]).reshape(-1)[0])
         teacher_dt = None if "teacher_dt" not in data.files or not data["teacher_dt"].size else float(np.asarray(data["teacher_dt"]).reshape(-1)[0])
         teacher_proj_Nv = None if "teacher_proj_Nv" not in data.files or not data["teacher_proj_Nv"].size else int(np.asarray(data["teacher_proj_Nv"]).reshape(-1)[0])
+        projection_quadrature_Nv = (
+            None
+            if "projection_quadrature_Nv" not in data.files
+            or not data["projection_quadrature_Nv"].size
+            else int(np.asarray(data["projection_quadrature_Nv"]).reshape(-1)[0])
+        )
         include_global_indicators = (
             bool(np.asarray(data["include_global_indicators"]).reshape(-1)[0])
             if "include_global_indicators" in data.files and data["include_global_indicators"].size
@@ -718,6 +731,7 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         teacher_vmax=teacher_vmax,
         teacher_dt=teacher_dt,
         teacher_proj_Nv=teacher_proj_Nv,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         include_global_indicators=include_global_indicators,
         n_low=n_low,
         training_mode=training_mode,

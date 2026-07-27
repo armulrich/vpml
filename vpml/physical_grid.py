@@ -443,6 +443,117 @@ def hermite_dual_basis(N: int, v: Array) -> Array:
     return hermite_dual_basis_scaled(int(N), v, vth=1.0)
 
 
+def trapezoid_quadrature_weights(v: Array) -> Array:
+    """Return weights equivalent to ``jnp.trapezoid(..., x=v, axis=0)``."""
+    v = jnp.asarray(v, dtype=jnp.float64)
+    if v.ndim != 1 or int(v.size) < 2:
+        raise ValueError("v must be a one-dimensional grid with at least two points")
+    if not bool(jnp.all(jnp.diff(v) > 0.0)):
+        raise ValueError("v must be strictly increasing")
+    weights = jnp.zeros_like(v)
+    weights = weights.at[0].set(0.5 * (v[1] - v[0]))
+    weights = weights.at[-1].set(0.5 * (v[-1] - v[-2]))
+    if int(v.size) > 2:
+        weights = weights.at[1:-1].set(0.5 * (v[2:] - v[:-2]))
+    return weights.astype(jnp.float64)
+
+
+def cubic_bspline_velocity_resampling_matrix(
+    source_v: Array,
+    target_v: Array,
+) -> Array:
+    """Build the linear map from native velocity nodes to the cubic spline at target nodes."""
+    source_v = jnp.asarray(source_v, dtype=jnp.float64)
+    target_v = jnp.asarray(target_v, dtype=jnp.float64)
+    if source_v.ndim != 1 or int(source_v.size) <= 3:
+        raise ValueError("source_v must be a one-dimensional grid with at least four points")
+    if target_v.ndim != 1 or int(target_v.size) < 2:
+        raise ValueError("target_v must be a one-dimensional grid with at least two points")
+    source_dv = jnp.diff(source_v)
+    if not bool(jnp.all(source_dv > 0.0)):
+        raise ValueError("source_v must be strictly increasing")
+    if not bool(jnp.allclose(source_dv, source_dv[0], rtol=1e-12, atol=1e-14)):
+        raise ValueError("source_v must be uniformly spaced")
+    if float(target_v[0]) < float(source_v[0]) or float(target_v[-1]) > float(source_v[-1]):
+        raise ValueError("target_v must lie within the source velocity interval")
+
+    source_nv = int(source_v.size)
+    sub = jnp.full((source_nv - 1,), 1.0, dtype=jnp.float64)
+    diag = jnp.full((source_nv,), 4.0, dtype=jnp.float64)
+    sup = jnp.full((source_nv - 1,), 1.0, dtype=jnp.float64)
+    nodal_basis = jnp.eye(source_nv, dtype=jnp.float64)
+    spline_coeffs = cubic_bspline_prefilter_constant(nodal_basis, sub, diag, sup)
+    target_coords = jnp.clip(
+        (target_v - source_v[0]) / source_dv[0],
+        0.0,
+        float(source_nv - 1),
+    )
+    coords = jnp.broadcast_to(target_coords[:, None], (int(target_v.size), source_nv))
+    return cubic_bspline_interp_constant(spline_coeffs, coords, cval=0.0)
+
+
+def build_cubic_spline_hermite_projection_matrix(
+    source_v: Array,
+    projection_order: int,
+    quadrature_Nv: int,
+    *,
+    vth: float = 1.0,
+) -> Array:
+    """Precompute spline interpolation plus velocity quadrature for Hermite moments."""
+    source_v = jnp.asarray(source_v, dtype=jnp.float64)
+    if int(projection_order) < 0:
+        raise ValueError("projection_order must be nonnegative")
+    if int(quadrature_Nv) <= 3:
+        raise ValueError("quadrature_Nv must exceed three")
+    target_v = jnp.linspace(
+        float(source_v[0]),
+        float(source_v[-1]),
+        int(quadrature_Nv),
+        dtype=jnp.float64,
+    )
+    resampling = cubic_bspline_velocity_resampling_matrix(source_v, target_v)
+    dual_basis = hermite_dual_basis_scaled(
+        int(projection_order),
+        target_v,
+        vth=float(vth),
+    )
+    weights = trapezoid_quadrature_weights(target_v)
+    return jnp.einsum(
+        "nm,m,mj->nj",
+        dual_basis,
+        weights,
+        resampling,
+        optimize=True,
+    ).astype(jnp.float64)
+
+
+def project_distribution_snapshot_with_hermite_matrix(
+    f_phys: Array,
+    projection_matrix: Array,
+    *,
+    equilibrium: Optional[Array] = None,
+) -> Array:
+    """Project a physical-grid snapshot using a precomputed velocity-moment matrix."""
+    f_phys = jnp.asarray(f_phys, dtype=jnp.float64)
+    projection_matrix = jnp.asarray(projection_matrix, dtype=jnp.float64)
+    if f_phys.ndim != 2:
+        raise ValueError(f"f_phys must have shape (Nv, Nx), got {f_phys.shape}")
+    if projection_matrix.ndim != 2 or int(projection_matrix.shape[1]) != int(f_phys.shape[0]):
+        raise ValueError(
+            "projection_matrix must have shape (projection_order, source_Nv), "
+            f"got {projection_matrix.shape} for f_phys={f_phys.shape}"
+        )
+    if equilibrium is not None:
+        equilibrium = jnp.asarray(equilibrium, dtype=jnp.float64)
+        if equilibrium.shape != (int(f_phys.shape[0]),):
+            raise ValueError(
+                f"equilibrium must have shape ({int(f_phys.shape[0])},), got {equilibrium.shape}"
+            )
+        f_phys = f_phys - equilibrium[:, None]
+    a_phys = projection_matrix @ f_phys
+    return jnp.fft.rfft(a_phys, axis=1).astype(jnp.complex128)
+
+
 def project_distribution_snapshot_to_fourier_hermite(
     f_phys: Array,
     v: Array,
@@ -571,4 +682,3 @@ def extract_interface_supervised_pairs_from_coeff_history(
             "targets": targets_out.reshape(-1, 2).astype(np.float64),
         }
     return out
-

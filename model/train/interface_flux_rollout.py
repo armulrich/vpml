@@ -43,14 +43,12 @@ from vpml.core import (
 from vpml.linear_landau import LinearLandauConfig, linear_explicit_N_hat, run_linear_landau_cnab2_raw
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
+    build_cubic_spline_hermite_projection_matrix,
     compute_electric_field_from_distribution,
-    cubic_bspline_interp_constant,
-    cubic_bspline_prefilter_constant,
     extract_interface_supervised_pairs_from_coeff_history,
     gaussian_pdf,
-    hermite_dual_basis_scaled,
     normalize_density_on_grid,
-    project_distribution_snapshot_to_fourier_hermite,
+    project_distribution_snapshot_with_hermite_matrix,
     run_semilagrangian_vlasov_poisson,
 )
 from vpml.visualization.training import save_training_loss_plot
@@ -68,6 +66,7 @@ INTERFACE_FLUX_ROLLOUT_CACHE_FORMAT = "landau_interface_flux_rollout_reference"
 INTERFACE_FLUX_ROLLOUT_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
 INTERFACE_FLUX_ROLLOUT_OBJECTIVE = "interface_flux_rollout"
 INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
+INTERFACE_FLUX_PROJECTION_SCHEME = "cubic_spline_uniform_trapezoid"
 EXACT_ROLLOUT_PRECISION_FLOAT64 = "float64"
 EXACT_ROLLOUT_PRECISION_FLOAT32 = "float32"
 ALL_EXACT_ROLLOUT_PRECISIONS = (
@@ -90,6 +89,7 @@ def build_interface_flux_rollout_cache_metadata(
     regimes: Sequence[str],
     teacher_Nx: int,
     teacher_Nv: int,
+    projection_quadrature_Nv: int,
     teacher_L: float,
     teacher_vmin: float,
     teacher_vmax: float,
@@ -114,6 +114,12 @@ def build_interface_flux_rollout_cache_metadata(
         "teacher_backend": np.array([GRID_CUBIC_SPLINE_TEACHER_BACKEND], dtype=np.str_),
         "teacher_Nx": np.array([int(teacher_Nx)], dtype=np.int32),
         "teacher_Nv": np.array([int(teacher_Nv)], dtype=np.int32),
+        "projection_quadrature_Nv": np.array(
+            [int(projection_quadrature_Nv)], dtype=np.int32
+        ),
+        "projection_quadrature_scheme": np.array(
+            [INTERFACE_FLUX_PROJECTION_SCHEME], dtype=np.str_
+        ),
         "teacher_L": np.array([float(teacher_L)], dtype=np.float64),
         "teacher_vmin": np.array([float(teacher_vmin)], dtype=np.float64),
         "teacher_vmax": np.array([float(teacher_vmax)], dtype=np.float64),
@@ -221,19 +227,27 @@ def _projected_history_projector(
     v: Array,
     projection_order: int,
     *,
+    projection_quadrature_Nv: int,
     equilibrium: Array,
+    projection_matrix: Optional[Array] = None,
     vth: float = 1.0,
 ):
-    dual_basis = hermite_dual_basis_scaled(int(projection_order), v, vth=vth)
-
-    def projector(f_state: Array) -> Array:
-        return project_distribution_snapshot_to_fourier_hermite(
-            f_state,
+    matrix = (
+        build_cubic_spline_hermite_projection_matrix(
             v,
             int(projection_order),
-            vth=vth,
+            int(projection_quadrature_Nv),
+            vth=float(vth),
+        )
+        if projection_matrix is None
+        else jnp.asarray(projection_matrix, dtype=jnp.float64)
+    )
+
+    def projector(f_state: Array) -> Array:
+        return project_distribution_snapshot_with_hermite_matrix(
+            f_state,
+            matrix,
             equilibrium=equilibrium,
-            dual_basis=dual_basis,
         )
 
     return projector
@@ -244,10 +258,17 @@ def _run_landau_teacher_projected_history(
     perturbation_x: Array,
     *,
     projection_order: int,
+    projection_quadrature_Nv: int,
     history_stride: int,
+    equilibrium: Optional[Array] = None,
+    projection_matrix: Optional[Array] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     v = config.v
-    equilibrium = maxwellian_equilibrium(v)
+    equilibrium = (
+        maxwellian_equilibrium(v)
+        if equilibrium is None
+        else jnp.asarray(equilibrium, dtype=jnp.float64)
+    )
     f0 = equilibrium[:, None] * (1.0 + jnp.asarray(perturbation_x, dtype=jnp.float64)[None, :])
     raw = run_semilagrangian_vlasov_poisson(
         config,
@@ -257,7 +278,9 @@ def _run_landau_teacher_projected_history(
         history_projector=_projected_history_projector(
             v,
             int(projection_order),
+            projection_quadrature_Nv=int(projection_quadrature_Nv),
             equilibrium=equilibrium,
+            projection_matrix=projection_matrix,
             vth=1.0,
         ),
     )
@@ -272,7 +295,10 @@ def _run_landau_teacher_projected_histories(
     perturbation_x: Array,
     *,
     projection_orders: Sequence[int],
+    projection_quadrature_Nv: int,
     history_stride: int,
+    equilibrium: Optional[Array] = None,
+    projection_matrices: Optional[Dict[int, Array]] = None,
 ) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
     orders = tuple(sorted(int(order) for order in projection_orders))
     if not orders:
@@ -284,7 +310,14 @@ def _run_landau_teacher_projected_histories(
             config,
             perturbation_x,
             projection_order=int(order),
+            projection_quadrature_Nv=int(projection_quadrature_Nv),
             history_stride=history_stride,
+            equilibrium=equilibrium,
+            projection_matrix=(
+                None
+                if projection_matrices is None
+                else projection_matrices.get(int(order))
+            ),
         )
         histories[int(order)] = coeff_hist
         if k_arr is None:
@@ -351,12 +384,22 @@ def _run_interface_flux_rollout_projected_history(
     perturbation_x: np.ndarray,
     *,
     max_projection_order: int,
+    projection_quadrature_Nv: int,
+    equilibrium: Optional[Array] = None,
+    projection_matrix: Optional[Array] = None,
 ) -> np.ndarray:
     coeff_histories, _ = _run_landau_teacher_projected_histories(
         config,
         perturbation_x,
         projection_orders=(int(max_projection_order),),
+        projection_quadrature_Nv=int(projection_quadrature_Nv),
         history_stride=1,
+        equilibrium=equilibrium,
+        projection_matrices=(
+            None
+            if projection_matrix is None
+            else {int(max_projection_order): projection_matrix}
+        ),
     )
     return np.asarray(coeff_histories[int(max_projection_order)], dtype=np.complex128)
 
@@ -367,6 +410,7 @@ def build_interface_flux_rollout_reference_dataset(
     regimes: Sequence[str],
     teacher_Nx: int,
     teacher_Nv: int,
+    projection_quadrature_Nv: int,
     teacher_L: float,
     teacher_vmin: float,
     teacher_vmax: float,
@@ -390,6 +434,7 @@ def build_interface_flux_rollout_reference_dataset(
         regimes=regimes,
         teacher_Nx=teacher_Nx,
         teacher_Nv=teacher_Nv,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         teacher_L=teacher_L,
         teacher_vmin=teacher_vmin,
         teacher_vmax=teacher_vmax,
@@ -423,6 +468,19 @@ def build_interface_flux_rollout_reference_dataset(
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     dataset: Dict[str, Dict[str, np.ndarray]] = {}
     active = tuple(regimes)
+    projection_v = jnp.linspace(
+        float(teacher_vmin),
+        float(teacher_vmax),
+        int(teacher_Nv),
+        dtype=jnp.float64,
+    )
+    projection_equilibrium = maxwellian_equilibrium(projection_v)
+    projection_matrix = build_cubic_spline_hermite_projection_matrix(
+        projection_v,
+        int(max_projection_order),
+        int(projection_quadrature_Nv),
+        vth=1.0,
+    )
 
     if REGIME_LINEAR in active:
         config = PhysicalGridVlasovPoissonConfig(
@@ -451,6 +509,9 @@ def build_interface_flux_rollout_reference_dataset(
                     config,
                     perturb,
                     max_projection_order=max_projection_order,
+                    projection_quadrature_Nv=int(projection_quadrature_Nv),
+                    equilibrium=projection_equilibrium,
+                    projection_matrix=projection_matrix,
                 )
             )
         dataset[REGIME_LINEAR] = {coeff_key: np.stack(cases, axis=0)}
@@ -480,6 +541,9 @@ def build_interface_flux_rollout_reference_dataset(
                     nonlinear_config,
                     float(eps) * perturb_template,
                     max_projection_order=max_projection_order,
+                    projection_quadrature_Nv=int(projection_quadrature_Nv),
+                    equilibrium=projection_equilibrium,
+                    projection_matrix=projection_matrix,
                 )
             )
         dataset[regime] = {coeff_key: np.stack(cases, axis=0)}
@@ -1021,6 +1085,7 @@ def build_learned_interface_closure(
     teacher_vmax: float,
     teacher_dt: float,
     teacher_proj_Nv: Optional[int],
+    projection_quadrature_Nv: Optional[int],
     n_low: int,
     rollout_horizon: int,
 ) -> LearnedInterfaceClosure:
@@ -1048,6 +1113,11 @@ def build_learned_interface_closure(
         teacher_vmax=float(teacher_vmax),
         teacher_dt=float(teacher_dt),
         teacher_proj_Nv=None if teacher_proj_Nv is None else int(teacher_proj_Nv),
+        projection_quadrature_Nv=(
+            None
+            if projection_quadrature_Nv is None
+            else int(projection_quadrature_Nv)
+        ),
         include_global_indicators=True,
         n_low=int(n_low),
         training_mode=INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
@@ -1444,6 +1514,7 @@ def make_interface_flux_rollout_batch_loss(
     teacher_vmax: float,
     teacher_dt: float,
     teacher_proj_Nv: Optional[int],
+    projection_quadrature_Nv: Optional[int],
     n_low: int,
     context_mode: str,
     rollout_horizon: int,
@@ -1538,6 +1609,7 @@ def make_interface_flux_rollout_batch_loss(
                 teacher_vmax=teacher_vmax,
                 teacher_dt=teacher_dt,
                 teacher_proj_Nv=teacher_proj_Nv,
+                projection_quadrature_Nv=projection_quadrature_Nv,
                 n_low=n_low,
                 rollout_horizon=rollout_horizon,
             )
@@ -1925,7 +1997,7 @@ CANONICAL_NV_TARGETS = (6, 7, 12, 20, 36, 64)
 CANONICAL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
 CANONICAL_WEAK_EPS = (0.02, 0.03, 0.05, 0.07, 0.10, 0.12, 0.15, 0.18)
 CANONICAL_STRONG_EPS = (0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.65)
-CANONICAL_METADATA_SCHEMA_VERSION = 1
+CANONICAL_METADATA_SCHEMA_VERSION = 2
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1959,6 +2031,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nv-scale", type=float, default=None)
     parser.add_argument("--teacher-Nx", type=int, default=256)
     parser.add_argument("--teacher-Nv", type=int, default=512)
+    parser.add_argument("--projection-quadrature-Nv", type=int, default=None)
     parser.add_argument("--teacher-L", type=float, default=4.0 * math.pi)
     parser.add_argument("--teacher-vmin", type=float, default=-8.0)
     parser.add_argument("--teacher-vmax", type=float, default=8.0)
@@ -1985,6 +2058,7 @@ def _canonical_metrics_payload(
     k_scale: float,
     nv_scale: float,
     teacher_projection_order: int,
+    projection_quadrature_Nv: int,
     regime_loss_stds: Dict[str, float],
     val_metrics: Dict[str, np.ndarray],
 ) -> Dict[str, np.ndarray]:
@@ -2029,6 +2103,12 @@ def _canonical_metrics_payload(
         "teacher_proj_Nv": np.array(
             [teacher_projection_order], dtype=np.int32
         ),
+        "projection_quadrature_Nv": np.array(
+            [int(projection_quadrature_Nv)], dtype=np.int32
+        ),
+        "projection_quadrature_scheme": np.array(
+            [INTERFACE_FLUX_PROJECTION_SCHEME], dtype=np.str_
+        ),
         "T_final": np.array([args.T_final], dtype=np.float64),
         "n_low": np.array([args.n_low], dtype=np.int32),
         "context_mode": np.array(["none"], dtype=np.str_),
@@ -2065,6 +2145,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("--steps-per-epoch must be positive")
     if float(args.T_final) <= 0.0:
         raise ValueError("--T-final must be positive")
+    projection_quadrature_Nv = (
+        int(args.teacher_Nv)
+        if args.projection_quadrature_Nv is None
+        else int(args.projection_quadrature_Nv)
+    )
+    if projection_quadrature_Nv <= 3:
+        raise ValueError("--projection-quadrature-Nv must exceed three")
     if any(target_nv < int(args.Nm) for target_nv in CANONICAL_NV_TARGETS):
         raise ValueError(
             f"Nm={args.Nm} exceeds the smallest canonical cutoff "
@@ -2077,6 +2164,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         regimes=CANONICAL_REGIMES,
         teacher_Nx=args.teacher_Nx,
         teacher_Nv=args.teacher_Nv,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         teacher_L=args.teacher_L,
         teacher_vmin=args.teacher_vmin,
         teacher_vmax=args.teacher_vmax,
@@ -2096,6 +2184,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         min_projection_order=None,
     )
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
+    print(
+        "[data] physical teacher and projection grids: "
+        f"teacher_Nv={int(args.teacher_Nv)} "
+        f"projection_quadrature_Nv={projection_quadrature_Nv}"
+    )
     for regime in CANONICAL_REGIMES:
         cases = np.asarray(reference[regime][coeff_key])
         print(
@@ -2244,6 +2337,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         teacher_vmax=args.teacher_vmax,
         teacher_dt=args.teacher_dt,
         teacher_proj_Nv=max_projection_order,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         n_low=args.n_low,
         context_mode="none",
         rollout_horizon=args.rollout_horizon,
@@ -2297,6 +2391,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         teacher_vmax=args.teacher_vmax,
         teacher_dt=args.teacher_dt,
         teacher_proj_Nv=max_projection_order,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         n_low=args.n_low,
         rollout_horizon=args.rollout_horizon,
     )
@@ -2314,6 +2409,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         k_scale=k_scale,
         nv_scale=nv_scale,
         teacher_projection_order=max_projection_order,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         regime_loss_stds=regime_loss_stds,
         val_metrics=val_metrics,
     )
