@@ -1,4 +1,4 @@
-"""Physical velocity-grid convergence diagnostic for Landau teachers."""
+"""Semi-Lagrangian velocity-grid convergence diagnostic for Landau teachers."""
 
 from __future__ import annotations
 
@@ -323,7 +323,7 @@ def _save_convergence_plot(
             )
     for axis, title in zip(axes, titles):
         axis.set_title(title)
-        axis.set_xlabel(r"Refined physical velocity points $N_v$")
+        axis.set_xlabel(r"Solver velocity-grid points $N_v$")
         axis.set_xticks(x_positions)
         axis.set_xticklabels([f"{grid:,}" for grid in all_refined_grids])
         axis.grid(True, which="both", alpha=0.25)
@@ -379,9 +379,9 @@ def _save_teacher_artifact(
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Refine the physical velocity grid of otherwise identical Landau "
-            "teachers and compare electric-field energy plus the direct "
-            "phase-space distribution."
+            "Refine the semi-Lagrangian solver's nodal velocity grid for "
+            "otherwise identical Landau teachers and compare electric-field "
+            "energy plus the direct phase-space distribution."
         )
     )
     parser.add_argument("--outdir", type=Path, required=True)
@@ -396,7 +396,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=2048,
         help=(
-            "Physical grid whose snapshots are saved for the independent "
+            "Solver velocity grid whose snapshots are saved for the independent "
             "projection-quadrature diagnostic."
         ),
     )
@@ -405,7 +405,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Optional snapshot artifact to reuse as the coarsest physical grid. "
+            "Optional snapshot artifact to reuse as the coarsest solver grid. "
             "Only the finer grids in --physical-Nv-list are simulated."
         ),
     )
@@ -431,7 +431,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    print_jax_runtime_summary(jax, context="physical velocity-grid diagnostic")
+    print_jax_runtime_summary(jax, context="semi-Lagrangian velocity-grid diagnostic")
     args = _build_arg_parser().parse_args(argv)
     outdir = args.outdir.resolve()
     if outdir.exists():

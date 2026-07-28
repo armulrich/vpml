@@ -49,7 +49,7 @@ if [[ -n "${COARSE_TEACHER_SNAPSHOTS}" ]]; then
   PHYSICAL_REUSE_ARGS+=(--coarse-teacher-snapshots "${COARSE_TEACHER_SNAPSHOTS}")
 fi
 
-echo "[landau-resolution] [1/3] Physical velocity-grid self-convergence"
+echo "[landau-resolution] [1/3] Semi-Lagrangian velocity-grid self-convergence"
 "${PYTHON_BIN}" -m model.diagnostics.physical_velocity_grid_convergence \
   --outdir "${PHYSICAL_OUTDIR}" \
   --teacher-Nx "${TEACHER_NX}" \
