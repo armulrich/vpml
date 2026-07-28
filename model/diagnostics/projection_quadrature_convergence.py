@@ -18,7 +18,6 @@ bootstrap_jax_runtime()
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-from matplotlib.ticker import NullFormatter
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -246,29 +245,29 @@ def _save_convergence_plot(
             }
         )
     )
+    x_positions = np.arange(len(all_refined_grids), dtype=np.float64)
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5), sharey=True)
     for case_name, by_refined_grid in refinement_summary_by_case.items():
-        refined_grids = tuple(sorted(int(value) for value in by_refined_grid))
         c_values = [
-            by_refined_grid[str(int(grid))][
+            by_refined_grid[str(grid)][
                 "global_C0_through_N_refinement_change"
             ]
-            for grid in refined_grids
+            for grid in all_refined_grids
         ]
         q_values = [
-            by_refined_grid[str(int(grid))]["global_qN_refinement_change"]
-            for grid in refined_grids
+            by_refined_grid[str(grid)]["global_qN_refinement_change"]
+            for grid in all_refined_grids
         ]
         label, color = display.get(case_name, (case_name, None))
-        axes[0].loglog(
-            refined_grids,
+        axes[0].semilogy(
+            x_positions,
             np.maximum(np.asarray(c_values, dtype=np.float64), 1e-16),
             marker="o",
             label=label,
             color=color,
         )
-        axes[1].loglog(
-            refined_grids,
+        axes[1].semilogy(
+            x_positions,
             np.maximum(np.asarray(q_values, dtype=np.float64), 1e-16),
             marker="o",
             label=label,
@@ -283,9 +282,8 @@ def _save_convergence_plot(
     ):
         axis.set_title(title)
         axis.set_xlabel(r"Projection quadrature points $M$")
-        axis.set_xticks(all_refined_grids)
+        axis.set_xticks(x_positions)
         axis.set_xticklabels([f"{grid:,}" for grid in all_refined_grids])
-        axis.xaxis.set_minor_formatter(NullFormatter())
         axis.grid(True, which="both", alpha=0.25)
     axes[0].set_ylabel(r"Relative refinement change $\delta_M^C$")
     axes[1].set_ylabel(r"Relative refinement change $\delta_M^q$")
