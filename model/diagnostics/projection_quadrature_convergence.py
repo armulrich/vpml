@@ -1,4 +1,4 @@
-"""Convergence diagnostic for fixed-spline Fourier-Hermite projection quadrature."""
+"""Convergence diagnostic for fixed-teacher Fourier-Hermite projection quadrature."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ bootstrap_jax_runtime()
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+from matplotlib.ticker import NullFormatter
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -107,14 +108,86 @@ def _case_perturbations(
     }
 
 
+def _load_teacher_snapshot_artifact(
+    artifact_path: Path,
+) -> Tuple[
+    PhysicalGridVlasovPoissonConfig,
+    Dict[str, np.ndarray],
+    Dict[str, np.ndarray],
+]:
+    with np.load(artifact_path, allow_pickle=False) as payload:
+        schema_version = int(np.asarray(payload["schema_version"]).item())
+        if schema_version != 1:
+            raise ValueError(
+                f"Unsupported teacher snapshot artifact schema: {schema_version}"
+            )
+        snapshot_times = tuple(
+            float(value) for value in np.asarray(payload["snapshot_times"])
+        )
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(np.asarray(payload["teacher_Nx"]).item()),
+            Nv=int(np.asarray(payload["teacher_Nv"]).item()),
+            Lx=float(np.asarray(payload["teacher_L"]).item()),
+            vmin=float(np.asarray(payload["teacher_vmin"]).item()),
+            vmax=float(np.asarray(payload["teacher_vmax"]).item()),
+            dt=float(np.asarray(payload["teacher_dt"]).item()),
+            T=float(np.asarray(payload["T_final"]).item()),
+            poisson_sign=float(np.asarray(payload["poisson_sign"]).item()),
+            snapshot_times=snapshot_times,
+        )
+        case_count = int(np.asarray(payload["case_count"]).item())
+        snapshots_by_case: Dict[str, np.ndarray] = {}
+        energy_payload: Dict[str, np.ndarray] = {}
+        for case_idx in range(case_count):
+            prefix = f"case_{case_idx:03d}"
+            case_name = str(np.asarray(payload[f"{prefix}_name"]).item())
+            snapshots_by_case[case_name] = np.asarray(
+                payload[f"{prefix}_snapshot_f"],
+                dtype=np.float64,
+            )
+            energy_payload[f"{case_name}_times"] = np.asarray(
+                payload[f"{prefix}_times"],
+                dtype=np.float64,
+            )
+            energy_payload[f"{case_name}_energy"] = np.asarray(
+                payload[f"{prefix}_energy"],
+                dtype=np.float64,
+            )
+        source_v = np.asarray(payload["source_v"], dtype=np.float64)
+        k_arr = np.asarray(payload["k_arr"], dtype=np.float64)
+
+    np.testing.assert_allclose(
+        source_v,
+        np.asarray(config.v, dtype=np.float64),
+        rtol=0.0,
+        atol=1e-13,
+    )
+    np.testing.assert_allclose(
+        k_arr,
+        np.asarray(config.k_arr, dtype=np.float64),
+        rtol=0.0,
+        atol=1e-13,
+    )
+    return config, snapshots_by_case, energy_payload
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Hold one physical cubic-spline trajectory fixed while refining only "
-            "the velocity quadrature used for Fourier-Hermite projection."
+            "Hold one physical-grid teacher trajectory fixed while refining only "
+            "the velocity quadrature applied to its cubic-spline representation."
         )
     )
     parser.add_argument("--outdir", type=Path, required=True)
+    parser.add_argument(
+        "--teacher-snapshots",
+        type=Path,
+        default=None,
+        help=(
+            "Optional snapshot artifact from physical_velocity_grid_convergence. "
+            "When provided, the physical teacher is reused instead of rerun."
+        ),
+    )
     parser.add_argument("--teacher-Nx", type=int, default=256)
     parser.add_argument("--teacher-Nv", type=int, default=512)
     parser.add_argument("--teacher-L", type=float, default=4.0 * math.pi)
@@ -212,6 +285,7 @@ def _save_convergence_plot(
         axis.set_xlabel(r"Projection quadrature points $M$")
         axis.set_xticks(all_refined_grids)
         axis.set_xticklabels([f"{grid:,}" for grid in all_refined_grids])
+        axis.xaxis.set_minor_formatter(NullFormatter())
         axis.grid(True, which="both", alpha=0.25)
     axes[0].set_ylabel(r"Relative refinement change $\delta_M^C$")
     axes[1].set_ylabel(r"Relative refinement change $\delta_M^q$")
@@ -258,17 +332,39 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"{CANONICAL_NV_TARGETS}"
         )
 
-    config = PhysicalGridVlasovPoissonConfig(
-        Nx=int(args.teacher_Nx),
-        Nv=int(args.teacher_Nv),
-        Lx=float(args.teacher_L),
-        vmin=float(args.teacher_vmin),
-        vmax=float(args.teacher_vmax),
-        dt=float(args.teacher_dt),
-        T=float(args.T_final),
-        poisson_sign=float(args.poisson_sign),
-        snapshot_times=tuple(snapshot_times),
-    )
+    snapshots_by_case: Optional[Dict[str, np.ndarray]] = None
+    reused_energy_payload: Optional[Dict[str, np.ndarray]] = None
+    if args.teacher_snapshots is not None:
+        teacher_artifact = args.teacher_snapshots.resolve()
+        if not teacher_artifact.is_file():
+            raise FileNotFoundError(
+                f"Teacher snapshot artifact does not exist: {teacher_artifact}"
+            )
+        config, snapshots_by_case, reused_energy_payload = (
+            _load_teacher_snapshot_artifact(teacher_artifact)
+        )
+        if not np.allclose(
+            np.asarray(snapshot_times, dtype=np.float64),
+            np.asarray(config.snapshot_times, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                "--snapshot-times must match the reused teacher snapshot artifact"
+            )
+        print(f"[diagnostic] reusing physical teacher snapshots from {teacher_artifact}")
+    else:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=int(args.teacher_Nx),
+            Nv=int(args.teacher_Nv),
+            Lx=float(args.teacher_L),
+            vmin=float(args.teacher_vmin),
+            vmax=float(args.teacher_vmax),
+            dt=float(args.teacher_dt),
+            T=float(args.T_final),
+            poisson_sign=float(args.poisson_sign),
+            snapshot_times=tuple(snapshot_times),
+        )
     source_v = np.asarray(config.v, dtype=np.float64)
     equilibrium = np.asarray(
         normalize_density_on_grid(
@@ -278,18 +374,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         dtype=np.float64,
     )
     k_arr = np.asarray(config.k_arr, dtype=np.float64)
-    perturbations = _case_perturbations(
-        config,
-        linear_eps=float(args.linear_eps),
-        linear_modes=linear_modes,
-        linear_seed=int(args.linear_seed),
-        weak_eps=float(args.weak_eps),
-        strong_eps=float(args.strong_eps),
-        nonlinear_k0=float(args.nonlinear_k0),
+    perturbations = (
+        _case_perturbations(
+            config,
+            linear_eps=float(args.linear_eps),
+            linear_modes=linear_modes,
+            linear_seed=int(args.linear_seed),
+            weak_eps=float(args.weak_eps),
+            strong_eps=float(args.strong_eps),
+            nonlinear_k0=float(args.nonlinear_k0),
+        )
+        if snapshots_by_case is None
+        else None
     )
 
     print(
-        "[diagnostic] fixed physical spline grid: "
+        "[diagnostic] fixed physical teacher grid: "
         f"Nx={int(config.Nx)} Nv={int(config.Nv)} dt={float(config.dt):g} "
         f"T={float(config.T):g}"
     )
@@ -314,17 +414,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     projected: Dict[str, Dict[int, np.ndarray]] = {}
     snapshot_hashes: Dict[str, str] = {}
-    energy_payload: Dict[str, np.ndarray] = {}
-    for case_name, perturbation in perturbations.items():
-        print(f"[diagnostic] running fixed teacher trajectory: {case_name}")
-        f0 = equilibrium[:, None] * (
-            1.0 + jnp.asarray(perturbation, dtype=jnp.float64)[None, :]
-        )
-        raw = run_semilagrangian_vlasov_poisson(config, f0)
-        snapshots = np.asarray(raw["snapshot_f"], dtype=np.float64)
+    energy_payload: Dict[str, np.ndarray] = (
+        dict(reused_energy_payload) if reused_energy_payload is not None else {}
+    )
+    case_names = (
+        tuple(snapshots_by_case)
+        if snapshots_by_case is not None
+        else tuple(perturbations or {})
+    )
+    for case_name in case_names:
+        if snapshots_by_case is not None:
+            print(f"[diagnostic] projecting reused teacher trajectory: {case_name}")
+            snapshots = np.asarray(snapshots_by_case[case_name], dtype=np.float64)
+        else:
+            print(f"[diagnostic] running fixed teacher trajectory: {case_name}")
+            perturbation = (perturbations or {})[case_name]
+            f0 = equilibrium[:, None] * (
+                1.0 + jnp.asarray(perturbation, dtype=jnp.float64)[None, :]
+            )
+            raw = run_semilagrangian_vlasov_poisson(config, f0)
+            snapshots = np.asarray(raw["snapshot_f"], dtype=np.float64)
+            energy_payload[f"{case_name}_times"] = np.asarray(
+                raw["times"],
+                dtype=np.float64,
+            )
+            energy_payload[f"{case_name}_energy"] = np.asarray(
+                raw["energy"],
+                dtype=np.float64,
+            )
         snapshot_hashes[case_name] = _snapshot_digest(snapshots)
-        energy_payload[f"{case_name}_times"] = np.asarray(raw["times"], dtype=np.float64)
-        energy_payload[f"{case_name}_energy"] = np.asarray(raw["energy"], dtype=np.float64)
         projected[case_name] = {
             int(quadrature_nv): _project_snapshots(
                 snapshots,
@@ -378,7 +496,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     records.append(
                         {
                             "case": case_name,
-                            "teacher_Nv": int(args.teacher_Nv),
+                            "teacher_Nv": int(config.Nv),
                             "projection_quadrature_Nv": int(quadrature_nv),
                             "reference_projection_Nv": reference_nv,
                             "time": float(snapshot_time),
@@ -471,7 +589,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             row = {
                 "case": case_name,
-                "teacher_Nv": int(args.teacher_Nv),
+                "teacher_Nv": int(config.Nv),
                 "coarse_projection_Nv": coarse_nv,
                 "refined_projection_Nv": refined_nv,
                 "refinement_ratio": float(refined_nv) / float(coarse_nv),
@@ -500,21 +618,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     payload = {
         "finest_grid_comparison": (
-            f"Fixed teacher spline trajectory at Nv={int(args.teacher_Nv)}; "
+            f"Fixed physical-grid teacher trajectory at Nv={int(config.Nv)}; "
             f"Nv={reference_nv} is the finest projection quadrature tested, "
             "not an exact solution"
         ),
         "same_physical_trajectory_for_every_projection_grid": True,
         "projection_scheme": INTERFACE_FLUX_PROJECTION_SCHEME,
         "teacher": {
-            "Nx": int(args.teacher_Nx),
-            "Nv": int(args.teacher_Nv),
-            "L": float(args.teacher_L),
-            "vmin": float(args.teacher_vmin),
-            "vmax": float(args.teacher_vmax),
-            "dt": float(args.teacher_dt),
-            "T_final": float(args.T_final),
+            "Nx": int(config.Nx),
+            "Nv": int(config.Nv),
+            "L": float(config.Lx),
+            "vmin": float(config.vmin),
+            "vmax": float(config.vmax),
+            "dt": float(config.dt),
+            "T_final": float(config.T),
         },
+        "reused_teacher_snapshot_artifact": (
+            str(args.teacher_snapshots.resolve())
+            if args.teacher_snapshots is not None
+            else None
+        ),
         "projection_order": int(args.projection_order),
         "cutoffs": list(int(value) for value in cutoffs),
         "snapshot_times": list(float(value) for value in snapshot_times),
@@ -551,11 +674,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"Saved projection convergence CSV to {csv_path}")
     print(f"Saved projection refinement summary to {refinement_csv_path}")
     print(f"Saved projection convergence plot to {figure_path}")
+    selected_refined_nv = (
+        4096 if 4096 in ordered_grids[1:] else int(ordered_grids[1])
+    )
+    selected_coarse_nv = ordered_grids[
+        ordered_grids.index(selected_refined_nv) - 1
+    ]
     for case_name in projected:
-        selected = refinement_summary_by_case[case_name].get("4096")
+        selected = refinement_summary_by_case[case_name].get(
+            str(selected_refined_nv)
+        )
         if selected is not None:
             print(
-                f"[diagnostic] {case_name} projection 2048->4096: "
+                f"[diagnostic] {case_name} projection "
+                f"{selected_coarse_nv}->{selected_refined_nv}: "
                 f"global_C_change="
                 f"{selected['global_C0_through_N_refinement_change']:.6e} "
                 f"global_q_change={selected['global_qN_refinement_change']:.6e} "
