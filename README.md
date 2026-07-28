@@ -121,23 +121,24 @@ $\displaystyle \mathcal L_{\mathrm{IF}}^H(\theta) = \sum_r \frac{w_r}{2BH|\mathc
 ### Train and evaluate
 
 ```bash
-TRAIN_ROLLOUT_HORIZON=128 \
-TRAIN_T_FINAL=60 \
 ./model/train/run_fh_interface_flux_rollout.sh \
-  out_bench/interface_flux_H128_T60
+  out_bench/interface_flux_H128_T120_landau60_split16x4
 ```
 
-The default run trains one shared `Nv=64` closure and evaluates every
-configured training initial condition. Every sampled time that can start a
-complete \(H\)-step window is eligible for optimization; there is no held-out
-validation split. The per-IC evaluations are therefore in-sample scientific
-diagnostics, not a generalization estimate.
+The default run trains one shared `Nv=64` closure from an immutable manifest of
+60 multimode Landau initial conditions: 20 linear, 20 weakly nonlinear, and 20
+strongly nonlinear. Each regime is split into 16 complete training trajectories
+and four complete held-out trajectories. Every training time that can start a
+complete \(H\)-step window is eligible for optimization. Held-out trajectories
+do not contribute to minibatches, normalization, or the fixed regime scales.
 
-The teacher evolves a physical velocity grid with `TEACHER_NV=512`. Hermite
+The teacher evolves a physical velocity grid with `TEACHER_NV=8192`. Hermite
 coefficients are then computed from the reconstructed spline using the finer
 projection quadrature `TEACHER_PROJECTION_NV=4096`. These are distinct grids:
 the latter improves the integral used to form training targets without changing
-the physical teacher simulation.
+the physical teacher simulation. The projected histories are written as one
+resumable complex64 memory-mapped shard per trajectory. Normalization and
+regime scales use streaming float64 accumulation over training shards only.
 
 Principal artifacts:
 
@@ -145,18 +146,24 @@ Principal artifacts:
 models/nv64/interface_closure.npz
 models/nv64/interface_closure.metrics.npz
 models/nv64/interface_closure.loss.png
-models/nv64/interface_closure_interface_flux_histories.npz
+out_bench/reference_cache/interface_flux_landau/<configuration-hash>/metadata.json
+out_bench/reference_cache/interface_flux_landau/<configuration-hash>/cases/<case-id>.npy
+out_bench/reference_cache/interface_flux_landau/<configuration-hash>/snapshots/<case-id>.npz
 evaluation_cases/<case>/nv_sweep_metric1.png
 evaluation_cases/<case>/nv_sweep_metric2.png
 evaluation_cases/<case>/fig10_learned_vs_nonlocal_nv_sweep_phase_space.png
 ```
+
+The evaluator writes those three figures separately for every requested IC and
+an aggregate JSON table of case and regime metrics. It does not generate
+cross-IC summary images.
 
 Common numerical controls:
 
 | Environment variable | Meaning | Default |
 | --- | --- | ---: |
 | `TRAIN_ROLLOUT_HORIZON` | Differentiated solver steps per window | `128` |
-| `TRAIN_T_FINAL` | Final teacher time for every regime | `60` |
+| `TRAIN_T_FINAL` | Final teacher time for every regime | `120` |
 | `TRAIN_BATCH_SIZE` | Anchors per optimizer step | `64` |
 | `TRAIN_STEPS_PER_EPOCH` | Optimizer steps per epoch | `30` |
 | `TRAIN_EPOCHS` | Number of epochs | `100` |
@@ -164,7 +171,11 @@ Common numerical controls:
 | `TRAIN_PRECISION` | Learned rollout precision | `float32` |
 | `TRAIN_SEED` | Training and augmentation seed | `0` |
 | `TRAIN_HISTORY_STRIDE` | Teacher-anchor stride | `20` |
-| `TEACHER_NV` | Physical teacher velocity points | `512` |
+| `TRAIN_IC_CASES_PER_REGIME` | Complete trajectories per regime | `20` |
+| `TRAIN_IC_HELDOUT_PER_REGIME` | Held-out trajectories per regime | `4` |
+| `TRAIN_REFERENCE_CACHE_DIR` | Shared resumable reference-cache root | `out_bench/reference_cache/interface_flux_landau` |
+| `EVAL_IC_SPLIT` | Manifest split evaluated after training | `heldout` |
+| `TEACHER_NV` | Physical teacher velocity points | `8192` |
 | `TEACHER_PROJECTION_NV` | Spline-to-Hermite quadrature points | `4096` |
 
 Reuse the checkpoint in an existing run directory:
@@ -172,12 +183,13 @@ Reuse the checkpoint in an existing run directory:
 ```bash
 RUN_TRAIN=0 \
 ./model/train/run_fh_interface_flux_rollout.sh \
-  out_bench/interface_flux_H128_T60
+  out_bench/interface_flux_H128_T120_landau60_split16x4
 ```
 
 Set `RUN_EVAL=0` to train without post-training evaluation. Set
 `EVAL_TRAINING_CASES=0` to evaluate one configured nonlinear case at the run
-root instead of generating the complete per-IC set.
+root instead of generating the complete held-out per-IC set. Set
+`EVAL_IC_SPLIT=train` only for explicitly labeled training-fit diagnostics.
 
 ### Controlled horizon sweep
 
