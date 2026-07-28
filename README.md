@@ -43,7 +43,7 @@ layout:
 | Classical benchmark suite | `./benchmarks/run_all_benchmarks.sh out_bench` | Benchmark figures and metrics |
 | Train and evaluate one interface closure | `./model/train/run_fh_interface_flux_rollout.sh <outdir>` | Checkpoint, loss, Metric 1/2, and Fig. 10 |
 | Compare rollout horizons | `./model/train/run_fh_interface_flux_horizon_sweep.sh <H-csv> <outdir>` | One comparable run per horizon |
-| Check spline-to-Hermite quadrature convergence | `./model/diagnostics/run_projection_quadrature_convergence.sh <outdir>` | Refinement plots and numerical summaries |
+| Select Landau teacher and projection resolutions | `./model/diagnostics/run_landau_resolution_diagnostics.sh <outdir>` | Physical-grid and projection refinement plots plus a qualified recommendation |
 
 Direct Python modules expose lower-level controls and `--help`, but the shell
 wrappers above set the compatible defaults needed for reproducible workflows.
@@ -193,18 +193,28 @@ Each run is stored under `H<horizon>/`.
 
 ## Diagnostics
 
-### Projection-quadrature convergence
+### Landau resolution convergence
 
-Validate the spline-to-Hermite projection independently of model training:
+Validate both the physical velocity discretization and the subsequent
+spline-to-Hermite projection independently of model training:
 
 ```bash
-./model/diagnostics/run_projection_quadrature_convergence.sh \
-  out_bench/projection_quadrature_convergence
+./model/diagnostics/run_landau_resolution_diagnostics.sh \
+  out_bench/landau_resolution_T120
 ```
 
-The default diagnostic keeps the physical teacher at `Nv=512`, runs to
-`T=120`, and compares projection quadratures from 512 through 16,384 points.
-It does not train or modify a closure checkpoint.
+The default diagnostic runs representative linear, weakly nonlinear, and
+strongly nonlinear Landau cases to `T=120`. It first compares physical teacher
+grids `Nv=512,1024,2048,4096` using complete electric-field energy histories
+and direct phase-space differences after cubic-spline resampling onto each
+refined grid. No Hermite projection enters this physical-grid check. The
+independent projection check then reuses snapshots from the finest physical
+grid in the configured list (`Nv=4096` by default) while refining only the
+spline-to-Hermite quadrature from 2,048 through 16,384 points. The combined
+report rejects projection evidence generated from a different physical grid
+and distinguishes passing a successive-change gate from merely being the
+finest grid tested. These changes are self-convergence indicators, not analytic
+error estimates. The diagnostic does not train or modify a closure checkpoint.
 
 ### Regenerate a loss figure
 
@@ -254,5 +264,6 @@ For command-specific options:
 
 ```bash
 python -m model.train.interface_flux_rollout --help
+python -m model.diagnostics.physical_velocity_grid_convergence --help
 python -m model.diagnostics.projection_quadrature_convergence --help
 ```
