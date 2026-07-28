@@ -9,7 +9,7 @@ export JAX_ENABLE_X64="${JAX_ENABLE_X64:-True}"
 export VPML_JAX_BACKEND="${VPML_JAX_BACKEND:-cpu}"
 
 TRAIN_ROLLOUT_HORIZON="${TRAIN_ROLLOUT_HORIZON:-128}"
-TRAIN_T_FINAL="${TRAIN_T_FINAL:-60.0}"
+TRAIN_T_FINAL="${TRAIN_T_FINAL:-120.0}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 TRAIN_STEPS_PER_EPOCH="${TRAIN_STEPS_PER_EPOCH:-30}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-100}"
@@ -24,9 +24,14 @@ TRAIN_RES_BLOCKS="${TRAIN_RES_BLOCKS:-2}"
 TRAIN_N_LOW="${TRAIN_N_LOW:-2}"
 TRAIN_HISTORY_STRIDE="${TRAIN_HISTORY_STRIDE:-20}"
 TRAIN_INIT_CHECKPOINT="${TRAIN_INIT_CHECKPOINT:-}"
+TRAIN_IC_CASES_PER_REGIME="${TRAIN_IC_CASES_PER_REGIME:-20}"
+TRAIN_IC_HELDOUT_PER_REGIME="${TRAIN_IC_HELDOUT_PER_REGIME:-4}"
+TRAIN_IC_GENERATION_SEED="${TRAIN_IC_GENERATION_SEED:-1729}"
+TRAIN_IC_SPLIT_SEED="${TRAIN_IC_SPLIT_SEED:-2718}"
+TRAIN_IC_MODES="${TRAIN_IC_MODES:-0.5,1.0,1.5,2.0}"
 
 TEACHER_NX="${TEACHER_NX:-256}"
-TEACHER_NV="${TEACHER_NV:-512}"
+TEACHER_NV="${TEACHER_NV:-8192}"
 TEACHER_PROJECTION_NV="${TEACHER_PROJECTION_NV:-4096}"
 TEACHER_DT="${TEACHER_DT:-0.01}"
 TEACHER_VMIN="${TEACHER_VMIN:--8.0}"
@@ -39,7 +44,8 @@ EVAL_NX="${EVAL_NX:-200}"
 EVAL_DT="${EVAL_DT:-0.005}"
 EVAL_EPS="${EVAL_EPS:-0.5}"
 EVAL_K0="${EVAL_K0:-0.5}"
-EVAL_SNAPSHOT_TIMES="${EVAL_SNAPSHOT_TIMES:-20.0,40.0,60.0}"
+EVAL_SNAPSHOT_TIMES="${EVAL_SNAPSHOT_TIMES:-20.0,40.0,60.0,80.0,100.0,120.0}"
+EVAL_IC_SPLIT="${EVAL_IC_SPLIT:-heldout}"
 EVAL_NV_PLOT="${EVAL_NV_PLOT:-1000}"
 EVAL_PHASE_VMIN="${EVAL_PHASE_VMIN:-0.0}"
 EVAL_PHASE_VMAX="${EVAL_PHASE_VMAX:-0.5}"
@@ -47,9 +53,10 @@ EVAL_PHASE_VRANGE="${EVAL_PHASE_VRANGE:--4.0,4.0}"
 EVAL_NONLOCAL_MU="${EVAL_NONLOCAL_MU:--1.017234}"
 
 OUTDIR="${1:-${REPO_ROOT}/out_bench/fh_interface_flux_H${TRAIN_ROLLOUT_HORIZON}_T${TRAIN_T_FINAL}_B${TRAIN_BATCH_SIZE}_steps${TRAIN_STEPS_PER_EPOCH}}"
+TRAIN_REFERENCE_CACHE_DIR="${TRAIN_REFERENCE_CACHE_DIR:-${REPO_ROOT}/out_bench/reference_cache/interface_flux_landau}"
+TRAIN_IC_MANIFEST="${TRAIN_IC_MANIFEST:-${TRAIN_REFERENCE_CACHE_DIR}/landau_ic_manifest_${TRAIN_IC_CASES_PER_REGIME}x3_seed${TRAIN_IC_GENERATION_SEED}_split${TRAIN_IC_SPLIT_SEED}.json}"
 MODEL_DIR="${OUTDIR}/models/nv64"
 CHECKPOINT="${MODEL_DIR}/interface_closure.npz"
-DATASET_CACHE="${MODEL_DIR}/interface_closure_interface_flux_histories.npz"
 LOSS_PLOT="${MODEL_DIR}/interface_closure.loss.png"
 
 mkdir -p "${MODEL_DIR}"
@@ -58,7 +65,8 @@ cd "${REPO_ROOT}"
 if [[ "${RUN_TRAIN}" != "0" ]]; then
   TRAIN_ARGS=(
     --checkpoint "${CHECKPOINT}"
-    --dataset-cache "${DATASET_CACHE}"
+    --reference-cache-dir "${TRAIN_REFERENCE_CACHE_DIR}"
+    --ic-manifest "${TRAIN_IC_MANIFEST}"
     --loss-plot "${LOSS_PLOT}"
     --rollout-horizon "${TRAIN_ROLLOUT_HORIZON}"
     --precision "${TRAIN_PRECISION}"
@@ -75,6 +83,12 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     --res-blocks "${TRAIN_RES_BLOCKS}"
     --n-low "${TRAIN_N_LOW}"
     --history-stride "${TRAIN_HISTORY_STRIDE}"
+    --ic-cases-per-regime "${TRAIN_IC_CASES_PER_REGIME}"
+    --ic-heldout-per-regime "${TRAIN_IC_HELDOUT_PER_REGIME}"
+    --ic-generation-seed "${TRAIN_IC_GENERATION_SEED}"
+    --ic-split-seed "${TRAIN_IC_SPLIT_SEED}"
+    --ic-modes "${TRAIN_IC_MODES}"
+    --cache-snapshot-times "${EVAL_SNAPSHOT_TIMES}"
     --teacher-Nx "${TEACHER_NX}"
     --teacher-Nv "${TEACHER_NV}"
     --projection-quadrature-Nv "${TEACHER_PROJECTION_NV}"
@@ -97,6 +111,13 @@ else
     exit 1
   fi
   echo "[interface-flux] [1/2] Reusing ${CHECKPOINT}"
+fi
+
+RESOLVED_REFERENCE_CACHE=""
+if [[ -f "${MODEL_DIR}/interface_closure.metrics.npz" ]]; then
+  RESOLVED_REFERENCE_CACHE="$("${PYTHON_BIN}" -c \
+    'import numpy as np, sys; d=np.load(sys.argv[1]); print(str(d["reference_cache_dir"].reshape(-1)[0]) if "reference_cache_dir" in d.files else "")' \
+    "${MODEL_DIR}/interface_closure.metrics.npz")"
 fi
 
 if [[ "${RUN_EVAL}" != "0" ]]; then
@@ -122,17 +143,17 @@ if [[ "${RUN_EVAL}" != "0" ]]; then
     --dealias-23
   )
   if [[ "${EVAL_TRAINING_CASES}" != "0" ]]; then
-    echo "[interface-flux] [2/2] Evaluating every canonical training IC"
+    if [[ -z "${RESOLVED_REFERENCE_CACHE}" ]]; then
+      echo "Per-IC evaluation requires reference_cache_dir metadata in ${MODEL_DIR}/interface_closure.metrics.npz" >&2
+      exit 1
+    fi
+    echo "[interface-flux] [2/2] Evaluating every ${EVAL_IC_SPLIT} IC"
     "${PYTHON_BIN}" -m model.eval_training_cases \
       "${COMMON_EVAL_ARGS[@]}" \
       --outdir "${OUTDIR}/evaluation_cases" \
-      --regimes linear_landau,nonlinear_landau_weak,nonlinear_landau_strong \
-      --linear-eps 0.01 \
-      --linear-modes 0.5,1.0,1.5,2.0 \
-      --linear-num-samples 8 \
-      --linear-seed 0 \
-      --weak-eps 0.02,0.03,0.05,0.07,0.10,0.12,0.15,0.18 \
-      --strong-eps 0.20,0.25,0.30,0.35,0.40,0.50,0.60,0.65
+      --ic-manifest "${TRAIN_IC_MANIFEST}" \
+      --ic-split "${EVAL_IC_SPLIT}" \
+      --teacher-reference-dir "${RESOLVED_REFERENCE_CACHE}/snapshots"
   else
     echo "[interface-flux] [2/2] Running Metric 1/2 and raw-HR Fig. 10 evaluation"
     "${PYTHON_BIN}" -m model.eval_nv_sweep \
@@ -154,6 +175,9 @@ Canonical interface-flux run complete.
   T final:    ${TRAIN_T_FINAL}
   teacher Nv: ${TEACHER_NV}
   projection: ${TEACHER_PROJECTION_NV}
+  IC manifest: ${TRAIN_IC_MANIFEST}
+  eval split:  ${EVAL_IC_SPLIT}
+  cache root:  ${TRAIN_REFERENCE_CACHE_DIR}
   precision:  ${TRAIN_PRECISION}
   backend:    regime_balanced_all_k_interface_flux
 EOF

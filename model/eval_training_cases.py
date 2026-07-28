@@ -11,6 +11,11 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 from model.eval_nv_sweep import main as run_nv_sweep
+from model.train.interface_flux_data import (
+    IC_SPLITS,
+    evaluate_manifest_case,
+    load_ic_manifest,
+)
 
 
 VALID_REGIMES = (
@@ -85,6 +90,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--field-num-low-modes", type=int, default=None)
     parser.add_argument("--field-k-max", type=float, default=None)
     parser.add_argument("--regimes", type=str, default=",".join(VALID_REGIMES))
+    parser.add_argument("--ic-manifest", type=Path, default=None)
+    parser.add_argument("--teacher-reference-dir", type=Path, default=None)
+    parser.add_argument(
+        "--ic-split",
+        choices=(*IC_SPLITS, "all"),
+        default="heldout",
+    )
     parser.add_argument("--linear-eps", type=float, default=0.01)
     parser.add_argument("--linear-modes", type=str, default="0.5,1.0,1.5,2.0")
     parser.add_argument("--linear-num-samples", type=int, default=8)
@@ -95,6 +107,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _case_specs(args: argparse.Namespace) -> List[Dict[str, object]]:
+    if args.ic_manifest is not None:
+        manifest = load_ic_manifest(args.ic_manifest)
+        x = np.linspace(
+            0.0, 4.0 * math.pi, int(args.Nx), endpoint=False, dtype=np.float64
+        )
+        teacher_x = np.linspace(
+            0.0,
+            4.0 * math.pi,
+            int(args.teacher_nx),
+            endpoint=False,
+            dtype=np.float64,
+        )
+        requested_split = str(args.ic_split)
+        specs = []
+        for case in manifest["cases"]:
+            if requested_split != "all" and str(case["split"]) != requested_split:
+                continue
+            specs.append(
+                {
+                    "id": str(case["case_id"]),
+                    "label": (
+                        f"{case['regime']}, eps={float(case['epsilon']):.4g}, "
+                        f"{case['split']}"
+                    ),
+                    "regime": str(case["regime"]),
+                    "split": str(case["split"]),
+                    "epsilon": float(case["epsilon"]),
+                    "perturbation": evaluate_manifest_case(case, x),
+                    "teacher_perturbation": evaluate_manifest_case(case, teacher_x),
+                }
+            )
+        if not specs:
+            raise ValueError(
+                f"IC manifest {args.ic_manifest} has no cases for split {requested_split!r}"
+            )
+        return specs
+
     regimes = parse_str_tuple(args.regimes)
     unknown = sorted(set(regimes) - set(VALID_REGIMES))
     if unknown:
@@ -117,6 +166,8 @@ def _case_specs(args: argparse.Namespace) -> List[Dict[str, object]]:
                 {
                     "id": f"linear_landau_sample{sample_idx:02d}",
                     "label": f"linear_landau sample {sample_idx}",
+                    "regime": "linear_landau",
+                    "split": "legacy",
                     "perturbation": perturbation,
                     "teacher_perturbation": teacher_perturbation,
                 }
@@ -132,6 +183,9 @@ def _case_specs(args: argparse.Namespace) -> List[Dict[str, object]]:
                 {
                     "id": f"{regime}_eps{_slug(f'{eps:g}')}",
                     "label": f"{regime}, eps={eps:g}",
+                    "regime": regime,
+                    "split": "legacy",
+                    "epsilon": float(eps),
                     "perturbation": float(eps) * np.cos(float(args.k0) * x),
                     "teacher_perturbation": float(eps) * np.cos(float(args.k0) * teacher_x),
                 }
@@ -146,6 +200,7 @@ def _sweep_args(
     perturbation_path: Path,
     teacher_perturbation_path: Path,
     label: str,
+    case_id: str,
 ) -> List[str]:
     command = [
         "--outdir", str(case_dir),
@@ -184,6 +239,13 @@ def _sweep_args(
         command.extend(("--field-num-low-modes", str(int(args.field_num_low_modes))))
     if args.field_k_max is not None:
         command.extend(("--field-k-max", str(float(args.field_k_max))))
+    if args.teacher_reference_dir is not None:
+        teacher_reference = args.teacher_reference_dir / f"{case_id}.npz"
+        if not teacher_reference.exists():
+            raise FileNotFoundError(
+                f"Missing cached teacher reference for {case_id}: {teacher_reference}"
+            )
+        command.extend(("--teacher-reference-npz", str(teacher_reference)))
     return command
 
 
@@ -211,23 +273,78 @@ def main(argv: Sequence[str] | None = None) -> None:
                 perturbation_path=perturbation_path,
                 teacher_perturbation_path=teacher_perturbation_path,
                 label=str(spec["label"]),
+                case_id=case_id,
             )
         )
+        with (case_dir / "summary.json").open("r", encoding="utf-8") as handle:
+            case_summary = json.load(handle)
+        nv_metrics = case_summary["cases"][0]
         summaries.append(
             {
                 "id": case_id,
                 "label": str(spec["label"]),
+                "regime": str(spec["regime"]),
+                "split": str(spec["split"]),
+                "epsilon": (
+                    None if "epsilon" not in spec else float(spec["epsilon"])
+                ),
                 "outdir": str(case_dir),
                 "summary": str(case_dir / "summary.json"),
+                "metrics": {
+                    key: nv_metrics[key]
+                    for key in (
+                        "epsilon_grow",
+                        "epsilon_E",
+                        "epsilon_E_truncation",
+                    )
+                },
             }
         )
 
+    regime_means: Dict[str, Dict[str, float]] = {}
+    for regime in VALID_REGIMES:
+        selected = [case for case in summaries if case["regime"] == regime]
+        if not selected:
+            continue
+        regime_means[regime] = {}
+        for key in ("epsilon_grow", "epsilon_E", "epsilon_E_truncation"):
+            values = [
+                float(case["metrics"][key])
+                for case in selected
+                if isinstance(case["metrics"][key], (int, float))
+            ]
+            regime_means[regime][key] = (
+                float(np.mean(values)) if values else float("nan")
+            )
+    macro_mean = {
+        key: float(
+            np.mean(
+                [
+                    regime_means[regime][key]
+                    for regime in regime_means
+                    if np.isfinite(regime_means[regime][key])
+                ]
+            )
+        )
+        for key in ("epsilon_grow", "epsilon_E", "epsilon_E_truncation")
+    }
     with (outdir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
                 "regimes": list(parse_str_tuple(args.regimes)),
+                "ic_manifest": (
+                    None if args.ic_manifest is None else str(args.ic_manifest)
+                ),
+                "ic_split": str(args.ic_split),
+                "teacher_reference_dir": (
+                    None
+                    if args.teacher_reference_dir is None
+                    else str(args.teacher_reference_dir)
+                ),
                 "phase_reference_mode": str(args.phase_reference_mode),
                 "cases": summaries,
+                "regime_means": regime_means,
+                "equal_regime_macro_mean": macro_mean,
             },
             handle,
             indent=2,

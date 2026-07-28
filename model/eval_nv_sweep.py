@@ -290,6 +290,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional 1D perturbation sampled on the HR teacher x grid.",
     )
     parser.add_argument(
+        "--teacher-reference-npz",
+        type=Path,
+        default=None,
+        help="Reuse a cached physical-teacher field history and selected snapshots.",
+    )
+    parser.add_argument(
         "--case-label",
         type=str,
         default=None,
@@ -374,7 +380,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             checkpoint_map[int(Nv)] = ckpt
         print(f"[nv-sweep] loaded per-Nv checkpoints from {checkpoint_dir} for evaluation")
     print(
-        "[nv-sweep] building one shared HR reference "
+        "[nv-sweep] preparing one shared HR reference "
         f"(teacher Nx={int(args.teacher_nx)}, Nv={int(args.teacher_nv)}, T={float(args.T):g}) "
         "and reusing it for every deployment Nv"
     )
@@ -405,17 +411,72 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             Lx=Lx,
             target_nx=int(args.teacher_nx),
         )[0]
-    hr_payload = run_physical_landau_reference(
-        Nx=int(args.teacher_nx),
-        Nv=int(args.teacher_nv),
-        Lx=Lx,
-        vmin=float(args.teacher_vmin),
-        vmax=float(args.teacher_vmax),
-        dt=float(args.teacher_dt),
-        T=float(args.T),
-        perturbation_x=perturb_hr,
-        snapshot_times=snapshot_times,
-    )
+    if args.teacher_reference_npz is None:
+        hr_payload = run_physical_landau_reference(
+            Nx=int(args.teacher_nx),
+            Nv=int(args.teacher_nv),
+            Lx=Lx,
+            vmin=float(args.teacher_vmin),
+            vmax=float(args.teacher_vmax),
+            dt=float(args.teacher_dt),
+            T=float(args.T),
+            perturbation_x=perturb_hr,
+            snapshot_times=snapshot_times,
+        )
+    else:
+        with np.load(args.teacher_reference_npz) as cached:
+            required = {
+                "x",
+                "v",
+                "k_arr",
+                "perturbation_x",
+                "equilibrium",
+                "energy",
+                "E_hat_hist_times",
+                "E_hat_hist",
+                "snapshot_times",
+                "snapshot_f",
+            }
+            missing = sorted(required - set(cached.files))
+            if missing:
+                raise ValueError(
+                    f"Cached teacher reference {args.teacher_reference_npz} "
+                    f"is missing {missing!r}"
+                )
+            hr_payload = {
+                "times": np.asarray(cached["E_hat_hist_times"], dtype=np.float64),
+                "E_hat_hist": np.asarray(cached["E_hat_hist"], dtype=np.complex128),
+                "energy": np.asarray(cached["energy"], dtype=np.float64),
+                "k_arr": np.asarray(cached["k_arr"], dtype=np.float64),
+                "x": np.asarray(cached["x"], dtype=np.float64),
+                "v": np.asarray(cached["v"], dtype=np.float64),
+                "perturbation_x": np.asarray(
+                    cached["perturbation_x"], dtype=np.float64
+                ),
+                "equilibrium": np.asarray(cached["equilibrium"], dtype=np.float64),
+                "snapshot_times": np.asarray(cached["snapshot_times"], dtype=np.float64),
+                "snapshot_f": np.asarray(cached["snapshot_f"], dtype=np.float64),
+            }
+        if hr_payload["x"].shape != (int(args.teacher_nx),):
+            raise ValueError("Cached teacher reference Nx does not match --teacher-Nx")
+        if hr_payload["v"].shape != (int(args.teacher_nv),):
+            raise ValueError("Cached teacher reference Nv does not match --teacher-Nv")
+        if not np.isclose(hr_payload["times"][-1], float(args.T)):
+            raise ValueError("Cached teacher reference final time does not match --T")
+        cached_perturbation = np.asarray(
+            hr_payload["perturbation_x"], dtype=np.float64
+        )
+        if cached_perturbation.shape != perturb_hr.shape or not np.allclose(
+            cached_perturbation,
+            perturb_hr,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                "Cached teacher reference initial condition does not match the "
+                "requested teacher perturbation"
+            )
+        print(f"[nv-sweep] reused cached HR reference {args.teacher_reference_npz}")
 
     growth_cases: List[GrowthSweepCase] = []
     field_cases: List[FieldSweepCase] = []
@@ -697,6 +758,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             None
             if args.teacher_initial_perturbation_npy is None
             else str(args.teacher_initial_perturbation_npy)
+        ),
+        "teacher_reference_npz": (
+            None
+            if args.teacher_reference_npz is None
+            else str(args.teacher_reference_npz)
         ),
         "nonlinear_case": {
             "Nx": int(args.Nx),
