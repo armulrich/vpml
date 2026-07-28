@@ -317,6 +317,7 @@ def run_semilagrangian_vlasov_poisson(
     history_stride: int = 1,
     return_state_history: bool = False,
     history_projector: Optional[HistoryProjectorFn] = None,
+    return_field_history: bool = False,
 ) -> Dict[str, np.ndarray | Array]:
     f0 = jnp.asarray(f0, dtype=jnp.float64)
     if f0.shape != (int(config.Nv), int(config.Nx)):
@@ -343,6 +344,13 @@ def run_semilagrangian_vlasov_poisson(
 
     E0 = compute_electric_field_from_distribution(f0, config, ops=ops)
     energy0 = electric_energy_from_field(E0, config)
+    field_history0 = None
+    if return_field_history:
+        E_hat0 = jnp.fft.rfft(E0).astype(jnp.complex128)
+        field_history0 = jnp.zeros(
+            (len(hist_steps), int(config.Nk)), dtype=jnp.complex128
+        )
+        field_history0 = field_history0.at[0].set(E_hat0)
 
     def default_external_field(t: Array, x: Array, k_arr: Array) -> Array:
         del t, x, k_arr
@@ -379,8 +387,27 @@ def run_semilagrangian_vlasov_poisson(
             )
         return history
 
+    def maybe_store_field_history(history: Array, step_i: Array, E_state: Array) -> Array:
+        if not return_field_history:
+            return history
+        E_hat = jnp.fft.rfft(E_state).astype(jnp.complex128)
+        history = jax.lax.cond(
+            (step_i % history_stride) == 0,
+            lambda h, arr=E_hat: h.at[step_i // history_stride].set(arr),
+            lambda h: h,
+            history,
+        )
+        if int(hist_steps[-1]) != nsteps:
+            history = jax.lax.cond(
+                step_i == int(nsteps),
+                lambda h, arr=E_hat: h.at[len(hist_steps) - 1].set(arr),
+                lambda h: h,
+                history,
+            )
+        return history
+
     def step(carry, step_i):
-        f_state, snaps, history = carry
+        f_state, snaps, history, field_history = carry
         t_mid = (step_i.astype(jnp.float64) - 0.5) * float(config.dt)
         f_half = advect_x_cubic(f_state, config, ops, 0.5 * float(config.dt))
         E_mid = compute_electric_field_from_distribution(f_half, config, ops=ops)
@@ -391,11 +418,12 @@ def run_semilagrangian_vlasov_poisson(
         en = electric_energy_from_field(E_new, config)
         snaps = maybe_store_snapshot(snaps, step_i, f_new)
         history = maybe_store_history(history, step_i, f_new)
-        return (f_new, snaps, history), en
+        field_history = maybe_store_field_history(field_history, step_i, E_new)
+        return (f_new, snaps, history, field_history), en
 
-    (f_last, snaps_out, hist_out), energy_hist = jax.lax.scan(
+    (f_last, snaps_out, hist_out, field_hist_out), energy_hist = jax.lax.scan(
         step,
-        (f0, snaps0, history_data0),
+        (f0, snaps0, history_data0, field_history0),
         jnp.arange(1, nsteps + 1, dtype=jnp.int32),
     )
     del f_last
@@ -412,6 +440,9 @@ def run_semilagrangian_vlasov_poisson(
     if return_state_history and hist_out is not None:
         raw["state_history"] = hist_out
         raw["state_history_times"] = hist_steps.astype(float) * float(config.dt)
+    if return_field_history and field_hist_out is not None:
+        raw["E_hat_hist"] = field_hist_out
+        raw["E_hat_hist_times"] = hist_steps.astype(float) * float(config.dt)
     return raw
 
 

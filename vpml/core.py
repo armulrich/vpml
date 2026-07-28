@@ -72,7 +72,7 @@ HIGHER_ORDER_HERMITE_TEACHER_BACKEND = "higher_order_hermite"
 INTERFACE_FLUX_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
 INTERFACE_FLUX_OBJECTIVE = "interface_flux_rollout"
 INTERFACE_FLUX_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
-INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 2
+INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 3
 
 _LEGACY_INTERFACE_FLUX_TRIPLE = (
     "exact_q_rollout",
@@ -305,6 +305,9 @@ class LearnedInterfaceClosure:
     base_input_dim: Optional[int] = None
     rollout_horizon: int = 0
     loss_backend: str = INTERFACE_FLUX_LOSS_BACKEND
+    ic_manifest_sha256: Optional[str] = None
+    training_ic_count: Optional[int] = None
+    heldout_ic_count: Optional[int] = None
 
     def __post_init__(self) -> None:
         if int(self.Nm) <= 0:
@@ -337,6 +340,10 @@ class LearnedInterfaceClosure:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
         if str(self.loss_backend) != INTERFACE_FLUX_LOSS_BACKEND:
             raise ValueError(f"Unsupported loss_backend={self.loss_backend!r}")
+        if self.training_ic_count is not None and int(self.training_ic_count) <= 0:
+            raise ValueError("training_ic_count must be positive when provided")
+        if self.heldout_ic_count is not None and int(self.heldout_ic_count) <= 0:
+            raise ValueError("heldout_ic_count must be positive when provided")
 
         input_dim = self.input_dim
         input_mean = jnp.asarray(self.input_mean, dtype=jnp.float64)
@@ -536,6 +543,18 @@ def save_learned_interface_closure_npz(
         "rollout_horizon": np.array([int(learned.rollout_horizon)], dtype=np.int32),
         "loss_backend": np.array([str(learned.loss_backend)], dtype=np.str_),
     }
+    if learned.ic_manifest_sha256 is not None:
+        payload["ic_manifest_sha256"] = np.array(
+            [str(learned.ic_manifest_sha256)], dtype=np.str_
+        )
+    if learned.training_ic_count is not None:
+        payload["training_ic_count"] = np.array(
+            [int(learned.training_ic_count)], dtype=np.int32
+        )
+    if learned.heldout_ic_count is not None:
+        payload["heldout_ic_count"] = np.array(
+            [int(learned.heldout_ic_count)], dtype=np.int32
+        )
     if learned.teacher_Lx is not None:
         payload["teacher_Lx"] = np.array([float(learned.teacher_Lx)], dtype=np.float64)
     if learned.teacher_Nx is not None:
@@ -691,6 +710,22 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "loss_backend" in data.files and data["loss_backend"].size
             else None
         )
+        ic_manifest_sha256 = (
+            str(np.asarray(data["ic_manifest_sha256"], dtype=np.str_).reshape(-1)[0])
+            if "ic_manifest_sha256" in data.files
+            and data["ic_manifest_sha256"].size
+            else None
+        )
+        training_ic_count = (
+            int(np.asarray(data["training_ic_count"]).reshape(-1)[0])
+            if "training_ic_count" in data.files and data["training_ic_count"].size
+            else None
+        )
+        heldout_ic_count = (
+            int(np.asarray(data["heldout_ic_count"]).reshape(-1)[0])
+            if "heldout_ic_count" in data.files and data["heldout_ic_count"].size
+            else None
+        )
         metadata_triple = (training_mode, train_objective, loss_backend)
         if metadata_triple == _LEGACY_INTERFACE_FLUX_TRIPLE:
             training_mode = INTERFACE_FLUX_TRAINING_MODE
@@ -741,6 +776,9 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         base_input_dim=base_input_dim,
         rollout_horizon=rollout_horizon,
         loss_backend=loss_backend,
+        ic_manifest_sha256=ic_manifest_sha256,
+        training_ic_count=training_ic_count,
+        heldout_ic_count=heldout_ic_count,
     )
 
 

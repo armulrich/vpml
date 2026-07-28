@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import gc
 import math
 import os
 from pathlib import Path
@@ -17,6 +18,21 @@ bootstrap_jax_runtime()
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from model.train.interface_flux_data import (
+    IC_SPLIT_HELDOUT,
+    IC_SPLIT_TRAIN,
+    StreamingMoments,
+    case_shard_is_complete,
+    evaluate_manifest_case,
+    grouped_history_gather,
+    initialize_reference_cache,
+    load_or_create_ic_manifest,
+    load_sharded_reference,
+    reference_cache_directory,
+    sha256_json,
+    write_case_shard,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MPLCONFIG = _REPO_ROOT / ".mplconfig"
@@ -62,7 +78,6 @@ REGIME_LINEAR = "linear_landau"
 REGIME_WEAK = "nonlinear_landau_weak"
 REGIME_STRONG = "nonlinear_landau_strong"
 ALL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
-INTERFACE_FLUX_ROLLOUT_CACHE_FORMAT = "landau_interface_flux_rollout_reference"
 INTERFACE_FLUX_ROLLOUT_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
 INTERFACE_FLUX_ROLLOUT_OBJECTIVE = "interface_flux_rollout"
 INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
@@ -82,62 +97,6 @@ def parse_float_tuple(text: str) -> Tuple[float, ...]:
 
 def interface_flux_rollout_coeff_key(projection_order: int) -> str:
     return f"a_hat_ref_order{int(projection_order)}"
-
-
-def build_interface_flux_rollout_cache_metadata(
-    *,
-    regimes: Sequence[str],
-    teacher_Nx: int,
-    teacher_Nv: int,
-    projection_quadrature_Nv: int,
-    teacher_L: float,
-    teacher_vmin: float,
-    teacher_vmax: float,
-    teacher_dt: float,
-    linear_T: float,
-    linear_eps: float,
-    linear_modes: Sequence[float],
-    linear_num_samples: int,
-    linear_seed: int,
-    linear_poisson_sign: float,
-    nonlinear_T: float,
-    nonlinear_k0: float,
-    nonlinear_poisson_sign: float,
-    weak_eps: Sequence[float],
-    strong_eps: Sequence[float],
-    Nv_targets: Sequence[int],
-    max_projection_order: int,
-) -> Dict[str, np.ndarray]:
-    return {
-        "dataset_format": np.array([INTERFACE_FLUX_ROLLOUT_CACHE_FORMAT], dtype=np.str_),
-        "regimes": np.asarray(tuple(regimes), dtype=np.str_),
-        "teacher_backend": np.array([GRID_CUBIC_SPLINE_TEACHER_BACKEND], dtype=np.str_),
-        "teacher_Nx": np.array([int(teacher_Nx)], dtype=np.int32),
-        "teacher_Nv": np.array([int(teacher_Nv)], dtype=np.int32),
-        "projection_quadrature_Nv": np.array(
-            [int(projection_quadrature_Nv)], dtype=np.int32
-        ),
-        "projection_quadrature_scheme": np.array(
-            [INTERFACE_FLUX_PROJECTION_SCHEME], dtype=np.str_
-        ),
-        "teacher_L": np.array([float(teacher_L)], dtype=np.float64),
-        "teacher_vmin": np.array([float(teacher_vmin)], dtype=np.float64),
-        "teacher_vmax": np.array([float(teacher_vmax)], dtype=np.float64),
-        "teacher_dt": np.array([float(teacher_dt)], dtype=np.float64),
-        "linear_T": np.array([float(linear_T)], dtype=np.float64),
-        "linear_eps": np.array([float(linear_eps)], dtype=np.float64),
-        "linear_modes": np.asarray(tuple(float(v) for v in linear_modes), dtype=np.float64),
-        "linear_num_samples": np.array([int(linear_num_samples)], dtype=np.int32),
-        "linear_seed": np.array([int(linear_seed)], dtype=np.int32),
-        "linear_poisson_sign": np.array([float(linear_poisson_sign)], dtype=np.float64),
-        "nonlinear_T": np.array([float(nonlinear_T)], dtype=np.float64),
-        "nonlinear_k0": np.array([float(nonlinear_k0)], dtype=np.float64),
-        "nonlinear_poisson_sign": np.array([float(nonlinear_poisson_sign)], dtype=np.float64),
-        "weak_eps": np.asarray(tuple(float(v) for v in weak_eps), dtype=np.float64),
-        "strong_eps": np.asarray(tuple(float(v) for v in strong_eps), dtype=np.float64),
-        "Nv_targets": np.asarray(tuple(int(v) for v in Nv_targets), dtype=np.int32),
-        "max_projection_order": np.array([int(max_projection_order)], dtype=np.int32),
-    }
 
 
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
@@ -194,20 +153,6 @@ def _tree_all_finite(tree) -> Array:
     return jnp.all(jnp.stack(checks))
 
 
-def sample_initial_condition(
-    rng: np.random.Generator,
-    x: np.ndarray,
-    modes: Sequence[float],
-    eps: float,
-) -> np.ndarray:
-    amplitudes = rng.uniform(0.5, 1.5, size=len(modes))
-    phases = rng.uniform(0.0, 2.0 * math.pi, size=len(modes))
-    a0 = np.zeros_like(x)
-    for amp, phase, mode in zip(amplitudes, phases, modes):
-        a0 = a0 + amp * np.cos(float(mode) * x + phase)
-    return (float(eps) / max(len(modes), 1)) * a0
-
-
 def append_pairs(
     accum: Dict[str, Dict[str, list]],
     regime: str,
@@ -231,6 +176,7 @@ def _projected_history_projector(
     equilibrium: Array,
     projection_matrix: Optional[Array] = None,
     vth: float = 1.0,
+    storage_dtype: object = jnp.complex128,
 ):
     matrix = (
         build_cubic_spline_hermite_projection_matrix(
@@ -244,11 +190,12 @@ def _projected_history_projector(
     )
 
     def projector(f_state: Array) -> Array:
-        return project_distribution_snapshot_with_hermite_matrix(
+        projected = project_distribution_snapshot_with_hermite_matrix(
             f_state,
             matrix,
             equilibrium=equilibrium,
         )
+        return projected.astype(storage_dtype)
 
     return projector
 
@@ -262,7 +209,10 @@ def _run_landau_teacher_projected_history(
     history_stride: int,
     equilibrium: Optional[Array] = None,
     projection_matrix: Optional[Array] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    storage_dtype: object = jnp.complex128,
+    return_raw: bool = False,
+    return_field_history: bool = False,
+) -> tuple:
     v = config.v
     equilibrium = (
         maxwellian_equilibrium(v)
@@ -275,6 +225,7 @@ def _run_landau_teacher_projected_history(
         f0,
         history_stride=history_stride,
         return_state_history=True,
+        return_field_history=bool(return_field_history),
         history_projector=_projected_history_projector(
             v,
             int(projection_order),
@@ -282,131 +233,20 @@ def _run_landau_teacher_projected_history(
             equilibrium=equilibrium,
             projection_matrix=projection_matrix,
             vth=1.0,
+            storage_dtype=storage_dtype,
         ),
     )
-    return (
-        np.asarray(raw["state_history"], dtype=np.complex128),
-        np.asarray(raw["k_arr"], dtype=np.float64),
-    )
-
-
-def _run_landau_teacher_projected_histories(
-    config: PhysicalGridVlasovPoissonConfig,
-    perturbation_x: Array,
-    *,
-    projection_orders: Sequence[int],
-    projection_quadrature_Nv: int,
-    history_stride: int,
-    equilibrium: Optional[Array] = None,
-    projection_matrices: Optional[Dict[int, Array]] = None,
-) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
-    orders = tuple(sorted(int(order) for order in projection_orders))
-    if not orders:
-        raise ValueError("projection_orders must be nonempty")
-    histories: Dict[int, np.ndarray] = {}
-    k_arr = None
-    for order in orders:
-        coeff_hist, order_k_arr = _run_landau_teacher_projected_history(
-            config,
-            perturbation_x,
-            projection_order=int(order),
-            projection_quadrature_Nv=int(projection_quadrature_Nv),
-            history_stride=history_stride,
-            equilibrium=equilibrium,
-            projection_matrix=(
-                None
-                if projection_matrices is None
-                else projection_matrices.get(int(order))
-            ),
-        )
-        histories[int(order)] = coeff_hist
-        if k_arr is None:
-            k_arr = order_k_arr
-        elif not np.array_equal(order_k_arr, k_arr):
-            raise ValueError("Projected teacher histories returned inconsistent Fourier grids")
-    assert k_arr is not None
-    return histories, np.asarray(k_arr, dtype=np.float64)
-
-
-def _cache_value_mismatch(actual: np.ndarray, expected: np.ndarray) -> bool:
-    if actual.shape != expected.shape:
-        return True
-    if actual.dtype.kind in {"U", "S", "O"} or expected.dtype.kind in {"U", "S", "O"}:
-        return not np.array_equal(np.asarray(actual, dtype=np.str_), np.asarray(expected, dtype=np.str_))
-    return not np.array_equal(actual, expected)
-
-
-def load_interface_flux_rollout_reference_cache(
-    path: Path,
-    *,
-    expected_metadata: Dict[str, np.ndarray],
-) -> Dict[str, Dict[str, np.ndarray]]:
-    with np.load(path) as data:
-        for key, expected in expected_metadata.items():
-            if key not in data.files:
-                raise ValueError(f"Exact q-rollout cache {path} is missing metadata field '{key}'.")
-            actual = np.asarray(data[key])
-            if _cache_value_mismatch(actual, np.asarray(expected)):
-                raise ValueError(
-                    f"Exact q-rollout cache {path} metadata mismatch for '{key}'. "
-                    "Rebuilding with the current teacher configuration is required."
-                )
-        regimes = tuple(str(v) for v in np.asarray(data["regimes"], dtype=np.str_).tolist())
-        max_projection_order = int(np.asarray(data["max_projection_order"], dtype=np.int32).reshape(-1)[0])
-        coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
-        dataset: Dict[str, Dict[str, np.ndarray]] = {}
-        for regime in regimes:
-            field = f"{regime}_{coeff_key}"
-            if field not in data.files:
-                raise ValueError(f"Exact q-rollout cache {path} is missing '{field}'.")
-            dataset[regime] = {
-                coeff_key: np.asarray(data[field], dtype=np.complex128),
-            }
-        return dataset
-
-
-def save_interface_flux_rollout_reference_cache(
-    path: Path,
-    dataset: Dict[str, Dict[str, np.ndarray]],
-    *,
-    metadata: Dict[str, np.ndarray],
-) -> None:
-    payload: Dict[str, np.ndarray] = dict(metadata)
-    for regime, arrays in dataset.items():
-        for key, value in arrays.items():
-            payload[f"{regime}_{key}"] = np.asarray(value, dtype=np.complex128)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, **payload)
-
-
-def _run_interface_flux_rollout_projected_history(
-    config: PhysicalGridVlasovPoissonConfig,
-    perturbation_x: np.ndarray,
-    *,
-    max_projection_order: int,
-    projection_quadrature_Nv: int,
-    equilibrium: Optional[Array] = None,
-    projection_matrix: Optional[Array] = None,
-) -> np.ndarray:
-    coeff_histories, _ = _run_landau_teacher_projected_histories(
-        config,
-        perturbation_x,
-        projection_orders=(int(max_projection_order),),
-        projection_quadrature_Nv=int(projection_quadrature_Nv),
-        history_stride=1,
-        equilibrium=equilibrium,
-        projection_matrices=(
-            None
-            if projection_matrix is None
-            else {int(max_projection_order): projection_matrix}
-        ),
-    )
-    return np.asarray(coeff_histories[int(max_projection_order)], dtype=np.complex128)
+    history = np.asarray(raw["state_history"], dtype=np.dtype(storage_dtype))
+    k_arr = np.asarray(raw["k_arr"], dtype=np.float64)
+    if return_raw:
+        return history, k_arr, raw
+    return history, k_arr
 
 
 def build_interface_flux_rollout_reference_dataset(
     *,
-    dataset_cache: Optional[Path],
+    reference_cache_root: Path,
+    ic_manifest_path: Path,
     regimes: Sequence[str],
     teacher_Nx: int,
     teacher_Nv: int,
@@ -415,59 +255,56 @@ def build_interface_flux_rollout_reference_dataset(
     teacher_vmin: float,
     teacher_vmax: float,
     teacher_dt: float,
-    linear_T: float,
-    linear_eps: float,
-    linear_modes: Sequence[float],
-    linear_num_samples: int,
-    linear_seed: int,
-    linear_poisson_sign: float,
-    nonlinear_T: float,
-    nonlinear_k0: float,
-    nonlinear_poisson_sign: float,
-    weak_eps: Sequence[float],
-    strong_eps: Sequence[float],
+    T_final: float,
+    teacher_poisson_sign: float,
+    snapshot_times: Sequence[float],
+    cases_per_regime: int,
+    heldout_cases_per_regime: int,
+    ic_generation_seed: int,
+    ic_split_seed: int,
+    ic_modes: Sequence[float],
     Nv_targets: Sequence[int],
     min_projection_order: Optional[int] = None,
-) -> Tuple[Dict[str, Dict[str, np.ndarray]], int]:
+) -> Tuple[Dict[str, Dict[str, object]], int, Dict[str, object], Path]:
+    """Build or resume one complex64 projected-history shard per complete IC."""
     max_projection_order = max(max(int(v) for v in Nv_targets) + 1, int(min_projection_order or 0))
-    cache_metadata = build_interface_flux_rollout_cache_metadata(
-        regimes=regimes,
-        teacher_Nx=teacher_Nx,
-        teacher_Nv=teacher_Nv,
-        projection_quadrature_Nv=projection_quadrature_Nv,
-        teacher_L=teacher_L,
-        teacher_vmin=teacher_vmin,
-        teacher_vmax=teacher_vmax,
-        teacher_dt=teacher_dt,
-        linear_T=linear_T,
-        linear_eps=linear_eps,
-        linear_modes=linear_modes,
-        linear_num_samples=linear_num_samples,
-        linear_seed=linear_seed,
-        linear_poisson_sign=linear_poisson_sign,
-        nonlinear_T=nonlinear_T,
-        nonlinear_k0=nonlinear_k0,
-        nonlinear_poisson_sign=nonlinear_poisson_sign,
-        weak_eps=weak_eps,
-        strong_eps=strong_eps,
-        Nv_targets=Nv_targets,
-        max_projection_order=max_projection_order,
+    manifest = load_or_create_ic_manifest(
+        ic_manifest_path,
+        cases_per_regime=int(cases_per_regime),
+        heldout_per_regime=int(heldout_cases_per_regime),
+        generation_seed=int(ic_generation_seed),
+        split_seed=int(ic_split_seed),
+        modes=tuple(float(value) for value in ic_modes),
+        domain_length=float(teacher_L),
     )
-    if dataset_cache is not None and dataset_cache.exists():
-        try:
-            return (
-                load_interface_flux_rollout_reference_cache(
-                    dataset_cache,
-                    expected_metadata=cache_metadata,
-                ),
-                max_projection_order,
-            )
-        except ValueError as exc:
-            print(f"[cache] ignoring interface-flux rollout cache {dataset_cache}: {exc}")
-
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
-    dataset: Dict[str, Dict[str, np.ndarray]] = {}
-    active = tuple(regimes)
+    configuration = {
+        "dataset_format": "landau_interface_flux_sharded_reference_v1",
+        "manifest_sha256": str(manifest["sha256"]),
+        "regimes": list(str(value) for value in regimes),
+        "teacher_backend": GRID_CUBIC_SPLINE_TEACHER_BACKEND,
+        "teacher_Nx": int(teacher_Nx),
+        "teacher_Nv": int(teacher_Nv),
+        "projection_quadrature_Nv": int(projection_quadrature_Nv),
+        "projection_quadrature_scheme": INTERFACE_FLUX_PROJECTION_SCHEME,
+        "teacher_L": float(teacher_L),
+        "teacher_vmin": float(teacher_vmin),
+        "teacher_vmax": float(teacher_vmax),
+        "teacher_dt": float(teacher_dt),
+        "T_final": float(T_final),
+        "teacher_poisson_sign": float(teacher_poisson_sign),
+        "max_projection_order": int(max_projection_order),
+        "snapshot_times": [float(value) for value in snapshot_times],
+        "solver_version": "semilagrangian_vlasov_poisson_strang_cubic_v1",
+        "storage_dtype": np.dtype(np.complex64).name,
+    }
+    cache_dir = reference_cache_directory(reference_cache_root, configuration)
+    initialize_reference_cache(
+        cache_dir,
+        configuration=configuration,
+        manifest=manifest,
+    )
+
     projection_v = jnp.linspace(
         float(teacher_vmin),
         float(teacher_vmax),
@@ -481,86 +318,127 @@ def build_interface_flux_rollout_reference_dataset(
         int(projection_quadrature_Nv),
         vth=1.0,
     )
-
-    if REGIME_LINEAR in active:
-        config = PhysicalGridVlasovPoissonConfig(
-            Nx=int(teacher_Nx),
-            Nv=int(teacher_Nv),
-            Lx=float(teacher_L),
-            vmin=float(teacher_vmin),
-            vmax=float(teacher_vmax),
-            dt=float(teacher_dt),
-            T=float(linear_T),
-            poisson_sign=float(linear_poisson_sign),
-            snapshot_times=(),
-        )
-        rng = np.random.default_rng(int(linear_seed))
-        x = np.asarray(config.x, dtype=np.float64)
-        cases = []
-        for _ in range(int(linear_num_samples)):
-            perturb = sample_initial_condition(
-                rng,
-                x,
-                modes=linear_modes,
-                eps=float(linear_eps),
-            )
-            cases.append(
-                _run_interface_flux_rollout_projected_history(
-                    config,
-                    perturb,
-                    max_projection_order=max_projection_order,
-                    projection_quadrature_Nv=int(projection_quadrature_Nv),
-                    equilibrium=projection_equilibrium,
-                    projection_matrix=projection_matrix,
-                )
-            )
-        dataset[REGIME_LINEAR] = {coeff_key: np.stack(cases, axis=0)}
-
-    nonlinear_config = PhysicalGridVlasovPoissonConfig(
+    config = PhysicalGridVlasovPoissonConfig(
         Nx=int(teacher_Nx),
         Nv=int(teacher_Nv),
         Lx=float(teacher_L),
         vmin=float(teacher_vmin),
         vmax=float(teacher_vmax),
         dt=float(teacher_dt),
-        T=float(nonlinear_T),
-        poisson_sign=float(nonlinear_poisson_sign),
-        snapshot_times=(),
+        T=float(T_final),
+        poisson_sign=float(teacher_poisson_sign),
+        snapshot_times=tuple(float(value) for value in snapshot_times),
     )
-    perturb_template = np.cos(float(nonlinear_k0) * np.asarray(nonlinear_config.x, dtype=np.float64))
-    for regime, eps_values in (
-        (REGIME_WEAK, weak_eps),
-        (REGIME_STRONG, strong_eps),
-    ):
-        if regime not in active:
-            continue
-        cases = []
-        for eps in eps_values:
-            cases.append(
-                _run_interface_flux_rollout_projected_history(
-                    nonlinear_config,
-                    float(eps) * perturb_template,
-                    max_projection_order=max_projection_order,
-                    projection_quadrature_Nv=int(projection_quadrature_Nv),
-                    equilibrium=projection_equilibrium,
-                    projection_matrix=projection_matrix,
-                )
+    expected_shape = (
+        int(config.nsteps) + 1,
+        int(max_projection_order),
+        int(config.Nk),
+    )
+    x = np.asarray(config.x, dtype=np.float64)
+    active = set(str(value) for value in regimes)
+    selected_cases = [
+        case for case in manifest["cases"] if str(case["regime"]) in active
+    ]
+    for case_number, case in enumerate(selected_cases, start=1):
+        case_id = str(case["case_id"])
+        if case_shard_is_complete(
+            cache_dir,
+            case_id,
+            expected_shape=expected_shape,
+            expected_dtype=np.dtype(np.complex64),
+        ):
+            print(
+                f"[cache] [{case_number}/{len(selected_cases)}] reusing {case_id}"
             )
-        dataset[regime] = {coeff_key: np.stack(cases, axis=0)}
+            continue
+        print(
+            f"[cache] [{case_number}/{len(selected_cases)}] generating {case_id} "
+            f"({case['split']})"
+        )
+        perturbation = evaluate_manifest_case(case, x)
+        history, _, raw = _run_landau_teacher_projected_history(
+            config,
+            perturbation,
+            projection_order=int(max_projection_order),
+            projection_quadrature_Nv=int(projection_quadrature_Nv),
+            history_stride=1,
+            equilibrium=projection_equilibrium,
+            projection_matrix=projection_matrix,
+            storage_dtype=jnp.complex64,
+            return_raw=True,
+            return_field_history=True,
+        )
+        if tuple(history.shape) != expected_shape:
+            raise ValueError(
+                f"Projected history for {case_id} has shape {history.shape}, "
+                f"expected {expected_shape}"
+            )
+        write_case_shard(
+            cache_dir,
+            case,
+            history,
+            history_times=np.asarray(raw["state_history_times"], dtype=np.float64),
+            snapshots={
+                "x": np.asarray(raw["x"], dtype=np.float64),
+                "v": np.asarray(raw["v"], dtype=np.float64),
+                "k_arr": np.asarray(raw["k_arr"], dtype=np.float64),
+                "perturbation_x": np.asarray(perturbation, dtype=np.float64),
+                "times": np.asarray(raw["times"], dtype=np.float64),
+                "energy": np.asarray(raw["energy"], dtype=np.float64),
+                "E_hat_hist_times": np.asarray(
+                    raw["E_hat_hist_times"], dtype=np.float64
+                ),
+                "E_hat_hist": np.asarray(raw["E_hat_hist"], dtype=np.complex128),
+                "snapshot_times": np.asarray(raw["snapshot_times"], dtype=np.float64),
+                "snapshot_f": np.asarray(raw["snapshot_f"], dtype=np.float64),
+                "equilibrium": np.asarray(
+                    projection_equilibrium, dtype=np.float64
+                ),
+            },
+        )
+        del history, raw
+        gc.collect()
 
-    if dataset_cache is not None:
-        save_interface_flux_rollout_reference_cache(dataset_cache, dataset, metadata=cache_metadata)
-    return dataset, max_projection_order
+    dataset = load_sharded_reference(
+        cache_dir,
+        manifest,
+        coeff_key=coeff_key,
+    )
+    return dataset, max_projection_order, manifest, cache_dir
+
+
+def _reference_case_histories(
+    group: Dict[str, object],
+    coeff_key: str,
+) -> Tuple[np.ndarray, ...]:
+    histories = group[coeff_key]
+    if isinstance(histories, np.ndarray) and histories.ndim == 4:
+        return tuple(histories[index] for index in range(int(histories.shape[0])))
+    return tuple(histories)
+
+
+def _reference_case_splits(
+    group: Dict[str, object],
+    case_count: int,
+) -> np.ndarray:
+    values = group.get("case_splits")
+    if values is None:
+        return np.full((int(case_count),), IC_SPLIT_TRAIN, dtype=np.str_)
+    splits = np.asarray(values, dtype=np.str_)
+    if splits.shape != (int(case_count),):
+        raise ValueError(
+            f"case_splits must have shape ({case_count},), got {splits.shape}"
+        )
+    return splits
 
 
 def build_interface_flux_rollout_qpair_dataset(
-    exact_dataset: Dict[str, Dict[str, np.ndarray]],
+    exact_dataset: Dict[str, Dict[str, object]],
     *,
     max_projection_order: int,
     Nv_targets: Sequence[int],
     Nm: int,
     k_arr: np.ndarray,
-    val_fraction: float,
     linear_history_stride: int,
     nonlinear_history_stride: int,
     rollout_horizon: int,
@@ -569,6 +447,7 @@ def build_interface_flux_rollout_qpair_dataset(
     store_training_pairs: bool = True,
     k_scale: Optional[float] = None,
     nv_scale: Optional[float] = None,
+    precomputed_training_stats: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Optional[Dict[str, np.ndarray]]]:
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     accum = {
@@ -594,28 +473,18 @@ def build_interface_flux_rollout_qpair_dataset(
         }
         for regime in exact_dataset
     }
-    input_sum: Optional[np.ndarray] = None
-    input_sum_sq: Optional[np.ndarray] = None
-    target_sum: Optional[np.ndarray] = None
-    target_sum_sq: Optional[np.ndarray] = None
-    input_count = 0
-    target_count = 0
+    input_moments = StreamingMoments()
+    target_moments = StreamingMoments()
 
     if not bool(store_training_pairs) and (k_scale is None or nv_scale is None):
         raise ValueError("k_scale and nv_scale are required when store_training_pairs=False")
 
-    def sampled_split_indices(history_length: int, stride: int) -> Tuple[np.ndarray, np.ndarray]:
+    def sampled_indices(history_length: int, stride: int) -> np.ndarray:
         nsteps = int(history_length) - 1
         sampled = np.arange(0, nsteps + 1, max(int(stride), 1), dtype=np.int32)
         if sampled.size == 0 or int(sampled[-1]) != nsteps:
             sampled = np.concatenate([sampled, np.array([nsteps], dtype=np.int32)])
-        if float(val_fraction) <= 0.0:
-            return sampled, np.zeros((0,), dtype=np.int32)
-        if sampled.shape[0] <= 1:
-            return sampled, sampled
-        n_val = max(1, int(round(int(sampled.shape[0]) * float(val_fraction))))
-        n_val = min(n_val, int(sampled.shape[0]) - 1)
-        return sampled[:-n_val], sampled[-n_val:]
+        return sampled[(sampled + int(rollout_horizon) - 1) < int(history_length)]
 
     def append_index_rows(
         *,
@@ -665,7 +534,6 @@ def build_interface_flux_rollout_qpair_dataset(
                 )
 
     def accumulate_training_stats(pairs_by_nv: Dict[int, Dict[str, np.ndarray]]) -> None:
-        nonlocal input_sum, input_sum_sq, target_sum, target_sum_sq, input_count, target_count
         assert k_scale is not None
         assert nv_scale is not None
         for payload in pairs_by_nv.values():
@@ -678,37 +546,40 @@ def build_interface_flux_rollout_qpair_dataset(
                 include_global_indicators=True,
             )
             targets = np.asarray(payload["targets"], dtype=np.float64)
-            input_sum, input_sum_sq, input_count = _accumulate_feature_moments(
-                input_sum,
-                input_sum_sq,
-                input_count,
-                inputs,
-            )
-            target_sum, target_sum_sq, target_count = _accumulate_feature_moments(
-                target_sum,
-                target_sum_sq,
-                target_count,
-                targets,
-            )
+            input_moments.update(inputs)
+            target_moments.update(targets)
 
     horizon = int(rollout_horizon)
     if horizon <= 0:
         raise ValueError("rollout_horizon must be positive for interface-flux rollout q-pairs")
     for regime, group in exact_dataset.items():
-        cases = np.asarray(group[coeff_key], dtype=np.complex128)
+        cases = _reference_case_histories(group, coeff_key)
+        case_splits = _reference_case_splits(group, len(cases))
         stride = int(linear_history_stride) if regime == REGIME_LINEAR else int(nonlinear_history_stride)
         stride = max(stride, 1)
         for case_idx, case_hist in enumerate(cases):
-            train_times, val_times = sampled_split_indices(int(case_hist.shape[0]), stride)
-            if int(train_times.shape[0]) > 0:
-                train_limit = int(train_times[-1])
-                train_times = train_times[(train_times + horizon - 1) <= train_limit]
-            for split, original_times in (("train", train_times), ("val", val_times)):
-                if int(original_times.shape[0]) == 0:
-                    continue
-                hist = case_hist[np.asarray(original_times, dtype=np.int32)]
-                if int(hist.shape[0]) == 0:
-                    continue
+            split_name = (
+                "train"
+                if str(case_splits[case_idx]) == IC_SPLIT_TRAIN
+                else "val"
+                if str(case_splits[case_idx]) == IC_SPLIT_HELDOUT
+                else None
+            )
+            if split_name is None:
+                raise ValueError(
+                    f"Unsupported trajectory split {case_splits[case_idx]!r}"
+                )
+            original_times = sampled_indices(int(case_hist.shape[0]), stride)
+            if int(original_times.shape[0]) == 0:
+                continue
+            needs_pairs = bool(store_training_pairs) or (
+                split_name == "train" and precomputed_training_stats is None
+            )
+            if needs_pairs:
+                hist = np.asarray(
+                    case_hist[np.asarray(original_times, dtype=np.int32)],
+                    dtype=np.complex128,
+                )
                 pairs = extract_interface_supervised_pairs_from_coeff_history(
                     hist,
                     Nv_targets=Nv_targets,
@@ -719,28 +590,26 @@ def build_interface_flux_rollout_qpair_dataset(
                     n_low=int(n_low),
                     context_mode=context_mode,
                 )
-                if bool(store_training_pairs) or split == "val":
-                    append_pairs(
-                        accum,
-                        regime,
-                        split,
-                        pairs,
-                    )
-                elif split == "train":
+                if bool(store_training_pairs):
+                    append_pairs(accum, regime, split_name, pairs)
+                elif split_name == "train":
                     accumulate_training_stats(pairs)
-                append_index_rows(
-                    regime=regime,
-                    split=split,
-                    case_idx=int(case_idx),
-                    time_indices=np.asarray(original_times, dtype=np.int32),
-                    k_count=int(case_hist.shape[-1]),
-                    include_flattened_k_rows=bool(store_training_pairs) or split == "val",
-                )
+            append_index_rows(
+                regime=regime,
+                split=split_name,
+                case_idx=int(case_idx),
+                time_indices=np.asarray(original_times, dtype=np.int32),
+                k_count=int(case_hist.shape[-1]),
+                include_flattened_k_rows=bool(store_training_pairs),
+            )
     raw_base_dim = 2 * int(Nm) + 4
     input_dim = raw_base_dim if str(context_mode) == "none" else 3 * raw_base_dim
     dataset: Dict[str, Dict[str, np.ndarray]] = {}
     for regime, payload in accum.items():
-        has_any_rows = any(payload[f"{split}_case_indices"] for split in ("train", "val"))
+        has_any_rows = any(
+            payload[f"{split}_anchor_case_indices"]
+            for split in ("train", "val")
+        )
         if not has_any_rows:
             continue
 
@@ -774,30 +643,25 @@ def build_interface_flux_rollout_qpair_dataset(
                 )
     computed_stats: Optional[Dict[str, np.ndarray]] = None
     if not bool(store_training_pairs):
-        if (
-            input_sum is None
-            or input_sum_sq is None
-            or target_sum is None
-            or target_sum_sq is None
-            or input_count <= 0
-            or target_count <= 0
-        ):
-            raise ValueError("Exact q-rollout could not compute training normalization stats")
-        input_mean = input_sum / float(input_count)
-        input_var = np.maximum(input_sum_sq / float(input_count) - input_mean * input_mean, 0.0)
-        target_mean = target_sum / float(target_count)
-        target_var = np.maximum(target_sum_sq / float(target_count) - target_mean * target_mean, 0.0)
-        computed_stats = {
-            "input_mean": np.asarray(input_mean, dtype=np.float64),
-            "input_std": safe_feature_std(np.sqrt(input_var)),
-            "target_mean": np.asarray(target_mean, dtype=np.float64),
-            "target_std": safe_feature_std(np.sqrt(target_var)),
-        }
+        if precomputed_training_stats is not None:
+            computed_stats = {
+                key: np.asarray(precomputed_training_stats[key], dtype=np.float64)
+                for key in ("input_mean", "input_std", "target_mean", "target_std")
+            }
+        else:
+            input_mean, input_std = input_moments.finalize()
+            target_mean, target_std = target_moments.finalize()
+            computed_stats = {
+                "input_mean": np.asarray(input_mean, dtype=np.float64),
+                "input_std": safe_feature_std(input_std),
+                "target_mean": np.asarray(target_mean, dtype=np.float64),
+                "target_std": safe_feature_std(target_std),
+            }
     return dataset, computed_stats
 
 
 def interface_flux_rollout_regime_loss_stds(
-    exact_dataset: Dict[str, Dict[str, np.ndarray]],
+    exact_dataset: Dict[str, Dict[str, object]],
     qpair_dataset: Dict[str, Dict[str, np.ndarray]],
     *,
     max_projection_order: int,
@@ -822,7 +686,7 @@ def interface_flux_rollout_regime_loss_stds(
     for regime, arrays in qpair_dataset.items():
         if regime not in exact_dataset:
             continue
-        histories = np.asarray(exact_dataset[regime][coeff_key])
+        histories = _reference_case_histories(exact_dataset[regime], coeff_key)
         anchor_cases = np.asarray(arrays["train_anchor_case_indices"], dtype=np.int32)
         anchor_times = np.asarray(arrays["train_anchor_time_indices"], dtype=np.int32)
         anchor_targets = np.asarray(arrays["train_anchor_target_nvs"], dtype=np.int32)
@@ -838,16 +702,20 @@ def interface_flux_rollout_regime_loss_stds(
                 case_idx = anchor_cases[chunk]
                 time_idx = anchor_times[chunk]
                 window_times = time_idx[:, None] + offsets[None, :]
-                if int(np.max(window_times)) >= int(histories.shape[1]):
+                if any(
+                    int(np.max(window_times[case_idx == index])) >= int(histories[index].shape[0])
+                    for index in np.unique(case_idx)
+                ):
                     raise ValueError(
                         f"Exact q-rollout regime scale window exceeds history for {regime}"
                     )
-                coeff = histories[
+                coeff = grouped_history_gather(
+                    histories,
                     case_idx[:, None],
                     window_times,
-                    int(target_nv),
-                    1:,
-                ]
+                    hermite_slice=int(target_nv),
+                    fourier_slice=slice(1, None),
+                )
                 q_abs_sq = (
                     float(target_nv)
                     * positive_k_sq[None, None, :]
@@ -1001,68 +869,6 @@ def default_exact_k_scale(k_arr: np.ndarray) -> float:
     if int(k_nonzero.shape[0]) == 0:
         return 1.0
     return max(float(np.max(np.abs(k_nonzero))), 1.0)
-
-
-def prepare_validation_dataset_from_stats(
-    dataset_base: Dict[str, Dict[str, np.ndarray]],
-    *,
-    Nm: int,
-    k_scale: float,
-    nv_scale: float,
-    context_mode: str,
-    stats: Dict[str, np.ndarray],
-) -> Dict[str, Dict[str, Array]]:
-    prepared: Dict[str, Dict[str, Array]] = {}
-    target_std_safe = np.maximum(np.asarray(stats["target_std"], dtype=np.float64), 1e-12)[None, :]
-    target_mean_row = np.asarray(stats["target_mean"], dtype=np.float64)[None, :]
-    input_dim = int(np.asarray(stats["input_mean"]).shape[0])
-    for regime, arrays in dataset_base.items():
-        val_inputs_base = np.asarray(arrays.get("val_inputs_base", np.zeros((0, input_dim), dtype=np.float64)), dtype=np.float64)
-        val_targets = np.asarray(arrays.get("val_targets", np.zeros((0, 2), dtype=np.float64)), dtype=np.float64)
-        if val_inputs_base.size:
-            val_inputs = build_model_inputs(
-                val_inputs_base,
-                Nm=Nm,
-                k_scale=k_scale,
-                nv_scale=nv_scale,
-                context_mode=context_mode,
-            )
-        else:
-            val_inputs = np.zeros((0, input_dim), dtype=np.float64)
-        prepared[regime] = {
-            "train_inputs": jnp.zeros((0, input_dim), dtype=jnp.float64),
-            "train_targets": jnp.zeros((0, 2), dtype=jnp.float64),
-            "train_targets_std": jnp.zeros((0, 2), dtype=jnp.float64),
-            "val_inputs": jnp.asarray(val_inputs, dtype=jnp.float64),
-            "val_targets": jnp.asarray(val_targets, dtype=jnp.float64),
-            "val_targets_std": jnp.asarray((val_targets - target_mean_row) / target_std_safe, dtype=jnp.float64),
-        }
-    return prepared
-
-
-def _accumulate_feature_moments(
-    total: Optional[np.ndarray],
-    total_sq: Optional[np.ndarray],
-    count: int,
-    values: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 2:
-        raise ValueError(f"Expected a 2D feature block, got shape {values.shape}")
-    if values.shape[0] == 0:
-        if total is None or total_sq is None:
-            return (
-                np.zeros((values.shape[1],), dtype=np.float64),
-                np.zeros((values.shape[1],), dtype=np.float64),
-                int(count),
-            )
-        return total, total_sq, int(count)
-    block_sum = np.sum(values, axis=0, dtype=np.float64)
-    block_sum_sq = np.sum(values * values, axis=0, dtype=np.float64)
-    if total is None or total_sq is None:
-        total = np.zeros_like(block_sum, dtype=np.float64)
-        total_sq = np.zeros_like(block_sum_sq, dtype=np.float64)
-    return total + block_sum, total_sq + block_sum_sq, int(count) + int(values.shape[0])
 
 
 def build_learned_interface_closure(
@@ -1297,7 +1103,7 @@ def interface_flux_rollout_loss_for_anchor_batch(
 
 
 def prepare_interface_flux_rollout_sampling_state(
-    reference_dataset: Dict[str, Dict[str, np.ndarray]],
+    reference_dataset: Dict[str, Dict[str, object]],
     interface_flux_dataset: Dict[str, Dict[str, np.ndarray]],
     *,
     max_projection_order: int,
@@ -1321,9 +1127,13 @@ def prepare_interface_flux_rollout_sampling_state(
             for target_nv in target_nvs
         }
         state: Dict[str, object] = {
-            "histories": np.asarray(
-                reference_dataset[regime][coeff_key],
-                dtype=history_np_dtype,
+            "histories": (
+                np.asarray(
+                    reference_dataset[regime][coeff_key],
+                    dtype=history_np_dtype,
+                )
+                if isinstance(reference_dataset[regime][coeff_key], np.ndarray)
+                else _reference_case_histories(reference_dataset[regime], coeff_key)
             ),
             "train_case_indices": np.asarray(arrays["train_case_indices"], dtype=np.int32),
             "train_time_indices": np.asarray(arrays["train_time_indices"], dtype=np.int32),
@@ -1456,14 +1266,31 @@ def sample_interface_flux_rollout_regime_batch(
         axis=1,
     )
     target_nv_i = int(target_nv)
-    stencils = histories[case_idx[:, None], stencil_times, :target_nv_i, :]
-    nk = int(histories.shape[-1])
+    stencils = grouped_history_gather(
+        histories,
+        case_idx[:, None],
+        stencil_times,
+        hermite_slice=slice(0, target_nv_i),
+        fourier_slice=slice(None),
+    )
+    first_history = (
+        histories[0]
+        if not isinstance(histories, np.ndarray) or histories.ndim != 4
+        else histories[0]
+    )
+    nk = int(first_history.shape[-1])
     if nk <= 1:
         raise ValueError("Exact q-rollout requires at least one nonzero Fourier mode")
     offsets = np.arange(int(rollout_horizon), dtype=np.int32)
     window_times = time_idx[:, None] + offsets[None, :]
     if bool(all_k_loss):
-        q_coeff = histories[case_idx[:, None], window_times, target_nv_i, :]
+        q_coeff = grouped_history_gather(
+            histories,
+            case_idx[:, None],
+            window_times,
+            hermite_slice=target_nv_i,
+            fourier_slice=slice(None),
+        )
         q_windows = (
             -1j
             * k_arr_np[None, None, :]
@@ -1471,7 +1298,18 @@ def sample_interface_flux_rollout_regime_batch(
             * q_coeff
         )
     else:
-        q_coeff = histories[case_idx[:, None], window_times, target_nv_i, k_indices[:, None]]
+        q_coeff_all = grouped_history_gather(
+            histories,
+            case_idx[:, None],
+            window_times,
+            hermite_slice=target_nv_i,
+            fourier_slice=slice(None),
+        )
+        q_coeff = q_coeff_all[
+            np.arange(batch_n, dtype=np.int32)[:, None],
+            np.arange(int(rollout_horizon), dtype=np.int32)[None, :],
+            k_indices[:, None],
+        ]
         q_windows = (
             -1j
             * k_arr_np[k_indices][:, None]
@@ -1707,7 +1545,7 @@ def interface_flux_cutoff_for_step(
 
 def train_with_interface_flux_rollout_minibatch_loss(
     params: Dict[str, Array],
-    reference_dataset: Dict[str, Dict[str, np.ndarray]],
+    reference_dataset: Dict[str, Dict[str, object]],
     interface_flux_dataset: Dict[str, Dict[str, np.ndarray]],
     batch_loss_fn,
     *,
@@ -1915,24 +1753,88 @@ def train_with_interface_flux_rollout_minibatch_loss(
 
 
 
-def evaluate_regime_metrics(
+def evaluate_heldout_interface_flux_metrics(
     learned: LearnedInterfaceClosure,
-    prepared: Dict[str, Dict[str, Array]],
+    reference_dataset: Dict[str, Dict[str, object]],
+    interface_flux_dataset: Dict[str, Dict[str, np.ndarray]],
+    *,
+    max_projection_order: int,
+    target_nvs: Sequence[int],
+    Nm: int,
+    k_arr: np.ndarray,
+    k_scale: float,
+    nv_scale: float,
+    n_low: int,
+    chunk_size: int = 64,
 ) -> Dict[str, np.ndarray]:
+    """Evaluate direct interface flux only on complete held-out trajectories."""
+    coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     metrics: Dict[str, np.ndarray] = {}
-    for regime, arrays in prepared.items():
-        pred = np.asarray(learned.predict_q_components(arrays["val_inputs"]), dtype=np.float64)
-        target = np.asarray(arrays["val_targets"], dtype=np.float64)
-        if target.shape[0] == 0:
-            mse = float("nan")
-            rel_l2 = float("nan")
-        else:
-            mse = float(np.mean((pred - target) ** 2))
-            denom = max(float(np.linalg.norm(target)), 1e-30)
-            rel_l2 = float(np.linalg.norm(pred - target) / denom)
+    chunk_n = max(int(chunk_size), 1)
+    for regime, arrays in interface_flux_dataset.items():
+        histories = _reference_case_histories(reference_dataset[regime], coeff_key)
+        anchor_cases = np.asarray(arrays["val_anchor_case_indices"], dtype=np.int32)
+        anchor_times = np.asarray(arrays["val_anchor_time_indices"], dtype=np.int32)
+        anchor_targets = np.asarray(arrays["val_anchor_target_nvs"], dtype=np.int32)
+        squared_error = 0.0
+        target_squared = 0.0
+        scalar_count = 0
+        sample_count = 0
+        for target_nv in target_nvs:
+            selected = np.flatnonzero(anchor_targets == int(target_nv)).astype(np.int32)
+            for start in range(0, int(selected.shape[0]), chunk_n):
+                chunk = selected[start : start + chunk_n]
+                if int(chunk.shape[0]) == 0:
+                    continue
+                states = grouped_history_gather(
+                    histories,
+                    anchor_cases[chunk],
+                    anchor_times[chunk],
+                    hermite_slice=slice(None),
+                    fourier_slice=slice(None),
+                )
+                pairs = extract_interface_supervised_pairs_from_coeff_history(
+                    np.asarray(states, dtype=np.complex128),
+                    Nv_targets=(int(target_nv),),
+                    Nm=int(Nm),
+                    k_arr=np.asarray(k_arr, dtype=np.float64),
+                    vth=1.0,
+                    include_global_indicators=True,
+                    n_low=int(n_low),
+                    context_mode="none",
+                )[int(target_nv)]
+                model_inputs = build_model_inputs(
+                    pairs["inputs_base"],
+                    Nm=int(Nm),
+                    k_scale=float(k_scale),
+                    nv_scale=float(nv_scale),
+                    context_mode="none",
+                )
+                target = np.asarray(pairs["targets"], dtype=np.float64)
+                prediction = np.asarray(
+                    learned.predict_q_components(jnp.asarray(model_inputs)),
+                    dtype=np.float64,
+                )
+                residual = prediction - target
+                squared_error += float(np.sum(residual * residual, dtype=np.float64))
+                target_squared += float(np.sum(target * target, dtype=np.float64))
+                scalar_count += int(target.size)
+                sample_count += int(target.shape[0])
+        mse = (
+            float(squared_error / float(scalar_count))
+            if scalar_count > 0
+            else float("nan")
+        )
+        rel_l2 = (
+            float(math.sqrt(squared_error / max(target_squared, 1e-300)))
+            if scalar_count > 0
+            else float("nan")
+        )
         metrics[f"val_q_mse_{regime}"] = np.array([mse], dtype=np.float64)
         metrics[f"val_q_rel_l2_{regime}"] = np.array([rel_l2], dtype=np.float64)
-        metrics[f"val_num_samples_{regime}"] = np.array([target.shape[0]], dtype=np.int32)
+        metrics[f"val_num_samples_{regime}"] = np.array(
+            [sample_count], dtype=np.int64
+        )
     return metrics
 
 
@@ -1946,6 +1848,7 @@ def _load_init_checkpoint_for_interface_closure(
     context_mode: str,
     equilibrium_centered: Optional[bool] = None,
     complex_normalization_mode: Optional[str] = None,
+    ic_manifest_sha256: Optional[str] = None,
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray], float, float]:
     learned = load_learned_interface_closure_npz(init_checkpoint)
     expected_targets = tuple(int(v) for v in Nv_targets)
@@ -1982,6 +1885,14 @@ def _load_init_checkpoint_for_interface_closure(
         raise ValueError(
             "--init-checkpoint complex_normalization_mode metadata does not match the requested normalization"
         )
+    if (
+        ic_manifest_sha256 is not None
+        and learned.ic_manifest_sha256 is not None
+        and str(learned.ic_manifest_sha256) != str(ic_manifest_sha256)
+    ):
+        raise ValueError(
+            "--init-checkpoint IC manifest does not match the requested training manifest"
+        )
     params = {
         key: jnp.asarray(value, dtype=jnp.float64)
         for key, value in learned.params.items()
@@ -1997,9 +1908,101 @@ def _load_init_checkpoint_for_interface_closure(
 
 CANONICAL_NV_TARGETS = (6, 7, 12, 20, 36, 64)
 CANONICAL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
-CANONICAL_WEAK_EPS = (0.02, 0.03, 0.05, 0.07, 0.10, 0.12, 0.15, 0.18)
-CANONICAL_STRONG_EPS = (0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.65)
-CANONICAL_METADATA_SCHEMA_VERSION = 2
+CANONICAL_METADATA_SCHEMA_VERSION = 3
+
+
+def _derived_statistics_path(
+    reference_cache_dir: Path,
+    *,
+    manifest_sha256: str,
+    rollout_horizon: int,
+    history_stride: int,
+    Nm: int,
+    n_low: int,
+    k_scale: float,
+    nv_scale: float,
+) -> Path:
+    configuration = {
+        "format": "interface_flux_training_statistics_v1",
+        "manifest_sha256": str(manifest_sha256),
+        "rollout_horizon": int(rollout_horizon),
+        "history_stride": int(history_stride),
+        "Nm": int(Nm),
+        "n_low": int(n_low),
+        "k_scale": float(k_scale),
+        "nv_scale": float(nv_scale),
+        "Nv_targets": list(CANONICAL_NV_TARGETS),
+        "normalization": "phase_isotropic",
+        "regime_scaling": "fixed_training_only",
+    }
+    return (
+        Path(reference_cache_dir)
+        / "derived"
+        / f"{sha256_json(configuration)[:20]}.npz"
+    )
+
+
+def _load_derived_statistics(
+    path: Path,
+) -> Optional[Tuple[Dict[str, np.ndarray], Dict[str, float]]]:
+    if not Path(path).exists():
+        return None
+    with np.load(path) as payload:
+        required = {
+            "input_mean",
+            "input_std",
+            "target_mean",
+            "target_std",
+            "regimes",
+            "regime_loss_stds",
+        }
+        if not required.issubset(payload.files):
+            return None
+        regimes = tuple(
+            str(value)
+            for value in np.asarray(payload["regimes"], dtype=np.str_).tolist()
+        )
+        if regimes != CANONICAL_REGIMES:
+            return None
+        stats = {
+            key: np.asarray(payload[key], dtype=np.float64)
+            for key in ("input_mean", "input_std", "target_mean", "target_std")
+        }
+        scale_values = np.asarray(payload["regime_loss_stds"], dtype=np.float64)
+        if scale_values.shape != (len(CANONICAL_REGIMES),):
+            return None
+        scales = {
+            regime: float(scale_values[index])
+            for index, regime in enumerate(CANONICAL_REGIMES)
+        }
+    return stats, scales
+
+
+def _save_derived_statistics(
+    path: Path,
+    *,
+    stats: Dict[str, np.ndarray],
+    regime_loss_stds: Dict[str, float],
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("wb") as handle:
+        np.savez(
+            handle,
+            **{
+                key: np.asarray(stats[key], dtype=np.float64)
+                for key in ("input_mean", "input_std", "target_mean", "target_std")
+            },
+            regimes=np.asarray(CANONICAL_REGIMES, dtype=np.str_),
+            regime_loss_stds=np.asarray(
+                [regime_loss_stds[regime] for regime in CANONICAL_REGIMES],
+                dtype=np.float64,
+            ),
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2008,7 +2011,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
-    parser.add_argument("--dataset-cache", type=Path, default=None)
+    parser.add_argument("--reference-cache-dir", type=Path, required=True)
+    parser.add_argument("--ic-manifest", type=Path, required=True)
     parser.add_argument("--loss-plot", type=Path, default=None)
     parser.add_argument("--build-dataset-only", action="store_true")
     parser.add_argument("--rollout-horizon", type=int, default=128)
@@ -2024,7 +2028,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=0.5)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--T-final", type=float, default=60.0)
+    parser.add_argument("--T-final", type=float, default=120.0)
     parser.add_argument("--Nm", type=int, default=6)
     parser.add_argument("--hidden-width", type=int, default=128)
     parser.add_argument("--res-blocks", type=int, default=2)
@@ -2032,19 +2036,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-scale", type=float, default=None)
     parser.add_argument("--nv-scale", type=float, default=None)
     parser.add_argument("--teacher-Nx", type=int, default=256)
-    parser.add_argument("--teacher-Nv", type=int, default=512)
-    parser.add_argument("--projection-quadrature-Nv", type=int, default=None)
+    parser.add_argument("--teacher-Nv", type=int, default=8192)
+    parser.add_argument("--projection-quadrature-Nv", type=int, default=4096)
     parser.add_argument("--teacher-L", type=float, default=4.0 * math.pi)
     parser.add_argument("--teacher-vmin", type=float, default=-8.0)
     parser.add_argument("--teacher-vmax", type=float, default=8.0)
     parser.add_argument("--teacher-dt", type=float, default=1e-2)
     parser.add_argument("--teacher-poisson-sign", type=float, default=1.0)
-    parser.add_argument("--linear-eps", type=float, default=1e-2)
-    parser.add_argument("--linear-modes", type=str, default="0.5,1.0,1.5,2.0")
-    parser.add_argument("--linear-num-samples", type=int, default=8)
-    parser.add_argument("--linear-seed", type=int, default=0)
+    parser.add_argument("--ic-cases-per-regime", type=int, default=20)
+    parser.add_argument("--ic-heldout-per-regime", type=int, default=4)
+    parser.add_argument("--ic-generation-seed", type=int, default=1729)
+    parser.add_argument("--ic-split-seed", type=int, default=2718)
+    parser.add_argument("--ic-modes", type=str, default="0.5,1.0,1.5,2.0")
     parser.add_argument("--history-stride", type=int, default=20)
-    parser.add_argument("--nonlinear-k0", type=float, default=0.5)
+    parser.add_argument(
+        "--cache-snapshot-times",
+        type=str,
+        default="20.0,40.0,60.0,80.0,100.0,120.0",
+    )
     parser.add_argument("--profile-trace-dir", type=Path, default=None)
     parser.add_argument("--profile-train-steps", type=int, default=0)
     parser.add_argument("--profile-skip-steps", type=int, default=1)
@@ -2063,6 +2072,8 @@ def _canonical_metrics_payload(
     projection_quadrature_Nv: int,
     regime_loss_stds: Dict[str, float],
     val_metrics: Dict[str, np.ndarray],
+    ic_manifest: Dict[str, object],
+    reference_cache_dir: Path,
 ) -> Dict[str, np.ndarray]:
     payload: Dict[str, np.ndarray] = {
         "metadata_schema_version": np.array(
@@ -2124,6 +2135,31 @@ def _canonical_metrics_payload(
             ["phase_isotropic"], dtype=np.str_
         ),
         "translation_augmented": np.array([True], dtype=np.bool_),
+        "ic_manifest_sha256": np.array(
+            [str(ic_manifest["sha256"])], dtype=np.str_
+        ),
+        "ic_manifest_path": np.array([str(args.ic_manifest)], dtype=np.str_),
+        "reference_cache_dir": np.array(
+            [str(reference_cache_dir)], dtype=np.str_
+        ),
+        "training_ic_count": np.array(
+            [
+                sum(
+                    str(case["split"]) == IC_SPLIT_TRAIN
+                    for case in ic_manifest["cases"]
+                )
+            ],
+            dtype=np.int32,
+        ),
+        "heldout_ic_count": np.array(
+            [
+                sum(
+                    str(case["split"]) == IC_SPLIT_HELDOUT
+                    for case in ic_manifest["cases"]
+                )
+            ],
+            dtype=np.int32,
+        ),
         "interface_flux_regime_loss_regimes": np.asarray(
             CANONICAL_REGIMES, dtype=np.str_
         ),
@@ -2160,9 +2196,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"{min(CANONICAL_NV_TARGETS)}"
         )
 
-    linear_modes = parse_float_tuple(args.linear_modes)
-    reference, max_projection_order = build_interface_flux_rollout_reference_dataset(
-        dataset_cache=args.dataset_cache,
+    ic_modes = parse_float_tuple(args.ic_modes)
+    cache_snapshot_times = parse_float_tuple(args.cache_snapshot_times)
+    reference, max_projection_order, ic_manifest, reference_cache_dir = (
+        build_interface_flux_rollout_reference_dataset(
+        reference_cache_root=args.reference_cache_dir,
+        ic_manifest_path=args.ic_manifest,
         regimes=CANONICAL_REGIMES,
         teacher_Nx=args.teacher_Nx,
         teacher_Nv=args.teacher_Nv,
@@ -2171,19 +2210,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         teacher_vmin=args.teacher_vmin,
         teacher_vmax=args.teacher_vmax,
         teacher_dt=args.teacher_dt,
-        linear_T=args.T_final,
-        linear_eps=args.linear_eps,
-        linear_modes=linear_modes,
-        linear_num_samples=args.linear_num_samples,
-        linear_seed=args.linear_seed,
-        linear_poisson_sign=args.teacher_poisson_sign,
-        nonlinear_T=args.T_final,
-        nonlinear_k0=args.nonlinear_k0,
-        nonlinear_poisson_sign=args.teacher_poisson_sign,
-        weak_eps=CANONICAL_WEAK_EPS,
-        strong_eps=CANONICAL_STRONG_EPS,
+        T_final=args.T_final,
+        teacher_poisson_sign=args.teacher_poisson_sign,
+        snapshot_times=cache_snapshot_times,
+        cases_per_regime=args.ic_cases_per_regime,
+        heldout_cases_per_regime=args.ic_heldout_per_regime,
+        ic_generation_seed=args.ic_generation_seed,
+        ic_split_seed=args.ic_split_seed,
+        ic_modes=ic_modes,
         Nv_targets=CANONICAL_NV_TARGETS,
         min_projection_order=None,
+        )
     )
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     print(
@@ -2192,16 +2229,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         f"projection_quadrature_Nv={projection_quadrature_Nv}"
     )
     for regime in CANONICAL_REGIMES:
-        cases = np.asarray(reference[regime][coeff_key])
+        cases = _reference_case_histories(reference[regime], coeff_key)
+        case_splits = _reference_case_splits(reference[regime], len(cases))
+        first_case = cases[0]
         print(
             f"[data] interface-flux rollout {regime}: "
-            f"cases={cases.shape[0]} history={cases.shape[1]} "
-            f"order={cases.shape[2]}"
+            f"cases={len(cases)} train={int(np.sum(case_splits == IC_SPLIT_TRAIN))} "
+            f"heldout={int(np.sum(case_splits == IC_SPLIT_HELDOUT))} "
+            f"history={first_case.shape[0]} order={first_case.shape[1]}"
         )
     if args.build_dataset_only:
-        if args.dataset_cache is None:
-            raise ValueError("--build-dataset-only requires --dataset-cache")
-        print(f"Saved interface-flux reference cache to {args.dataset_cache}")
+        print(f"Saved interface-flux reference cache to {reference_cache_dir}")
         return
 
     k_arr = np.asarray(
@@ -2231,6 +2269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 context_mode="none",
                 equilibrium_centered=True,
                 complex_normalization_mode="phase_isotropic",
+                ic_manifest_sha256=str(ic_manifest["sha256"]),
             )
         )
         print(
@@ -2251,13 +2290,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if init_nv_scale is not None
         else float(max(CANONICAL_NV_TARGETS))
     )
+    derived_statistics_path = _derived_statistics_path(
+        reference_cache_dir,
+        manifest_sha256=str(ic_manifest["sha256"]),
+        rollout_horizon=args.rollout_horizon,
+        history_stride=args.history_stride,
+        Nm=args.Nm,
+        n_low=args.n_low,
+        k_scale=k_scale,
+        nv_scale=nv_scale,
+    )
+    cached_derived_statistics = _load_derived_statistics(derived_statistics_path)
+    cached_stats: Optional[Dict[str, np.ndarray]] = None
+    cached_regime_loss_stds: Optional[Dict[str, float]] = None
+    if cached_derived_statistics is not None:
+        cached_stats, cached_regime_loss_stds = cached_derived_statistics
+        print(
+            "[data] reusing training-only normalization and regime scales from "
+            f"{derived_statistics_path}"
+        )
     dataset_base, precomputed_stats = build_interface_flux_rollout_qpair_dataset(
         reference,
         max_projection_order=max_projection_order,
         Nv_targets=CANONICAL_NV_TARGETS,
         Nm=args.Nm,
         k_arr=k_arr,
-        val_fraction=0.0,
         linear_history_stride=args.history_stride,
         nonlinear_history_stride=args.history_stride,
         rollout_horizon=args.rollout_horizon,
@@ -2266,9 +2323,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         store_training_pairs=False,
         k_scale=k_scale,
         nv_scale=nv_scale,
+        precomputed_training_stats=(
+            init_stats if init_stats is not None else cached_stats
+        ),
     )
     if init_stats is not None:
         stats = init_stats
+    elif cached_stats is not None:
+        stats = cached_stats
     else:
         if precomputed_stats is None:
             raise RuntimeError("interface-flux training statistics are unavailable")
@@ -2277,26 +2339,38 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             Nm=args.Nm,
             context_mode="none",
         )
-    prepared = prepare_validation_dataset_from_stats(
-        dataset_base,
-        Nm=args.Nm,
-        k_scale=k_scale,
-        nv_scale=nv_scale,
-        context_mode="none",
-        stats=stats,
-    )
     for regime in CANONICAL_REGIMES:
-        anchors = int(dataset_base[regime]["train_anchor_time_indices"].shape[0])
-        print(f"[data] {regime}: {anchors} interface-flux rollout anchors")
+        train_anchors = int(
+            dataset_base[regime]["train_anchor_time_indices"].shape[0]
+        )
+        heldout_anchors = int(
+            dataset_base[regime]["val_anchor_time_indices"].shape[0]
+        )
+        print(
+            f"[data] {regime}: train_anchors={train_anchors} "
+            f"heldout_anchors={heldout_anchors}"
+        )
 
-    regime_loss_stds = interface_flux_rollout_regime_loss_stds(
-        reference,
-        dataset_base,
-        max_projection_order=max_projection_order,
-        target_nvs=CANONICAL_NV_TARGETS,
-        k_arr=k_arr,
-        rollout_horizon=args.rollout_horizon,
-    )
+    regime_loss_stds = cached_regime_loss_stds
+    if regime_loss_stds is None:
+        regime_loss_stds = interface_flux_rollout_regime_loss_stds(
+            reference,
+            dataset_base,
+            max_projection_order=max_projection_order,
+            target_nvs=CANONICAL_NV_TARGETS,
+            k_arr=k_arr,
+            rollout_horizon=args.rollout_horizon,
+        )
+    if cached_derived_statistics is None:
+        _save_derived_statistics(
+            derived_statistics_path,
+            stats=stats,
+            regime_loss_stds=regime_loss_stds,
+        )
+        print(
+            "[data] saved training-only normalization and regime scales to "
+            f"{derived_statistics_path}"
+        )
     print(
         "[data] fixed regime-balanced interface-flux scales: "
         + " ".join(
@@ -2397,7 +2471,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         n_low=args.n_low,
         rollout_horizon=args.rollout_horizon,
     )
-    val_metrics = evaluate_regime_metrics(learned, prepared)
+    learned = replace(
+        learned,
+        ic_manifest_sha256=str(ic_manifest["sha256"]),
+        training_ic_count=sum(
+            str(case["split"]) == IC_SPLIT_TRAIN
+            for case in ic_manifest["cases"]
+        ),
+        heldout_ic_count=sum(
+            str(case["split"]) == IC_SPLIT_HELDOUT
+            for case in ic_manifest["cases"]
+        ),
+    )
+    val_metrics = evaluate_heldout_interface_flux_metrics(
+        learned,
+        reference,
+        dataset_base,
+        max_projection_order=max_projection_order,
+        target_nvs=CANONICAL_NV_TARGETS,
+        Nm=args.Nm,
+        k_arr=k_arr,
+        k_scale=k_scale,
+        nv_scale=nv_scale,
+        n_low=args.n_low,
+    )
 
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     save_learned_interface_closure_npz(args.checkpoint, learned)
@@ -2414,6 +2511,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         projection_quadrature_Nv=projection_quadrature_Nv,
         regime_loss_stds=regime_loss_stds,
         val_metrics=val_metrics,
+        ic_manifest=ic_manifest,
+        reference_cache_dir=reference_cache_dir,
     )
     np.savez(metrics_path, **metrics_payload)
     loss_plot_path = (

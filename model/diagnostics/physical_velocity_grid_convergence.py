@@ -24,7 +24,7 @@ _MPLCONFIG = _REPO_ROOT / ".mplconfig"
 if _MPLCONFIG.exists():
     os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIG))
 
-from model.train.interface_flux_rollout import sample_initial_condition
+from model.train.interface_flux_data import sample_initial_condition
 from model.diagnostics.projection_quadrature_convergence import (
     _load_teacher_snapshot_artifact,
 )

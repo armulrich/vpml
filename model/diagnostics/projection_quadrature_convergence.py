@@ -29,8 +29,8 @@ if _MPLCONFIG.exists():
 from model.train.interface_flux_rollout import (
     CANONICAL_NV_TARGETS,
     INTERFACE_FLUX_PROJECTION_SCHEME,
-    sample_initial_condition,
 )
+from model.train.interface_flux_data import sample_initial_condition
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     build_cubic_spline_hermite_projection_matrix,
