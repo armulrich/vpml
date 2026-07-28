@@ -84,18 +84,22 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         ]
         self.assertEqual(observed, [6, 7, 12, 20, 36, 64, 6, 7])
 
-    def test_zero_validation_fraction_uses_every_sampled_time_for_training(self) -> None:
+    def test_whole_trajectory_split_never_mixes_time_windows(self) -> None:
         max_projection_order = 4
         coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
-        coeff_history = np.zeros((1, 5, max_projection_order + 1, 3), dtype=np.complex128)
+        coeff_history = np.zeros((2, 5, max_projection_order + 1, 3), dtype=np.complex128)
         coeff_history[:, :, 3:, 1:] = 0.25 + 0.1j
         dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
-            {trainer.REGIME_LINEAR: {coeff_key: coeff_history}},
+            {
+                trainer.REGIME_LINEAR: {
+                    coeff_key: coeff_history,
+                    "case_splits": np.array(["train", "heldout"]),
+                }
+            },
             max_projection_order=max_projection_order,
             Nv_targets=(4,),
             Nm=2,
             k_arr=np.array([0.0, 0.5, 1.0], dtype=np.float64),
-            val_fraction=0.0,
             linear_history_stride=2,
             nonlinear_history_stride=2,
             rollout_horizon=1,
@@ -107,8 +111,18 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             linear["train_anchor_time_indices"],
             np.array([0, 2, 4], dtype=np.int32),
         )
-        self.assertEqual(linear["val_anchor_time_indices"].size, 0)
-        self.assertEqual(linear["val_targets"].shape[0], 0)
+        np.testing.assert_array_equal(
+            linear["val_anchor_time_indices"],
+            np.array([0, 2, 4], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            linear["train_anchor_case_indices"],
+            np.zeros((3,), dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            linear["val_anchor_case_indices"],
+            np.ones((3,), dtype=np.int32),
+        )
 
     def test_h1_target_matches_direct_interface_flux_prediction(self) -> None:
         params = _zero_params(6)
@@ -236,8 +250,88 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             targets * phases[:, None, :],
         )
 
+    def test_sharded_and_stacked_sampling_are_identical(self) -> None:
+        rng = np.random.default_rng(31)
+        max_projection_order = 4
+        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        histories = (
+            rng.normal(size=(2, 8, max_projection_order + 1, 5))
+            + 1j * rng.normal(size=(2, 8, max_projection_order + 1, 5))
+        ).astype(np.complex64)
+        reference_stacked = {
+            trainer.REGIME_LINEAR: {
+                coeff_key: histories,
+                "case_splits": np.array(["train", "train"]),
+            }
+        }
+        dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
+            reference_stacked,
+            max_projection_order=max_projection_order,
+            Nv_targets=(4,),
+            Nm=2,
+            k_arr=np.arange(5, dtype=np.float64) * 0.5,
+            linear_history_stride=1,
+            nonlinear_history_stride=1,
+            rollout_horizon=2,
+            n_low=2,
+            context_mode="none",
+        )
+        reference_sharded = {
+            trainer.REGIME_LINEAR: {
+                coeff_key: tuple(histories[index] for index in range(2)),
+                "case_splits": np.array(["train", "train"]),
+            }
+        }
+        stacked_state = trainer.prepare_interface_flux_rollout_sampling_state(
+            reference_stacked,
+            dataset,
+            max_projection_order=max_projection_order,
+            target_nvs=(4,),
+            history_dtype=np.complex64,
+        )
+        sharded_state = trainer.prepare_interface_flux_rollout_sampling_state(
+            reference_sharded,
+            dataset,
+            max_projection_order=max_projection_order,
+            target_nvs=(4,),
+            history_dtype=np.complex64,
+        )
+        selected = np.array([0, 3, 7, 10], dtype=np.int32)
+        kwargs = {
+            "regime": trainer.REGIME_LINEAR,
+            "target_nv": 4,
+            "rollout_horizon": 2,
+            "batch_size": 4,
+            "k_arr": np.arange(5, dtype=np.float64) * 0.5,
+            "complex_dtype": jnp.complex64,
+            "all_k_loss": True,
+            "selected_indices": selected,
+        }
+        stacked_batch = trainer.sample_interface_flux_rollout_regime_batch(
+            stacked_state,
+            rng=np.random.default_rng(37),
+            **kwargs,
+        )
+        sharded_batch = trainer.sample_interface_flux_rollout_regime_batch(
+            sharded_state,
+            rng=np.random.default_rng(37),
+            **kwargs,
+        )
+        for key in stacked_batch:
+            np.testing.assert_array_equal(
+                np.asarray(sharded_batch[key]),
+                np.asarray(stacked_batch[key]),
+            )
+
     def test_checkpoint_round_trip_and_legacy_adapter(self) -> None:
-        learned = _closure()
+        learned = LearnedInterfaceClosure(
+            **{
+                **_closure().__dict__,
+                "ic_manifest_sha256": "abc123",
+                "training_ic_count": 48,
+                "heldout_ic_count": 12,
+            }
+        )
         state = jnp.zeros((4, 3), dtype=jnp.complex128).at[3, 1].set(
             0.25 + 0.1j
         )
@@ -253,6 +347,9 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
                 trainer.INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
             )
             self.assertEqual(loaded.projection_quadrature_Nv, 64)
+            self.assertEqual(loaded.ic_manifest_sha256, "abc123")
+            self.assertEqual(loaded.training_ic_count, 48)
+            self.assertEqual(loaded.heldout_ic_count, 12)
             np.testing.assert_allclose(
                 np.asarray(learned_interface_q_hat(state, k_arr, 4, loaded)),
                 expected,
@@ -276,6 +373,54 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
                 np.asarray(learned_interface_q_hat(state, k_arr, 4, adapted)),
                 expected,
             )
+
+    def test_derived_training_statistics_round_trip(self) -> None:
+        stats = {
+            "input_mean": np.arange(6, dtype=np.float64),
+            "input_std": np.arange(6, dtype=np.float64) + 1.0,
+            "target_mean": np.array([0.0, 0.0], dtype=np.float64),
+            "target_std": np.array([2.0, 2.0], dtype=np.float64),
+        }
+        scales = {
+            regime: float(index + 1)
+            for index, regime in enumerate(trainer.CANONICAL_REGIMES)
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "derived" / "stats.npz"
+            trainer._save_derived_statistics(
+                path,
+                stats=stats,
+                regime_loss_stds=scales,
+            )
+            loaded = trainer._load_derived_statistics(path)
+            self.assertIsNotNone(loaded)
+            loaded_stats, loaded_scales = loaded
+            for key in stats:
+                np.testing.assert_array_equal(loaded_stats[key], stats[key])
+            self.assertEqual(loaded_scales, scales)
+
+    def test_warm_start_rejects_different_ic_manifest(self) -> None:
+        learned = LearnedInterfaceClosure(
+            **{
+                **_closure().__dict__,
+                "ic_manifest_sha256": "manifest-a",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint.npz"
+            save_learned_interface_closure_npz(path, learned)
+            with self.assertRaisesRegex(ValueError, "IC manifest"):
+                trainer._load_init_checkpoint_for_interface_closure(
+                    path,
+                    Nm=1,
+                    hidden_width=8,
+                    res_blocks=0,
+                    Nv_targets=(4,),
+                    context_mode="none",
+                    equilibrium_centered=True,
+                    complex_normalization_mode="phase_isotropic",
+                    ic_manifest_sha256="manifest-b",
+                )
 
 
 if __name__ == "__main__":
