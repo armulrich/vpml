@@ -19,7 +19,7 @@ dependencies = [
 [project.scripts]
 fh-nonlinear-sim = "benchmarks.fh_nonlinear_sim_jax:main"
 fh-benchmarks-2412-07073 = "benchmarks.fh_benchmarks_2412_07073_jax:main"
-fh-ml-tail-closure-train = "model.train.train:main"
+fh-interface-flux-train = "model.train.interface_flux_rollout:main"
 fh-learned-closure-eval = "model.eval:main"
 
 [tool.setuptools.packages.find]

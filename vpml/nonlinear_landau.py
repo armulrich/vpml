@@ -50,6 +50,7 @@ class NonlinearLandauParams:
     Nv_plot: int = 1000
     vmin: float = 0.0
     vmax: float = 0.5
+    initial_perturbation_x: Optional[np.ndarray] = None
 
 
 def _snapshot_indices(snapshot_times: Sequence[float], dt: float) -> np.ndarray:
@@ -106,8 +107,18 @@ def run_nonlinear_landau_rollout_raw(
         closure=closure,
     )
     m_eq = jnp.zeros((int(params.Nv),), dtype=jnp.float64).at[0].set(1.0)
+    if params.initial_perturbation_x is None:
+        initial_perturbation_x = float(params.eps) * jnp.cos(float(params.k0) * integ.x)
+    else:
+        initial_perturbation_np = np.asarray(params.initial_perturbation_x, dtype=np.float64)
+        if initial_perturbation_np.shape != (int(params.Nx),):
+            raise ValueError(
+                "initial_perturbation_x must have shape "
+                f"({int(params.Nx)},), got {initial_perturbation_np.shape}"
+            )
+        initial_perturbation_x = jnp.asarray(initial_perturbation_np, dtype=jnp.float64)
     a_phys0 = jnp.zeros((int(params.Nv), int(params.Nx)), dtype=jnp.float64)
-    a_phys0 = a_phys0.at[0].set(float(params.eps) * jnp.cos(float(params.k0) * integ.x))
+    a_phys0 = a_phys0.at[0].set(initial_perturbation_x)
     a_hat0 = integ.apply_mask_hat(rfft_x(a_phys0))
 
     damping_rates = None
@@ -129,9 +140,17 @@ def run_nonlinear_landau_rollout_raw(
 
     nsteps = int(round(float(params.T) / float(params.dt)))
     snap_steps = _snapshot_indices(params.snapshot_times, params.dt)
+    if snap_steps.size != np.unique(snap_steps).size:
+        raise ValueError("snapshot_times must map to distinct time steps")
+    if np.any(snap_steps < 0) or np.any(snap_steps > nsteps):
+        raise ValueError("snapshot_times must lie within [0, T]")
+    snap_slot_by_step = np.full((nsteps + 1,), -1, dtype=np.int32)
+    snap_slot_by_step[snap_steps] = np.arange(len(snap_steps), dtype=np.int32)
+    snap_slot_by_step_jax = jnp.asarray(snap_slot_by_step)
     snaps0 = jnp.zeros((len(snap_steps), int(params.Nv), int(params.Nx)), dtype=jnp.float64)
-    if 0 in snap_steps:
-        snap0_idx = int(np.where(snap_steps == 0)[0][0])
+
+    snap0_idx = int(snap_slot_by_step[0])
+    if snap0_idx >= 0:
         snaps0 = snaps0.at[snap0_idx].set(irfft_x(a_hat0, int(params.Nx)))
 
     hist_steps = np.arange(0, nsteps + 1, history_stride, dtype=np.int32)
@@ -143,22 +162,22 @@ def run_nonlinear_landau_rollout_raw(
         hist0 = hist0.at[0].set(a_hat0)
 
     n0 = explicit_n_hat(a_hat0)
-    b0 = (
-        learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned_closure)
-        if learned_closure is not None
-        else jnp.zeros_like(a_hat0)
-    )
+    if learned_closure is None:
+        b0 = jnp.zeros_like(a_hat0)
+    else:
+        b0 = learned_boundary_flux_hat(a_hat0, integ.k_arr, integ.Nv, integ.vth, learned_closure)
 
     def maybe_store(snaps: Array, step_i: Array, a_hat_new: Array) -> Array:
+        if len(snap_steps) == 0:
+            return snaps
         a_phys_new = irfft_x(a_hat_new, int(params.Nx))
-        for j, snap_step in enumerate(snap_steps):
-            snaps = jax.lax.cond(
-                step_i == int(snap_step),
-                lambda s, arr=a_phys_new, idx=j: s.at[idx].set(arr),
-                lambda s: s,
-                snaps,
-            )
-        return snaps
+        snap_slot = snap_slot_by_step_jax[step_i]
+        return jax.lax.cond(
+            snap_slot >= 0,
+            lambda s: s.at[snap_slot].set(a_phys_new),
+            lambda s: s,
+            snaps,
+        )
 
     def maybe_store_history(history: Array, step_i: Array, a_hat_new: Array) -> Array:
         if not return_state_history:
@@ -179,13 +198,12 @@ def run_nonlinear_landau_rollout_raw(
         return history
 
     def step(carry, i):
-        a_hat, n_prev, b_prev, snaps, history = carry
+        a_hat, a_hat_prev, n_prev, b_prev, snaps, history = carry
         n_hat = explicit_n_hat(a_hat)
-        b_hat = (
-            jnp.zeros_like(a_hat)
-            if learned_closure is None
-            else learned_boundary_flux_hat(a_hat, integ.k_arr, integ.Nv, integ.vth, learned_closure)
-        )
+        if learned_closure is None:
+            b_hat = jnp.zeros_like(a_hat)
+        else:
+            b_hat = learned_boundary_flux_hat(a_hat, integ.k_arr, integ.Nv, integ.vth, learned_closure)
         a_new = integ.step_cnab2(
             a_hat,
             n_hat,
@@ -195,14 +213,14 @@ def run_nonlinear_landau_rollout_raw(
         )
         snaps = maybe_store(snaps, i, a_new)
         history = maybe_store_history(history, i, a_new)
-        return (a_new, n_hat, b_hat, snaps, history), 0.0
+        return (a_new, a_hat, n_hat, b_hat, snaps, history), 0.0
 
-    (a_last, n_last, b_last, snaps_out, hist_out), _ = jax.lax.scan(
+    (a_last, a_prev_last, n_last, b_last, snaps_out, hist_out), _ = jax.lax.scan(
         step,
-        (a_hat0, n0, b0, snaps0, hist0),
+        (a_hat0, a_hat0, n0, b0, snaps0, hist0),
         jnp.arange(1, nsteps + 1, dtype=jnp.int32),
     )
-    del a_last, n_last, b_last
+    del a_last, a_prev_last, n_last, b_last
 
     raw: Dict[str, np.ndarray | Array] = {
         "x": np.asarray(integ.x),

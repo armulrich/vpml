@@ -69,6 +69,16 @@ Array = jnp.ndarray
 LEGACY_GRID_CUBIC_TEACHER_BACKEND = "physical_grid_cubic_v1"
 GRID_CUBIC_SPLINE_TEACHER_BACKEND = "grid_cubic_spline"
 HIGHER_ORDER_HERMITE_TEACHER_BACKEND = "higher_order_hermite"
+INTERFACE_FLUX_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
+INTERFACE_FLUX_OBJECTIVE = "interface_flux_rollout"
+INTERFACE_FLUX_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
+INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 2
+
+_LEGACY_INTERFACE_FLUX_TRIPLE = (
+    "exact_q_rollout",
+    "q_rollout",
+    "exact_fourier_hermite_q_rollout",
+)
 
 
 def normalize_teacher_backend_name(name: Optional[str]) -> Optional[str]:
@@ -254,27 +264,13 @@ class NonlocalClosure:
 @dataclass(frozen=True)
 class LearnedInterfaceClosure:
     """
-    Solver-embedded learned interface closure for the unresolved Hermite tail.
-
-    Previous version
-    ----------------
-    The original closure predicted the complex interface term q_k directly from the
-    current resolved Hermite window:
+    Solver-embedded learned interface-flux closure for the unresolved Hermite tail.
 
         x_k(t) = Std(Re z_k(t), Im z_k(t), |k|/k_scale, Nv/nv_scale, E(t), H_low(t))
 
-    and trained only with one-step q-supervision.
-
-    Stability-aware version
-    -----------------------
-    The new trainer can also attach temporal context and use a hybrid objective. The
-    deployed model remains a direct map from standardized features to q_k, but the
-    feature builder may use a context mode such as
-
-        x_k^ctx(t) = (x_k(t), x_k(t - dt), x_k(t) - x_k(t - dt)).
-
     The network is a linear shortcut branch plus a nonlinear residual MLP branch.
-    Old q-only checkpoints remain loadable without migration.
+    Supported legacy exact-q checkpoints are normalized to the canonical metadata
+    identifiers when loaded.
     """
     params: Dict[str, Array]
     Nm: int
@@ -286,6 +282,9 @@ class LearnedInterfaceClosure:
     target_std: Array
     hidden_width: int = 128
     res_blocks: int = 2
+    equilibrium_centered: bool = False
+    complex_normalization_mode: str = "componentwise"
+    translation_augmented: bool = False
     Nv_targets: Optional[Tuple[int, ...]] = None
     train_regimes: Optional[Tuple[str, ...]] = None
     teacher_backend: Optional[str] = None
@@ -296,25 +295,16 @@ class LearnedInterfaceClosure:
     teacher_vmax: Optional[float] = None
     teacher_dt: Optional[float] = None
     teacher_proj_Nv: Optional[int] = None
+    projection_quadrature_Nv: Optional[int] = None
     include_global_indicators: bool = True
     n_low: int = 2
-    training_mode: str = "offline_rollout"
-    train_objective: str = "q_only"
+    training_mode: str = INTERFACE_FLUX_TRAINING_MODE
+    train_objective: str = INTERFACE_FLUX_OBJECTIVE
     context_mode: str = "none"
     context_lags: int = 0
     base_input_dim: Optional[int] = None
     rollout_horizon: int = 0
-    rollout_anchor_samples: int = 0
-    tail_start_fraction: float = 2.0 / 3.0
-    loss_backend: Optional[str] = None
-    lambda_q: float = 1.0
-    lambda_E: float = 0.0
-    lambda_dist: float = 0.0
-    lambda_tail: float = 0.0
-    lambda_neg: float = 0.0
-    lambda_reg: float = 0.0
-    online_v_probes: int = 0
-    stability_loss_definition: Optional[str] = None
+    loss_backend: str = INTERFACE_FLUX_LOSS_BACKEND
 
     def __post_init__(self) -> None:
         if int(self.Nm) <= 0:
@@ -323,13 +313,19 @@ class LearnedInterfaceClosure:
             raise ValueError("hidden_width must be positive")
         if int(self.res_blocks) < 0:
             raise ValueError("res_blocks must be nonnegative")
+        if str(self.complex_normalization_mode) not in {"componentwise", "phase_isotropic"}:
+            raise ValueError(
+                "complex_normalization_mode must be 'componentwise' or 'phase_isotropic'"
+            )
         if float(self.k_scale) <= 0.0:
             raise ValueError("k_scale must be positive")
         if float(self.nv_scale) <= 0.0:
             raise ValueError("nv_scale must be positive")
         if int(self.n_low) < 0:
             raise ValueError("n_low must be nonnegative")
-        if str(self.training_mode) not in {"offline_rollout", "online_rollout"}:
+        if self.projection_quadrature_Nv is not None and int(self.projection_quadrature_Nv) <= 3:
+            raise ValueError("projection_quadrature_Nv must exceed three when provided")
+        if str(self.training_mode) != INTERFACE_FLUX_TRAINING_MODE:
             raise ValueError(f"Unsupported training_mode={self.training_mode!r}")
         if str(self.context_mode) not in {"none", "lag1_delta"}:
             raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
@@ -337,14 +333,10 @@ class LearnedInterfaceClosure:
             raise ValueError("context_lags must be nonnegative")
         if int(self.rollout_horizon) < 0:
             raise ValueError("rollout_horizon must be nonnegative")
-        if int(self.rollout_anchor_samples) < 0:
-            raise ValueError("rollout_anchor_samples must be nonnegative")
-        if not (0.0 < float(self.tail_start_fraction) <= 1.0):
-            raise ValueError("tail_start_fraction must lie in (0, 1]")
-        if str(self.train_objective) not in {"q_only", "trajectory", "trajectory_q_hybrid"}:
+        if str(self.train_objective) != INTERFACE_FLUX_OBJECTIVE:
             raise ValueError(f"Unsupported train_objective={self.train_objective!r}")
-        if int(self.online_v_probes) < 0:
-            raise ValueError("online_v_probes must be nonnegative")
+        if str(self.loss_backend) != INTERFACE_FLUX_LOSS_BACKEND:
+            raise ValueError(f"Unsupported loss_backend={self.loss_backend!r}")
 
         input_dim = self.input_dim
         input_mean = jnp.asarray(self.input_mean, dtype=jnp.float64)
@@ -374,18 +366,22 @@ class LearnedInterfaceClosure:
         raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
 
     def standardized_inputs(self, x: Array) -> Array:
-        x = jnp.asarray(x, dtype=jnp.float64)
-        std = jnp.maximum(jnp.asarray(self.input_std, dtype=jnp.float64), 1e-12)
-        return (x - jnp.asarray(self.input_mean, dtype=jnp.float64)) / std
+        input_mean = jnp.asarray(self.input_mean)
+        real_dtype = input_mean.dtype
+        x = jnp.asarray(x, dtype=real_dtype)
+        std = jnp.maximum(jnp.asarray(self.input_std, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+        return (x - input_mean) / std
 
     def unstandardized_targets(self, y: Array) -> Array:
-        y = jnp.asarray(y, dtype=jnp.float64)
-        std = jnp.maximum(jnp.asarray(self.target_std, dtype=jnp.float64), 1e-12)
-        return y * std + jnp.asarray(self.target_mean, dtype=jnp.float64)
+        target_mean = jnp.asarray(self.target_mean)
+        real_dtype = target_mean.dtype
+        y = jnp.asarray(y, dtype=real_dtype)
+        std = jnp.maximum(jnp.asarray(self.target_std, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+        return y * std + target_mean
 
     def predict_standardized_components(self, raw_features: Array) -> Array:
         feats = self.standardized_inputs(raw_features)
-        return jax.vmap(
+        pred = jax.vmap(
             lambda z: interface_closure_apply(
                 self.params,
                 z,
@@ -393,11 +389,45 @@ class LearnedInterfaceClosure:
                 res_blocks=int(self.res_blocks),
             )
         )(feats)
+        if not bool(self.equilibrium_centered):
+            return pred
+
+        zero_raw = jnp.zeros_like(jnp.asarray(raw_features))
+        base_dim = int(self.raw_base_dim)
+        k_col = 2 * int(self.Nm)
+        nv_col = k_col + 1
+        if self.context_mode == "none":
+            zero_raw = zero_raw.at[:, k_col : nv_col + 1].set(
+                jnp.asarray(raw_features)[:, k_col : nv_col + 1]
+            )
+        elif self.context_mode == "lag1_delta":
+            for offset in (0, base_dim):
+                zero_raw = zero_raw.at[:, offset + k_col : offset + nv_col + 1].set(
+                    jnp.asarray(raw_features)[:, offset + k_col : offset + nv_col + 1]
+                )
+        else:
+            raise ValueError(f"Unsupported context_mode={self.context_mode!r}")
+        zero_feats = self.standardized_inputs(zero_raw)
+        zero_pred = jax.vmap(
+            lambda z: interface_closure_apply(
+                self.params,
+                z,
+                hidden_width=int(self.hidden_width),
+                res_blocks=int(self.res_blocks),
+            )
+        )(zero_feats)
+        return pred - zero_pred
 
     def predict_q_components(self, raw_features: Array) -> Array:
-        return self.unstandardized_targets(
-            self.predict_standardized_components(raw_features)
-        )
+        pred = self.predict_standardized_components(raw_features)
+        if bool(self.equilibrium_centered):
+            real_dtype = jnp.asarray(self.target_std).dtype
+            std = jnp.maximum(
+                jnp.asarray(self.target_std, dtype=real_dtype),
+                jnp.asarray(1e-12, dtype=real_dtype),
+            )
+            return jnp.asarray(pred, dtype=real_dtype) * std
+        return self.unstandardized_targets(pred)
 
 
 def _xavier_normal(key: Array, shape: Tuple[int, int]) -> Array:
@@ -435,6 +465,7 @@ def init_interface_closure_params(
         params[f"b2_{block_idx}"] = jnp.zeros((int(hidden_width),), dtype=jnp.float64)
     params["W_out"] = _xavier_normal(keys[idx], (int(hidden_width), 2))
     params["b_out"] = jnp.zeros((2,), dtype=jnp.float64)
+    idx += 1
     return params
 
 
@@ -447,7 +478,8 @@ def interface_closure_apply(
 ) -> Array:
     """Apply the shared residual interface-closure network to one standardized feature vector."""
     del hidden_width  # encoded in parameter shapes
-    x = jnp.asarray(x, dtype=jnp.float64)
+    param_dtype = jnp.asarray(params["W_lin"]).dtype
+    x = jnp.asarray(x, dtype=param_dtype)
     y_lin = x @ params["W_lin"] + params["b_lin"]
     h = jax.nn.silu(x @ params["W_in"] + params["b_in"])
     for block_idx in range(int(res_blocks)):
@@ -455,7 +487,7 @@ def interface_closure_apply(
         residual = residual @ params[f"W2_{block_idx}"] + params[f"b2_{block_idx}"]
         h = h + residual
     y_nl = h @ params["W_out"] + params["b_out"]
-    return (y_lin + y_nl).astype(jnp.float64)
+    return (y_lin + y_nl).astype(param_dtype)
 
 
 def save_learned_interface_closure_npz(
@@ -465,6 +497,9 @@ def save_learned_interface_closure_npz(
     """Save a learned interface-closure checkpoint in NPZ format."""
     payload: Dict[str, np.ndarray] = {
         "closure_kind": np.array(["interface_closure"], dtype=np.str_),
+        "metadata_schema_version": np.array(
+            [INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION], dtype=np.int32
+        ),
         "Nm": np.array([int(learned.Nm)], dtype=np.int32),
         "k_scale": np.array([float(learned.k_scale)], dtype=np.float64),
         "nv_scale": np.array([float(learned.nv_scale)], dtype=np.float64),
@@ -474,6 +509,9 @@ def save_learned_interface_closure_npz(
         "target_std": np.asarray(learned.target_std, dtype=np.float64),
         "hidden_width": np.array([int(learned.hidden_width)], dtype=np.int32),
         "res_blocks": np.array([int(learned.res_blocks)], dtype=np.int32),
+        "equilibrium_centered": np.array([int(bool(learned.equilibrium_centered))], dtype=np.int32),
+        "complex_normalization_mode": np.array([str(learned.complex_normalization_mode)], dtype=np.str_),
+        "translation_augmented": np.array([int(bool(learned.translation_augmented))], dtype=np.int32),
         "Nv_targets": np.array(
             [] if learned.Nv_targets is None else learned.Nv_targets,
             dtype=np.int32,
@@ -496,19 +534,8 @@ def save_learned_interface_closure_npz(
         "context_lags": np.array([int(learned.context_lags)], dtype=np.int32),
         "base_input_dim": np.array([int(learned.raw_base_dim if learned.base_input_dim is None else learned.base_input_dim)], dtype=np.int32),
         "rollout_horizon": np.array([int(learned.rollout_horizon)], dtype=np.int32),
-        "rollout_anchor_samples": np.array([int(learned.rollout_anchor_samples)], dtype=np.int32),
-        "tail_start_fraction": np.array([float(learned.tail_start_fraction)], dtype=np.float64),
-        "loss_backend": np.array([] if learned.loss_backend is None else [str(learned.loss_backend)], dtype=np.str_),
-        "lambda_q": np.array([float(learned.lambda_q)], dtype=np.float64),
-        "lambda_E": np.array([float(learned.lambda_E)], dtype=np.float64),
-        "lambda_dist": np.array([float(learned.lambda_dist)], dtype=np.float64),
-        "lambda_tail": np.array([float(learned.lambda_tail)], dtype=np.float64),
-        "lambda_neg": np.array([float(learned.lambda_neg)], dtype=np.float64),
-        "lambda_reg": np.array([float(learned.lambda_reg)], dtype=np.float64),
-        "online_v_probes": np.array([int(learned.online_v_probes)], dtype=np.int32),
+        "loss_backend": np.array([str(learned.loss_backend)], dtype=np.str_),
     }
-    if learned.stability_loss_definition is not None:
-        payload["stability_loss_definition"] = np.array([str(learned.stability_loss_definition)], dtype=np.str_)
     if learned.teacher_Lx is not None:
         payload["teacher_Lx"] = np.array([float(learned.teacher_Lx)], dtype=np.float64)
     if learned.teacher_Nx is not None:
@@ -523,6 +550,10 @@ def save_learned_interface_closure_npz(
         payload["teacher_dt"] = np.array([float(learned.teacher_dt)], dtype=np.float64)
     if learned.teacher_proj_Nv is not None:
         payload["teacher_proj_Nv"] = np.array([int(learned.teacher_proj_Nv)], dtype=np.int32)
+    if learned.projection_quadrature_Nv is not None:
+        payload["projection_quadrature_Nv"] = np.array(
+            [int(learned.projection_quadrature_Nv)], dtype=np.int32
+        )
     for name, value in learned.params.items():
         payload[name] = np.asarray(value, dtype=np.float64)
     np.savez(path, **payload)
@@ -538,6 +569,17 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             raise ValueError(
                 f"Incompatible learned-closure checkpoint at {path}: expected interface_closure. "
                 "Legacy mu-tail checkpoints are no longer supported and must be retrained."
+            )
+        schema_version = (
+            int(np.asarray(data["metadata_schema_version"]).reshape(-1)[0])
+            if "metadata_schema_version" in data.files
+            and data["metadata_schema_version"].size
+            else 0
+        )
+        if schema_version > INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Checkpoint schema {schema_version} is newer than supported schema "
+                f"{INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION}"
             )
 
         params = {
@@ -561,6 +603,21 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         target_std = jnp.asarray(data["target_std"], dtype=jnp.float64)
         hidden_width = int(np.asarray(data["hidden_width"]).reshape(-1)[0])
         res_blocks = int(np.asarray(data["res_blocks"]).reshape(-1)[0])
+        equilibrium_centered = (
+            bool(np.asarray(data["equilibrium_centered"]).reshape(-1)[0])
+            if "equilibrium_centered" in data.files and data["equilibrium_centered"].size
+            else False
+        )
+        complex_normalization_mode = (
+            str(np.asarray(data["complex_normalization_mode"], dtype=np.str_).reshape(-1)[0])
+            if "complex_normalization_mode" in data.files and data["complex_normalization_mode"].size
+            else "componentwise"
+        )
+        translation_augmented = (
+            bool(np.asarray(data["translation_augmented"]).reshape(-1)[0])
+            if "translation_augmented" in data.files and data["translation_augmented"].size
+            else False
+        )
 
         Nv_targets = None
         if "Nv_targets" in data.files and data["Nv_targets"].size:
@@ -583,6 +640,12 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         teacher_vmax = None if "teacher_vmax" not in data.files or not data["teacher_vmax"].size else float(np.asarray(data["teacher_vmax"]).reshape(-1)[0])
         teacher_dt = None if "teacher_dt" not in data.files or not data["teacher_dt"].size else float(np.asarray(data["teacher_dt"]).reshape(-1)[0])
         teacher_proj_Nv = None if "teacher_proj_Nv" not in data.files or not data["teacher_proj_Nv"].size else int(np.asarray(data["teacher_proj_Nv"]).reshape(-1)[0])
+        projection_quadrature_Nv = (
+            None
+            if "projection_quadrature_Nv" not in data.files
+            or not data["projection_quadrature_Nv"].size
+            else int(np.asarray(data["projection_quadrature_Nv"]).reshape(-1)[0])
+        )
         include_global_indicators = (
             bool(np.asarray(data["include_global_indicators"]).reshape(-1)[0])
             if "include_global_indicators" in data.files and data["include_global_indicators"].size
@@ -623,61 +686,26 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
             if "rollout_horizon" in data.files and data["rollout_horizon"].size
             else 0
         )
-        rollout_anchor_samples = (
-            int(np.asarray(data["rollout_anchor_samples"]).reshape(-1)[0])
-            if "rollout_anchor_samples" in data.files and data["rollout_anchor_samples"].size
-            else 0
-        )
-        tail_start_fraction = (
-            float(np.asarray(data["tail_start_fraction"]).reshape(-1)[0])
-            if "tail_start_fraction" in data.files and data["tail_start_fraction"].size
-            else 2.0 / 3.0
-        )
         loss_backend = (
             str(np.asarray(data["loss_backend"], dtype=np.str_).reshape(-1)[0])
             if "loss_backend" in data.files and data["loss_backend"].size
             else None
         )
-        lambda_q = (
-            float(np.asarray(data["lambda_q"]).reshape(-1)[0])
-            if "lambda_q" in data.files and data["lambda_q"].size
-            else 1.0
-        )
-        lambda_E = (
-            float(np.asarray(data["lambda_E"]).reshape(-1)[0])
-            if "lambda_E" in data.files and data["lambda_E"].size
-            else 0.0
-        )
-        lambda_dist = (
-            float(np.asarray(data["lambda_dist"]).reshape(-1)[0])
-            if "lambda_dist" in data.files and data["lambda_dist"].size
-            else 0.0
-        )
-        lambda_tail = (
-            float(np.asarray(data["lambda_tail"]).reshape(-1)[0])
-            if "lambda_tail" in data.files and data["lambda_tail"].size
-            else 0.0
-        )
-        lambda_neg = (
-            float(np.asarray(data["lambda_neg"]).reshape(-1)[0])
-            if "lambda_neg" in data.files and data["lambda_neg"].size
-            else 0.0
-        )
-        lambda_reg = (
-            float(np.asarray(data["lambda_reg"]).reshape(-1)[0])
-            if "lambda_reg" in data.files and data["lambda_reg"].size
-            else 0.0
-        )
-        online_v_probes = (
-            int(np.asarray(data["online_v_probes"]).reshape(-1)[0])
-            if "online_v_probes" in data.files and data["online_v_probes"].size
-            else 0
-        )
-        stability_loss_definition = (
-            str(np.asarray(data["stability_loss_definition"], dtype=np.str_).reshape(-1)[0])
-            if "stability_loss_definition" in data.files and data["stability_loss_definition"].size
-            else None
-        )
+        metadata_triple = (training_mode, train_objective, loss_backend)
+        if metadata_triple == _LEGACY_INTERFACE_FLUX_TRIPLE:
+            training_mode = INTERFACE_FLUX_TRAINING_MODE
+            train_objective = INTERFACE_FLUX_OBJECTIVE
+            loss_backend = INTERFACE_FLUX_LOSS_BACKEND
+        elif metadata_triple != (
+            INTERFACE_FLUX_TRAINING_MODE,
+            INTERFACE_FLUX_OBJECTIVE,
+            INTERFACE_FLUX_LOSS_BACKEND,
+        ):
+            raise ValueError(
+                "Unsupported learned-closure trainer metadata "
+                f"{metadata_triple!r}; only canonical interface-flux and legacy "
+                "solver-embedded exact-q checkpoints are supported"
+            )
 
     return LearnedInterfaceClosure(
         params=params,
@@ -690,6 +718,9 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         target_std=target_std,
         hidden_width=hidden_width,
         res_blocks=res_blocks,
+        equilibrium_centered=equilibrium_centered,
+        complex_normalization_mode=complex_normalization_mode,
+        translation_augmented=translation_augmented,
         Nv_targets=Nv_targets,
         train_regimes=train_regimes,
         teacher_backend=teacher_backend,
@@ -700,6 +731,7 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         teacher_vmax=teacher_vmax,
         teacher_dt=teacher_dt,
         teacher_proj_Nv=teacher_proj_Nv,
+        projection_quadrature_Nv=projection_quadrature_Nv,
         include_global_indicators=include_global_indicators,
         n_low=n_low,
         training_mode=training_mode,
@@ -708,24 +740,14 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         context_lags=context_lags,
         base_input_dim=base_input_dim,
         rollout_horizon=rollout_horizon,
-        rollout_anchor_samples=rollout_anchor_samples,
-        tail_start_fraction=tail_start_fraction,
         loss_backend=loss_backend,
-        lambda_q=lambda_q,
-        lambda_E=lambda_E,
-        lambda_dist=lambda_dist,
-        lambda_tail=lambda_tail,
-        lambda_neg=lambda_neg,
-        lambda_reg=lambda_reg,
-        online_v_probes=online_v_probes,
-        stability_loss_definition=stability_loss_definition,
     )
 
 
-def _hermitian_rfft_weights(nk: int) -> Array:
+def _hermitian_rfft_weights(nk: int, *, dtype: object = jnp.float64) -> Array:
     if int(nk) <= 0:
         raise ValueError("nk must be positive")
-    weights = jnp.ones((int(nk),), dtype=jnp.float64)
+    weights = jnp.ones((int(nk),), dtype=dtype)
     if int(nk) > 2:
         weights = weights.at[1:-1].set(2.0)
     return weights
@@ -746,8 +768,10 @@ def learned_closure_global_indicators(
     The sums are evaluated on the stored rFFT half-spectrum with Hermitian weights so
     they remain comparable to the full-spectrum quantities for real-valued states.
     """
-    a_hat = jnp.asarray(a_hat, dtype=jnp.complex128)
-    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    complex_dtype = a_hat.dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
     if a_hat.ndim != 2:
         raise ValueError(f"a_hat must have shape (Nv, Nk), got {a_hat.shape}")
     if k_arr.ndim != 1 or k_arr.shape[0] != a_hat.shape[1]:
@@ -755,16 +779,16 @@ def learned_closure_global_indicators(
     if int(n_low) < 0:
         raise ValueError("n_low must be nonnegative")
 
-    weights = _hermitian_rfft_weights(a_hat.shape[1])
+    weights = _hermitian_rfft_weights(a_hat.shape[1], dtype=real_dtype)
 
-    e_hat = jnp.zeros((a_hat.shape[1],), dtype=jnp.complex128)
+    e_hat = jnp.zeros((a_hat.shape[1],), dtype=complex_dtype)
     if a_hat.shape[1] > 1:
         e_hat = e_hat.at[1:].set(1j * a_hat[0, 1:] / k_arr[1:])
     field_activity = jnp.sum(weights[1:] * (jnp.abs(e_hat[1:]) ** 2))
 
     n_hi = min(int(n_low), int(a_hat.shape[0]) - 1)
     low_energy = jnp.sum(weights[None, :] * (jnp.abs(a_hat[: n_hi + 1, :]) ** 2))
-    return field_activity.astype(jnp.float64), low_energy.astype(jnp.float64)
+    return field_activity.astype(real_dtype), low_energy.astype(real_dtype)
 
 
 def learned_closure_raw_base_features(
@@ -779,16 +803,18 @@ def learned_closure_raw_base_features(
     if Nm > Nv:
         raise ValueError(f"Learned closure Nm={Nm} exceeds Nv={Nv}")
 
-    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
     if k_arr.shape[0] <= 1:
-        return jnp.zeros((0, learned.raw_base_dim), dtype=jnp.float64)
+        return jnp.zeros((0, learned.raw_base_dim), dtype=real_dtype)
 
     z = jnp.swapaxes(a_hat[Nv - Nm : Nv, 1:], 0, 1)
     feature_cols = [
         jnp.real(z),
         jnp.imag(z),
         jnp.abs(k_arr[1:])[:, None],
-        jnp.full((z.shape[0], 1), float(Nv), dtype=jnp.float64),
+        jnp.full((z.shape[0], 1), float(Nv), dtype=real_dtype),
     ]
     if learned.include_global_indicators:
         field_activity, low_energy = learned_closure_global_indicators(
@@ -797,7 +823,7 @@ def learned_closure_raw_base_features(
             n_low=int(learned.n_low),
         )
         globals_mat = jnp.broadcast_to(
-            jnp.array([field_activity, low_energy], dtype=jnp.float64)[None, :],
+            jnp.array([field_activity, low_energy], dtype=real_dtype)[None, :],
             (z.shape[0], 2),
         )
         feature_cols.append(globals_mat)
@@ -828,23 +854,27 @@ def scale_learned_closure_raw_features(
     learned: LearnedInterfaceClosure,
 ) -> Array:
     """Apply the k/Nv scaling used before global feature standardization."""
-    raw_features = jnp.asarray(raw_features, dtype=jnp.float64)
+    raw_features = jnp.asarray(raw_features)
+    real_dtype = raw_features.dtype
+    k_scale = jnp.asarray(float(learned.k_scale), dtype=real_dtype)
+    nv_scale = jnp.asarray(float(learned.nv_scale), dtype=real_dtype)
     base_dim = int(learned.raw_base_dim)
+    k_col = 2 * int(learned.Nm)
+
+    def scale_base_features(features: Array) -> Array:
+        prefix = jnp.ones((k_col,), dtype=real_dtype)
+        scaled_cols = jnp.stack((jnp.reciprocal(k_scale), jnp.reciprocal(nv_scale)))
+        suffix = jnp.ones((base_dim - k_col - 2,), dtype=real_dtype)
+        scale = jnp.concatenate((prefix, scaled_cols, suffix), axis=0)
+        return features * scale[None, :]
+
     if learned.context_mode == "none":
-        feats = raw_features
-        feats = feats.at[:, 2 * int(learned.Nm)].divide(float(learned.k_scale))
-        feats = feats.at[:, 2 * int(learned.Nm) + 1].divide(float(learned.nv_scale))
-        return feats
+        return scale_base_features(raw_features)
     if learned.context_mode == "lag1_delta":
         current = raw_features[:, :base_dim]
         previous = raw_features[:, base_dim : 2 * base_dim]
-        delta = raw_features[:, 2 * base_dim :]
-        k_col = 2 * int(learned.Nm)
-        nv_col = k_col + 1
-        current = current.at[:, k_col].divide(float(learned.k_scale))
-        current = current.at[:, nv_col].divide(float(learned.nv_scale))
-        previous = previous.at[:, k_col].divide(float(learned.k_scale))
-        previous = previous.at[:, nv_col].divide(float(learned.nv_scale))
+        current = scale_base_features(current)
+        previous = scale_base_features(previous)
         delta = current - previous
         return jnp.concatenate([current, previous, delta], axis=1)
     raise ValueError(f"Unsupported context_mode={learned.context_mode!r}")
@@ -870,8 +900,11 @@ def learned_interface_q_hat(
     if Nm > Nv:
         raise ValueError(f"Learned closure Nm={Nm} exceeds Nv={Nv}")
 
-    k_arr = jnp.asarray(k_arr, dtype=jnp.float64)
-    q_hat = jnp.zeros((k_arr.shape[0],), dtype=jnp.complex128)
+    a_hat = jnp.asarray(a_hat)
+    real_dtype = jnp.real(a_hat).dtype
+    complex_dtype = a_hat.dtype
+    k_arr = jnp.asarray(k_arr, dtype=real_dtype)
+    q_hat = jnp.zeros((k_arr.shape[0],), dtype=complex_dtype)
     if k_arr.shape[0] <= 1:
         return q_hat
 
@@ -884,16 +917,28 @@ def learned_interface_q_hat(
     )
     raw_features = scale_learned_closure_raw_features(raw_features, learned)
     pred = learned.predict_q_components(raw_features)
-    if (
-        str(learned.training_mode) == "online_rollout"
-        and str(learned.loss_backend) == "field_distribution_v1"
-    ):
-        # Keep solver-in-the-loop optimization in a numerically stable regime
-        # while preserving full JAX differentiability.
-        clip = jnp.asarray([0.25, 0.75], dtype=jnp.float64)
-        pred = clip * jnp.tanh(pred / clip)
-    q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(jnp.complex128)
+    q_nonzero = (pred[:, 0] + 1j * pred[:, 1]).astype(complex_dtype)
     return q_hat.at[1:].set(q_nonzero)
+
+
+def _standardized_learned_closure_features(
+    a_hat: Array,
+    k_arr: Array,
+    Nv: int,
+    learned: LearnedInterfaceClosure,
+    *,
+    a_hat_prev: Optional[Array] = None,
+) -> Array:
+    """Return standardized nonzero-k interface-closure features."""
+    raw_features = learned_closure_raw_features(
+        a_hat,
+        k_arr,
+        int(Nv),
+        learned,
+        a_hat_prev=a_hat_prev,
+    )
+    scaled = scale_learned_closure_raw_features(raw_features, learned)
+    return learned.standardized_inputs(scaled)
 
 
 def learned_boundary_flux_hat(
@@ -907,8 +952,9 @@ def learned_boundary_flux_hat(
 ) -> Array:
     """Return the learned Hermite-boundary interface contribution, nonzero only on the last row."""
     del vth  # q_k is learned directly in physical units.
+    a_hat = jnp.asarray(a_hat)
     q_hat = learned_interface_q_hat(a_hat, k_arr, Nv, learned, a_hat_prev=a_hat_prev)
-    B_hat = jnp.zeros_like(a_hat, dtype=jnp.complex128)
+    B_hat = jnp.zeros_like(a_hat)
     return B_hat.at[int(Nv) - 1].set(q_hat)
 
 
@@ -1263,35 +1309,39 @@ class FourierHermiteIMEX:
     vth: float = 1.0
     dealias_23: bool = True
     closure: Optional[NonlocalClosure] = None
+    real_dtype: object = jnp.float64
+    complex_dtype: object = jnp.complex128
 
     def __post_init__(self):
         if self.Nx <= 0 or self.Nv <= 0:
             raise ValueError("Nx and Nv must be positive")
         if self.vth <= 0:
             raise ValueError("vth must be positive")
+        self.real_dtype = jnp.dtype(self.real_dtype)
+        self.complex_dtype = jnp.dtype(self.complex_dtype)
 
         dx = float(self.Lx) / float(self.Nx)
         self.dx = dx
 
         self.x = jnp.linspace(0.0, float(self.Lx), int(self.Nx), endpoint=False)
-        self.k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(int(self.Nx), d=dx).astype(jnp.float64)
+        self.k_arr = (2.0 * jnp.pi * jnp.fft.rfftfreq(int(self.Nx), d=dx)).astype(self.real_dtype)
         self.Nk = int(self.Nx // 2 + 1)
 
-        self.sqrt_n = jnp.sqrt(jnp.arange(int(self.Nv), dtype=jnp.float64))
-        self.sqrt_np1 = jnp.sqrt(jnp.arange(1, int(self.Nv) + 1, dtype=jnp.float64))
+        self.sqrt_n = jnp.sqrt(jnp.arange(int(self.Nv), dtype=self.real_dtype))
+        self.sqrt_np1 = jnp.sqrt(jnp.arange(1, int(self.Nv) + 1, dtype=self.real_dtype))
 
         # 2/3 dealias mask (rFFT length Nk)
         self.mask = _mask_23(self.Nx) if self.dealias_23 else None
 
         # --- Precompute tridiagonal coefficients for the implicit CN solve ---
         dt_half = 0.5 * float(self.dt)
-        s = jnp.sqrt(jnp.arange(1, int(self.Nv), dtype=jnp.float64))              # sqrt(1..Nv-1)
-        val = (1j * dt_half * self.k_arr * float(self.vth)).astype(jnp.complex128)  # (Nk,)
+        s = jnp.sqrt(jnp.arange(1, int(self.Nv), dtype=self.real_dtype))              # sqrt(1..Nv-1)
+        val = (1j * dt_half * self.k_arr * float(self.vth)).astype(self.complex_dtype)  # (Nk,)
 
         # sub/sup: (Nk, Nv-1)
-        self.sub = (val[:, None] * s[None, :]).astype(jnp.complex128)
+        self.sub = (val[:, None] * s[None, :]).astype(self.complex_dtype)
         self.sup = self.sub.copy()
-        self.diag = jnp.ones((self.Nk, int(self.Nv)), dtype=jnp.complex128)
+        self.diag = jnp.ones((self.Nk, int(self.Nv)), dtype=self.complex_dtype)
 
         # Optional Nm=1 closure -> diagonal modification on last Hermite mode
         self._closure_Ldiag_last = None
@@ -1299,11 +1349,11 @@ class FourierHermiteIMEX:
             Nm = int(self.closure.Nm)
             if Nm != 1:
                 raise ValueError("Time-stepping integrator supports NonlocalClosure only for Nm=1.")
-            mu = jnp.asarray(self.closure.mu_tail[0], dtype=jnp.float64)
+            mu = jnp.asarray(self.closure.mu_tail[0], dtype=self.real_dtype)
             signk = jnp.sign(self.k_arr)
             # L_diag_last = k*vth*sqrt(Nv)*mu*sign(k)
             Ldiag_last = (self.k_arr * float(self.vth) * jnp.sqrt(float(self.Nv)) * mu * signk)
-            self._closure_Ldiag_last = Ldiag_last.astype(jnp.complex128)
+            self._closure_Ldiag_last = Ldiag_last.astype(self.complex_dtype)
             self.diag = self.diag.at[:, int(self.Nv) - 1].set(1.0 - dt_half * self._closure_Ldiag_last)
 
         # Batched solver (vmap over k)
@@ -1363,7 +1413,7 @@ class FourierHermiteIMEX:
         """Compute electric field E(x) in physical space from a_hat[0,k]."""
         rho_hat = a_hat[0]
         E_hat = self.E_hat_from_rho_hat(rho_hat, poisson_sign=poisson_sign)
-        return jnp.fft.irfft(E_hat, n=int(self.Nx)).astype(jnp.float64)
+        return jnp.fft.irfft(E_hat, n=int(self.Nx)).astype(self.real_dtype)
 
     def electric_energy(self, a_hat: Array, poisson_sign: float = +1.0) -> Array:
         """Return 0.5 * ∫ E^2 dx (discrete trapezoid == dx * sum)."""
