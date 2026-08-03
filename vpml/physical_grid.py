@@ -193,8 +193,10 @@ def _bspline_weights(frac: Array) -> Tuple[Array, Array, Array, Array]:
 def cubic_bspline_prefilter_periodic(values: Array, periodic_den: Array) -> Array:
     values = jnp.asarray(values, dtype=jnp.float64)
     periodic_den = jnp.asarray(periodic_den, dtype=jnp.float64)
-    coeff_hat = jnp.fft.fft(values, axis=-1) / periodic_den[None, :]
-    return jnp.fft.ifft(coeff_hat, axis=-1).real.astype(jnp.float64)
+    nx = int(values.shape[-1])
+    nk = nx // 2 + 1
+    coeff_hat = jnp.fft.rfft(values, axis=-1) / periodic_den[None, :nk]
+    return jnp.fft.irfft(coeff_hat, n=nx, axis=-1).astype(jnp.float64)
 
 
 def cubic_bspline_prefilter_constant(

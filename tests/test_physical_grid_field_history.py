@@ -6,6 +6,7 @@ import numpy as np
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     compute_electric_field_from_distribution,
+    cubic_bspline_prefilter_periodic,
     gaussian_pdf,
     normalize_density_on_grid,
     run_semilagrangian_vlasov_poisson,
@@ -13,6 +14,23 @@ from vpml.physical_grid import (
 
 
 class PhysicalGridFieldHistoryTests(unittest.TestCase):
+    def test_real_periodic_prefilter_matches_complex_fft_reference(self) -> None:
+        values = jnp.asarray(
+            np.random.default_rng(7).normal(size=(5, 16)),
+            dtype=jnp.float64,
+        )
+        mode = jnp.arange(values.shape[-1], dtype=jnp.float64)
+        denominator = (
+            4.0
+            + 2.0 * jnp.cos(2.0 * np.pi * mode / float(values.shape[-1]))
+        ) / 6.0
+        expected = jnp.fft.ifft(
+            jnp.fft.fft(values, axis=-1) / denominator[None, :],
+            axis=-1,
+        ).real
+        actual = cubic_bspline_prefilter_periodic(values, denominator)
+        np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+
     def test_detached_field_history_matches_recomputed_fields(self) -> None:
         config = PhysicalGridVlasovPoissonConfig(
             Nx=8,
