@@ -136,9 +136,14 @@ The teacher evolves a physical velocity grid with `TEACHER_NV=8192`. Hermite
 coefficients are then computed from the reconstructed spline using the finer
 projection quadrature `TEACHER_PROJECTION_NV=4096`. These are distinct grids:
 the latter improves the integral used to form training targets without changing
-the physical teacher simulation. The projected histories are written as one
-resumable complex64 memory-mapped shard per trajectory. Normalization and
-regime scales use streaming float64 accumulation over training shards only.
+the physical teacher simulation. `TEACHER_NX` controls the physical teacher's
+spatial grid, while `TRAIN_ROLLOUT_NX` controls the retained Fourier bandwidth
+and differentiable reduced-solver rollout. When the rollout grid is coarser,
+the cached unnormalized rFFT coefficients are spectrally restricted and
+rescaled; the physical teacher cache is reused unchanged. The projected
+histories are written as one resumable complex64 memory-mapped shard per
+trajectory. Normalization and regime scales use streaming float64 accumulation
+over training shards only.
 
 Principal artifacts:
 
@@ -175,6 +180,8 @@ Common numerical controls:
 | `TRAIN_IC_HELDOUT_PER_REGIME` | Held-out trajectories per regime | `4` |
 | `TRAIN_REFERENCE_CACHE_DIR` | Shared resumable reference-cache root | `out_bench/reference_cache/interface_flux_landau` |
 | `EVAL_IC_SPLIT` | Manifest split evaluated after training | `heldout` |
+| `TEACHER_NX` | Physical teacher spatial points | `256` |
+| `TRAIN_ROLLOUT_NX` | Retained training-rollout spatial points | `256` |
 | `TEACHER_NV` | Physical teacher velocity points | `8192` |
 | `TEACHER_PROJECTION_NV` | Spline-to-Hermite quadrature points | `4096` |
 
