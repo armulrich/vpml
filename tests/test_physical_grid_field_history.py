@@ -52,6 +52,7 @@ class PhysicalGridFieldHistoryTests(unittest.TestCase):
             f0,
             return_state_history=True,
             return_field_history=True,
+            return_final_state=True,
         )
         expected = np.stack(
             [
@@ -70,6 +71,12 @@ class PhysicalGridFieldHistoryTests(unittest.TestCase):
             expected,
             rtol=1e-12,
             atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(raw["final_state"]),
+            np.asarray(raw["state_history"])[-1],
+            rtol=0.0,
+            atol=0.0,
         )
 
 

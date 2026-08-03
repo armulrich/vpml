@@ -320,6 +320,7 @@ def run_semilagrangian_vlasov_poisson(
     return_state_history: bool = False,
     history_projector: Optional[HistoryProjectorFn] = None,
     return_field_history: bool = False,
+    return_final_state: bool = False,
 ) -> Dict[str, np.ndarray | Array]:
     f0 = jnp.asarray(f0, dtype=jnp.float64)
     if f0.shape != (int(config.Nv), int(config.Nx)):
@@ -423,12 +424,15 @@ def run_semilagrangian_vlasov_poisson(
         field_history = maybe_store_field_history(field_history, step_i, E_new)
         return (f_new, snaps, history, field_history), en
 
-    (f_last, snaps_out, hist_out, field_hist_out), energy_hist = jax.lax.scan(
-        step,
-        (f0, snaps0, history_data0, field_history0),
-        jnp.arange(1, nsteps + 1, dtype=jnp.int32),
+    scan_steps = jnp.arange(1, nsteps + 1, dtype=jnp.int32)
+
+    @jax.jit
+    def run_scan(initial_carry):
+        return jax.lax.scan(step, initial_carry, scan_steps)
+
+    (f_last, snaps_out, hist_out, field_hist_out), energy_hist = run_scan(
+        (f0, snaps0, history_data0, field_history0)
     )
-    del f_last
 
     raw: Dict[str, np.ndarray | Array] = {
         "x": np.asarray(ops["x"]),
@@ -445,6 +449,8 @@ def run_semilagrangian_vlasov_poisson(
     if return_field_history and field_hist_out is not None:
         raw["E_hat_hist"] = field_hist_out
         raw["E_hat_hist_times"] = hist_steps.astype(float) * float(config.dt)
+    if return_final_state:
+        raw["final_state"] = np.asarray(f_last)
     return raw
 
 
