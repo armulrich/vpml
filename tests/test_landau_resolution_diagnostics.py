@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -13,13 +14,147 @@ from model.diagnostics.physical_velocity_grid_convergence import (
     _energy_block_changes,
     _save_teacher_artifact,
 )
+from model.diagnostics.physical_spatial_grid_convergence import (
+    _distribution_successive_x_change,
+)
+from model.diagnostics.physical_grid_2d_convergence import (
+    _parse_case_names,
+    _projected_change,
+    _run_case_segmented,
+)
 from model.diagnostics.projection_quadrature_convergence import (
     _load_teacher_snapshot_artifact,
 )
-from vpml.physical_grid import PhysicalGridVlasovPoissonConfig
+from vpml.physical_grid import (
+    PhysicalGridVlasovPoissonConfig,
+    gaussian_pdf,
+    normalize_density_on_grid,
+    run_semilagrangian_vlasov_poisson,
+)
 
 
 class LandauResolutionDiagnosticTests(unittest.TestCase):
+    def test_case_selection_supports_all_and_explicit_subsets(self) -> None:
+        available = ("linear", "weak", "strong")
+        self.assertEqual(_parse_case_names("all", available), available)
+        self.assertEqual(
+            _parse_case_names("strong,linear", available),
+            ("strong", "linear"),
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown case"):
+            _parse_case_names("missing", available)
+
+    def test_segmented_case_matches_monolithic_solver(self) -> None:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=8,
+            Nv=16,
+            Lx=4.0 * np.pi,
+            vmin=-6.0,
+            vmax=6.0,
+            dt=0.01,
+            T=0.04,
+            snapshot_times=(0.0, 0.02, 0.04),
+        )
+        equilibrium = normalize_density_on_grid(
+            gaussian_pdf(config.v, mean=0.0, sigma=1.0),
+            config.v,
+        )
+        f0 = np.asarray(equilibrium)[:, None] * (
+            1.0 + 0.01 * np.cos(0.5 * np.asarray(config.x))[None, :]
+        )
+        monolithic = run_semilagrangian_vlasov_poisson(config, f0)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            segmented = _run_case_segmented(
+                config=config,
+                f0=f0,
+                case_name="linear",
+                cases_dir=Path(temporary_directory),
+                snapshot_times=config.snapshot_times,
+                checkpoint_interval_time=0.02,
+            )
+        np.testing.assert_allclose(
+            segmented["snapshot_f"],
+            monolithic["snapshot_f"],
+            rtol=1e-13,
+            atol=1e-13,
+        )
+        np.testing.assert_allclose(
+            segmented["energy"],
+            monolithic["energy"],
+            rtol=1e-13,
+            atol=1e-13,
+        )
+
+    def test_segmented_case_resumes_from_completed_checkpoint(self) -> None:
+        config = PhysicalGridVlasovPoissonConfig(
+            Nx=8,
+            Nv=16,
+            Lx=4.0 * np.pi,
+            vmin=-6.0,
+            vmax=6.0,
+            dt=0.01,
+            T=0.04,
+            snapshot_times=(0.0, 0.02, 0.04),
+        )
+        equilibrium = normalize_density_on_grid(
+            gaussian_pdf(config.v, mean=0.0, sigma=1.0),
+            config.v,
+        )
+        f0 = np.asarray(equilibrium)[:, None] * (
+            1.0 + 0.01 * np.cos(0.5 * np.asarray(config.x))[None, :]
+        )
+        monolithic = run_semilagrangian_vlasov_poisson(config, f0)
+        call_count = 0
+
+        def interrupt_second_segment(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("planned interruption")
+            return run_semilagrangian_vlasov_poisson(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cases_dir = Path(temporary_directory)
+            with mock.patch(
+                "model.diagnostics.physical_grid_2d_convergence."
+                "run_semilagrangian_vlasov_poisson",
+                side_effect=interrupt_second_segment,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "planned interruption"):
+                    _run_case_segmented(
+                        config=config,
+                        f0=f0,
+                        case_name="linear",
+                        cases_dir=cases_dir,
+                        snapshot_times=config.snapshot_times,
+                        checkpoint_interval_time=0.02,
+                    )
+            checkpoint_path = (
+                cases_dir / ".linear.progress" / "checkpoint.npz"
+            )
+            with np.load(checkpoint_path) as checkpoint:
+                self.assertEqual(int(checkpoint["completed_steps"]), 2)
+            resumed = _run_case_segmented(
+                config=config,
+                f0=f0,
+                case_name="linear",
+                cases_dir=cases_dir,
+                snapshot_times=config.snapshot_times,
+                checkpoint_interval_time=0.02,
+            )
+        np.testing.assert_allclose(
+            resumed["snapshot_f"],
+            monolithic["snapshot_f"],
+            rtol=1e-13,
+            atol=1e-13,
+        )
+        np.testing.assert_allclose(
+            resumed["energy"],
+            monolithic["energy"],
+            rtol=1e-13,
+            atol=1e-13,
+        )
+
     def test_distribution_change_uses_direct_phase_space_geometry(self) -> None:
         refined = np.ones((2, 8, 4), dtype=np.float64)
         coarse = 0.5 * refined
@@ -54,6 +189,31 @@ class LandauResolutionDiagnosticTests(unittest.TestCase):
             changes["energy_refinement_change_t2_to_4"],
             0.25,
         )
+
+    def test_spatial_distribution_change_resamples_periodic_grid(self) -> None:
+        coarse_x = np.arange(8, dtype=np.float64) * (2.0 * np.pi / 8.0)
+        refined_x = np.arange(16, dtype=np.float64) * (2.0 * np.pi / 16.0)
+        coarse = np.cos(2.0 * coarse_x)[None, None, :]
+        refined = np.cos(2.0 * refined_x)[None, None, :]
+        change, by_snapshot = _distribution_successive_x_change(
+            coarse,
+            refined,
+            equilibrium=np.zeros(1),
+            row_chunk=1,
+        )
+        self.assertLess(change, 1e-12)
+        self.assertLess(float(by_snapshot[0]), 1e-12)
+
+    def test_projected_change_is_invariant_to_common_complex_scaling(self) -> None:
+        base = np.ones((2, 3, 4), dtype=np.complex128)
+        change_c, change_q = _projected_change(
+            base,
+            2.0 * base,
+            cutoffs=(1, 2),
+            domain_length=4.0 * np.pi,
+        )
+        self.assertAlmostEqual(change_c, 0.5)
+        self.assertAlmostEqual(change_q, 0.5)
 
     def test_combined_report_does_not_certify_finest_physical_grid(self) -> None:
         physical_payload = {
