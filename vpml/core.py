@@ -72,7 +72,7 @@ HIGHER_ORDER_HERMITE_TEACHER_BACKEND = "higher_order_hermite"
 INTERFACE_FLUX_TRAINING_MODE = "solver_embedded_interface_flux_rollout"
 INTERFACE_FLUX_OBJECTIVE = "interface_flux_rollout"
 INTERFACE_FLUX_LOSS_BACKEND = "regime_balanced_all_k_interface_flux"
-INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 3
+INTERFACE_FLUX_CHECKPOINT_SCHEMA_VERSION = 4
 
 _LEGACY_INTERFACE_FLUX_TRIPLE = (
     "exact_q_rollout",
@@ -290,6 +290,7 @@ class LearnedInterfaceClosure:
     teacher_backend: Optional[str] = None
     teacher_Lx: Optional[float] = None
     teacher_Nx: Optional[int] = None
+    rollout_Nx: Optional[int] = None
     teacher_Nv: Optional[int] = None
     teacher_vmin: Optional[float] = None
     teacher_vmax: Optional[float] = None
@@ -328,6 +329,14 @@ class LearnedInterfaceClosure:
             raise ValueError("n_low must be nonnegative")
         if self.projection_quadrature_Nv is not None and int(self.projection_quadrature_Nv) <= 3:
             raise ValueError("projection_quadrature_Nv must exceed three when provided")
+        if self.rollout_Nx is not None and int(self.rollout_Nx) <= 1:
+            raise ValueError("rollout_Nx must exceed one when provided")
+        if (
+            self.rollout_Nx is not None
+            and self.teacher_Nx is not None
+            and int(self.rollout_Nx) > int(self.teacher_Nx)
+        ):
+            raise ValueError("rollout_Nx cannot exceed teacher_Nx")
         if str(self.training_mode) != INTERFACE_FLUX_TRAINING_MODE:
             raise ValueError(f"Unsupported training_mode={self.training_mode!r}")
         if str(self.context_mode) not in {"none", "lag1_delta"}:
@@ -559,6 +568,8 @@ def save_learned_interface_closure_npz(
         payload["teacher_Lx"] = np.array([float(learned.teacher_Lx)], dtype=np.float64)
     if learned.teacher_Nx is not None:
         payload["teacher_Nx"] = np.array([int(learned.teacher_Nx)], dtype=np.int32)
+    if learned.rollout_Nx is not None:
+        payload["rollout_Nx"] = np.array([int(learned.rollout_Nx)], dtype=np.int32)
     if learned.teacher_Nv is not None:
         payload["teacher_Nv"] = np.array([int(learned.teacher_Nv)], dtype=np.int32)
     if learned.teacher_vmin is not None:
@@ -654,6 +665,11 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
 
         teacher_Lx = None if "teacher_Lx" not in data.files or not data["teacher_Lx"].size else float(np.asarray(data["teacher_Lx"]).reshape(-1)[0])
         teacher_Nx = None if "teacher_Nx" not in data.files or not data["teacher_Nx"].size else int(np.asarray(data["teacher_Nx"]).reshape(-1)[0])
+        rollout_Nx = (
+            int(np.asarray(data["rollout_Nx"]).reshape(-1)[0])
+            if "rollout_Nx" in data.files and data["rollout_Nx"].size
+            else teacher_Nx
+        )
         teacher_Nv = None if "teacher_Nv" not in data.files or not data["teacher_Nv"].size else int(np.asarray(data["teacher_Nv"]).reshape(-1)[0])
         teacher_vmin = None if "teacher_vmin" not in data.files or not data["teacher_vmin"].size else float(np.asarray(data["teacher_vmin"]).reshape(-1)[0])
         teacher_vmax = None if "teacher_vmax" not in data.files or not data["teacher_vmax"].size else float(np.asarray(data["teacher_vmax"]).reshape(-1)[0])
@@ -761,6 +777,7 @@ def load_learned_interface_closure_npz(path: str | os.PathLike[str]) -> LearnedI
         teacher_backend=teacher_backend,
         teacher_Lx=teacher_Lx,
         teacher_Nx=teacher_Nx,
+        rollout_Nx=rollout_Nx,
         teacher_Nv=teacher_Nv,
         teacher_vmin=teacher_vmin,
         teacher_vmax=teacher_vmax,

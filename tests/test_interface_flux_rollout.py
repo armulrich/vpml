@@ -52,6 +52,7 @@ def _closure(*, params=None, centered: bool = True) -> LearnedInterfaceClosure:
         teacher_backend="grid_cubic_spline",
         teacher_Lx=4.0 * math.pi,
         teacher_Nx=4,
+        rollout_Nx=4,
         teacher_Nv=64,
         teacher_vmin=-8.0,
         teacher_vmax=8.0,
@@ -73,6 +74,36 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         self.assertNotIn("--train-objective", option_names)
         self.assertNotIn("--tail-history-lift", option_names)
         self.assertNotIn("--exact-q-grouped-relative-loss", option_names)
+        self.assertIn("--rollout-Nx", option_names)
+
+    def test_spectral_restriction_preserves_coarse_grid_signal(self) -> None:
+        source_nx = 16
+        target_nx = 8
+        source_x = 2.0 * np.pi * np.arange(source_nx) / float(source_nx)
+        target_x = 2.0 * np.pi * np.arange(target_nx) / float(target_nx)
+        source_signal = (
+            0.7
+            + 0.2 * np.cos(source_x)
+            - 0.3 * np.sin(2.0 * source_x)
+            + 0.1 * np.cos(4.0 * source_x)
+        )
+        expected = (
+            0.7
+            + 0.2 * np.cos(target_x)
+            - 0.3 * np.sin(2.0 * target_x)
+            + 0.1 * np.cos(4.0 * target_x)
+        )
+        restricted = trainer.restrict_rfft_coefficients_to_grid(
+            np.fft.rfft(source_signal),
+            source_Nx=source_nx,
+            target_Nx=target_nx,
+        )
+        np.testing.assert_allclose(
+            np.fft.irfft(restricted, n=target_nx),
+            expected,
+            rtol=1e-13,
+            atol=1e-13,
+        )
 
     def test_cutoff_cycle_is_per_optimizer_step(self) -> None:
         observed = [
@@ -323,6 +354,147 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
                 np.asarray(stacked_batch[key]),
             )
 
+    def test_sampling_restricts_cached_teacher_to_rollout_grid(self) -> None:
+        max_projection_order = 4
+        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        source_nx = 8
+        rollout_nx = 4
+        history = np.zeros(
+            (1, 5, max_projection_order + 1, source_nx // 2 + 1),
+            dtype=np.complex64,
+        )
+        history[0, :, :, 1] = 4.0 + 2.0j
+        reference = {
+            trainer.REGIME_LINEAR: {
+                coeff_key: history,
+                "case_splits": np.array(["train"]),
+            }
+        }
+        k_arr = np.array([0.0, 0.5, 1.0], dtype=np.float64)
+        dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
+            reference,
+            max_projection_order=max_projection_order,
+            Nv_targets=(4,),
+            Nm=2,
+            k_arr=k_arr,
+            linear_history_stride=1,
+            nonlinear_history_stride=1,
+            rollout_horizon=2,
+            n_low=2,
+            context_mode="none",
+            source_Nx=source_nx,
+            rollout_Nx=rollout_nx,
+        )
+        state = trainer.prepare_interface_flux_rollout_sampling_state(
+            reference,
+            dataset,
+            max_projection_order=max_projection_order,
+            target_nvs=(4,),
+            history_dtype=np.complex64,
+            fourier_count=rollout_nx // 2 + 1,
+            source_Nx=source_nx,
+            rollout_Nx=rollout_nx,
+        )
+        batch = trainer.sample_interface_flux_rollout_regime_batch(
+            state,
+            regime=trainer.REGIME_LINEAR,
+            target_nv=4,
+            rollout_horizon=2,
+            batch_size=1,
+            k_arr=k_arr,
+            rng=np.random.default_rng(9),
+            complex_dtype=jnp.complex64,
+            all_k_loss=True,
+            selected_indices=np.array([0], dtype=np.int32),
+        )
+        self.assertEqual(tuple(batch["anchor_stencils"].shape), (1, 3, 4, 3))
+        self.assertEqual(tuple(batch["ref_q_windows"].shape), (1, 2, 3))
+        np.testing.assert_allclose(
+            np.asarray(batch["anchor_stencils"])[0, 0, 0, 1],
+            2.0 + 1.0j,
+        )
+
+    def test_training_statistics_ignore_unretained_teacher_modes(self) -> None:
+        rng = np.random.default_rng(17)
+        max_projection_order = 4
+        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        source_nx = 8
+        rollout_nx = 4
+        base = (
+            rng.normal(size=(1, 5, max_projection_order + 1, source_nx // 2 + 1))
+            + 1j
+            * rng.normal(
+                size=(1, 5, max_projection_order + 1, source_nx // 2 + 1)
+            )
+        ).astype(np.complex64)
+        changed = base.copy()
+        changed[..., rollout_nx // 2 + 1 :] *= 1e6
+        common = {
+            "max_projection_order": max_projection_order,
+            "Nv_targets": (4,),
+            "Nm": 2,
+            "k_arr": np.array([0.0, 0.5, 1.0], dtype=np.float64),
+            "linear_history_stride": 1,
+            "nonlinear_history_stride": 1,
+            "rollout_horizon": 2,
+            "n_low": 2,
+            "context_mode": "none",
+            "store_training_pairs": False,
+            "k_scale": 1.0,
+            "nv_scale": 4.0,
+            "source_Nx": source_nx,
+            "rollout_Nx": rollout_nx,
+        }
+
+        def build(history):
+            return trainer.build_interface_flux_rollout_qpair_dataset(
+                {
+                    trainer.REGIME_LINEAR: {
+                        coeff_key: history,
+                        "case_splits": np.array(["train"]),
+                    }
+                },
+                **common,
+            )
+
+        dataset_base, stats_base = build(base)
+        dataset_changed, stats_changed = build(changed)
+        self.assertIsNotNone(stats_base)
+        self.assertIsNotNone(stats_changed)
+        for key in stats_base:
+            np.testing.assert_allclose(stats_changed[key], stats_base[key])
+        scales_base = trainer.interface_flux_rollout_regime_loss_stds(
+            {
+                trainer.REGIME_LINEAR: {
+                    coeff_key: base,
+                    "case_splits": np.array(["train"]),
+                }
+            },
+            dataset_base,
+            max_projection_order=max_projection_order,
+            target_nvs=(4,),
+            k_arr=common["k_arr"],
+            rollout_horizon=2,
+            source_Nx=source_nx,
+            rollout_Nx=rollout_nx,
+        )
+        scales_changed = trainer.interface_flux_rollout_regime_loss_stds(
+            {
+                trainer.REGIME_LINEAR: {
+                    coeff_key: changed,
+                    "case_splits": np.array(["train"]),
+                }
+            },
+            dataset_changed,
+            max_projection_order=max_projection_order,
+            target_nvs=(4,),
+            k_arr=common["k_arr"],
+            rollout_horizon=2,
+            source_Nx=source_nx,
+            rollout_Nx=rollout_nx,
+        )
+        self.assertEqual(scales_changed, scales_base)
+
     def test_checkpoint_round_trip_and_legacy_adapter(self) -> None:
         learned = LearnedInterfaceClosure(
             **{
@@ -347,6 +519,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
                 trainer.INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
             )
             self.assertEqual(loaded.projection_quadrature_Nv, 64)
+            self.assertEqual(loaded.rollout_Nx, 4)
             self.assertEqual(loaded.ic_manifest_sha256, "abc123")
             self.assertEqual(loaded.training_ic_count, 48)
             self.assertEqual(loaded.heldout_ic_count, 12)
@@ -398,6 +571,24 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             for key in stats:
                 np.testing.assert_array_equal(loaded_stats[key], stats[key])
             self.assertEqual(loaded_scales, scales)
+
+    def test_derived_statistics_key_includes_rollout_grid(self) -> None:
+        common = {
+            "manifest_sha256": "manifest",
+            "rollout_horizon": 128,
+            "history_stride": 20,
+            "Nm": 6,
+            "n_low": 2,
+            "k_scale": 64.0,
+            "nv_scale": 64.0,
+        }
+        first = trainer._derived_statistics_path(
+            Path("cache"), rollout_Nx=256, **common
+        )
+        second = trainer._derived_statistics_path(
+            Path("cache"), rollout_Nx=1024, **common
+        )
+        self.assertNotEqual(first, second)
 
     def test_warm_start_rejects_different_ic_manifest(self) -> None:
         learned = LearnedInterfaceClosure(

@@ -31,6 +31,7 @@ TRAIN_IC_SPLIT_SEED="${TRAIN_IC_SPLIT_SEED:-2718}"
 TRAIN_IC_MODES="${TRAIN_IC_MODES:-0.5,1.0,1.5,2.0}"
 
 TEACHER_NX="${TEACHER_NX:-256}"
+TRAIN_ROLLOUT_NX="${TRAIN_ROLLOUT_NX:-256}"
 TEACHER_NV="${TEACHER_NV:-8192}"
 TEACHER_PROJECTION_NV="${TEACHER_PROJECTION_NV:-4096}"
 TEACHER_DT="${TEACHER_DT:-0.01}"
@@ -90,6 +91,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     --ic-modes "${TRAIN_IC_MODES}"
     --cache-snapshot-times "${EVAL_SNAPSHOT_TIMES}"
     --teacher-Nx "${TEACHER_NX}"
+    --rollout-Nx "${TRAIN_ROLLOUT_NX}"
     --teacher-Nv "${TEACHER_NV}"
     --projection-quadrature-Nv "${TEACHER_PROJECTION_NV}"
     --teacher-dt "${TEACHER_DT}"
@@ -174,6 +176,8 @@ Canonical interface-flux run complete.
   H:          ${TRAIN_ROLLOUT_HORIZON}
   T final:    ${TRAIN_T_FINAL}
   teacher Nv: ${TEACHER_NV}
+  teacher Nx: ${TEACHER_NX}
+  rollout Nx: ${TRAIN_ROLLOUT_NX}
   projection: ${TEACHER_PROJECTION_NV}
   IC manifest: ${TRAIN_IC_MANIFEST}
   eval split:  ${EVAL_IC_SPLIT}

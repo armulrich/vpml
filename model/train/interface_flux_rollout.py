@@ -99,6 +99,38 @@ def interface_flux_rollout_coeff_key(projection_order: int) -> str:
     return f"a_hat_ref_order{int(projection_order)}"
 
 
+def restrict_rfft_coefficients_to_grid(
+    coefficients: np.ndarray,
+    *,
+    source_Nx: int,
+    target_Nx: int,
+) -> np.ndarray:
+    """Restrict unnormalized rFFT coefficients to a coarser periodic grid."""
+    source_nx = int(source_Nx)
+    target_nx = int(target_Nx)
+    if source_nx <= 1 or target_nx <= 1 or target_nx > source_nx:
+        raise ValueError(
+            f"Require 1 < target_Nx <= source_Nx, got {target_nx} and {source_nx}"
+        )
+    values = np.asarray(coefficients)
+    target_nk = target_nx // 2 + 1
+    if int(values.shape[-1]) < target_nk:
+        raise ValueError(
+            f"Coefficient width {int(values.shape[-1])} cannot represent "
+            f"target_Nx={target_nx}"
+        )
+    if source_nx == target_nx:
+        if int(values.shape[-1]) != target_nk:
+            return np.asarray(values[..., :target_nk])
+        return values
+
+    restricted = np.asarray(values[..., :target_nk]).copy()
+    restricted *= float(target_nx) / float(source_nx)
+    if target_nx % 2 == 0:
+        restricted[..., -1] = 2.0 * np.real(restricted[..., -1])
+    return restricted
+
+
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
     zeros = jax.tree_util.tree_map(jnp.zeros_like, params)
     return {"step": jnp.array(0, dtype=jnp.int32), "m": zeros, "v": zeros}
@@ -448,6 +480,8 @@ def build_interface_flux_rollout_qpair_dataset(
     k_scale: Optional[float] = None,
     nv_scale: Optional[float] = None,
     precomputed_training_stats: Optional[Dict[str, np.ndarray]] = None,
+    source_Nx: Optional[int] = None,
+    rollout_Nx: Optional[int] = None,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Optional[Dict[str, np.ndarray]]]:
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     accum = {
@@ -478,6 +512,11 @@ def build_interface_flux_rollout_qpair_dataset(
 
     if not bool(store_training_pairs) and (k_scale is None or nv_scale is None):
         raise ValueError("k_scale and nv_scale are required when store_training_pairs=False")
+    retained_k_count = int(np.asarray(k_arr).shape[0])
+    if retained_k_count <= 1:
+        raise ValueError("interface-flux training requires at least one positive Fourier mode")
+    if (source_Nx is None) != (rollout_Nx is None):
+        raise ValueError("source_Nx and rollout_Nx must be provided together")
 
     def sampled_indices(history_length: int, stride: int) -> np.ndarray:
         nsteps = int(history_length) - 1
@@ -558,6 +597,11 @@ def build_interface_flux_rollout_qpair_dataset(
         stride = int(linear_history_stride) if regime == REGIME_LINEAR else int(nonlinear_history_stride)
         stride = max(stride, 1)
         for case_idx, case_hist in enumerate(cases):
+            if int(case_hist.shape[-1]) < retained_k_count:
+                raise ValueError(
+                    f"Reference history for {regime} has {int(case_hist.shape[-1])} "
+                    f"Fourier modes but training requires {retained_k_count}"
+                )
             split_name = (
                 "train"
                 if str(case_splits[case_idx]) == IC_SPLIT_TRAIN
@@ -577,9 +621,19 @@ def build_interface_flux_rollout_qpair_dataset(
             )
             if needs_pairs:
                 hist = np.asarray(
-                    case_hist[np.asarray(original_times, dtype=np.int32)],
+                    case_hist[
+                        np.asarray(original_times, dtype=np.int32),
+                        :,
+                        :retained_k_count,
+                    ],
                     dtype=np.complex128,
                 )
+                if source_Nx is not None and rollout_Nx is not None:
+                    hist = restrict_rfft_coefficients_to_grid(
+                        hist,
+                        source_Nx=int(source_Nx),
+                        target_Nx=int(rollout_Nx),
+                    )
                 pairs = extract_interface_supervised_pairs_from_coeff_history(
                     hist,
                     Nv_targets=Nv_targets,
@@ -599,7 +653,7 @@ def build_interface_flux_rollout_qpair_dataset(
                 split=split_name,
                 case_idx=int(case_idx),
                 time_indices=np.asarray(original_times, dtype=np.int32),
-                k_count=int(case_hist.shape[-1]),
+                k_count=retained_k_count,
                 include_flattened_k_rows=bool(store_training_pairs),
             )
     raw_base_dim = 2 * int(Nm) + 4
@@ -669,6 +723,8 @@ def interface_flux_rollout_regime_loss_stds(
     k_arr: np.ndarray,
     rollout_horizon: int,
     chunk_size: int = 64,
+    source_Nx: Optional[int] = None,
+    rollout_Nx: Optional[int] = None,
 ) -> Dict[str, float]:
     """Compute fixed phase-isotropic q-loss scales for each training regime."""
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
@@ -681,6 +737,8 @@ def interface_flux_rollout_regime_loss_stds(
     chunk_n = max(int(chunk_size), 1)
     offsets = np.arange(horizon, dtype=np.int32)
     positive_k_sq = k_values[1:] ** 2
+    if (source_Nx is None) != (rollout_Nx is None):
+        raise ValueError("source_Nx and rollout_Nx must be provided together")
     scales: Dict[str, float] = {}
 
     for regime, arrays in qpair_dataset.items():
@@ -714,8 +772,19 @@ def interface_flux_rollout_regime_loss_stds(
                     case_idx[:, None],
                     window_times,
                     hermite_slice=int(target_nv),
-                    fourier_slice=slice(1, None),
+                    fourier_slice=slice(1, int(k_values.shape[0])),
                 )
+                if source_Nx is not None and rollout_Nx is not None:
+                    with_zero_mode = np.zeros(
+                        (*coeff.shape[:-1], int(k_values.shape[0])),
+                        dtype=coeff.dtype,
+                    )
+                    with_zero_mode[..., 1:] = coeff
+                    coeff = restrict_rfft_coefficients_to_grid(
+                        with_zero_mode,
+                        source_Nx=int(source_Nx),
+                        target_Nx=int(rollout_Nx),
+                    )[..., 1:]
                 q_abs_sq = (
                     float(target_nv)
                     * positive_k_sq[None, None, :]
@@ -896,6 +965,7 @@ def build_learned_interface_closure(
     projection_quadrature_Nv: Optional[int],
     n_low: int,
     rollout_horizon: int,
+    rollout_Nx: Optional[int] = None,
 ) -> LearnedInterfaceClosure:
     return LearnedInterfaceClosure(
         params=params,
@@ -916,6 +986,9 @@ def build_learned_interface_closure(
         teacher_backend=str(normalize_teacher_backend_name(teacher_backend)),
         teacher_Lx=float(teacher_Lx),
         teacher_Nx=int(teacher_Nx),
+        rollout_Nx=(
+            int(teacher_Nx) if rollout_Nx is None else int(rollout_Nx)
+        ),
         teacher_Nv=int(teacher_Nv),
         teacher_vmin=float(teacher_vmin),
         teacher_vmax=float(teacher_vmax),
@@ -1109,11 +1182,42 @@ def prepare_interface_flux_rollout_sampling_state(
     max_projection_order: int,
     target_nvs: Sequence[int],
     history_dtype: object = np.complex128,
+    fourier_count: Optional[int] = None,
+    source_Nx: Optional[int] = None,
+    rollout_Nx: Optional[int] = None,
 ) -> Dict[str, Dict[str, object]]:
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     history_np_dtype = exact_rollout_numpy_complex_dtype(history_dtype)
     sampling_state: Dict[str, Dict[str, object]] = {}
+    if (source_Nx is None) != (rollout_Nx is None):
+        raise ValueError("source_Nx and rollout_Nx must be provided together")
     for regime, arrays in interface_flux_dataset.items():
+        histories = (
+            np.asarray(
+                reference_dataset[regime][coeff_key],
+                dtype=history_np_dtype,
+            )
+            if isinstance(reference_dataset[regime][coeff_key], np.ndarray)
+            else _reference_case_histories(reference_dataset[regime], coeff_key)
+        )
+        first_history = histories[0] if not isinstance(histories, np.ndarray) else histories[0]
+        retained_k_count = (
+            int(first_history.shape[-1])
+            if fourier_count is None
+            else int(fourier_count)
+        )
+        if rollout_Nx is not None:
+            expected_k_count = int(rollout_Nx) // 2 + 1
+            if retained_k_count != expected_k_count:
+                raise ValueError(
+                    f"rollout_Nx={int(rollout_Nx)} requires {expected_k_count} "
+                    f"Fourier modes, got {retained_k_count}"
+                )
+        if retained_k_count <= 1 or retained_k_count > int(first_history.shape[-1]):
+            raise ValueError(
+                f"Invalid retained Fourier count {retained_k_count} for {regime} "
+                f"history width {int(first_history.shape[-1])}"
+            )
         train_target_nvs = np.asarray(arrays["train_target_nvs"], dtype=np.int32)
         target_pools = {
             int(target_nv): np.flatnonzero(train_target_nvs == int(target_nv)).astype(np.int32)
@@ -1127,14 +1231,10 @@ def prepare_interface_flux_rollout_sampling_state(
             for target_nv in target_nvs
         }
         state: Dict[str, object] = {
-            "histories": (
-                np.asarray(
-                    reference_dataset[regime][coeff_key],
-                    dtype=history_np_dtype,
-                )
-                if isinstance(reference_dataset[regime][coeff_key], np.ndarray)
-                else _reference_case_histories(reference_dataset[regime], coeff_key)
-            ),
+            "histories": histories,
+            "fourier_count": retained_k_count,
+            "source_Nx": source_Nx,
+            "rollout_Nx": rollout_Nx,
             "train_case_indices": np.asarray(arrays["train_case_indices"], dtype=np.int32),
             "train_time_indices": np.asarray(arrays["train_time_indices"], dtype=np.int32),
             "train_k_indices": np.asarray(arrays["train_k_indices"], dtype=np.int32),
@@ -1235,6 +1335,12 @@ def sample_interface_flux_rollout_regime_batch(
     real_np_dtype = exact_rollout_numpy_real_dtype(complex_dtype)
     real_jax_dtype = jnp.float32 if real_np_dtype == np.dtype(np.float32) else jnp.float64
     k_arr_np = np.asarray(k_arr, dtype=real_np_dtype)
+    retained_k_count = int(regime_state["fourier_count"])
+    if int(k_arr_np.shape[0]) != retained_k_count:
+        raise ValueError(
+            f"k_arr has {int(k_arr_np.shape[0])} modes but sampling retains "
+            f"{retained_k_count}"
+        )
     if selected_indices is None:
         selected = select_interface_flux_rollout_regime_indices(
             sampling_state,
@@ -1271,14 +1377,20 @@ def sample_interface_flux_rollout_regime_batch(
         case_idx[:, None],
         stencil_times,
         hermite_slice=slice(0, target_nv_i),
-        fourier_slice=slice(None),
+        fourier_slice=slice(0, retained_k_count),
     )
+    if regime_state["source_Nx"] is not None:
+        stencils = restrict_rfft_coefficients_to_grid(
+            stencils,
+            source_Nx=int(regime_state["source_Nx"]),
+            target_Nx=int(regime_state["rollout_Nx"]),
+        )
     first_history = (
         histories[0]
         if not isinstance(histories, np.ndarray) or histories.ndim != 4
         else histories[0]
     )
-    nk = int(first_history.shape[-1])
+    nk = retained_k_count
     if nk <= 1:
         raise ValueError("Exact q-rollout requires at least one nonzero Fourier mode")
     offsets = np.arange(int(rollout_horizon), dtype=np.int32)
@@ -1289,8 +1401,14 @@ def sample_interface_flux_rollout_regime_batch(
             case_idx[:, None],
             window_times,
             hermite_slice=target_nv_i,
-            fourier_slice=slice(None),
+            fourier_slice=slice(0, retained_k_count),
         )
+        if regime_state["source_Nx"] is not None:
+            q_coeff = restrict_rfft_coefficients_to_grid(
+                q_coeff,
+                source_Nx=int(regime_state["source_Nx"]),
+                target_Nx=int(regime_state["rollout_Nx"]),
+            )
         q_windows = (
             -1j
             * k_arr_np[None, None, :]
@@ -1303,8 +1421,14 @@ def sample_interface_flux_rollout_regime_batch(
             case_idx[:, None],
             window_times,
             hermite_slice=target_nv_i,
-            fourier_slice=slice(None),
+            fourier_slice=slice(0, retained_k_count),
         )
+        if regime_state["source_Nx"] is not None:
+            q_coeff_all = restrict_rfft_coefficients_to_grid(
+                q_coeff_all,
+                source_Nx=int(regime_state["source_Nx"]),
+                target_Nx=int(regime_state["rollout_Nx"]),
+            )
         q_coeff = q_coeff_all[
             np.arange(batch_n, dtype=np.int32)[:, None],
             np.arange(int(rollout_horizon), dtype=np.int32)[None, :],
@@ -1365,12 +1489,19 @@ def make_interface_flux_rollout_batch_loss(
     equilibrium_centered: bool = True,
     complex_normalization_mode: str = "phase_isotropic",
     translation_augmented: bool = True,
+    rollout_Nx: Optional[int] = None,
 ) -> Tuple[object, Sequence[str]]:
     active_regimes = tuple(regime for regime in train_regimes if regime in regime_weights)
     weights = np.asarray([float(regime_weights[regime]) for regime in active_regimes], dtype=np.float64)
     weights = weights / np.sum(weights)
     weight_arr = jnp.asarray(weights, dtype=jnp.float64)
     target_nvs = tuple(int(v) for v in Nv_targets)
+    retained_nx = int(teacher_Nx) if rollout_Nx is None else int(rollout_Nx)
+    if retained_nx <= 1 or retained_nx > int(teacher_Nx):
+        raise ValueError(
+            f"rollout_Nx={retained_nx} must be greater than one and no larger "
+            f"than teacher_Nx={int(teacher_Nx)}"
+        )
     real_dtype, complex_dtype = exact_rollout_precision_dtypes(str(rollout_precision))
     q_loss_stds = {
         regime: jnp.full(
@@ -1387,7 +1518,7 @@ def make_interface_flux_rollout_batch_loss(
             raise ValueError(f"Missing interface-flux rollout regime loss scales for {missing!r}")
     linear_integrators = {
         int(target_nv): FourierHermiteIMEX(
-            Nx=int(teacher_Nx),
+            Nx=retained_nx,
             Nv=int(target_nv),
             Lx=float(teacher_Lx),
             dt=float(teacher_dt),
@@ -1401,7 +1532,7 @@ def make_interface_flux_rollout_batch_loss(
     }
     nonlinear_integrators = {
         int(target_nv): FourierHermiteIMEX(
-            Nx=int(teacher_Nx),
+            Nx=retained_nx,
             Nv=int(target_nv),
             Lx=float(teacher_Lx),
             dt=float(teacher_dt),
@@ -1452,6 +1583,7 @@ def make_interface_flux_rollout_batch_loss(
                 projection_quadrature_Nv=projection_quadrature_Nv,
                 n_low=n_low,
                 rollout_horizon=rollout_horizon,
+                rollout_Nx=retained_nx,
             )
             total_q = jnp.asarray(0.0, dtype=jnp.float64)
             for weight, regime in zip(weight_arr, active_regimes):
@@ -1509,6 +1641,7 @@ def make_interface_flux_rollout_batch_loss(
         else {str(key): float(value) for key, value in regime_q_loss_stds.items()}
     )  # type: ignore[attr-defined]
     loss_fn.teacher_Lx = float(teacher_Lx)  # type: ignore[attr-defined]
+    loss_fn.rollout_Nx = retained_nx  # type: ignore[attr-defined]
     return loss_fn, active_regimes
 
 
@@ -1560,6 +1693,8 @@ def train_with_interface_flux_rollout_minibatch_loss(
     steps_per_epoch: int,
     rollout_horizon: int,
     seed: int,
+    source_Nx: int,
+    rollout_Nx: int,
     log_components: Sequence[str] = (),
     profile_trace_dir: Optional[Path] = None,
     profile_train_steps: int = 0,
@@ -1638,6 +1773,9 @@ def train_with_interface_flux_rollout_minibatch_loss(
         max_projection_order=int(max_projection_order),
         target_nvs=target_nvs,
         history_dtype=history_complex_dtype,
+        fourier_count=int(np.asarray(k_arr).shape[0]),
+        source_Nx=int(source_Nx),
+        rollout_Nx=int(rollout_Nx),
     )
 
     profile_steps = max(int(profile_train_steps), 0)
@@ -1766,9 +1904,16 @@ def evaluate_heldout_interface_flux_metrics(
     nv_scale: float,
     n_low: int,
     chunk_size: int = 64,
+    source_Nx: Optional[int] = None,
+    rollout_Nx: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     """Evaluate direct interface flux only on complete held-out trajectories."""
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
+    retained_k_count = int(np.asarray(k_arr).shape[0])
+    if retained_k_count <= 1:
+        raise ValueError("Held-out interface-flux evaluation requires positive Fourier modes")
+    if (source_Nx is None) != (rollout_Nx is None):
+        raise ValueError("source_Nx and rollout_Nx must be provided together")
     metrics: Dict[str, np.ndarray] = {}
     chunk_n = max(int(chunk_size), 1)
     for regime, arrays in interface_flux_dataset.items():
@@ -1791,8 +1936,14 @@ def evaluate_heldout_interface_flux_metrics(
                     anchor_cases[chunk],
                     anchor_times[chunk],
                     hermite_slice=slice(None),
-                    fourier_slice=slice(None),
+                    fourier_slice=slice(0, retained_k_count),
                 )
+                if source_Nx is not None and rollout_Nx is not None:
+                    states = restrict_rfft_coefficients_to_grid(
+                        states,
+                        source_Nx=int(source_Nx),
+                        target_Nx=int(rollout_Nx),
+                    )
                 pairs = extract_interface_supervised_pairs_from_coeff_history(
                     np.asarray(states, dtype=np.complex128),
                     Nv_targets=(int(target_nv),),
@@ -1849,6 +2000,7 @@ def _load_init_checkpoint_for_interface_closure(
     equilibrium_centered: Optional[bool] = None,
     complex_normalization_mode: Optional[str] = None,
     ic_manifest_sha256: Optional[str] = None,
+    rollout_Nx: Optional[int] = None,
 ) -> Tuple[Dict[str, Array], Dict[str, np.ndarray], float, float]:
     learned = load_learned_interface_closure_npz(init_checkpoint)
     expected_targets = tuple(int(v) for v in Nv_targets)
@@ -1893,6 +2045,15 @@ def _load_init_checkpoint_for_interface_closure(
         raise ValueError(
             "--init-checkpoint IC manifest does not match the requested training manifest"
         )
+    if (
+        rollout_Nx is not None
+        and learned.rollout_Nx is not None
+        and int(learned.rollout_Nx) != int(rollout_Nx)
+    ):
+        raise ValueError(
+            f"--init-checkpoint rollout_Nx={int(learned.rollout_Nx)} does not "
+            f"match requested rollout_Nx={int(rollout_Nx)}"
+        )
     params = {
         key: jnp.asarray(value, dtype=jnp.float64)
         for key, value in learned.params.items()
@@ -1908,7 +2069,7 @@ def _load_init_checkpoint_for_interface_closure(
 
 CANONICAL_NV_TARGETS = (6, 7, 12, 20, 36, 64)
 CANONICAL_REGIMES = (REGIME_LINEAR, REGIME_WEAK, REGIME_STRONG)
-CANONICAL_METADATA_SCHEMA_VERSION = 3
+CANONICAL_METADATA_SCHEMA_VERSION = 4
 
 
 def _derived_statistics_path(
@@ -1921,6 +2082,7 @@ def _derived_statistics_path(
     n_low: int,
     k_scale: float,
     nv_scale: float,
+    rollout_Nx: int,
 ) -> Path:
     configuration = {
         "format": "interface_flux_training_statistics_v1",
@@ -1931,6 +2093,7 @@ def _derived_statistics_path(
         "n_low": int(n_low),
         "k_scale": float(k_scale),
         "nv_scale": float(nv_scale),
+        "rollout_Nx": int(rollout_Nx),
         "Nv_targets": list(CANONICAL_NV_TARGETS),
         "normalization": "phase_isotropic",
         "regime_scaling": "fixed_training_only",
@@ -2036,6 +2199,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-scale", type=float, default=None)
     parser.add_argument("--nv-scale", type=float, default=None)
     parser.add_argument("--teacher-Nx", type=int, default=256)
+    parser.add_argument("--rollout-Nx", type=int, default=256)
     parser.add_argument("--teacher-Nv", type=int, default=8192)
     parser.add_argument("--projection-quadrature-Nv", type=int, default=4096)
     parser.add_argument("--teacher-L", type=float, default=4.0 * math.pi)
@@ -2109,6 +2273,7 @@ def _canonical_metrics_payload(
         ),
         "teacher_Lx": np.array([args.teacher_L], dtype=np.float64),
         "teacher_Nx": np.array([args.teacher_Nx], dtype=np.int32),
+        "rollout_Nx": np.array([args.rollout_Nx], dtype=np.int32),
         "teacher_Nv": np.array([args.teacher_Nv], dtype=np.int32),
         "teacher_vmin": np.array([args.teacher_vmin], dtype=np.float64),
         "teacher_vmax": np.array([args.teacher_vmax], dtype=np.float64),
@@ -2183,6 +2348,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("--steps-per-epoch must be positive")
     if float(args.T_final) <= 0.0:
         raise ValueError("--T-final must be positive")
+    if int(args.rollout_Nx) <= 1 or int(args.rollout_Nx) > int(args.teacher_Nx):
+        raise ValueError(
+            f"--rollout-Nx={int(args.rollout_Nx)} must be greater than one and "
+            f"no larger than --teacher-Nx={int(args.teacher_Nx)}"
+        )
     projection_quadrature_Nv = (
         int(args.teacher_Nv)
         if args.projection_quadrature_Nv is None
@@ -2224,7 +2394,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
     print(
-        "[data] physical teacher and projection grids: "
+        "[data] physical teacher, rollout, and projection grids: "
+        f"teacher_Nx={int(args.teacher_Nx)} "
+        f"rollout_Nx={int(args.rollout_Nx)} "
         f"teacher_Nv={int(args.teacher_Nv)} "
         f"projection_quadrature_Nv={projection_quadrature_Nv}"
     )
@@ -2244,7 +2416,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     k_arr = np.asarray(
         FourierHermiteIMEX(
-            Nx=int(args.teacher_Nx),
+            Nx=int(args.rollout_Nx),
             Nv=max(CANONICAL_NV_TARGETS),
             Lx=float(args.teacher_L),
             dt=float(args.teacher_dt),
@@ -2270,6 +2442,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 equilibrium_centered=True,
                 complex_normalization_mode="phase_isotropic",
                 ic_manifest_sha256=str(ic_manifest["sha256"]),
+                rollout_Nx=int(args.rollout_Nx),
             )
         )
         print(
@@ -2299,6 +2472,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         n_low=args.n_low,
         k_scale=k_scale,
         nv_scale=nv_scale,
+        rollout_Nx=int(args.rollout_Nx),
     )
     cached_derived_statistics = _load_derived_statistics(derived_statistics_path)
     cached_stats: Optional[Dict[str, np.ndarray]] = None
@@ -2326,6 +2500,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         precomputed_training_stats=(
             init_stats if init_stats is not None else cached_stats
         ),
+        source_Nx=int(args.teacher_Nx),
+        rollout_Nx=int(args.rollout_Nx),
     )
     if init_stats is not None:
         stats = init_stats
@@ -2360,6 +2536,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             target_nvs=CANONICAL_NV_TARGETS,
             k_arr=k_arr,
             rollout_horizon=args.rollout_horizon,
+            source_Nx=int(args.teacher_Nx),
+            rollout_Nx=int(args.rollout_Nx),
         )
     if cached_derived_statistics is None:
         _save_derived_statistics(
@@ -2424,6 +2602,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         equilibrium_centered=True,
         complex_normalization_mode="phase_isotropic",
         translation_augmented=True,
+        rollout_Nx=int(args.rollout_Nx),
     )
     params, component_history = train_with_interface_flux_rollout_minibatch_loss(
         params,
@@ -2441,6 +2620,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         steps_per_epoch=args.steps_per_epoch,
         rollout_horizon=args.rollout_horizon,
         seed=args.seed,
+        source_Nx=int(args.teacher_Nx),
+        rollout_Nx=int(args.rollout_Nx),
         log_components=("q",),
         profile_trace_dir=args.profile_trace_dir,
         profile_train_steps=args.profile_train_steps,
@@ -2470,6 +2651,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         projection_quadrature_Nv=projection_quadrature_Nv,
         n_low=args.n_low,
         rollout_horizon=args.rollout_horizon,
+        rollout_Nx=int(args.rollout_Nx),
     )
     learned = replace(
         learned,
@@ -2494,6 +2676,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         k_scale=k_scale,
         nv_scale=nv_scale,
         n_low=args.n_low,
+        source_Nx=int(args.teacher_Nx),
+        rollout_Nx=int(args.rollout_Nx),
     )
 
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
