@@ -17,7 +17,7 @@ Array = jax.Array
 
 DEFAULT_DENSITY_FLOOR = 1e-4
 DEFAULT_PRESSURE_FLOOR = 1e-4
-DEFAULT_NORMALIZED_HEAT_FLUX_BOUND = 8.0
+DEFAULT_NORMALIZED_HEAT_FLUX_BOUND = 128.0
 
 
 def primitive_fields(
@@ -27,30 +27,46 @@ def primitive_fields(
     poisson_sign: float = 1.0,
     density_floor: float = DEFAULT_DENSITY_FLOOR,
 ) -> Array:
-    """Return ``(rho - 1, u, pressure - 1, E)`` from conservative moments."""
+    """Return ``(rho - 1, u, pressure - 1, E)`` from centered moments."""
     state = jnp.asarray(state)
-    rho, momentum, second = state[:, 0], state[:, 1], state[:, 2]
+    density_perturbation, momentum, second_perturbation = (
+        state[:, 0],
+        state[:, 1],
+        state[:, 2],
+    )
+    rho = 1.0 + density_perturbation
     safe_rho = jnp.maximum(rho, jnp.asarray(density_floor, rho.dtype))
     velocity = momentum / safe_rho
-    pressure = second - momentum * velocity
-    field = electric_field_from_density(rho, k_arr, poisson_sign=poisson_sign)
-    return jnp.stack((rho - 1.0, velocity, pressure - 1.0, field), axis=1)
+    pressure_perturbation = second_perturbation - momentum * velocity
+    field = electric_field_from_density(
+        density_perturbation, k_arr, poisson_sign=poisson_sign
+    )
+    return jnp.stack(
+        (density_perturbation, velocity, pressure_perturbation, field), axis=1
+    )
 
 
 def electric_field_from_density(
-    density: Array,
+    density_perturbation: Array,
     k_arr: Array,
     *,
     poisson_sign: float = 1.0,
 ) -> Array:
-    density = jnp.asarray(density)
-    k_arr = jnp.asarray(k_arr, dtype=density.dtype)
-    density_hat = jnp.fft.rfft(density - jnp.mean(density, axis=-1, keepdims=True), axis=-1)
+    """Solve Poisson's equation from the centered density field."""
+    density_perturbation = jnp.asarray(density_perturbation)
+    k_arr = jnp.asarray(k_arr, dtype=density_perturbation.dtype)
+    density_hat = jnp.fft.rfft(
+        density_perturbation
+        - jnp.mean(density_perturbation, axis=-1, keepdims=True),
+        axis=-1,
+    )
     field_hat = jnp.zeros_like(density_hat)
     field_hat = field_hat.at[:, 1:].set(
         (float(poisson_sign) * 1j) * density_hat[:, 1:] / k_arr[None, 1:]
     )
-    return jnp.fft.irfft(field_hat, n=density.shape[-1], axis=-1).astype(density.dtype)
+    return jnp.fft.irfft(
+        field_hat, n=density_perturbation.shape[-1], axis=-1
+    ).astype(density_perturbation.dtype)
 
 
 def spectral_derivative(values: Array, k_arr: Array) -> Array:
@@ -146,32 +162,20 @@ def spectral_memory_closure_step(
     k_arr: Array,
     *,
     input_scale: Array,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     amplitude_center: float,
     amplitude_scale: float,
     previous_heat_flux_gradient: Array | None = None,
-    dynamic_amplitude_scaling: bool = False,
     poisson_sign: float = 1.0,
     normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
 ) -> Tuple[Array, Array]:
     """Advance closure memory and return the central heat-flux divergence."""
     fields = primitive_fields(state, k_arr, poisson_sign=poisson_sign)
     real_dtype = fields.dtype
-    if dynamic_amplitude_scaling:
-        density_amplitude = jnp.sqrt(jnp.mean(jnp.square(fields[:, 0]), axis=-1))
-        nonzero = density_amplitude > 0.0
-        physical_amplitude = density_amplitude
-        normalized = jnp.where(
-            nonzero[:, None, None],
-            fields / jnp.where(nonzero, density_amplitude, 1.0)[:, None, None],
-            0.0,
-        )
-        log_amplitude = jnp.where(nonzero, jnp.log(density_amplitude), 0.0)
-    else:
-        physical_amplitude = jnp.asarray(amplitude, dtype=real_dtype)
-        scale = jnp.asarray(input_scale, dtype=real_dtype)[None, :, None]
-        normalized = fields / scale
-        log_amplitude = jnp.log(jnp.maximum(physical_amplitude, 1e-8))
+    physical_amplitude = jnp.asarray(amplitude, dtype=real_dtype)
+    scale = jnp.asarray(input_scale, dtype=real_dtype)[None, :, None]
+    normalized = fields / scale
+    log_amplitude = jnp.log(jnp.maximum(physical_amplitude, 1e-8))
     amplitude_feature = (
         (log_amplitude - jnp.asarray(amplitude_center, dtype=real_dtype))
         / jnp.asarray(max(float(amplitude_scale), 1e-8), dtype=real_dtype)
@@ -183,17 +187,9 @@ def spectral_memory_closure_step(
     gain = jnp.exp(jnp.clip(gain_exponent, -6.0, 6.0))
     if previous_heat_flux_gradient is not None:
         closure_history = jnp.asarray(previous_heat_flux_gradient, dtype=real_dtype)
-        if dynamic_amplitude_scaling:
-            closure_history = jnp.where(
-                nonzero[:, None],
-                closure_history
-                / jnp.where(nonzero, density_amplitude, 1.0)[:, None],
-                0.0,
-            )
-        else:
-            closure_history = closure_history / jnp.asarray(
-                heat_flux_scale, dtype=real_dtype
-            )
+        closure_history = closure_history / jnp.asarray(
+            heat_flux_gradient_scale, dtype=real_dtype
+        )
         normalized = jnp.concatenate((normalized, closure_history[:, None]), axis=1)
     normalized = normalized * gain[:, :, None]
     joined = jnp.concatenate((normalized, hidden), axis=1)
@@ -207,20 +203,21 @@ def spectral_memory_closure_step(
     gate = jax.nn.sigmoid(gate_logits)
     candidate = jnp.tanh(candidate_logits)
     hidden_new = gate * hidden + (1.0 - gate) * candidate
-    raw_heat_flux_normalized = spectral_channel_operator(
+    raw_gradient_normalized = spectral_channel_operator(
         hidden_new,
         params["output_local"],
         params["output_spectral_real"],
         params["output_spectral_imag"],
     )[:, 0]
     bound = jnp.asarray(normalized_heat_flux_bound, dtype=real_dtype)
-    heat_flux_normalized = bound * jnp.tanh(raw_heat_flux_normalized / bound)
-    heat_flux = (
-        physical_amplitude[:, None]
-        * jnp.asarray(heat_flux_scale, dtype=real_dtype)
-        * heat_flux_normalized
+    gradient_normalized = bound * jnp.tanh(raw_gradient_normalized / bound)
+    heat_flux_gradient = (
+        jnp.asarray(heat_flux_gradient_scale, dtype=real_dtype)
+        * gradient_normalized
     )
-    heat_flux_gradient = spectral_derivative(heat_flux, k_arr)
+    heat_flux_gradient = heat_flux_gradient - jnp.mean(
+        heat_flux_gradient, axis=-1, keepdims=True
+    )
     return hidden_new, heat_flux_gradient
 
 
@@ -235,21 +232,28 @@ def low_moment_rhs(
 ) -> Array:
     """Conservative three-moment equations with central heat-flux closure."""
     state = jnp.asarray(state)
-    rho, momentum, second = state[:, 0], state[:, 1], state[:, 2]
+    density_perturbation, momentum, second_perturbation = (
+        state[:, 0],
+        state[:, 1],
+        state[:, 2],
+    )
+    rho = 1.0 + density_perturbation
     safe_rho = jnp.maximum(rho, jnp.asarray(density_floor, rho.dtype))
     velocity = momentum / safe_rho
+    pressure_perturbation = second_perturbation - momentum * velocity
     pressure = jnp.maximum(
-        second - momentum * velocity,
-        jnp.asarray(pressure_floor, state.dtype),
+        1.0 + pressure_perturbation, jnp.asarray(pressure_floor, state.dtype)
     )
-    field = electric_field_from_density(rho, k_arr, poisson_sign=poisson_sign)
+    field = electric_field_from_density(
+        density_perturbation, k_arr, poisson_sign=poisson_sign
+    )
     raw_third_resolved = _dealias(rho * velocity**3 + 3.0 * velocity * pressure)
     force_momentum = _dealias(rho * field)
     force_second = _dealias(momentum * field)
     return jnp.stack(
         (
             -spectral_derivative(momentum, k_arr),
-            -spectral_derivative(second, k_arr) - force_momentum,
+            -spectral_derivative(second_perturbation, k_arr) - force_momentum,
             -spectral_derivative(raw_third_resolved, k_arr)
             - heat_flux_gradient
             - 2.0 * force_second,
@@ -286,9 +290,10 @@ def low_moment_rk4_step(
     # Standard 2/3 pseudo-spectral filtering prevents unresolved products from
     # feeding the highest retained modes back into the fluid state.
     updated = _dealias(updated)
-    density_mean = jnp.mean(state[:, 0], axis=-1, keepdims=True)
+    density_mean = 1.0 + jnp.mean(state[:, 0], axis=-1, keepdims=True)
     floor = jnp.asarray(density_floor, state.dtype)
-    density_excess = jnp.maximum(updated[:, 0] - floor, 0.0)
+    updated_density = 1.0 + updated[:, 0]
+    density_excess = jnp.maximum(updated_density - floor, 0.0)
     mean_excess = jnp.mean(density_excess, axis=-1, keepdims=True)
     target_excess = jnp.maximum(density_mean - floor, 0.0)
     corrected_density = jnp.where(
@@ -296,27 +301,30 @@ def low_moment_rk4_step(
         floor + density_excess * target_excess / mean_excess,
         jnp.broadcast_to(density_mean, density_excess.shape),
     )
-    density = jnp.where(
-        jnp.min(updated[:, 0], axis=-1, keepdims=True) < floor,
-        corrected_density,
+    density_perturbation = jnp.where(
+        jnp.min(updated_density, axis=-1, keepdims=True) < floor,
+        corrected_density - 1.0,
         updated[:, 0],
     )
     momentum = updated[:, 1]
+    density = 1.0 + density_perturbation
     kinetic = momentum * momentum / density
-    raw_pressure = updated[:, 2] - kinetic
+    raw_pressure = 1.0 + updated[:, 2] - kinetic
     pressure_floor_value = jnp.asarray(pressure_floor, state.dtype)
     rounding_margin = (
         8.0
         * jnp.finfo(state.dtype).eps
         * jnp.maximum(1.0, jnp.abs(kinetic))
     )
-    corrected_second = pressure_floor_value + kinetic + rounding_margin
-    second = jnp.where(
+    corrected_second_perturbation = (
+        pressure_floor_value + kinetic + rounding_margin - 1.0
+    )
+    second_perturbation = jnp.where(
         raw_pressure < pressure_floor_value,
-        corrected_second,
+        corrected_second_perturbation,
         updated[:, 2],
     )
-    return jnp.stack((density, momentum, second), axis=1)
+    return jnp.stack((density_perturbation, momentum, second_perturbation), axis=1)
 
 
 def warm_spectral_memory(
@@ -327,11 +335,10 @@ def warm_spectral_memory(
     *,
     width: int,
     input_scale: Array,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     amplitude_center: float,
     amplitude_scale: float,
     closure_history_input: bool = False,
-    dynamic_amplitude_scaling: bool = False,
     return_closure_history: bool = False,
     poisson_sign: float = 1.0,
     normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
@@ -353,11 +360,10 @@ def warm_spectral_memory(
             amplitude,
             k_arr,
             input_scale=input_scale,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             previous_heat_flux_gradient=(previous if closure_history_input else None),
-            dynamic_amplitude_scaling=dynamic_amplitude_scaling,
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
         )
@@ -379,12 +385,11 @@ def rollout_low_moment_closure(
     horizon: int,
     dt: float,
     input_scale: Array,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     amplitude_center: float,
     amplitude_scale: float,
     previous_heat_flux_gradient: Array | None = None,
     closure_history_input: bool = False,
-    dynamic_amplitude_scaling: bool = False,
     return_closure_history: bool = False,
     poisson_sign: float = 1.0,
     normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
@@ -401,11 +406,10 @@ def rollout_low_moment_closure(
             amplitude,
             k_arr,
             input_scale=input_scale,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             previous_heat_flux_gradient=(previous if closure_history_input else None),
-            dynamic_amplitude_scaling=dynamic_amplitude_scaling,
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
         )

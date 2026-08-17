@@ -54,7 +54,7 @@ REGIMES = (
 TRAINING_MODE = "solver_embedded_low_moment_spectral_memory"
 OBJECTIVE = "low_moment_trajectory"
 MODEL_BACKEND = "causal_translation_equivariant_spectral_memory"
-CHECKPOINT_SCHEMA = 1
+CHECKPOINT_SCHEMA = 2
 
 
 def _restrict_rfft(values: np.ndarray, source_nx: int, target_nx: int) -> np.ndarray:
@@ -79,31 +79,46 @@ def low_hermite_coefficients_to_conservative(
     target_nx: int,
     dtype: np.dtype = np.dtype(np.float32),
 ) -> np.ndarray:
-    """Convert spline-integrated C0:C2 into rho, momentum, and raw second moment."""
-    coeff = np.asarray(coefficients)
+    """Convert C0:C2 into centered density, momentum, and second moment."""
+    requested_dtype = np.dtype(dtype)
+    complex_dtype = np.complex128 if requested_dtype == np.float64 else np.complex64
+    coeff = np.asarray(coefficients, dtype=complex_dtype)
     if coeff.shape[-2] < 3:
         raise ValueError("At least C0, C1, and C2 are required")
     coeff = _restrict_rfft(coeff[..., :3, :], source_nx, target_nx)
     physical = np.fft.irfft(coeff, n=int(target_nx), axis=-1)
-    density = 1.0 + physical[..., 0, :]
+    density_perturbation = physical[..., 0, :]
     momentum = physical[..., 1, :]
-    second = density + math.sqrt(2.0) * physical[..., 2, :]
-    return np.stack((density, momentum, second), axis=-2).astype(dtype)
+    second_perturbation = density_perturbation + math.sqrt(2.0) * physical[..., 2, :]
+    return np.stack(
+        (density_perturbation, momentum, second_perturbation), axis=-2
+    ).astype(requested_dtype)
 
 
 def _primitive_numpy(state: np.ndarray, domain_length: float) -> np.ndarray:
     state = np.asarray(state, dtype=np.float64)
-    rho, momentum, second = state[..., 0, :], state[..., 1, :], state[..., 2, :]
+    density_perturbation, momentum, second_perturbation = (
+        state[..., 0, :],
+        state[..., 1, :],
+        state[..., 2, :],
+    )
+    rho = 1.0 + density_perturbation
     safe_rho = np.where(np.abs(rho) > 1e-8, rho, 1e-8)
     velocity = momentum / safe_rho
-    pressure = second - momentum * velocity
+    pressure_perturbation = second_perturbation - momentum * velocity
     nx = int(state.shape[-1])
     k_arr = 2.0 * math.pi * np.fft.rfftfreq(nx, d=float(domain_length) / nx)
-    rho_hat = np.fft.rfft(rho - np.mean(rho, axis=-1, keepdims=True), axis=-1)
+    rho_hat = np.fft.rfft(
+        density_perturbation
+        - np.mean(density_perturbation, axis=-1, keepdims=True),
+        axis=-1,
+    )
     field_hat = np.zeros_like(rho_hat)
     field_hat[..., 1:] = 1j * rho_hat[..., 1:] / k_arr[1:]
     field = np.fft.irfft(field_hat, n=nx, axis=-1)
-    return np.stack((rho - 1.0, velocity, pressure - 1.0, field), axis=-2)
+    return np.stack(
+        (density_perturbation, velocity, pressure_perturbation, field), axis=-2
+    )
 
 
 def _central_heat_flux_numpy(
@@ -115,10 +130,11 @@ def _central_heat_flux_numpy(
 ) -> np.ndarray:
     coeff = _restrict_rfft(np.asarray(coefficients)[..., :4, :], source_nx, target_nx)
     physical = np.fft.irfft(coeff, n=int(target_nx), axis=-1)
-    rho, momentum, second = state[..., 0, :], state[..., 1, :], state[..., 2, :]
+    rho = 1.0 + state[..., 0, :]
+    momentum = state[..., 1, :]
     safe_rho = np.where(np.abs(rho) > 1e-8, rho, 1e-8)
     velocity = momentum / safe_rho
-    pressure = second - momentum * velocity
+    pressure = 1.0 + state[..., 2, :] - momentum * velocity
     raw_third = math.sqrt(6.0) * physical[..., 3, :] + 3.0 * momentum
     return raw_third - 3.0 * velocity * pressure - rho * velocity**3
 
@@ -205,7 +221,7 @@ def _gather_coefficients(
 def _statistics_path(cache_dir: Path, rollout_nx: int, stats_stride: int) -> Path:
     key = sha256_json(
         {
-            "kind": "low_moment_spectral_memory_stats_v2",
+            "kind": "low_moment_spectral_memory_stats_v3_centered_gradient",
             "rollout_nx": int(rollout_nx),
             "stats_stride": int(stats_stride),
         }
@@ -228,8 +244,9 @@ def _compute_training_statistics(
     global_count = 0
     regime_sum = {regime: np.zeros((4,), dtype=np.float64) for regime in REGIMES}
     regime_count = {regime: 0 for regime in REGIMES}
-    heat_flux_sum = 0.0
-    heat_flux_count = 0
+    heat_flux_gradient_sum_global = 0.0
+    heat_flux_gradient_count_global = 0
+    heat_flux_gradient_max_abs = 0.0
     heat_flux_gradient_sum = {regime: 0.0 for regime in REGIMES}
     heat_flux_gradient_count = {regime: 0 for regime in REGIMES}
     train_log_amplitudes = []
@@ -241,8 +258,7 @@ def _compute_training_statistics(
         for history, case_id, split in zip(histories, case_ids, splits):
             if str(split) != IC_SPLIT_TRAIN:
                 continue
-            epsilon = amplitudes[str(case_id)]
-            train_log_amplitudes.append(math.log(epsilon))
+            train_log_amplitudes.append(math.log(amplitudes[str(case_id)]))
             indices = np.arange(0, int(history.shape[0]), max(int(stats_stride), 1))
             for start in range(0, int(indices.size), 64):
                 rows = indices[start : start + 64]
@@ -262,9 +278,7 @@ def _compute_training_statistics(
                     state,
                     source_nx=source_nx,
                     target_nx=rollout_nx,
-                ) / max(epsilon, 1e-8)
-                heat_flux_sum += float(np.sum(heat_flux * heat_flux, dtype=np.float64))
-                heat_flux_count += int(heat_flux.size)
+                )
                 k_arr = 2.0 * math.pi * np.fft.rfftfreq(
                     int(rollout_nx), d=float(domain_length) / float(rollout_nx)
                 )
@@ -277,6 +291,14 @@ def _compute_training_statistics(
                     np.sum(heat_flux_gradient * heat_flux_gradient, dtype=np.float64)
                 )
                 heat_flux_gradient_count[regime] += int(heat_flux_gradient.size)
+                heat_flux_gradient_sum_global += float(
+                    np.sum(heat_flux_gradient * heat_flux_gradient, dtype=np.float64)
+                )
+                heat_flux_gradient_count_global += int(heat_flux_gradient.size)
+                heat_flux_gradient_max_abs = max(
+                    heat_flux_gradient_max_abs,
+                    float(np.max(np.abs(heat_flux_gradient))),
+                )
     input_scale = np.sqrt(global_sum / max(global_count, 1))
     regime_scales = np.stack(
         [np.sqrt(regime_sum[regime] / max(regime_count[regime], 1)) for regime in REGIMES]
@@ -287,8 +309,14 @@ def _compute_training_statistics(
     return {
         "input_scale": input_scale,
         "regime_scales": regime_scales,
-        "heat_flux_scale": np.array(
-            [math.sqrt(heat_flux_sum / max(heat_flux_count, 1))], dtype=np.float64
+        "heat_flux_gradient_scale": np.array(
+            [
+                math.sqrt(
+                    heat_flux_gradient_sum_global
+                    / max(heat_flux_gradient_count_global, 1)
+                )
+            ],
+            dtype=np.float64,
         ),
         "heat_flux_gradient_regime_scales": np.asarray(
             [
@@ -302,6 +330,9 @@ def _compute_training_statistics(
                 for regime in REGIMES
             ],
             dtype=np.float64,
+        ),
+        "heat_flux_gradient_max_abs": np.array(
+            [heat_flux_gradient_max_abs], dtype=np.float64
         ),
         "amplitude_center": np.array([np.mean(log_amplitudes)], dtype=np.float64),
         "amplitude_scale": np.array(
@@ -715,7 +746,7 @@ def make_loss_function(
     dt: float,
     input_scale: np.ndarray,
     regime_scales: np.ndarray,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     amplitude_center: float,
     amplitude_scale: float,
     poisson_sign: float,
@@ -724,7 +755,6 @@ def make_loss_function(
     pressure_floor: float,
     relative_trajectory_loss: bool = False,
     closure_history_input: bool = False,
-    dynamic_amplitude_scaling: bool = False,
 ):
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
@@ -738,11 +768,10 @@ def make_loss_function(
             k_jax,
             width=width,
             input_scale=input_scale_jax,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             closure_history_input=closure_history_input,
-            dynamic_amplitude_scaling=dynamic_amplitude_scaling,
             return_closure_history=closure_history_input,
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
@@ -761,12 +790,11 @@ def make_loss_function(
             horizon=horizon,
             dt=dt,
             input_scale=input_scale_jax,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             previous_heat_flux_gradient=previous_gradient,
             closure_history_input=closure_history_input,
-            dynamic_amplitude_scaling=dynamic_amplitude_scaling,
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
             density_floor=density_floor,
@@ -788,11 +816,13 @@ def make_loss_function(
         ).reshape(batch_count, time_count, 4, batch["targets"].shape[-1])
         if relative_trajectory_loss:
             numerator = jnp.sum(
-                jnp.square(predicted_fields - target_fields), axis=(1, 2, 3)
+                jnp.square(predicted_fields - target_fields), axis=(1, 3)
             )
-            denominator = jnp.sum(jnp.square(target_fields), axis=(1, 2, 3))
+            denominator = jnp.sum(jnp.square(target_fields), axis=(1, 3))
             sample_loss = jnp.where(
-                denominator > 0.0, numerator / denominator, jnp.nan
+                jnp.all(denominator > 0.0, axis=1),
+                jnp.mean(numerator / denominator, axis=1),
+                jnp.nan,
             )
         else:
             scales = regime_scales_jax[batch["regime_index"]][:, None, :, None]
@@ -821,7 +851,7 @@ def make_continuous_chunk_loss_function(
     dt: float,
     input_scale: np.ndarray,
     regime_scales: np.ndarray,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     amplitude_center: float,
     amplitude_scale: float,
     poisson_sign: float,
@@ -830,7 +860,6 @@ def make_continuous_chunk_loss_function(
     pressure_floor: float,
     relative_trajectory_loss: bool = False,
     closure_history_input: bool = False,
-    dynamic_amplitude_scaling: bool = False,
 ):
     """Return one truncated-gradient chunk of a continuous autonomous rollout."""
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
@@ -854,11 +883,10 @@ def make_continuous_chunk_loss_function(
                 k_jax,
                 width=width,
                 input_scale=input_scale_jax,
-                heat_flux_scale=heat_flux_scale,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
                 amplitude_center=amplitude_center,
                 amplitude_scale=amplitude_scale,
                 closure_history_input=closure_history_input,
-                dynamic_amplitude_scaling=dynamic_amplitude_scaling,
                 return_closure_history=closure_history_input,
                 poisson_sign=poisson_sign,
                 normalized_heat_flux_bound=normalized_heat_flux_bound,
@@ -882,12 +910,11 @@ def make_continuous_chunk_loss_function(
             horizon=horizon,
             dt=dt,
             input_scale=input_scale_jax,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             previous_heat_flux_gradient=previous_gradient,
             closure_history_input=closure_history_input,
-            dynamic_amplitude_scaling=dynamic_amplitude_scaling,
             return_closure_history=closure_history_input,
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
@@ -911,14 +938,16 @@ def make_continuous_chunk_loss_function(
             poisson_sign=poisson_sign,
         ).reshape(batch_count, time_count, 4, targets.shape[-1])
         if relative_trajectory_loss:
-            numerator = jnp.sum(jnp.square(predicted_fields - target_fields), axis=(1, 2, 3))
+            numerator = jnp.sum(
+                jnp.square(predicted_fields - target_fields), axis=(1, 3)
+            )
             if trajectory_target_norm is None:
                 trajectory_target_norm = jnp.sum(
-                    jnp.square(target_fields), axis=(1, 2, 3)
+                    jnp.square(target_fields), axis=(1, 3)
                 )
             sample_loss = jnp.where(
-                trajectory_target_norm > 0.0,
-                numerator / trajectory_target_norm,
+                jnp.all(trajectory_target_norm > 0.0, axis=1),
+                jnp.mean(numerator / trajectory_target_norm, axis=1),
                 jnp.nan,
             )
         else:
@@ -950,7 +979,7 @@ def make_supervised_heat_flux_loss(
     k_arr: np.ndarray,
     width: int,
     input_scale: np.ndarray,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     heat_flux_gradient_regime_scales: np.ndarray,
     amplitude_center: float,
     amplitude_scale: float,
@@ -972,7 +1001,7 @@ def make_supervised_heat_flux_loss(
             k_jax,
             width=width,
             input_scale=input_scale_jax,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             poisson_sign=poisson_sign,
@@ -985,7 +1014,7 @@ def make_supervised_heat_flux_loss(
             batch["amplitude"],
             k_jax,
             input_scale=input_scale_jax,
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             poisson_sign=poisson_sign,
@@ -1162,7 +1191,7 @@ def _evaluate_heldout(
     width: int,
     memory_steps: int,
     input_scale: np.ndarray,
-    heat_flux_scale: float,
+    heat_flux_gradient_scale: float,
     amplitude_center: float,
     amplitude_scale: float,
     poisson_sign: float,
@@ -1171,7 +1200,6 @@ def _evaluate_heldout(
     density_floor: float,
     pressure_floor: float,
     closure_history_input: bool = False,
-    dynamic_amplitude_scaling: bool = False,
 ) -> None:
     amplitudes_by_id = _case_amplitudes(manifest)
     initial_states = []
@@ -1209,11 +1237,10 @@ def _evaluate_heldout(
         k_jax,
         width=width,
         input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
-        heat_flux_scale=heat_flux_scale,
+        heat_flux_gradient_scale=heat_flux_gradient_scale,
         amplitude_center=amplitude_center,
         amplitude_scale=amplitude_scale,
         closure_history_input=closure_history_input,
-        dynamic_amplitude_scaling=dynamic_amplitude_scaling,
         return_closure_history=True,
         poisson_sign=poisson_sign,
         normalized_heat_flux_bound=normalized_heat_flux_bound,
@@ -1243,12 +1270,11 @@ def _evaluate_heldout(
             horizon=length,
             dt=dt,
             input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
-            heat_flux_scale=heat_flux_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             previous_heat_flux_gradient=current_gradient,
             closure_history_input=closure_history_input,
-            dynamic_amplitude_scaling=dynamic_amplitude_scaling,
             return_closure_history=True,
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
@@ -1272,9 +1298,9 @@ def _evaluate_heldout(
         )
         state = states[:, -1]
         states_numpy = np.asarray(states, dtype=np.float64)
-        density = states_numpy[:, :, 0]
+        density = 1.0 + states_numpy[:, :, 0]
         momentum = states_numpy[:, :, 1]
-        pressure = states_numpy[:, :, 2] - momentum * momentum / density
+        pressure = 1.0 + states_numpy[:, :, 2] - momentum * momentum / density
         minimum_density = np.minimum(
             minimum_density, np.min(density, axis=(1, 2))
         )
@@ -1477,7 +1503,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--width", type=int, default=24)
     parser.add_argument("--spectral-modes", type=int, default=16)
-    parser.add_argument("--dynamic-amplitude-scaling", action="store_true")
     parser.add_argument("--closure-history-input", action="store_true")
     parser.add_argument("--relative-trajectory-loss", action="store_true")
     parser.add_argument("--stats-stride", type=int, default=20)
@@ -1540,13 +1565,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "continuous trajectories already accumulate every chunk; set "
                 "gradient-accumulation-steps=1"
             )
-    elif any(
-        (
-            args.dynamic_amplitude_scaling,
-            args.closure_history_input,
-            args.relative_trajectory_loss,
-        )
-    ):
+    elif any((args.closure_history_input, args.relative_trajectory_loss)):
         raise ValueError("the scaling/history ablation requires continuous trajectories")
     if not 0.0 <= args.loss_ema_decay < 1.0:
         raise ValueError("loss EMA decay must be in [0, 1)")
@@ -1585,6 +1604,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         params, checkpoint_metadata, checkpoint_stats = _load_checkpoint(
             args.evaluate_checkpoint
         )
+        if int(checkpoint_metadata.get("schema_version", 0)) != CHECKPOINT_SCHEMA:
+            raise ValueError(
+                "Checkpoint uses the obsolete full-state/heat-flux parameterization"
+            )
         if str(checkpoint_metadata.get("manifest_sha256")) != str(manifest["sha256"]):
             raise ValueError("Checkpoint and reference-cache IC manifests do not match")
         checkpoint_source_nx = int(checkpoint_metadata["source_Nx"])
@@ -1609,7 +1632,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             width=int(checkpoint_metadata["width"]),
             memory_steps=int(checkpoint_metadata["memory_steps"]),
             input_scale=checkpoint_stats["input_scale"],
-            heat_flux_scale=float(checkpoint_stats["heat_flux_scale"][0]),
+            heat_flux_gradient_scale=float(checkpoint_stats["heat_flux_gradient_scale"][0]),
             amplitude_center=float(checkpoint_stats["amplitude_center"][0]),
             amplitude_scale=float(checkpoint_stats["amplitude_scale"][0]),
             poisson_sign=poisson_sign,
@@ -1627,9 +1650,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ),
             closure_history_input=bool(
                 checkpoint_metadata.get("closure_history_input", False)
-            ),
-            dynamic_amplitude_scaling=bool(
-                checkpoint_metadata.get("dynamic_amplitude_scaling", False)
             ),
         )
         metrics_path = outdir / "training_metrics.npz"
@@ -1680,6 +1700,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "[data] low-moment input scales: "
         + ", ".join(f"{value:.4e}" for value in stats["input_scale"])
     )
+    required_output_bound = float(stats["heat_flux_gradient_max_abs"][0]) / float(
+        stats["heat_flux_gradient_scale"][0]
+    )
+    if float(args.normalized_heat_flux_bound) <= required_output_bound:
+        raise ValueError(
+            "normalized heat-flux-gradient bound cannot represent the training data: "
+            f"configured={args.normalized_heat_flux_bound:.6g} "
+            f"required>{required_output_bound:.6g}"
+        )
+    print(
+        "[data] heat-flux-gradient scale/bound: "
+        f"scale={float(stats['heat_flux_gradient_scale'][0]):.6e} "
+        f"required_normalized_max={required_output_bound:.3f} "
+        f"configured_bound={args.normalized_heat_flux_bound:.3f}"
+    )
     horizon_description = (
         f"fixed_H={args.rollout_horizon}"
         if len(curriculum) == 1
@@ -1705,6 +1740,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.init_checkpoint
         )
         expected = {
+            "schema_version": CHECKPOINT_SCHEMA,
+            "state_representation": "centered_conservative_v1",
+            "closure_output": "zero_mean_heat_flux_gradient",
             "manifest_sha256": str(manifest["sha256"]),
             "source_Nx": source_nx,
             "rollout_Nx": int(args.rollout_Nx),
@@ -1776,7 +1814,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "normalized_heat_flux_bound": args.normalized_heat_flux_bound,
         "density_floor": args.density_floor,
         "pressure_floor": args.pressure_floor,
-        "dynamic_amplitude_scaling": args.dynamic_amplitude_scaling,
+        "state_representation": "centered_conservative_v1",
+        "closure_output": "zero_mean_heat_flux_gradient",
         "closure_history_input": args.closure_history_input,
         "relative_trajectory_loss": args.relative_trajectory_loss,
     }
@@ -1787,7 +1826,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             k_arr=k_arr,
             width=args.width,
             input_scale=stats["input_scale"],
-            heat_flux_scale=float(stats["heat_flux_scale"][0]),
+            heat_flux_gradient_scale=float(stats["heat_flux_gradient_scale"][0]),
             heat_flux_gradient_regime_scales=stats[
                 "heat_flux_gradient_regime_scales"
             ],
@@ -1883,7 +1922,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             dt=dt,
             input_scale=stats["input_scale"],
             regime_scales=stats["regime_scales"],
-            heat_flux_scale=float(stats["heat_flux_scale"][0]),
+            heat_flux_gradient_scale=float(stats["heat_flux_gradient_scale"][0]),
             amplitude_center=float(stats["amplitude_center"][0]),
             amplitude_scale=float(stats["amplitude_scale"][0]),
             poisson_sign=poisson_sign,
@@ -1892,7 +1931,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             pressure_floor=args.pressure_floor,
             relative_trajectory_loss=args.relative_trajectory_loss,
             closure_history_input=args.closure_history_input,
-            dynamic_amplitude_scaling=args.dynamic_amplitude_scaling,
         )
         value_and_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
         evaluate_loss = jax.jit(loss_fn)
@@ -1963,7 +2001,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     dt=dt,
                     input_scale=stats["input_scale"],
                     regime_scales=stats["regime_scales"],
-                    heat_flux_scale=float(stats["heat_flux_scale"][0]),
+                    heat_flux_gradient_scale=float(stats["heat_flux_gradient_scale"][0]),
                     amplitude_center=float(stats["amplitude_center"][0]),
                     amplitude_scale=float(stats["amplitude_scale"][0]),
                     poisson_sign=poisson_sign,
@@ -1972,7 +2010,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     pressure_floor=args.pressure_floor,
                     relative_trajectory_loss=args.relative_trajectory_loss,
                     closure_history_input=args.closure_history_input,
-                    dynamic_amplitude_scaling=args.dynamic_amplitude_scaling,
                 )
                 cache[key] = jax.jit(
                     jax.value_and_grad(chunk_loss, has_aux=True)
@@ -1998,7 +2035,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     poisson_sign=poisson_sign,
                 ).reshape(target_shape[0], target_shape[1], 4, target_shape[-1])
                 trajectory_target_norm = jnp.sum(
-                    jnp.square(target_fields), axis=(1, 2, 3)
+                    jnp.square(target_fields), axis=(1, 3)
                 )
                 if np.any(np.asarray(trajectory_target_norm) <= 0.0):
                     raise ValueError(
@@ -2435,7 +2472,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             width=args.width,
             memory_steps=args.memory_steps,
             input_scale=stats["input_scale"],
-            heat_flux_scale=float(stats["heat_flux_scale"][0]),
+            heat_flux_gradient_scale=float(stats["heat_flux_gradient_scale"][0]),
             amplitude_center=float(stats["amplitude_center"][0]),
             amplitude_scale=float(stats["amplitude_scale"][0]),
             poisson_sign=poisson_sign,
@@ -2444,7 +2481,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             density_floor=args.density_floor,
             pressure_floor=args.pressure_floor,
             closure_history_input=args.closure_history_input,
-            dynamic_amplitude_scaling=args.dynamic_amplitude_scaling,
         )
 
 

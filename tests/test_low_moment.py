@@ -33,9 +33,9 @@ class LowMomentClosureTests(unittest.TestCase):
         )
         x = np.linspace(0.0, 2.0 * np.pi, nx, endpoint=False)
         initial = np.zeros((3, 3, nx), dtype=np.float32)
-        initial[:, 0] = 1.0 + 0.01 * np.cos(x)
+        initial[:, 0] = 0.01 * np.cos(x)
         initial[:, 1] = 0.005 * np.sin(x)
-        initial[:, 2] = 1.0 + 0.01 * np.sin(2.0 * x)
+        initial[:, 2] = 0.01 * np.sin(2.0 * x)
         memory = np.repeat(initial[:, None], 3, axis=1)
         targets = np.repeat(initial[:, None], 4, axis=1)
         amplitude = np.asarray([0.01, 0.1, 0.5], dtype=np.float32)
@@ -46,7 +46,7 @@ class LowMomentClosureTests(unittest.TestCase):
             dt=0.01,
             input_scale=np.ones((4,), dtype=np.float32),
             regime_scales=np.ones((3, 4), dtype=np.float32),
-            heat_flux_scale=1.0,
+            heat_flux_gradient_scale=1.0,
             amplitude_center=-2.0,
             amplitude_scale=1.0,
             poisson_sign=1.0,
@@ -135,10 +135,10 @@ class LowMomentClosureTests(unittest.TestCase):
         )
         self.assertEqual(batch["memory"].shape, (3, 3, 3, nx))
         self.assertEqual(batch["targets"].shape, (3, 5, 3, nx))
-        np.testing.assert_allclose(batch["initial"][:, 0], 1.0)
-        np.testing.assert_allclose(batch["memory"][:, :, 0], 1.0)
+        np.testing.assert_allclose(batch["initial"][:, 0], 0.0)
+        np.testing.assert_allclose(batch["memory"][:, :, 0], 0.0)
         expected_density = np.broadcast_to(
-            1.0 + np.arange(1, 6, dtype=np.float32)[:, None], (5, nx)
+            np.arange(1, 6, dtype=np.float32)[:, None], (5, nx)
         )
         np.testing.assert_allclose(batch["targets"][0, :, 0], expected_density)
 
@@ -228,11 +228,22 @@ class LowMomentClosureTests(unittest.TestCase):
         state = low_hermite_coefficients_to_conservative(
             coefficients, source_nx=nx, target_nx=nx, dtype=np.float64
         )
-        np.testing.assert_allclose(state[0], 1.0 + c0, atol=1e-12)
+        np.testing.assert_allclose(state[0], c0, atol=1e-12)
         np.testing.assert_allclose(state[1], c1, atol=1e-12)
         np.testing.assert_allclose(
-            state[2], 1.0 + c0 + math.sqrt(2.0) * c2, atol=1e-12
+            state[2], c0 + math.sqrt(2.0) * c2, atol=1e-12
         )
+
+    def test_centered_conversion_preserves_sub_float32_epsilon_perturbation(self) -> None:
+        nx = 32
+        x = np.linspace(0.0, 2.0 * np.pi, nx, endpoint=False)
+        perturbation = 1e-11 * np.cos(x)
+        coefficients = np.zeros((3, nx // 2 + 1), dtype=np.complex64)
+        coefficients[0] = np.fft.rfft(perturbation).astype(np.complex64)
+        state = low_hermite_coefficients_to_conservative(
+            coefficients, source_nx=nx, target_nx=nx, dtype=np.float32
+        )
+        np.testing.assert_allclose(state[0], perturbation, rtol=2e-6, atol=1e-18)
 
     def test_equilibrium_is_exact_fixed_point(self) -> None:
         nx = 32
@@ -242,7 +253,6 @@ class LowMomentClosureTests(unittest.TestCase):
             jax.random.PRNGKey(0), width=width, spectral_modes=6
         )
         state = jnp.zeros((2, 3, nx), dtype=jnp.float32)
-        state = state.at[:, 0].set(1.0).at[:, 2].set(1.0)
         hidden = jnp.zeros((2, width, nx), dtype=jnp.float32)
         hidden_new, heat_flux_gradient = spectral_memory_closure_step(
             params,
@@ -251,7 +261,7 @@ class LowMomentClosureTests(unittest.TestCase):
             jnp.asarray([0.01, 0.5], dtype=jnp.float32),
             k_arr,
             input_scale=jnp.ones((4,), dtype=jnp.float32),
-            heat_flux_scale=1.0,
+            heat_flux_gradient_scale=1.0,
             amplitude_center=-2.0,
             amplitude_scale=1.0,
         )
@@ -262,7 +272,24 @@ class LowMomentClosureTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(np.asarray(updated), np.asarray(state))
 
-    def test_dynamic_amplitude_scaling_tracks_current_state(self) -> None:
+    def test_rk4_preserves_sub_epsilon_centered_uniform_state(self) -> None:
+        nx = 32
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(
+            nx, d=4.0 * jnp.pi / nx
+        )
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        state = state.at[:, 0].set(1e-11).at[:, 2].set(1e-11)
+        updated = low_moment_rk4_step(
+            state,
+            jnp.zeros((1, nx), dtype=jnp.float32),
+            k_arr,
+            0.01,
+        )
+        np.testing.assert_allclose(
+            np.asarray(updated), np.asarray(state), rtol=2e-6, atol=1e-18
+        )
+
+    def test_direct_heat_flux_gradient_has_zero_spatial_mean(self) -> None:
         nx = 32
         width = 6
         k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
@@ -273,33 +300,24 @@ class LowMomentClosureTests(unittest.TestCase):
             input_channels=5,
         )
         params["output_local"] = jnp.ones((1, width), dtype=jnp.float32)
-        x = jnp.linspace(0.0, 2.0 * jnp.pi, nx, endpoint=False)
-        base = jnp.zeros((1, 3, nx), dtype=jnp.float32)
-        base = base.at[:, 0].set(1.0 + 0.01 * jnp.cos(x))
-        base = base.at[:, 2].set(1.0 + 0.01 * jnp.sin(x))
-        large = base.at[:, 0].set(1.0 + 0.1 * jnp.cos(x))
-        large = large.at[:, 2].set(1.0 + 0.1 * jnp.sin(x))
+        x = jnp.linspace(
+            0.0, 2.0 * jnp.pi, nx, endpoint=False, dtype=jnp.float32
+        )
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        state = state.at[:, 0].set(0.1 * jnp.cos(x))
+        state = state.at[:, 2].set(0.1 * jnp.sin(x))
         hidden = jnp.zeros((1, width, nx), dtype=jnp.float32)
         common = dict(
             input_scale=jnp.ones((4,), dtype=jnp.float32),
-            heat_flux_scale=1.0,
+            heat_flux_gradient_scale=1.0,
             amplitude_center=0.0,
             amplitude_scale=1.0,
             previous_heat_flux_gradient=jnp.zeros((1, nx), dtype=jnp.float32),
-            dynamic_amplitude_scaling=True,
         )
-        _, small_gradient = spectral_memory_closure_step(
-            params, base, hidden, jnp.ones((1,)), k_arr, **common
+        _, gradient = spectral_memory_closure_step(
+            params, state, hidden, jnp.ones((1,)), k_arr, **common
         )
-        _, large_gradient = spectral_memory_closure_step(
-            params, large, hidden, jnp.ones((1,)), k_arr, **common
-        )
-        np.testing.assert_allclose(
-            np.asarray(large_gradient),
-            10.0 * np.asarray(small_gradient),
-            rtol=2e-4,
-            atol=2e-6,
-        )
+        np.testing.assert_allclose(np.mean(np.asarray(gradient), axis=-1), 0.0, atol=1e-7)
 
     def test_relative_trajectory_loss_has_no_additive_denominator_floor(self) -> None:
         nx = 8
@@ -309,8 +327,6 @@ class LowMomentClosureTests(unittest.TestCase):
             jax.random.PRNGKey(13), width=width, spectral_modes=3
         )
         equilibrium = np.zeros((3, 3, nx), dtype=np.float32)
-        equilibrium[:, 0] = 1.0
-        equilibrium[:, 2] = 1.0
         loss = make_continuous_chunk_loss_function(
             k_arr=k_arr,
             width=width,
@@ -319,7 +335,7 @@ class LowMomentClosureTests(unittest.TestCase):
             dt=0.01,
             input_scale=np.ones((4,), dtype=np.float32),
             regime_scales=np.ones((3, 4), dtype=np.float32),
-            heat_flux_scale=1.0,
+            heat_flux_gradient_scale=1.0,
             amplitude_center=0.0,
             amplitude_scale=1.0,
             poisson_sign=1.0,
@@ -346,9 +362,9 @@ class LowMomentClosureTests(unittest.TestCase):
             0.0, 2.0 * jnp.pi, nx, endpoint=False, dtype=jnp.float32
         )
         density = 1.0 + 1.2 * jnp.cos(x)
-        state = state.at[:, 0].set(density)
+        state = state.at[:, 0].set(density - 1.0)
         state = state.at[:, 1].set(jnp.asarray(0.4, dtype=state.dtype))
-        state = state.at[:, 2].set(jnp.asarray(0.02, dtype=state.dtype))
+        state = state.at[:, 2].set(jnp.asarray(-0.98, dtype=state.dtype))
         updated = low_moment_rk4_step(
             state,
             jnp.zeros((1, nx), dtype=jnp.float32),
@@ -356,11 +372,11 @@ class LowMomentClosureTests(unittest.TestCase):
             0.0,
         )
         fields = primitive_fields(updated, k_arr)
-        self.assertGreaterEqual(float(jnp.min(updated[:, 0])), 0.999e-4)
+        self.assertGreaterEqual(float(jnp.min(updated[:, 0] + 1.0)), 0.999e-4)
         self.assertGreaterEqual(float(jnp.min(fields[:, 2] + 1.0)), 0.999e-4)
         np.testing.assert_allclose(
-            np.asarray(jnp.mean(updated[:, 0], axis=-1)),
-            np.asarray(jnp.mean(state[:, 0], axis=-1)),
+            np.asarray(jnp.mean(updated[:, 0] + 1.0, axis=-1)),
+            np.asarray(jnp.mean(state[:, 0] + 1.0, axis=-1)),
             rtol=1e-6,
         )
 
@@ -374,7 +390,6 @@ class LowMomentClosureTests(unittest.TestCase):
         params["amplitude_gain"] = jnp.full((4,), 1e6, dtype=jnp.float32)
         params["output_local"] = jnp.full((1, width), 1e6, dtype=jnp.float32)
         state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
-        state = state.at[:, 0].set(1.0).at[:, 2].set(1.0)
         hidden = jnp.ones((1, width, nx), dtype=jnp.float32)
         _, gradient = spectral_memory_closure_step(
             params,
@@ -383,7 +398,7 @@ class LowMomentClosureTests(unittest.TestCase):
             jnp.asarray([0.65], dtype=jnp.float32),
             k_arr,
             input_scale=jnp.ones((4,), dtype=jnp.float32),
-            heat_flux_scale=1.0,
+            heat_flux_gradient_scale=1.0,
             amplitude_center=-3.0,
             amplitude_scale=1.0,
         )
@@ -399,13 +414,13 @@ class LowMomentClosureTests(unittest.TestCase):
         )
         rng = np.random.default_rng(4)
         state = np.zeros((2, 3, nx), dtype=np.float32)
-        state[:, 0] = 1.0 + 0.03 * rng.normal(size=(2, nx))
+        state[:, 0] = 0.03 * rng.normal(size=(2, nx))
         state[:, 1] = 0.02 * rng.normal(size=(2, nx))
-        state[:, 2] = 1.0 + 0.04 * rng.normal(size=(2, nx))
+        state[:, 2] = 0.04 * rng.normal(size=(2, nx))
         hidden = 0.01 * rng.normal(size=(2, width, nx)).astype(np.float32)
         kwargs = dict(
             input_scale=jnp.asarray([0.1, 0.1, 0.1, 0.1], dtype=jnp.float32),
-            heat_flux_scale=0.2,
+            heat_flux_gradient_scale=0.2,
             amplitude_center=-2.0,
             amplitude_scale=1.0,
         )
