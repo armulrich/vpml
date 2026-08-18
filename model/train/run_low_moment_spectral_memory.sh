@@ -38,6 +38,8 @@ WIDTH="${TRAIN_MODEL_WIDTH:-24}"
 SPECTRAL_MODES="${TRAIN_SPECTRAL_MODES:-16}"
 CLOSURE_HISTORY_INPUT="${TRAIN_CLOSURE_HISTORY_INPUT:-0}"
 RELATIVE_TRAJECTORY_LOSS="${TRAIN_RELATIVE_TRAJECTORY_LOSS:-0}"
+RELATIVE_TIME_BLOCK="${TRAIN_RELATIVE_TIME_BLOCK:-0}"
+CONVERGENCE_FLOOR_FILE="${TRAIN_CONVERGENCE_FLOOR_FILE:-}"
 HEAT_FLUX_BOUND="${TRAIN_NORMALIZED_HEAT_FLUX_BOUND:-128.0}"
 DENSITY_FLOOR="${TRAIN_DENSITY_FLOOR:-1e-4}"
 PRESSURE_FLOOR="${TRAIN_PRESSURE_FLOOR:-1e-4}"
@@ -72,6 +74,7 @@ ARGS=(
   --grad-clip "${GRAD_CLIP}"
   --width "${WIDTH}"
   --spectral-modes "${SPECTRAL_MODES}"
+  --relative-time-block "${RELATIVE_TIME_BLOCK}"
   --normalized-heat-flux-bound "${HEAT_FLUX_BOUND}"
   --density-floor "${DENSITY_FLOOR}"
   --pressure-floor "${PRESSURE_FLOOR}"
@@ -86,6 +89,9 @@ if [[ "${CLOSURE_HISTORY_INPUT}" == "1" ]]; then
 fi
 if [[ "${RELATIVE_TRAJECTORY_LOSS}" == "1" ]]; then
   ARGS+=(--relative-trajectory-loss)
+fi
+if [[ -n "${CONVERGENCE_FLOOR_FILE}" ]]; then
+  ARGS+=(--convergence-floor-file "${CONVERGENCE_FLOOR_FILE}")
 fi
 if [[ "${EVAL_AFTER_TRAINING}" == "0" ]]; then
   ARGS+=(--skip-evaluation)

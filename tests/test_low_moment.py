@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from model.train.low_moment_closure import (
+    _block_relative_sample_loss,
     _electric_field_energy,
     build_complete_trajectory_case_batches,
     build_diagnostic_panel,
@@ -24,6 +25,54 @@ from vpml.low_moment import (
 
 
 class LowMomentClosureTests(unittest.TestCase):
+    def test_block_relative_loss_weights_fixed_time_blocks_equally(self) -> None:
+        target = jnp.ones((1, 4, 4, 2), dtype=jnp.float32)
+        predicted = target.at[:, :2].add(1.0).at[:, 2:].add(2.0)
+        value = _block_relative_sample_loss(
+            predicted,
+            target,
+            jnp.asarray([0], dtype=jnp.int32),
+            jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32),
+            block_steps=2,
+            block_count=2,
+            floor_rms=jnp.full((3, 4), 0.1, dtype=jnp.float32),
+        )
+        np.testing.assert_allclose(np.asarray(value), [2.5], rtol=1e-6)
+
+    def test_block_relative_loss_uses_convergence_floor_at_zero_signal(self) -> None:
+        target = jnp.zeros((1, 2, 4, 2), dtype=jnp.float32)
+        predicted = jnp.ones_like(target)
+        value = _block_relative_sample_loss(
+            predicted,
+            target,
+            jnp.asarray([2], dtype=jnp.int32),
+            jnp.asarray([[1, 2]], dtype=jnp.int32),
+            block_steps=2,
+            block_count=1,
+            floor_rms=jnp.ones((3, 4), dtype=jnp.float32),
+        )
+        np.testing.assert_allclose(np.asarray(value), [1.0], rtol=1e-6)
+
+    def test_block_relative_chunk_losses_sum_to_complete_loss(self) -> None:
+        target = jnp.ones((1, 4, 4, 2), dtype=jnp.float32)
+        predicted = target.at[:, :2].add(1.0).at[:, 2:].add(2.0)
+        full_norm = jnp.full((1, 2, 4), 4.0, dtype=jnp.float32)
+        values = []
+        for start in (0, 2):
+            values.append(
+                _block_relative_sample_loss(
+                    predicted[:, start : start + 2],
+                    target[:, start : start + 2],
+                    jnp.asarray([0], dtype=jnp.int32),
+                    jnp.asarray([[start + 1, start + 2]], dtype=jnp.int32),
+                    block_steps=2,
+                    block_count=2,
+                    floor_rms=jnp.full((3, 4), 0.1, dtype=jnp.float32),
+                    trajectory_target_norm=full_norm,
+                )
+            )
+        np.testing.assert_allclose(np.asarray(values[0] + values[1]), [2.5], rtol=1e-6)
+
     def test_continuous_chunks_carry_state_and_memory_without_reset(self) -> None:
         nx = 16
         width = 6

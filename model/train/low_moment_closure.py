@@ -57,6 +57,69 @@ MODEL_BACKEND = "causal_translation_equivariant_spectral_memory"
 CHECKPOINT_SCHEMA = 2
 
 
+def _load_convergence_floor(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
+    with np.load(path, allow_pickle=False) as payload:
+        floor_rms = np.asarray(payload["floor_rms"], dtype=np.float64)
+        metadata = json.loads(str(np.asarray(payload["metadata_json"]).reshape(-1)[0]))
+    if floor_rms.shape != (len(REGIMES), 4):
+        raise ValueError(
+            "Convergence floor must have shape (3 regimes, 4 primitive channels), "
+            f"got {floor_rms.shape}"
+        )
+    if not np.all(np.isfinite(floor_rms)) or np.any(floor_rms <= 0.0):
+        raise ValueError("Convergence floor RMS values must be finite and positive")
+    return floor_rms, metadata
+
+
+def _block_relative_sample_loss(
+    predicted_fields,
+    target_fields,
+    regime_index,
+    target_indices,
+    *,
+    block_steps: int,
+    block_count: int,
+    floor_rms,
+    trajectory_target_norm=None,
+):
+    """Relative primitive-field error in fixed physical-time blocks."""
+    squared_error = jnp.sum(jnp.square(predicted_fields - target_fields), axis=-1)
+    block_ids = jnp.minimum(
+        jnp.maximum((target_indices - 1) // int(block_steps), 0),
+        int(block_count) - 1,
+    )
+    membership = jax.nn.one_hot(block_ids, int(block_count), dtype=squared_error.dtype)
+    numerator = jnp.einsum("btq,btc->bqc", membership, squared_error)
+    sample_counts = jnp.sum(membership, axis=1)
+    supplied_target_norm = trajectory_target_norm is not None
+    if not supplied_target_norm:
+        target_energy = jnp.sum(jnp.square(target_fields), axis=-1)
+        trajectory_target_norm = jnp.einsum(
+            "btq,btc->bqc", membership, target_energy
+        )
+    channel_floor = floor_rms[regime_index]
+    floor_energy = (
+        sample_counts[:, :, None]
+        * predicted_fields.shape[-1]
+        * jnp.square(channel_floor[:, None, :])
+    )
+    denominator = (
+        trajectory_target_norm
+        if supplied_target_norm
+        else jnp.maximum(trajectory_target_norm, floor_energy)
+    )
+    valid = sample_counts > 0
+    ratios = numerator / denominator
+    divisor = (
+        int(block_count)
+        if supplied_target_norm
+        else jnp.maximum(jnp.sum(valid, axis=1), 1)
+    )
+    return jnp.sum(jnp.where(valid[:, :, None], ratios, 0.0), axis=(1, 2)) / (
+        divisor * predicted_fields.shape[2]
+    )
+
+
 def _restrict_rfft(values: np.ndarray, source_nx: int, target_nx: int) -> np.ndarray:
     values = np.asarray(values)
     source_nx = int(source_nx)
@@ -400,6 +463,7 @@ def sample_batch(
     amplitudes = []
     regime_indices = []
     heat_flux_gradient_targets = []
+    start_indices = []
     for regime_index, regime in enumerate(REGIMES):
         group = grouped[regime]
         histories = tuple(group[coefficient_key])
@@ -487,12 +551,14 @@ def sample_batch(
             np.asarray([amplitudes_by_id[str(case_ids[index])] for index in cases])
         )
         regime_indices.append(np.full((len(cases),), regime_index, dtype=np.int32))
+        start_indices.append(times)
     batch = {
         "memory": np.concatenate(memories, axis=0).astype(np.float32),
         "initial": np.concatenate(initials, axis=0).astype(np.float32),
         "targets": np.concatenate(targets, axis=0).astype(np.float32),
         "amplitude": np.concatenate(amplitudes, axis=0).astype(np.float32),
         "regime_index": np.concatenate(regime_indices, axis=0),
+        "start_index": np.concatenate(start_indices, axis=0).astype(np.int32),
         "heat_flux_gradient_target": np.concatenate(
             heat_flux_gradient_targets, axis=0
         ).astype(np.float32),
@@ -755,10 +821,18 @@ def make_loss_function(
     pressure_floor: float,
     relative_trajectory_loss: bool = False,
     closure_history_input: bool = False,
+    relative_time_block_steps: int = 0,
+    relative_time_block_count: int = 0,
+    convergence_floor_rms: Optional[np.ndarray] = None,
 ):
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
     regime_scales_jax = jnp.asarray(regime_scales, dtype=jnp.float32)
+    convergence_floor_jax = (
+        None
+        if convergence_floor_rms is None
+        else jnp.asarray(convergence_floor_rms, dtype=jnp.float32)
+    )
 
     def loss(params, batch):
         warm_result = warm_spectral_memory(
@@ -815,15 +889,29 @@ def make_loss_function(
             poisson_sign=poisson_sign,
         ).reshape(batch_count, time_count, 4, batch["targets"].shape[-1])
         if relative_trajectory_loss:
-            numerator = jnp.sum(
-                jnp.square(predicted_fields - target_fields), axis=(1, 3)
-            )
-            denominator = jnp.sum(jnp.square(target_fields), axis=(1, 3))
-            sample_loss = jnp.where(
-                jnp.all(denominator > 0.0, axis=1),
-                jnp.mean(numerator / denominator, axis=1),
-                jnp.nan,
-            )
+            if convergence_floor_jax is not None:
+                target_indices = batch["start_index"][:, None] + jnp.arange(
+                    1, time_count + 1, dtype=jnp.int32
+                )[None, :]
+                sample_loss = _block_relative_sample_loss(
+                    predicted_fields,
+                    target_fields,
+                    batch["regime_index"],
+                    target_indices,
+                    block_steps=relative_time_block_steps,
+                    block_count=relative_time_block_count,
+                    floor_rms=convergence_floor_jax,
+                )
+            else:
+                numerator = jnp.sum(
+                    jnp.square(predicted_fields - target_fields), axis=(1, 3)
+                )
+                denominator = jnp.sum(jnp.square(target_fields), axis=(1, 3))
+                sample_loss = jnp.where(
+                    jnp.all(denominator > 0.0, axis=1),
+                    jnp.mean(numerator / denominator, axis=1),
+                    jnp.nan,
+                )
         else:
             scales = regime_scales_jax[batch["regime_index"]][:, None, :, None]
             normalized_error = (predicted_fields - target_fields) / scales
@@ -860,11 +948,19 @@ def make_continuous_chunk_loss_function(
     pressure_floor: float,
     relative_trajectory_loss: bool = False,
     closure_history_input: bool = False,
+    relative_time_block_steps: int = 0,
+    relative_time_block_count: int = 0,
+    convergence_floor_rms: Optional[np.ndarray] = None,
 ):
     """Return one truncated-gradient chunk of a continuous autonomous rollout."""
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
     regime_scales_jax = jnp.asarray(regime_scales, dtype=jnp.float32)
+    convergence_floor_jax = (
+        None
+        if convergence_floor_rms is None
+        else jnp.asarray(convergence_floor_rms, dtype=jnp.float32)
+    )
 
     def loss(
         params,
@@ -874,6 +970,7 @@ def make_continuous_chunk_loss_function(
         amplitude,
         regime_index,
         trajectory_target_norm=None,
+        target_indices=None,
     ):
         if warm_memory:
             warmed = warm_spectral_memory(
@@ -938,18 +1035,30 @@ def make_continuous_chunk_loss_function(
             poisson_sign=poisson_sign,
         ).reshape(batch_count, time_count, 4, targets.shape[-1])
         if relative_trajectory_loss:
-            numerator = jnp.sum(
-                jnp.square(predicted_fields - target_fields), axis=(1, 3)
-            )
-            if trajectory_target_norm is None:
-                trajectory_target_norm = jnp.sum(
-                    jnp.square(target_fields), axis=(1, 3)
+            if convergence_floor_jax is not None:
+                sample_loss = _block_relative_sample_loss(
+                    predicted_fields,
+                    target_fields,
+                    regime_index,
+                    target_indices,
+                    block_steps=relative_time_block_steps,
+                    block_count=relative_time_block_count,
+                    floor_rms=convergence_floor_jax,
+                    trajectory_target_norm=trajectory_target_norm,
                 )
-            sample_loss = jnp.where(
-                jnp.all(trajectory_target_norm > 0.0, axis=1),
-                jnp.mean(numerator / trajectory_target_norm, axis=1),
-                jnp.nan,
-            )
+            else:
+                numerator = jnp.sum(
+                    jnp.square(predicted_fields - target_fields), axis=(1, 3)
+                )
+                if trajectory_target_norm is None:
+                    trajectory_target_norm = jnp.sum(
+                        jnp.square(target_fields), axis=(1, 3)
+                    )
+                sample_loss = jnp.where(
+                    jnp.all(trajectory_target_norm > 0.0, axis=1),
+                    jnp.mean(numerator / trajectory_target_norm, axis=1),
+                    jnp.nan,
+                )
         else:
             scales = regime_scales_jax[regime_index][:, None, :, None]
             sample_loss = jnp.mean(
@@ -1505,6 +1614,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spectral-modes", type=int, default=16)
     parser.add_argument("--closure-history-input", action="store_true")
     parser.add_argument("--relative-trajectory-loss", action="store_true")
+    parser.add_argument(
+        "--relative-time-block",
+        type=float,
+        default=0.0,
+        help="Fixed physical-time block duration for relative trajectory loss",
+    )
+    parser.add_argument(
+        "--convergence-floor-file",
+        type=Path,
+        default=None,
+        help="NPZ containing regime/channel RMS teacher-grid disagreement",
+    )
     parser.add_argument("--stats-stride", type=int, default=20)
     parser.add_argument("--validation-every", type=int, default=5)
     parser.add_argument("--training-diagnostic-cases-per-regime", type=int, default=4)
@@ -1567,6 +1688,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
     elif any((args.closure_history_input, args.relative_trajectory_loss)):
         raise ValueError("the scaling/history ablation requires continuous trajectories")
+    if (args.relative_time_block > 0.0) != (args.convergence_floor_file is not None):
+        raise ValueError(
+            "relative-time-block and convergence-floor-file must be enabled together"
+        )
+    if args.relative_time_block > 0.0 and not args.relative_trajectory_loss:
+        raise ValueError("fixed time blocks require relative-trajectory-loss")
     if not 0.0 <= args.loss_ema_decay < 1.0:
         raise ValueError("loss EMA decay must be in [0, 1)")
     if not math.isfinite(args.nonfinite_trajectory_penalty) or (
@@ -1597,6 +1724,47 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     domain_length = float(configuration["teacher_L"])
     dt = float(configuration["teacher_dt"])
     poisson_sign = float(configuration["teacher_poisson_sign"])
+    relative_time_block_steps = 0
+    relative_time_block_count = 0
+    convergence_floor_rms = None
+    convergence_floor_metadata = None
+    if args.convergence_floor_file is not None:
+        relative_time_block_steps = int(round(args.relative_time_block / dt))
+        if relative_time_block_steps <= 0 or not math.isclose(
+            relative_time_block_steps * dt, args.relative_time_block, abs_tol=1e-10
+        ):
+            raise ValueError("relative-time-block must be an integer multiple of dt")
+        total_steps = int(round(float(configuration["T_final"]) / dt))
+        relative_time_block_count = int(
+            math.ceil(total_steps / relative_time_block_steps)
+        )
+        convergence_floor_rms, convergence_floor_metadata = _load_convergence_floor(
+            args.convergence_floor_file
+        )
+        expected_floor_metadata = {
+            "regimes": list(REGIMES),
+            "channels": [
+                "density_perturbation",
+                "velocity",
+                "pressure_perturbation",
+                "electric_field",
+            ],
+            "rollout_Nx": int(args.rollout_Nx),
+        }
+        floor_mismatches = {
+            key: (convergence_floor_metadata.get(key), expected)
+            for key, expected in expected_floor_metadata.items()
+            if convergence_floor_metadata.get(key) != expected
+        }
+        if floor_mismatches:
+            raise ValueError(
+                f"Convergence floor metadata does not match training: {floor_mismatches}"
+            )
+        print(
+            f"[data] block-relative trajectory loss: block={args.relative_time_block:g} "
+            f"blocks={relative_time_block_count} "
+            f"convergence_floor={args.convergence_floor_file}"
+        )
     if int(args.rollout_Nx) > source_nx:
         raise ValueError("rollout-Nx cannot exceed the cached teacher Nx")
     outdir = args.outdir.resolve()
@@ -1818,6 +1986,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "closure_output": "zero_mean_heat_flux_gradient",
         "closure_history_input": args.closure_history_input,
         "relative_trajectory_loss": args.relative_trajectory_loss,
+        "relative_time_block": args.relative_time_block,
+        "convergence_floor_file": (
+            None
+            if args.convergence_floor_file is None
+            else str(args.convergence_floor_file.resolve())
+        ),
+        "convergence_floor_metadata": convergence_floor_metadata,
     }
     started = time.perf_counter()
     global_epoch = 0
@@ -1931,6 +2106,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             pressure_floor=args.pressure_floor,
             relative_trajectory_loss=args.relative_trajectory_loss,
             closure_history_input=args.closure_history_input,
+            relative_time_block_steps=relative_time_block_steps,
+            relative_time_block_count=relative_time_block_count,
+            convergence_floor_rms=convergence_floor_rms,
         )
         value_and_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
         evaluate_loss = jax.jit(loss_fn)
@@ -2010,6 +2188,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     pressure_floor=args.pressure_floor,
                     relative_trajectory_loss=args.relative_trajectory_loss,
                     closure_history_input=args.closure_history_input,
+                    relative_time_block_steps=relative_time_block_steps,
+                    relative_time_block_count=relative_time_block_count,
+                    convergence_floor_rms=convergence_floor_rms,
                 )
                 cache[key] = jax.jit(
                     jax.value_and_grad(chunk_loss, has_aux=True)
@@ -2034,10 +2215,40 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     jnp.asarray(k_arr, dtype=jnp.float32),
                     poisson_sign=poisson_sign,
                 ).reshape(target_shape[0], target_shape[1], 4, target_shape[-1])
-                trajectory_target_norm = jnp.sum(
-                    jnp.square(target_fields), axis=(1, 3)
-                )
-                if np.any(np.asarray(trajectory_target_norm) <= 0.0):
+                if convergence_floor_rms is not None:
+                    full_indices = jnp.broadcast_to(
+                        jnp.arange(1, target_shape[1] + 1, dtype=jnp.int32)[None, :],
+                        (target_shape[0], target_shape[1]),
+                    )
+                    membership = jax.nn.one_hot(
+                        jnp.minimum(
+                            (full_indices - 1) // relative_time_block_steps,
+                            relative_time_block_count - 1,
+                        ),
+                        relative_time_block_count,
+                        dtype=target_fields.dtype,
+                    )
+                    target_energy = jnp.sum(jnp.square(target_fields), axis=-1)
+                    trajectory_target_norm = jnp.einsum(
+                        "btq,btc->bqc", membership, target_energy
+                    )
+                    full_counts = jnp.sum(membership, axis=1)
+                    floor_by_regime = jnp.asarray(
+                        convergence_floor_rms, dtype=target_fields.dtype
+                    )[regime_index]
+                    trajectory_target_norm = jnp.maximum(
+                        trajectory_target_norm,
+                        full_counts[:, :, None]
+                        * target_shape[-1]
+                        * jnp.square(floor_by_regime[:, None, :]),
+                    )
+                else:
+                    trajectory_target_norm = jnp.sum(
+                        jnp.square(target_fields), axis=(1, 3)
+                    )
+                if convergence_floor_rms is None and np.any(
+                    np.asarray(trajectory_target_norm) <= 0.0
+                ):
                     raise ValueError(
                         "Relative trajectory loss excludes zero-norm target trajectories"
                     )
@@ -2065,6 +2276,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     amplitude,
                     regime_index,
                     trajectory_target_norm,
+                    jnp.broadcast_to(
+                        jnp.arange(
+                            completed + 1,
+                            completed + chunk_length + 1,
+                            dtype=jnp.int32,
+                        )[None, :],
+                        (targets.shape[0], chunk_length),
+                    ),
                 )
                 if gradients:
                     (
