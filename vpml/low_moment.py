@@ -154,6 +154,211 @@ def init_spectral_memory_params(
     }
 
 
+def init_explicit_window_params(
+    key: Array,
+    *,
+    width: int,
+    spectral_modes: int,
+    memory_steps: int,
+    input_channels: int = 4,
+    dtype=jnp.float32,
+) -> Dict[str, Array]:
+    """Initialize a causal finite-window spectral closure.
+
+    Unlike the recurrent backend, this model does not compress the observed
+    history into a latent state.  Every retained lag has an explicit learned
+    coefficient in the Fourier-domain delay kernel.
+    """
+    width = int(width)
+    modes = int(spectral_modes)
+    lags = int(memory_steps)
+    channels = int(input_channels)
+    if min(width, modes, lags, channels) <= 0:
+        raise ValueError("width, spectral_modes, memory_steps, and channels must be positive")
+    keys = jax.random.split(key, 10)
+    history_scale = 0.08 / math.sqrt(float(lags * channels))
+    current_scale = 0.12 / math.sqrt(float(channels))
+    mixer_scale = math.sqrt(2.0 / float(2 * width))
+    return {
+        "history_local": history_scale
+        * jax.random.normal(keys[0], (width, lags, channels), dtype=dtype),
+        "history_spectral_real": history_scale
+        * jax.random.normal(keys[1], (modes, width, lags, channels), dtype=dtype),
+        "history_spectral_imag": history_scale
+        * jax.random.normal(keys[2], (modes, width, lags, channels), dtype=dtype),
+        "current_local": current_scale
+        * jax.random.normal(keys[3], (width, channels), dtype=dtype),
+        "current_spectral_real": current_scale
+        * jax.random.normal(keys[4], (modes, width, channels), dtype=dtype),
+        "current_spectral_imag": current_scale
+        * jax.random.normal(keys[5], (modes, width, channels), dtype=dtype),
+        "mixer_local": mixer_scale
+        * jax.random.normal(keys[6], (width, width), dtype=dtype),
+        "mixer_spectral_real": (0.08 / math.sqrt(float(width)))
+        * jax.random.normal(keys[7], (modes, width, width), dtype=dtype),
+        "mixer_spectral_imag": (0.08 / math.sqrt(float(width)))
+        * jax.random.normal(keys[8], (modes, width, width), dtype=dtype),
+        "output_local": jnp.zeros((1, width), dtype=dtype),
+        "output_spectral_real": jnp.zeros((modes, 1, width), dtype=dtype),
+        "output_spectral_imag": jnp.zeros((modes, 1, width), dtype=dtype),
+        "amplitude_gain": jnp.zeros((channels,), dtype=dtype),
+    }
+
+
+def _normalized_closure_fields(
+    params: Dict[str, Array],
+    state: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    input_scale: Array,
+    amplitude_center: float,
+    amplitude_scale: float,
+    previous_heat_flux_gradient: Array | None,
+    heat_flux_gradient_scale: float,
+    poisson_sign: float,
+) -> Array:
+    fields = primitive_fields(state, k_arr, poisson_sign=poisson_sign)
+    real_dtype = fields.dtype
+    normalized = fields / jnp.asarray(input_scale, dtype=real_dtype)[None, :, None]
+    if previous_heat_flux_gradient is not None:
+        previous = jnp.asarray(previous_heat_flux_gradient, dtype=real_dtype)
+        previous = previous / jnp.asarray(heat_flux_gradient_scale, dtype=real_dtype)
+        normalized = jnp.concatenate((normalized, previous[:, None]), axis=1)
+    physical_amplitude = jnp.asarray(amplitude, dtype=real_dtype)
+    log_amplitude = jnp.log(jnp.maximum(physical_amplitude, 1e-8))
+    amplitude_feature = (
+        (log_amplitude - jnp.asarray(amplitude_center, dtype=real_dtype))
+        / jnp.asarray(max(float(amplitude_scale), 1e-8), dtype=real_dtype)
+    )
+    gain_exponent = amplitude_feature[:, None] * jnp.tanh(
+        jnp.asarray(params["amplitude_gain"], dtype=real_dtype)
+    )[None, :]
+    gain = jnp.exp(jnp.clip(gain_exponent, -6.0, 6.0))
+    return normalized * gain[:, :, None]
+
+
+def explicit_window_closure_step(
+    params: Dict[str, Array],
+    state: Array,
+    history: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    input_scale: Array,
+    heat_flux_gradient_scale: float,
+    amplitude_center: float,
+    amplitude_scale: float,
+    previous_heat_flux_gradient: Array | None = None,
+    poisson_sign: float = 1.0,
+    normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
+    encoded_history: Array | None = None,
+) -> Array:
+    """Predict the closure from the current state and an explicit state window."""
+    state = jnp.asarray(state)
+    history = jnp.asarray(history)
+    batch, lag_count, _, nx = history.shape
+    current = _normalized_closure_fields(
+        params,
+        state,
+        amplitude,
+        k_arr,
+        input_scale=input_scale,
+        amplitude_center=amplitude_center,
+        amplitude_scale=amplitude_scale,
+        previous_heat_flux_gradient=previous_heat_flux_gradient,
+        heat_flux_gradient_scale=heat_flux_gradient_scale,
+        poisson_sign=poisson_sign,
+    )
+    if encoded_history is None:
+        encoded_history = encode_explicit_window_history(
+            params,
+            history,
+            k_arr,
+            input_scale=input_scale,
+            closure_history_input=(previous_heat_flux_gradient is not None),
+            poisson_sign=poisson_sign,
+        )
+    local = encoded_history + jnp.einsum(
+        "bcn,wc->bwn", current, params["current_local"]
+    )
+    current_hat = jnp.fft.rfft(current, axis=-1)
+    retained = min(int(params["history_spectral_real"].shape[0]), int(current_hat.shape[-1]))
+    current_weights = _complex_weights(
+        params["current_spectral_real"][:retained],
+        params["current_spectral_imag"][:retained],
+        current_hat.dtype,
+    )
+    encoded_hat = jnp.einsum(
+        "bcm,mwc->bwm", current_hat[..., :retained], current_weights
+    )
+    full_hat = jnp.zeros(
+        (batch, params["current_local"].shape[0], current_hat.shape[-1]),
+        dtype=current_hat.dtype,
+    ).at[..., :retained].set(encoded_hat)
+    encoded = local + jnp.fft.irfft(full_hat, n=nx, axis=-1)
+    encoded = jax.nn.silu(encoded)
+    mixed = spectral_channel_operator(
+        encoded,
+        params["mixer_local"],
+        params["mixer_spectral_real"],
+        params["mixer_spectral_imag"],
+    )
+    features = encoded + jax.nn.silu(mixed)
+    raw = spectral_channel_operator(
+        features,
+        params["output_local"],
+        params["output_spectral_real"],
+        params["output_spectral_imag"],
+    )[:, 0]
+    bound = jnp.asarray(normalized_heat_flux_bound, dtype=state.dtype)
+    normalized_gradient = bound * jnp.tanh(raw / bound)
+    gradient = jnp.asarray(heat_flux_gradient_scale, dtype=state.dtype) * normalized_gradient
+    return gradient - jnp.mean(gradient, axis=-1, keepdims=True)
+
+
+def encode_explicit_window_history(
+    params: Dict[str, Array],
+    history: Array,
+    k_arr: Array,
+    *,
+    input_scale: Array,
+    closure_history_input: bool,
+    poisson_sign: float = 1.0,
+) -> Array:
+    """Encode a sampled history once; reuse it until the next sampled update."""
+    history = jnp.asarray(history)
+    batch, lag_count, _, nx = history.shape
+    history_flat = history.reshape(batch * lag_count, history.shape[2], nx)
+    fields = primitive_fields(
+        history_flat, k_arr, poisson_sign=poisson_sign
+    ).reshape(batch, lag_count, 4, nx)
+    fields = fields / jnp.asarray(input_scale, dtype=history.dtype)[None, None, :, None]
+    if closure_history_input:
+        fields = jnp.concatenate(
+            (fields, jnp.zeros((batch, lag_count, 1, nx), dtype=history.dtype)),
+            axis=2,
+        )
+    local = jnp.einsum("blcn,wlc->bwn", fields, params["history_local"])
+    fields_hat = jnp.fft.rfft(fields, axis=-1)
+    retained = min(
+        int(params["history_spectral_real"].shape[0]), int(fields_hat.shape[-1])
+    )
+    weights = _complex_weights(
+        params["history_spectral_real"][:retained],
+        params["history_spectral_imag"][:retained],
+        fields_hat.dtype,
+    )
+    encoded_hat = jnp.einsum(
+        "blcm,mwlc->bwm", fields_hat[..., :retained], weights
+    )
+    full_hat = jnp.zeros(
+        (batch, params["history_local"].shape[0], fields_hat.shape[-1]),
+        dtype=fields_hat.dtype,
+    ).at[..., :retained].set(encoded_hat)
+    return local + jnp.fft.irfft(full_hat, n=nx, axis=-1)
+
+
 def spectral_memory_closure_step(
     params: Dict[str, Array],
     state: Array,
@@ -438,3 +643,122 @@ def rollout_low_moment_closure(
     del final_state
     result = (jnp.swapaxes(states, 0, 1), final_hidden)
     return result + (final_gradient,) if return_closure_history else result
+
+
+def rollout_explicit_window_closure(
+    params: Dict[str, Array],
+    initial_state: Array,
+    history: Array,
+    history_counter: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    horizon: int,
+    dt: float,
+    memory_stride: int,
+    input_scale: Array,
+    heat_flux_gradient_scale: float,
+    amplitude_center: float,
+    amplitude_scale: float,
+    previous_heat_flux_gradient: Array | None = None,
+    closure_history_input: bool = False,
+    encoded_history: Array | None = None,
+    poisson_sign: float = 1.0,
+    normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
+    density_floor: float = DEFAULT_DENSITY_FLOOR,
+    pressure_floor: float = DEFAULT_PRESSURE_FLOOR,
+) -> Tuple[Array, Tuple[Array, Array, Array]]:
+    """Roll out while retaining a sampled window of model-produced states."""
+    stride = int(memory_stride)
+    if stride <= 0:
+        raise ValueError("memory_stride must be positive")
+    if previous_heat_flux_gradient is None:
+        previous_heat_flux_gradient = jnp.zeros(
+            (initial_state.shape[0], initial_state.shape[-1]), dtype=initial_state.dtype
+        )
+    history_counter = jnp.asarray(history_counter, dtype=jnp.int32)
+    if encoded_history is None:
+        encoded_history = encode_explicit_window_history(
+            params,
+            history,
+            k_arr,
+            input_scale=input_scale,
+            closure_history_input=closure_history_input,
+            poisson_sign=poisson_sign,
+        )
+
+    def body(carry, _):
+        state, window, encoded, counter, previous = carry
+        gradient = explicit_window_closure_step(
+            params,
+            state,
+            window,
+            amplitude,
+            k_arr,
+            input_scale=input_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            amplitude_center=amplitude_center,
+            amplitude_scale=amplitude_scale,
+            previous_heat_flux_gradient=(previous if closure_history_input else None),
+            poisson_sign=poisson_sign,
+            normalized_heat_flux_bound=normalized_heat_flux_bound,
+            encoded_history=encoded,
+        )
+        state_new = low_moment_rk4_step(
+            state,
+            gradient,
+            k_arr,
+            dt,
+            poisson_sign=poisson_sign,
+            density_floor=density_floor,
+            pressure_floor=pressure_floor,
+        )
+        next_counter = counter + 1
+        should_sample = next_counter >= stride
+        def sample_window(_):
+            sampled_window = jnp.concatenate(
+                (window[:, 1:], state_new[:, None]), axis=1
+            )
+            sampled_encoded = encode_explicit_window_history(
+                params,
+                sampled_window,
+                k_arr,
+                input_scale=input_scale,
+                closure_history_input=closure_history_input,
+                poisson_sign=poisson_sign,
+            )
+            return sampled_window, sampled_encoded, jnp.asarray(0, dtype=jnp.int32)
+
+        def retain_window(_):
+            return window, encoded, next_counter
+
+        window_new, encoded_new, counter_new = jax.lax.cond(
+            should_sample, sample_window, retain_window, operand=None
+        )
+        return (state_new, window_new, encoded_new, counter_new, gradient), state_new
+
+    (
+        final_state,
+        final_window,
+        final_encoded,
+        final_counter,
+        final_gradient,
+    ), states = jax.lax.scan(
+        jax.checkpoint(body),
+        (
+            initial_state,
+            history,
+            encoded_history,
+            history_counter,
+            previous_heat_flux_gradient,
+        ),
+        xs=None,
+        length=int(horizon),
+    )
+    del final_state
+    return jnp.swapaxes(states, 0, 1), (
+        final_window,
+        final_encoded,
+        final_counter,
+        final_gradient,
+    )
