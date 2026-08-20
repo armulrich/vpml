@@ -17,14 +17,94 @@ from model.train.low_moment_closure import (
     sample_complete_trajectory_batch,
 )
 from vpml.low_moment import (
+    explicit_window_closure_step,
+    init_explicit_window_params,
     init_spectral_memory_params,
     low_moment_rk4_step,
     primitive_fields,
     spectral_memory_closure_step,
+    rollout_explicit_window_closure,
 )
 
 
 class LowMomentClosureTests(unittest.TestCase):
+    def test_explicit_window_is_history_sensitive_and_translation_equivariant(self) -> None:
+        nx = 32
+        width = 8
+        memory_steps = 6
+        shift = 5
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_explicit_window_params(
+            jax.random.PRNGKey(41),
+            width=width,
+            spectral_modes=8,
+            memory_steps=memory_steps,
+        )
+        params["output_local"] = jnp.ones((1, width), dtype=jnp.float32)
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        history_a = jnp.zeros((1, memory_steps, 3, nx), dtype=jnp.float32)
+        history_b = history_a.at[:, 0, 0].set(0.05 * jnp.cos(x))
+        kwargs = dict(
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+        )
+        gradient_a = explicit_window_closure_step(
+            params, state, history_a, jnp.asarray([0.1]), k_arr, **kwargs
+        )
+        gradient_b = explicit_window_closure_step(
+            params, state, history_b, jnp.asarray([0.1]), k_arr, **kwargs
+        )
+        self.assertGreater(float(jnp.linalg.norm(gradient_b - gradient_a)), 1e-7)
+        gradient_shifted = explicit_window_closure_step(
+            params,
+            jnp.roll(state, shift, axis=-1),
+            jnp.roll(history_b, shift, axis=-1),
+            jnp.asarray([0.1]),
+            k_arr,
+            **kwargs,
+        )
+        np.testing.assert_allclose(
+            np.asarray(gradient_shifted),
+            np.roll(np.asarray(gradient_b), shift, axis=-1),
+            atol=3e-6,
+        )
+
+    def test_explicit_window_equilibrium_and_stride_update(self) -> None:
+        nx = 16
+        memory_steps = 4
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_explicit_window_params(
+            jax.random.PRNGKey(42),
+            width=6,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+        )
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        history = jnp.zeros((1, memory_steps, 3, nx), dtype=jnp.float32)
+        states, (history_new, encoded, counter, gradient) = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=3,
+            dt=0.01,
+            memory_stride=2,
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+        )
+        np.testing.assert_array_equal(np.asarray(states), np.zeros_like(states))
+        np.testing.assert_array_equal(np.asarray(history_new), np.zeros_like(history_new))
+        np.testing.assert_array_equal(np.asarray(encoded), np.zeros_like(encoded))
+        np.testing.assert_array_equal(np.asarray(gradient), np.zeros_like(gradient))
+        self.assertEqual(int(counter), 1)
+
     def test_block_relative_loss_weights_fixed_time_blocks_equally(self) -> None:
         target = jnp.ones((1, 4, 4, 2), dtype=jnp.float32)
         predicted = target.at[:, :2].add(1.0).at[:, 2:].add(2.0)

@@ -32,9 +32,12 @@ from vpml.low_moment import (
     DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
     DEFAULT_PRESSURE_FLOOR,
     electric_field_from_density,
+    encode_explicit_window_history,
     init_spectral_memory_params,
+    init_explicit_window_params,
     primitive_fields,
     rollout_low_moment_closure,
+    rollout_explicit_window_closure,
     spectral_memory_closure_step,
     warm_spectral_memory,
 )
@@ -824,6 +827,8 @@ def make_loss_function(
     relative_time_block_steps: int = 0,
     relative_time_block_count: int = 0,
     convergence_floor_rms: Optional[np.ndarray] = None,
+    memory_backend: str = "latent_recurrent",
+    memory_stride: int = 1,
 ):
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
@@ -835,46 +840,69 @@ def make_loss_function(
     )
 
     def loss(params, batch):
-        warm_result = warm_spectral_memory(
-            params,
-            batch["memory"],
-            batch["amplitude"],
-            k_jax,
-            width=width,
-            input_scale=input_scale_jax,
-            heat_flux_gradient_scale=heat_flux_gradient_scale,
-            amplitude_center=amplitude_center,
-            amplitude_scale=amplitude_scale,
-            closure_history_input=closure_history_input,
-            return_closure_history=closure_history_input,
-            poisson_sign=poisson_sign,
-            normalized_heat_flux_bound=normalized_heat_flux_bound,
-        )
-        if closure_history_input:
-            hidden, previous_gradient = warm_result
+        if memory_backend == "explicit_window":
+            rollout_result = rollout_explicit_window_closure(
+                params,
+                batch["initial"],
+                batch["memory"],
+                jnp.asarray(0, dtype=jnp.int32),
+                batch["amplitude"],
+                k_jax,
+                horizon=horizon,
+                dt=dt,
+                memory_stride=memory_stride,
+                input_scale=input_scale_jax,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                amplitude_center=amplitude_center,
+                amplitude_scale=amplitude_scale,
+                closure_history_input=closure_history_input,
+                poisson_sign=poisson_sign,
+                normalized_heat_flux_bound=normalized_heat_flux_bound,
+                density_floor=density_floor,
+                pressure_floor=pressure_floor,
+            )
+            predicted = rollout_result[0]
         else:
-            hidden = warm_result
-            previous_gradient = None
-        rollout_result = rollout_low_moment_closure(
-            params,
-            batch["initial"],
-            hidden,
-            batch["amplitude"],
-            k_jax,
-            horizon=horizon,
-            dt=dt,
-            input_scale=input_scale_jax,
-            heat_flux_gradient_scale=heat_flux_gradient_scale,
-            amplitude_center=amplitude_center,
-            amplitude_scale=amplitude_scale,
-            previous_heat_flux_gradient=previous_gradient,
-            closure_history_input=closure_history_input,
-            poisson_sign=poisson_sign,
-            normalized_heat_flux_bound=normalized_heat_flux_bound,
-            density_floor=density_floor,
-            pressure_floor=pressure_floor,
-        )
-        predicted = rollout_result[0]
+            warm_result = warm_spectral_memory(
+                params,
+                batch["memory"],
+                batch["amplitude"],
+                k_jax,
+                width=width,
+                input_scale=input_scale_jax,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                amplitude_center=amplitude_center,
+                amplitude_scale=amplitude_scale,
+                closure_history_input=closure_history_input,
+                return_closure_history=closure_history_input,
+                poisson_sign=poisson_sign,
+                normalized_heat_flux_bound=normalized_heat_flux_bound,
+            )
+            if closure_history_input:
+                hidden, previous_gradient = warm_result
+            else:
+                hidden = warm_result
+                previous_gradient = None
+            rollout_result = rollout_low_moment_closure(
+                params,
+                batch["initial"],
+                hidden,
+                batch["amplitude"],
+                k_jax,
+                horizon=horizon,
+                dt=dt,
+                input_scale=input_scale_jax,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                amplitude_center=amplitude_center,
+                amplitude_scale=amplitude_scale,
+                previous_heat_flux_gradient=previous_gradient,
+                closure_history_input=closure_history_input,
+                poisson_sign=poisson_sign,
+                normalized_heat_flux_bound=normalized_heat_flux_bound,
+                density_floor=density_floor,
+                pressure_floor=pressure_floor,
+            )
+            predicted = rollout_result[0]
         batch_count, time_count = predicted.shape[:2]
         predicted_fields = primitive_fields(
             predicted.reshape(batch_count * time_count, 3, predicted.shape[-1]),
@@ -951,6 +979,8 @@ def make_continuous_chunk_loss_function(
     relative_time_block_steps: int = 0,
     relative_time_block_count: int = 0,
     convergence_floor_rms: Optional[np.ndarray] = None,
+    memory_backend: str = "latent_recurrent",
+    memory_stride: int = 1,
 ):
     """Return one truncated-gradient chunk of a continuous autonomous rollout."""
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
@@ -972,7 +1002,41 @@ def make_continuous_chunk_loss_function(
         trajectory_target_norm=None,
         target_indices=None,
     ):
-        if warm_memory:
+        if memory_backend == "explicit_window":
+            if warm_memory:
+                history = memory_or_hidden
+                encoded_history = None
+                history_counter = jnp.asarray(0, dtype=jnp.int32)
+                previous_gradient = jnp.zeros(
+                    (initial_state.shape[0], initial_state.shape[-1]),
+                    dtype=initial_state.dtype,
+                )
+            else:
+                history, encoded_history, history_counter, previous_gradient = memory_or_hidden
+            rollout_result = rollout_explicit_window_closure(
+                params,
+                initial_state,
+                history,
+                history_counter,
+                amplitude,
+                k_jax,
+                horizon=horizon,
+                dt=dt,
+                memory_stride=memory_stride,
+                input_scale=input_scale_jax,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                amplitude_center=amplitude_center,
+                amplitude_scale=amplitude_scale,
+                previous_heat_flux_gradient=previous_gradient,
+                closure_history_input=closure_history_input,
+                encoded_history=encoded_history,
+                poisson_sign=poisson_sign,
+                normalized_heat_flux_bound=normalized_heat_flux_bound,
+                density_floor=density_floor,
+                pressure_floor=pressure_floor,
+            )
+            predicted, final_memory = rollout_result
+        elif warm_memory:
             warmed = warm_spectral_memory(
                 params,
                 memory_or_hidden,
@@ -998,31 +1062,37 @@ def make_continuous_chunk_loss_function(
         else:
             hidden = memory_or_hidden
             previous_gradient = None
-        rollout_result = rollout_low_moment_closure(
-            params,
-            initial_state,
-            hidden,
-            amplitude,
-            k_jax,
-            horizon=horizon,
-            dt=dt,
-            input_scale=input_scale_jax,
-            heat_flux_gradient_scale=heat_flux_gradient_scale,
-            amplitude_center=amplitude_center,
-            amplitude_scale=amplitude_scale,
-            previous_heat_flux_gradient=previous_gradient,
-            closure_history_input=closure_history_input,
-            return_closure_history=closure_history_input,
-            poisson_sign=poisson_sign,
-            normalized_heat_flux_bound=normalized_heat_flux_bound,
-            density_floor=density_floor,
-            pressure_floor=pressure_floor,
-        )
-        if closure_history_input:
-            predicted, final_hidden, final_gradient = rollout_result
-        else:
-            predicted, final_hidden = rollout_result
-            final_gradient = None
+        if memory_backend != "explicit_window":
+            rollout_result = rollout_low_moment_closure(
+                params,
+                initial_state,
+                hidden,
+                amplitude,
+                k_jax,
+                horizon=horizon,
+                dt=dt,
+                input_scale=input_scale_jax,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                amplitude_center=amplitude_center,
+                amplitude_scale=amplitude_scale,
+                previous_heat_flux_gradient=previous_gradient,
+                closure_history_input=closure_history_input,
+                return_closure_history=closure_history_input,
+                poisson_sign=poisson_sign,
+                normalized_heat_flux_bound=normalized_heat_flux_bound,
+                density_floor=density_floor,
+                pressure_floor=pressure_floor,
+            )
+            if closure_history_input:
+                predicted, final_hidden, final_gradient = rollout_result
+            else:
+                predicted, final_hidden = rollout_result
+                final_gradient = None
+            final_memory = (
+                (final_hidden, final_gradient)
+                if closure_history_input
+                else final_hidden
+            )
         batch_count, time_count = predicted.shape[:2]
         predicted_fields = primitive_fields(
             predicted.reshape(batch_count * time_count, 3, predicted.shape[-1]),
@@ -1070,9 +1140,6 @@ def make_continuous_chunk_loss_function(
                 / jnp.maximum(jnp.sum(regime_index == index), 1)
                 for index in range(len(REGIMES))
             ]
-        )
-        final_memory = (
-            (final_hidden, final_gradient) if closure_history_input else final_hidden
         )
         return jnp.mean(sample_loss), (
             regime_loss,
@@ -1299,6 +1366,7 @@ def _evaluate_heldout(
     dt: float,
     width: int,
     memory_steps: int,
+    memory_stride: int,
     input_scale: np.ndarray,
     heat_flux_gradient_scale: float,
     amplitude_center: float,
@@ -1309,6 +1377,7 @@ def _evaluate_heldout(
     density_floor: float,
     pressure_floor: float,
     closure_history_input: bool = False,
+    memory_backend: str = "latent_recurrent",
 ) -> None:
     amplitudes_by_id = _case_amplitudes(manifest)
     initial_states = []
@@ -1339,21 +1408,39 @@ def _evaluate_heldout(
     # Training clamps unavailable pre-t=0 history to the initial state. Apply
     # the same causal initialization during autonomous held-out evaluation.
     initial_history = jnp.repeat(state[:, None, :, :], int(memory_steps), axis=1)
-    hidden, previous_gradient = warm_spectral_memory(
-        params,
-        initial_history,
-        amplitude,
-        k_jax,
-        width=width,
-        input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
-        heat_flux_gradient_scale=heat_flux_gradient_scale,
-        amplitude_center=amplitude_center,
-        amplitude_scale=amplitude_scale,
-        closure_history_input=closure_history_input,
-        return_closure_history=True,
-        poisson_sign=poisson_sign,
-        normalized_heat_flux_bound=normalized_heat_flux_bound,
-    )
+    previous_gradient = jnp.zeros((state.shape[0], state.shape[-1]), dtype=state.dtype)
+    if memory_backend == "explicit_window":
+        initial_encoded_history = encode_explicit_window_history(
+            params,
+            initial_history,
+            k_jax,
+            input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
+            closure_history_input=closure_history_input,
+            poisson_sign=poisson_sign,
+        )
+        model_memory = (
+            initial_history,
+            initial_encoded_history,
+            jnp.asarray(0, dtype=jnp.int32),
+            previous_gradient,
+        )
+    else:
+        hidden, previous_gradient = warm_spectral_memory(
+            params,
+            initial_history,
+            amplitude,
+            k_jax,
+            width=width,
+            input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            amplitude_center=amplitude_center,
+            amplitude_scale=amplitude_scale,
+            closure_history_input=closure_history_input,
+            return_closure_history=True,
+            poisson_sign=poisson_sign,
+            normalized_heat_flux_bound=normalized_heat_flux_bound,
+        )
+        model_memory = (hidden, previous_gradient)
     field_hat_chunks = [
         np.fft.rfft(
             np.asarray(
@@ -1369,8 +1456,33 @@ def _evaluate_heldout(
     pressure_limiter_hits = np.zeros((case_count,), dtype=np.int64)
     state_point_count = 0
 
-    def run_chunk(current_state, current_hidden, current_gradient, length: int):
-        return rollout_low_moment_closure(
+    def run_chunk(current_state, current_memory, length: int):
+        if memory_backend == "explicit_window":
+            window, encoded, counter, gradient = current_memory
+            return rollout_explicit_window_closure(
+                params,
+                current_state,
+                window,
+                counter,
+                amplitude,
+                k_jax,
+                horizon=length,
+                dt=dt,
+                memory_stride=memory_stride,
+                input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                amplitude_center=amplitude_center,
+                amplitude_scale=amplitude_scale,
+                previous_heat_flux_gradient=gradient,
+                closure_history_input=closure_history_input,
+                encoded_history=encoded,
+                poisson_sign=poisson_sign,
+                normalized_heat_flux_bound=normalized_heat_flux_bound,
+                density_floor=density_floor,
+                pressure_floor=pressure_floor,
+            )
+        current_hidden, current_gradient = current_memory
+        states, final_hidden, final_gradient = rollout_low_moment_closure(
             params,
             current_state,
             current_hidden,
@@ -1390,6 +1502,7 @@ def _evaluate_heldout(
             density_floor=density_floor,
             pressure_floor=pressure_floor,
         )
+        return states, (final_hidden, final_gradient)
 
     total_steps = int(round(float(manifest.get("T_final", 0.0)) / float(dt)))
     if total_steps <= 0:
@@ -1400,11 +1513,9 @@ def _evaluate_heldout(
         length = min(int(chunk_steps), total_steps - completed)
         if length not in compiled:
             compiled[length] = jax.jit(
-                lambda s, h, g, n=length: run_chunk(s, h, g, n)
+                lambda s, m, n=length: run_chunk(s, m, n)
             )
-        states, hidden, previous_gradient = compiled[length](
-            state, hidden, previous_gradient
-        )
+        states, model_memory = compiled[length](state, model_memory)
         state = states[:, -1]
         states_numpy = np.asarray(states, dtype=np.float64)
         density = 1.0 + states_numpy[:, :, 0]
@@ -1602,6 +1713,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--memory-steps", type=int, default=50)
     parser.add_argument("--memory-stride", type=int, default=10)
+    parser.add_argument(
+        "--memory-backend",
+        choices=("latent_recurrent", "explicit_window"),
+        default="latent_recurrent",
+        help="Compress history recurrently or retain it in an explicit delay window",
+    )
     parser.add_argument("--history-stride", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8, help="Per-regime batch size")
     parser.add_argument("--epochs", type=int, default=100)
@@ -1688,6 +1805,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
     elif any((args.closure_history_input, args.relative_trajectory_loss)):
         raise ValueError("the scaling/history ablation requires continuous trajectories")
+    if args.memory_backend == "explicit_window" and args.supervised_warmup_epochs:
+        raise ValueError("explicit-window training does not use supervised warm-up")
     if (args.relative_time_block > 0.0) != (args.convergence_floor_file is not None):
         raise ValueError(
             "relative-time-block and convergence-floor-file must be enabled together"
@@ -1799,6 +1918,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             dt=dt,
             width=int(checkpoint_metadata["width"]),
             memory_steps=int(checkpoint_metadata["memory_steps"]),
+            memory_stride=int(checkpoint_metadata["memory_stride"]),
             input_scale=checkpoint_stats["input_scale"],
             heat_flux_gradient_scale=float(checkpoint_stats["heat_flux_gradient_scale"][0]),
             amplitude_center=float(checkpoint_stats["amplitude_center"][0]),
@@ -1818,6 +1938,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ),
             closure_history_input=bool(
                 checkpoint_metadata.get("closure_history_input", False)
+            ),
+            memory_backend=str(
+                checkpoint_metadata.get("memory_backend", "latent_recurrent")
             ),
         )
         metrics_path = outdir / "training_metrics.npz"
@@ -1889,20 +2012,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         else "curriculum=" + ",".join(f"{h}:{e}" for h, e in curriculum)
     )
     print(
-        f"[model] width={args.width} modes={args.spectral_modes} "
+        f"[model] backend={args.memory_backend} width={args.width} "
+        f"modes={args.spectral_modes} "
         f"memory_span={args.memory_steps * args.memory_stride * dt:.3f} "
         f"rollout_span={args.rollout_horizon * dt:.3f} "
         f"warmup={args.supervised_warmup_epochs} {horizon_description}"
     )
     nx = int(args.rollout_Nx)
     k_arr = 2.0 * math.pi * np.fft.rfftfreq(nx, d=domain_length / nx)
-    params = init_spectral_memory_params(
-        jax.random.PRNGKey(args.seed),
-        width=args.width,
-        spectral_modes=args.spectral_modes,
-        input_channels=5 if args.closure_history_input else 4,
-        dtype=jnp.float32,
-    )
+    if args.memory_backend == "explicit_window":
+        params = init_explicit_window_params(
+            jax.random.PRNGKey(args.seed),
+            width=args.width,
+            spectral_modes=args.spectral_modes,
+            memory_steps=args.memory_steps,
+            input_channels=5 if args.closure_history_input else 4,
+            dtype=jnp.float32,
+        )
+    else:
+        params = init_spectral_memory_params(
+            jax.random.PRNGKey(args.seed),
+            width=args.width,
+            spectral_modes=args.spectral_modes,
+            input_channels=5 if args.closure_history_input else 4,
+            dtype=jnp.float32,
+        )
     if args.init_checkpoint is not None:
         initialized_params, initialized_metadata, _ = _load_checkpoint(
             args.init_checkpoint
@@ -1916,6 +2050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "rollout_Nx": int(args.rollout_Nx),
             "width": int(args.width),
             "spectral_modes": int(args.spectral_modes),
+            "memory_backend": str(args.memory_backend),
         }
         mismatches = {
             key: (initialized_metadata.get(key), value)
@@ -1964,6 +2099,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "supervised_heat_flux_warmup_epochs": args.supervised_warmup_epochs,
         "memory_steps": args.memory_steps,
         "memory_stride": args.memory_stride,
+        "memory_backend": args.memory_backend,
         "width": args.width,
         "spectral_modes": args.spectral_modes,
         "batch_size_per_regime": args.batch_size,
@@ -2109,6 +2245,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             relative_time_block_steps=relative_time_block_steps,
             relative_time_block_count=relative_time_block_count,
             convergence_floor_rms=convergence_floor_rms,
+            memory_backend=args.memory_backend,
+            memory_stride=args.memory_stride,
         )
         value_and_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
         evaluate_loss = jax.jit(loss_fn)
@@ -2191,6 +2329,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     relative_time_block_steps=relative_time_block_steps,
                     relative_time_block_count=relative_time_block_count,
                     convergence_floor_rms=convergence_floor_rms,
+                    memory_backend=args.memory_backend,
+                    memory_stride=args.memory_stride,
                 )
                 cache[key] = jax.jit(
                     jax.value_and_grad(chunk_loss, has_aux=True)
@@ -2690,6 +2830,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             dt=dt,
             width=args.width,
             memory_steps=args.memory_steps,
+            memory_stride=args.memory_stride,
             input_scale=stats["input_scale"],
             heat_flux_gradient_scale=float(stats["heat_flux_gradient_scale"][0]),
             amplitude_center=float(stats["amplitude_center"][0]),
@@ -2700,6 +2841,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             density_floor=args.density_floor,
             pressure_floor=args.pressure_floor,
             closure_history_input=args.closure_history_input,
+            memory_backend=args.memory_backend,
         )
 
 
