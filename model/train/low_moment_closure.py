@@ -1005,6 +1005,10 @@ def make_continuous_chunk_loss_function(
         if memory_backend == "explicit_window":
             if warm_memory:
                 history = memory_or_hidden
+                closure_history = jnp.zeros(
+                    (history.shape[0], history.shape[1], history.shape[-1]),
+                    dtype=history.dtype,
+                )
                 encoded_history = None
                 history_counter = jnp.asarray(0, dtype=jnp.int32)
                 previous_gradient = jnp.zeros(
@@ -1012,7 +1016,13 @@ def make_continuous_chunk_loss_function(
                     dtype=initial_state.dtype,
                 )
             else:
-                history, encoded_history, history_counter, previous_gradient = memory_or_hidden
+                (
+                    history,
+                    closure_history,
+                    encoded_history,
+                    history_counter,
+                    previous_gradient,
+                ) = memory_or_hidden
             rollout_result = rollout_explicit_window_closure(
                 params,
                 initial_state,
@@ -1030,6 +1040,7 @@ def make_continuous_chunk_loss_function(
                 previous_heat_flux_gradient=previous_gradient,
                 closure_history_input=closure_history_input,
                 encoded_history=encoded_history,
+                heat_flux_gradient_history=closure_history,
                 poisson_sign=poisson_sign,
                 normalized_heat_flux_bound=normalized_heat_flux_bound,
                 density_floor=density_floor,
@@ -1410,16 +1421,23 @@ def _evaluate_heldout(
     initial_history = jnp.repeat(state[:, None, :, :], int(memory_steps), axis=1)
     previous_gradient = jnp.zeros((state.shape[0], state.shape[-1]), dtype=state.dtype)
     if memory_backend == "explicit_window":
+        initial_closure_history = jnp.zeros(
+            (state.shape[0], int(memory_steps), state.shape[-1]), dtype=state.dtype
+        )
         initial_encoded_history = encode_explicit_window_history(
             params,
             initial_history,
             k_jax,
             input_scale=jnp.asarray(input_scale, dtype=jnp.float32),
-            closure_history_input=closure_history_input,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            heat_flux_gradient_history=(
+                initial_closure_history if closure_history_input else None
+            ),
             poisson_sign=poisson_sign,
         )
         model_memory = (
             initial_history,
+            initial_closure_history,
             initial_encoded_history,
             jnp.asarray(0, dtype=jnp.int32),
             previous_gradient,
@@ -1458,7 +1476,7 @@ def _evaluate_heldout(
 
     def run_chunk(current_state, current_memory, length: int):
         if memory_backend == "explicit_window":
-            window, encoded, counter, gradient = current_memory
+            window, closure_window, encoded, counter, gradient = current_memory
             return rollout_explicit_window_closure(
                 params,
                 current_state,
@@ -1476,6 +1494,7 @@ def _evaluate_heldout(
                 previous_heat_flux_gradient=gradient,
                 closure_history_input=closure_history_input,
                 encoded_history=encoded,
+                heat_flux_gradient_history=closure_window,
                 poisson_sign=poisson_sign,
                 normalized_heat_flux_bound=normalized_heat_flux_bound,
                 density_floor=density_floor,

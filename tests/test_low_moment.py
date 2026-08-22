@@ -84,7 +84,13 @@ class LowMomentClosureTests(unittest.TestCase):
         )
         state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
         history = jnp.zeros((1, memory_steps, 3, nx), dtype=jnp.float32)
-        states, (history_new, encoded, counter, gradient) = rollout_explicit_window_closure(
+        states, (
+            history_new,
+            closure_history_new,
+            encoded,
+            counter,
+            gradient,
+        ) = rollout_explicit_window_closure(
             params,
             state,
             history,
@@ -101,9 +107,172 @@ class LowMomentClosureTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(np.asarray(states), np.zeros_like(states))
         np.testing.assert_array_equal(np.asarray(history_new), np.zeros_like(history_new))
+        np.testing.assert_array_equal(
+            np.asarray(closure_history_new), np.zeros_like(closure_history_new)
+        )
         np.testing.assert_array_equal(np.asarray(encoded), np.zeros_like(encoded))
         np.testing.assert_array_equal(np.asarray(gradient), np.zeros_like(gradient))
         self.assertEqual(int(counter), 1)
+
+    def test_explicit_window_uses_predicted_closure_history(self) -> None:
+        nx = 32
+        memory_steps = 5
+        width = 8
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_explicit_window_params(
+            jax.random.PRNGKey(43),
+            width=width,
+            spectral_modes=8,
+            memory_steps=memory_steps,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, width), dtype=jnp.float32)
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        history = jnp.zeros((1, memory_steps, 3, nx), dtype=jnp.float32)
+        closure_history_a = jnp.zeros((1, memory_steps, nx), dtype=jnp.float32)
+        closure_history_b = closure_history_a.at[:, 1].set(0.1 * jnp.cos(x))
+        previous = jnp.zeros((1, nx), dtype=jnp.float32)
+        kwargs = dict(
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            previous_heat_flux_gradient=previous,
+        )
+        gradient_a = explicit_window_closure_step(
+            params,
+            state,
+            history,
+            jnp.asarray([0.1]),
+            k_arr,
+            heat_flux_gradient_history=closure_history_a,
+            **kwargs,
+        )
+        gradient_b = explicit_window_closure_step(
+            params,
+            state,
+            history,
+            jnp.asarray([0.1]),
+            k_arr,
+            heat_flux_gradient_history=closure_history_b,
+            **kwargs,
+        )
+        self.assertGreater(float(jnp.linalg.norm(gradient_b - gradient_a)), 1e-7)
+
+    def test_explicit_window_rollout_populates_closure_history_causally(self) -> None:
+        nx = 16
+        memory_steps = 4
+        width = 6
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_explicit_window_params(
+            jax.random.PRNGKey(44),
+            width=width,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, width), dtype=jnp.float32)
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            0.02 * jnp.cos(x)
+        )
+        history = jnp.repeat(state[:, None], memory_steps, axis=1)
+        _, (_, closure_history, _, counter, gradient) = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            dt=0.01,
+            memory_stride=1,
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            closure_history_input=True,
+        )
+        self.assertGreater(float(jnp.linalg.norm(closure_history[:, -2:])), 1e-7)
+        np.testing.assert_array_equal(
+            np.asarray(closure_history[:, :-2]),
+            np.zeros_like(np.asarray(closure_history[:, :-2])),
+        )
+        self.assertGreater(float(jnp.linalg.norm(gradient)), 1e-7)
+        self.assertEqual(int(counter), 0)
+
+    def test_explicit_closure_history_survives_rollout_chunk_boundary(self) -> None:
+        nx = 16
+        memory_steps = 4
+        width = 6
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_explicit_window_params(
+            jax.random.PRNGKey(45),
+            width=width,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, width), dtype=jnp.float32)
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            0.02 * jnp.cos(x)
+        )
+        history = jnp.repeat(state[:, None], memory_steps, axis=1)
+        common = dict(
+            dt=0.01,
+            memory_stride=2,
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            closure_history_input=True,
+        )
+        full_states, full_memory = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=4,
+            **common,
+        )
+        first_states, first_memory = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            **common,
+        )
+        window, closure_history, encoded, counter, gradient = first_memory
+        second_states, second_memory = rollout_explicit_window_closure(
+            params,
+            first_states[:, -1],
+            window,
+            counter,
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            previous_heat_flux_gradient=gradient,
+            heat_flux_gradient_history=closure_history,
+            encoded_history=encoded,
+            **common,
+        )
+        np.testing.assert_allclose(
+            np.asarray(jnp.concatenate((first_states, second_states), axis=1)),
+            np.asarray(full_states),
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        for chunked, complete in zip(second_memory, full_memory):
+            np.testing.assert_allclose(
+                np.asarray(chunked), np.asarray(complete), rtol=2e-6, atol=2e-6
+            )
 
     def test_block_relative_loss_weights_fixed_time_blocks_equally(self) -> None:
         target = jnp.ones((1, 4, 4, 2), dtype=jnp.float32)

@@ -250,6 +250,7 @@ def explicit_window_closure_step(
     amplitude_center: float,
     amplitude_scale: float,
     previous_heat_flux_gradient: Array | None = None,
+    heat_flux_gradient_history: Array | None = None,
     poisson_sign: float = 1.0,
     normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
     encoded_history: Array | None = None,
@@ -276,7 +277,8 @@ def explicit_window_closure_step(
             history,
             k_arr,
             input_scale=input_scale,
-            closure_history_input=(previous_heat_flux_gradient is not None),
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            heat_flux_gradient_history=heat_flux_gradient_history,
             poisson_sign=poisson_sign,
         )
     local = encoded_history + jnp.einsum(
@@ -323,7 +325,8 @@ def encode_explicit_window_history(
     k_arr: Array,
     *,
     input_scale: Array,
-    closure_history_input: bool,
+    heat_flux_gradient_scale: float,
+    heat_flux_gradient_history: Array | None = None,
     poisson_sign: float = 1.0,
 ) -> Array:
     """Encode a sampled history once; reuse it until the next sampled update."""
@@ -334,10 +337,27 @@ def encode_explicit_window_history(
         history_flat, k_arr, poisson_sign=poisson_sign
     ).reshape(batch, lag_count, 4, nx)
     fields = fields / jnp.asarray(input_scale, dtype=history.dtype)[None, None, :, None]
-    if closure_history_input:
-        fields = jnp.concatenate(
-            (fields, jnp.zeros((batch, lag_count, 1, nx), dtype=history.dtype)),
-            axis=2,
+    expected_channels = int(params["history_local"].shape[-1])
+    if expected_channels == 5:
+        if heat_flux_gradient_history is None:
+            heat_flux_gradient_history = jnp.zeros(
+                (batch, lag_count, nx), dtype=history.dtype
+            )
+        closure_history = jnp.asarray(
+            heat_flux_gradient_history, dtype=history.dtype
+        )
+        if closure_history.shape != (batch, lag_count, nx):
+            raise ValueError(
+                "heat-flux-gradient history must match the state-history batch, "
+                "lag, and spatial dimensions"
+            )
+        closure_history = closure_history / jnp.asarray(
+            heat_flux_gradient_scale, dtype=history.dtype
+        )
+        fields = jnp.concatenate((fields, closure_history[:, :, None]), axis=2)
+    elif expected_channels != 4:
+        raise ValueError(
+            f"explicit-window encoder expects 4 or 5 input channels, got {expected_channels}"
         )
     local = jnp.einsum("blcn,wlc->bwn", fields, params["history_local"])
     fields_hat = jnp.fft.rfft(fields, axis=-1)
@@ -667,7 +687,8 @@ def rollout_explicit_window_closure(
     normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
     density_floor: float = DEFAULT_DENSITY_FLOOR,
     pressure_floor: float = DEFAULT_PRESSURE_FLOOR,
-) -> Tuple[Array, Tuple[Array, Array, Array]]:
+    heat_flux_gradient_history: Array | None = None,
+) -> Tuple[Array, Tuple[Array, Array, Array, Array, Array]]:
     """Roll out while retaining a sampled window of model-produced states."""
     stride = int(memory_stride)
     if stride <= 0:
@@ -676,6 +697,11 @@ def rollout_explicit_window_closure(
         previous_heat_flux_gradient = jnp.zeros(
             (initial_state.shape[0], initial_state.shape[-1]), dtype=initial_state.dtype
         )
+    if heat_flux_gradient_history is None:
+        heat_flux_gradient_history = jnp.zeros(
+            (history.shape[0], history.shape[1], history.shape[-1]),
+            dtype=history.dtype,
+        )
     history_counter = jnp.asarray(history_counter, dtype=jnp.int32)
     if encoded_history is None:
         encoded_history = encode_explicit_window_history(
@@ -683,12 +709,15 @@ def rollout_explicit_window_closure(
             history,
             k_arr,
             input_scale=input_scale,
-            closure_history_input=closure_history_input,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            heat_flux_gradient_history=(
+                heat_flux_gradient_history if closure_history_input else None
+            ),
             poisson_sign=poisson_sign,
         )
 
     def body(carry, _):
-        state, window, encoded, counter, previous = carry
+        state, window, closure_window, encoded, counter, previous = carry
         gradient = explicit_window_closure_step(
             params,
             state,
@@ -700,6 +729,9 @@ def rollout_explicit_window_closure(
             amplitude_center=amplitude_center,
             amplitude_scale=amplitude_scale,
             previous_heat_flux_gradient=(previous if closure_history_input else None),
+            heat_flux_gradient_history=(
+                closure_window if closure_history_input else None
+            ),
             poisson_sign=poisson_sign,
             normalized_heat_flux_bound=normalized_heat_flux_bound,
             encoded_history=encoded,
@@ -719,27 +751,46 @@ def rollout_explicit_window_closure(
             sampled_window = jnp.concatenate(
                 (window[:, 1:], state_new[:, None]), axis=1
             )
+            sampled_closure_window = jnp.concatenate(
+                (closure_window[:, 1:], gradient[:, None]), axis=1
+            )
             sampled_encoded = encode_explicit_window_history(
                 params,
                 sampled_window,
                 k_arr,
                 input_scale=input_scale,
-                closure_history_input=closure_history_input,
+                heat_flux_gradient_scale=heat_flux_gradient_scale,
+                heat_flux_gradient_history=(
+                    sampled_closure_window if closure_history_input else None
+                ),
                 poisson_sign=poisson_sign,
             )
-            return sampled_window, sampled_encoded, jnp.asarray(0, dtype=jnp.int32)
+            return (
+                sampled_window,
+                sampled_closure_window,
+                sampled_encoded,
+                jnp.asarray(0, dtype=jnp.int32),
+            )
 
         def retain_window(_):
-            return window, encoded, next_counter
+            return window, closure_window, encoded, next_counter
 
-        window_new, encoded_new, counter_new = jax.lax.cond(
+        window_new, closure_window_new, encoded_new, counter_new = jax.lax.cond(
             should_sample, sample_window, retain_window, operand=None
         )
-        return (state_new, window_new, encoded_new, counter_new, gradient), state_new
+        return (
+            state_new,
+            window_new,
+            closure_window_new,
+            encoded_new,
+            counter_new,
+            gradient,
+        ), state_new
 
     (
         final_state,
         final_window,
+        final_closure_window,
         final_encoded,
         final_counter,
         final_gradient,
@@ -748,6 +799,7 @@ def rollout_explicit_window_closure(
         (
             initial_state,
             history,
+            heat_flux_gradient_history,
             encoded_history,
             history_counter,
             previous_heat_flux_gradient,
@@ -758,6 +810,7 @@ def rollout_explicit_window_closure(
     del final_state
     return jnp.swapaxes(states, 0, 1), (
         final_window,
+        final_closure_window,
         final_encoded,
         final_counter,
         final_gradient,
