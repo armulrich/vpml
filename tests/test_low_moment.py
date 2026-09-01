@@ -1,33 +1,648 @@
 import math
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from model.diagnostics.low_moment_resonance_identifiability import (
+    mode_bounce_exposure,
+)
 from model.train.low_moment_closure import (
     _block_relative_sample_loss,
     _electric_field_energy,
+    _load_or_build_primitive_target_cache,
+    _primitive_numpy,
     build_complete_trajectory_case_batches,
     build_diagnostic_panel,
+    limit_training_anchors,
     low_hermite_coefficients_to_conservative,
+    make_loss_function,
     make_continuous_chunk_loss_function,
     parse_horizon_curriculum,
+    parse_train_case_limits,
     sample_complete_trajectory_batch,
 )
 from vpml.low_moment import (
+    DYNAMIC_INPUT_SCALING,
+    _dealias,
+    _causal_temporal_convolution,
+    electric_field_from_density,
     explicit_window_closure_step,
+    init_causal_spacetime_operator_params,
     init_explicit_window_params,
     init_spectral_memory_params,
+    init_window_fno_params,
+    low_moment_rhs,
     low_moment_rk4_step,
     primitive_fields,
+    spectral_derivative,
     spectral_memory_closure_step,
     rollout_explicit_window_closure,
 )
 
 
 class LowMomentClosureTests(unittest.TestCase):
+    def test_mode_bounce_exposure_integrates_constant_frequency(self) -> None:
+        density_hat = np.zeros((4, 3), dtype=np.complex128)
+        density_hat[:, 1] = 4.0
+        frequency, exposure = mode_bounce_exposure(
+            density_hat,
+            source_nx=16,
+            domain_length=4.0 * math.pi,
+            dt=0.25,
+            modes=2,
+        )
+        expected_frequency = math.sqrt(0.5)
+        np.testing.assert_allclose(frequency[:, 0], expected_frequency)
+        np.testing.assert_allclose(
+            exposure[:, 0], expected_frequency * np.arange(4) * 0.25
+        )
+        np.testing.assert_array_equal(frequency[:, 1], 0.0)
+        np.testing.assert_array_equal(exposure[:, 1], 0.0)
+
+    def test_batched_rhs_matches_unfused_pseudospectral_operations(self) -> None:
+        nx = 64
+        batch = 3
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        phase = jnp.arange(batch, dtype=jnp.float32)[:, None] * 0.23
+        state = jnp.stack(
+            (
+                0.08 * jnp.cos(x[None] + phase),
+                0.03 * jnp.sin(2.0 * x[None] - phase),
+                0.05 * jnp.cos(3.0 * x[None] + 0.5 * phase),
+            ),
+            axis=1,
+        )
+        closure = 0.01 * jnp.sin(4.0 * x[None] + phase)
+
+        density_perturbation, momentum, second_perturbation = (
+            state[:, 0],
+            state[:, 1],
+            state[:, 2],
+        )
+        rho = 1.0 + density_perturbation
+        velocity = momentum / jnp.maximum(rho, 1e-4)
+        pressure = jnp.maximum(
+            1.0 + second_perturbation - momentum * velocity, 1e-4
+        )
+        field = electric_field_from_density(density_perturbation, k_arr)
+        third_flux = _dealias(rho * velocity**3 + 3.0 * velocity * pressure)
+        expected = jnp.stack(
+            (
+                -spectral_derivative(momentum, k_arr),
+                -spectral_derivative(second_perturbation, k_arr)
+                - _dealias(rho * field),
+                -spectral_derivative(third_flux, k_arr)
+                - closure
+                - 2.0 * _dealias(momentum * field),
+            ),
+            axis=1,
+        )
+        actual = low_moment_rhs(state, closure, k_arr)
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+    def test_primitive_target_cache_matches_direct_conversion_and_reuses_files(self) -> None:
+        nx = 16
+        steps = 7
+        k_count = nx // 2 + 1
+        grouped = {}
+        cases = []
+        x_mode = np.arange(steps, dtype=np.float32)
+        for regime_index, regime in enumerate(
+            (
+                "linear_landau",
+                "nonlinear_landau_weak",
+                "nonlinear_landau_strong",
+            )
+        ):
+            case_id = f"{regime}_ic00"
+            history = np.zeros((steps, 4, k_count), dtype=np.complex64)
+            history[:, 0, 1] = (0.01 + 0.01 * regime_index) * np.exp(
+                0.1j * x_mode
+            )
+            history[:, 1, 1] = 0.005j * (regime_index + 1)
+            history[:, 2, 2] = 0.003 * (regime_index + 1)
+            grouped[regime] = {
+                "case_ids": np.asarray([case_id]),
+                "case_splits": np.asarray(["train"]),
+                "coefficients": (history,),
+            }
+            cases.append({"case_id": case_id, "epsilon": 0.1})
+        manifest = {"sha256": "test-manifest", "cases": cases}
+
+        with tempfile.TemporaryDirectory() as directory:
+            cached, norms, root = _load_or_build_primitive_target_cache(
+                Path(directory),
+                grouped,
+                manifest,
+                "coefficients",
+                source_nx=nx,
+                rollout_nx=nx,
+                domain_length=4.0 * math.pi,
+                poisson_sign=1.0,
+                chunk_steps=3,
+            )
+            for regime in grouped:
+                direct_state = low_hermite_coefficients_to_conservative(
+                    grouped[regime]["coefficients"][0][:, :3],
+                    source_nx=nx,
+                    target_nx=nx,
+                    dtype=np.float32,
+                )
+                direct = _primitive_numpy(direct_state, 4.0 * math.pi)
+                k_arr = 2.0 * np.pi * np.fft.rfftfreq(
+                    nx, d=4.0 * math.pi / nx
+                )
+                jax_direct = np.asarray(
+                    primitive_fields(jnp.asarray(direct_state), jnp.asarray(k_arr))
+                )
+                np.testing.assert_allclose(cached[regime][0], direct, rtol=2e-6, atol=2e-6)
+                np.testing.assert_allclose(
+                    cached[regime][0], jax_direct, rtol=2e-6, atol=2e-6
+                )
+                case_id = str(grouped[regime]["case_ids"][0])
+                expected_norm = np.sum(np.square(direct[1:], dtype=np.float64), axis=(0, 2))
+                np.testing.assert_allclose(norms[case_id], expected_norm, rtol=2e-6)
+            self.assertTrue((root / "metadata.json").is_file())
+            with mock.patch(
+                "model.train.low_moment_closure.low_hermite_coefficients_to_conservative",
+                side_effect=AssertionError("cache should be reused"),
+            ):
+                reused, reused_norms, reused_root = _load_or_build_primitive_target_cache(
+                    Path(directory),
+                    grouped,
+                    manifest,
+                    "coefficients",
+                    source_nx=nx,
+                    rollout_nx=nx,
+                    domain_length=4.0 * math.pi,
+                    poisson_sign=1.0,
+                    chunk_steps=3,
+                )
+            self.assertEqual(reused_root, root)
+            self.assertEqual(reused["linear_landau"][0].dtype, np.float32)
+            np.testing.assert_allclose(
+                reused_norms["linear_landau_ic00"], norms["linear_landau_ic00"]
+            )
+
+    def test_window_fno_is_equivariant_history_sensitive_and_zero_mean(self) -> None:
+        nx = 32
+        memory_steps = 6
+        shift = 5
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_window_fno_params(
+            jax.random.PRNGKey(104),
+            width=8,
+            spectral_modes=9,
+            memory_steps=memory_steps,
+            depth=3,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, 8), dtype=jnp.float32) / 8.0
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            0.2 * jnp.cos(x) + 0.05 * jnp.cos(2.0 * x + 0.3)
+        )
+        history_a = jnp.repeat(state[:, None], memory_steps, axis=1)
+        history_b = history_a.at[:, 0, 1].set(0.04 * jnp.sin(3.0 * x))
+        closure_history = jnp.zeros((1, memory_steps, nx), dtype=jnp.float32)
+        previous = jnp.zeros((1, nx), dtype=jnp.float32)
+        kwargs = dict(
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            previous_heat_flux_gradient=previous,
+            heat_flux_gradient_history=closure_history,
+        )
+        gradient_a = explicit_window_closure_step(
+            params, state, history_a, jnp.asarray([0.2]), k_arr, **kwargs
+        )
+        gradient_b = explicit_window_closure_step(
+            params, state, history_b, jnp.asarray([0.2]), k_arr, **kwargs
+        )
+        self.assertGreater(float(jnp.linalg.norm(gradient_b - gradient_a)), 1e-7)
+        self.assertAlmostEqual(float(jnp.mean(gradient_b)), 0.0, places=6)
+        shifted = explicit_window_closure_step(
+            params,
+            jnp.roll(state, shift, axis=-1),
+            jnp.roll(history_b, shift, axis=-1),
+            jnp.asarray([0.2]),
+            k_arr,
+            previous_heat_flux_gradient=jnp.roll(previous, shift, axis=-1),
+            heat_flux_gradient_history=jnp.roll(
+                closure_history, shift, axis=-1
+            ),
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+        )
+        np.testing.assert_allclose(
+            np.asarray(shifted),
+            np.roll(np.asarray(gradient_b), shift, axis=-1),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+
+    def test_window_fno_scan_unroll_preserves_rollout(self) -> None:
+        nx = 16
+        memory_steps = 4
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_window_fno_params(
+            jax.random.PRNGKey(105),
+            width=6,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+            depth=2,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, 6), dtype=jnp.float32) / 12.0
+        state = 1e-3 * jax.random.normal(
+            jax.random.PRNGKey(106), (1, 3, nx), dtype=jnp.float32
+        )
+        history = jnp.repeat(state[:, None], memory_steps, axis=1)
+        common = dict(
+            horizon=8,
+            dt=0.01,
+            memory_stride=2,
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=0.1,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            closure_history_input=True,
+        )
+        rollout_one = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            scan_unroll=1,
+            **common,
+        )
+        rollout_four = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            scan_unroll=4,
+            **common,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(rollout_four[0]), np.asarray(rollout_one[0])
+        )
+        for value_four, value_one in zip(rollout_four[1], rollout_one[1]):
+            np.testing.assert_array_equal(np.asarray(value_four), np.asarray(value_one))
+
+    def test_training_case_limits_are_nested_and_leave_validation_unchanged(self) -> None:
+        anchors = {
+            regime: {
+                "train_cases": np.repeat(np.arange(6, dtype=np.int32), 3),
+                "train_times": np.tile(np.arange(3, dtype=np.int32), 6),
+                "val_cases": np.repeat(np.arange(6, 8, dtype=np.int32), 2),
+                "val_times": np.tile(np.arange(2, dtype=np.int32), 2),
+            }
+            for regime in (
+                "linear_landau",
+                "nonlinear_landau_weak",
+                "nonlinear_landau_strong",
+            )
+        }
+        small, small_cases = limit_training_anchors(
+            anchors,
+            {"nonlinear_landau_strong": 2},
+            seed=17,
+        )
+        large, large_cases = limit_training_anchors(
+            anchors,
+            {"nonlinear_landau_strong": 4},
+            seed=17,
+        )
+        self.assertTrue(
+            set(small_cases["nonlinear_landau_strong"]).issubset(
+                set(large_cases["nonlinear_landau_strong"])
+            )
+        )
+        np.testing.assert_array_equal(
+            small["nonlinear_landau_strong"]["val_cases"],
+            anchors["nonlinear_landau_strong"]["val_cases"],
+        )
+        self.assertEqual(
+            np.unique(small["linear_landau"]["train_cases"]).size,
+            6,
+        )
+
+    def test_parse_training_case_limits(self) -> None:
+        self.assertEqual(
+            parse_train_case_limits("nonlinear_landau_strong=4"),
+            {"nonlinear_landau_strong": 4},
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            parse_train_case_limits("unknown=4")
+
+    def test_temporal_convolution_is_strictly_causal(self) -> None:
+        values = jnp.zeros((1, 8, 1, 1), dtype=jnp.float32)
+        values = values.at[:, 6].set(1.0)
+        kernel = jnp.ones((3, 1, 1), dtype=jnp.float32)
+        output = _causal_temporal_convolution(values, kernel, dilation=2)
+        np.testing.assert_array_equal(np.asarray(output[:, :6]), 0.0)
+        self.assertGreater(float(output[0, 6, 0, 0]), 0.0)
+
+    def test_spacetime_operator_is_history_sensitive_equivariant_and_finite(self) -> None:
+        nx = 32
+        memory_steps = 6
+        width = 8
+        shift = 7
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_causal_spacetime_operator_params(
+            jax.random.PRNGKey(101),
+            width=width,
+            spectral_modes=8,
+            memory_steps=memory_steps,
+            depth=3,
+            temporal_kernel_size=3,
+        )
+        params["output_local"] = jnp.ones((1, width), dtype=jnp.float32)
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            0.03 * jnp.cos(x) + 0.01 * jnp.cos(2.0 * x + 0.4)
+        )
+        history_a = jnp.repeat(state[:, None], memory_steps, axis=1)
+        history_b = history_a.at[:, 0, 1].set(0.02 * jnp.sin(3.0 * x))
+        closure_history = jnp.zeros((1, memory_steps, nx), dtype=jnp.float32)
+        previous = jnp.zeros((1, nx), dtype=jnp.float32)
+        kwargs = dict(
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            previous_heat_flux_gradient=previous,
+            heat_flux_gradient_history=closure_history,
+        )
+        gradient_a = explicit_window_closure_step(
+            params, state, history_a, jnp.asarray([0.1]), k_arr, **kwargs
+        )
+        gradient_b = explicit_window_closure_step(
+            params, state, history_b, jnp.asarray([0.1]), k_arr, **kwargs
+        )
+        self.assertTrue(bool(jnp.all(jnp.isfinite(gradient_b))))
+        self.assertGreater(float(jnp.linalg.norm(gradient_b - gradient_a)), 1e-7)
+        gradient_shifted = explicit_window_closure_step(
+            params,
+            jnp.roll(state, shift, axis=-1),
+            jnp.roll(history_b, shift, axis=-1),
+            jnp.asarray([0.1]),
+            k_arr,
+            previous_heat_flux_gradient=jnp.roll(previous, shift, axis=-1),
+            heat_flux_gradient_history=jnp.roll(
+                closure_history, shift, axis=-1
+            ),
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+        )
+        np.testing.assert_allclose(
+            np.asarray(gradient_shifted),
+            np.roll(np.asarray(gradient_b), shift, axis=-1),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+
+    def test_dynamic_window_scaling_is_amplitude_equivariant(self) -> None:
+        nx = 32
+        memory_steps = 5
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_window_fno_params(
+            jax.random.PRNGKey(109),
+            width=8,
+            spectral_modes=9,
+            memory_steps=memory_steps,
+            depth=2,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, 8), dtype=jnp.float32) / 8.0
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            0.08 * jnp.cos(x) + 0.03 * jnp.cos(2.0 * x + 0.4)
+        )
+        history = jnp.repeat(state[:, None], memory_steps, axis=1)
+        previous = 0.01 * jnp.sin(x)[None]
+        closure_history = jnp.repeat(previous[:, None], memory_steps, axis=1)
+        kwargs = dict(
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            previous_heat_flux_gradient=previous,
+            heat_flux_gradient_history=closure_history,
+            input_scaling=DYNAMIC_INPUT_SCALING,
+        )
+        base = explicit_window_closure_step(
+            params, state, history, jnp.asarray([0.08]), k_arr, **kwargs
+        )
+        factor = 3.0
+        scaled = explicit_window_closure_step(
+            params,
+            factor * state,
+            factor * history,
+            jnp.asarray([factor * 0.08]),
+            k_arr,
+            **{
+                **kwargs,
+                "previous_heat_flux_gradient": factor * previous,
+                "heat_flux_gradient_history": factor * closure_history,
+            },
+        )
+        np.testing.assert_allclose(
+            np.asarray(scaled), factor * np.asarray(base), rtol=3e-5, atol=3e-6
+        )
+
+    def test_uniform_heating_option_only_restores_zero_mode(self) -> None:
+        nx = 32
+        memory_steps = 5
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_window_fno_params(
+            jax.random.PRNGKey(110),
+            width=8,
+            spectral_modes=9,
+            memory_steps=memory_steps,
+            depth=2,
+            input_channels=5,
+        )
+        params["output_local"] = jnp.ones((1, 8), dtype=jnp.float32) / 8.0
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            0.15 * jnp.cos(x) + 0.04 * jnp.cos(2.0 * x + 0.2)
+        )
+        history = jnp.repeat(state[:, None], memory_steps, axis=1)
+        kwargs = dict(
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            previous_heat_flux_gradient=jnp.zeros((1, nx)),
+            heat_flux_gradient_history=jnp.zeros((1, memory_steps, nx)),
+        )
+        centered = explicit_window_closure_step(
+            params, state, history, jnp.asarray([0.15]), k_arr, **kwargs
+        )
+        effective = explicit_window_closure_step(
+            params,
+            state,
+            history,
+            jnp.asarray([0.15]),
+            k_arr,
+            allow_uniform_heating=True,
+            **kwargs,
+        )
+        self.assertAlmostEqual(float(jnp.mean(centered)), 0.0, places=6)
+        difference = np.asarray(effective - centered)
+        np.testing.assert_allclose(
+            difference,
+            np.broadcast_to(np.mean(difference, axis=-1, keepdims=True), difference.shape),
+            atol=2e-6,
+        )
+
+    def test_spacetime_operator_preserves_equilibrium_and_chunk_boundaries(self) -> None:
+        nx = 16
+        memory_steps = 4
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_causal_spacetime_operator_params(
+            jax.random.PRNGKey(102),
+            width=6,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+            depth=2,
+            temporal_kernel_size=3,
+        )
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        history = jnp.zeros((1, memory_steps, 3, nx), dtype=jnp.float32)
+        common = dict(
+            dt=0.01,
+            memory_stride=2,
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            closure_history_input=True,
+        )
+        full_states, full_memory = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=4,
+            **common,
+        )
+        np.testing.assert_array_equal(np.asarray(full_states), np.zeros_like(full_states))
+        first_states, first_memory = rollout_explicit_window_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            **common,
+        )
+        window, closure_history, encoded, counter, gradient = first_memory
+        second_states, second_memory = rollout_explicit_window_closure(
+            params,
+            first_states[:, -1],
+            window,
+            counter,
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            previous_heat_flux_gradient=gradient,
+            heat_flux_gradient_history=closure_history,
+            encoded_history=encoded,
+            **common,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jnp.concatenate((first_states, second_states), axis=1)),
+            np.asarray(full_states),
+        )
+        for chunked, complete in zip(second_memory, full_memory):
+            np.testing.assert_allclose(np.asarray(chunked), np.asarray(complete))
+
+    def test_spacetime_operator_training_gradient_is_finite_and_nonzero(self) -> None:
+        nx = 16
+        memory_steps = 4
+        horizon = 2
+        width = 6
+        k_arr = 2.0 * np.pi * np.fft.rfftfreq(nx, d=4.0 * np.pi / nx)
+        params = init_causal_spacetime_operator_params(
+            jax.random.PRNGKey(103),
+            width=width,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+            depth=2,
+            temporal_kernel_size=3,
+        )
+        x = jnp.linspace(0.0, 4.0 * jnp.pi, nx, endpoint=False)
+        initial = jnp.zeros((3, 3, nx), dtype=jnp.float32).at[:, 0].set(
+            jnp.stack(
+                (
+                    0.01 * jnp.cos(x),
+                    0.08 * jnp.cos(x + 0.2),
+                    0.4 * jnp.cos(x) + 0.1 * jnp.cos(2.0 * x + 0.5),
+                )
+            )
+        )
+        memory = jnp.repeat(initial[:, None], memory_steps, axis=1)
+        targets = jnp.repeat(initial[:, None], horizon, axis=1).at[:, :, 1].add(
+            0.01 * jnp.sin(x)
+        )
+        batch = {
+            "initial": initial,
+            "memory": memory,
+            "targets": targets,
+            "amplitude": jnp.asarray([0.01, 0.08, 0.4], dtype=jnp.float32),
+            "regime_index": jnp.asarray([0, 1, 2], dtype=jnp.int32),
+            "start_index": jnp.zeros((3,), dtype=jnp.int32),
+        }
+        loss_fn = make_loss_function(
+            k_arr=k_arr,
+            width=width,
+            horizon=horizon,
+            dt=0.01,
+            input_scale=np.ones((4,), dtype=np.float32),
+            regime_scales=np.ones((3, 4), dtype=np.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            poisson_sign=1.0,
+            normalized_heat_flux_bound=128.0,
+            density_floor=1e-4,
+            pressure_floor=1e-4,
+            closure_history_input=True,
+            memory_backend="causal_spacetime_operator",
+            memory_stride=1,
+        )
+        (loss_value, _), gradients = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(params, batch)
+        leaves = jax.tree_util.tree_leaves(gradients)
+        self.assertTrue(bool(jnp.isfinite(loss_value)))
+        self.assertTrue(all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves))
+        self.assertGreater(
+            float(jnp.sqrt(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))),
+            0.0,
+        )
+
     def test_explicit_window_is_history_sensitive_and_translation_equivariant(self) -> None:
         nx = 32
         width = 8
@@ -439,6 +1054,43 @@ class LowMomentClosureTests(unittest.TestCase):
             np.arange(1, 6, dtype=np.float32)[:, None], (5, nx)
         )
         np.testing.assert_allclose(batch["targets"][0, :, 0], expected_density)
+
+        primitive_targets = {
+            regime: (
+                np.broadcast_to(
+                    np.arange(6, dtype=np.float32)[:, None, None],
+                    (6, 4, nx),
+                ).copy(),
+            )
+            for regime in regimes
+        }
+        trajectory_norms = {
+            case["case_id"]: np.full((4,), 10.0 + index, dtype=np.float64)
+            for index, case in enumerate(cases)
+        }
+        cached_batch = sample_complete_trajectory_batch(
+            np.random.default_rng(1),
+            grouped,
+            {"cases": cases},
+            "coefficients",
+            {regime: np.asarray([0], dtype=np.int32) for regime in regimes},
+            memory_steps=3,
+            memory_stride=2,
+            source_nx=nx,
+            rollout_nx=nx,
+            translation_augmentation=False,
+            primitive_target_histories=primitive_targets,
+            trajectory_target_norm_by_id=trajectory_norms,
+        )
+        self.assertNotIn("targets", cached_batch)
+        self.assertEqual(cached_batch["target_fields"].shape, (3, 5, 4, nx))
+        np.testing.assert_allclose(
+            cached_batch["target_fields"][0, :, 0, 0], np.arange(1, 6)
+        )
+        np.testing.assert_allclose(
+            cached_batch["trajectory_target_norm"],
+            np.stack([trajectory_norms[case["case_id"]] for case in cases]),
+        )
 
     def test_diagnostic_panel_covers_every_heldout_ic_at_fixed_times(self) -> None:
         regimes = (

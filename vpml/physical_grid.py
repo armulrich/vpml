@@ -311,6 +311,37 @@ def advect_v_cubic(
     return cubic_bspline_interp_constant(coeffs, coords, cval=0.0)
 
 
+def build_physical_grid_ops(
+    config: PhysicalGridVlasovPoissonConfig,
+) -> Dict[str, Array]:
+    """Build reusable interpolation and Fourier operators for repeated stepping."""
+    return _physical_grid_ops(config)
+
+
+def semilagrangian_vlasov_poisson_step(
+    config: PhysicalGridVlasovPoissonConfig,
+    f_phys: Array,
+    *,
+    ops: Optional[Dict[str, Array]] = None,
+    external_field: Optional[Array] = None,
+) -> Tuple[Array, Array]:
+    """Advance one Strang-split step and return the new distribution and field."""
+    f_phys = jnp.asarray(f_phys, dtype=jnp.float64)
+    if f_phys.shape != (int(config.Nv), int(config.Nx)):
+        raise ValueError(
+            f"f_phys must have shape ({config.Nv}, {config.Nx}), got {f_phys.shape}"
+        )
+    step_ops = _physical_grid_ops(config) if ops is None else ops
+    f_half = advect_x_cubic(f_phys, config, step_ops, 0.5 * float(config.dt))
+    E_mid = compute_electric_field_from_distribution(f_half, config, ops=step_ops)
+    if external_field is not None:
+        E_mid = E_mid + jnp.asarray(external_field, dtype=jnp.float64)
+    f_vel = advect_v_cubic(f_half, config, step_ops, E_mid, float(config.dt))
+    f_new = advect_x_cubic(f_vel, config, step_ops, 0.5 * float(config.dt))
+    E_new = compute_electric_field_from_distribution(f_new, config, ops=step_ops)
+    return f_new, E_new
+
+
 def run_semilagrangian_vlasov_poisson(
     config: PhysicalGridVlasovPoissonConfig,
     f0: Array,
@@ -412,12 +443,13 @@ def run_semilagrangian_vlasov_poisson(
     def step(carry, step_i):
         f_state, snaps, history, field_history = carry
         t_mid = (step_i.astype(jnp.float64) - 0.5) * float(config.dt)
-        f_half = advect_x_cubic(f_state, config, ops, 0.5 * float(config.dt))
-        E_mid = compute_electric_field_from_distribution(f_half, config, ops=ops)
         H_mid = jnp.asarray(ext_fn(t_mid, ops["x"], ops["k_arr"]), dtype=jnp.float64)
-        f_vel = advect_v_cubic(f_half, config, ops, E_mid + H_mid, float(config.dt))
-        f_new = advect_x_cubic(f_vel, config, ops, 0.5 * float(config.dt))
-        E_new = compute_electric_field_from_distribution(f_new, config, ops=ops)
+        f_new, E_new = semilagrangian_vlasov_poisson_step(
+            config,
+            f_state,
+            ops=ops,
+            external_field=H_mid,
+        )
         en = electric_energy_from_field(E_new, config)
         snaps = maybe_store_snapshot(snaps, step_i, f_new)
         history = maybe_store_history(history, step_i, f_new)
