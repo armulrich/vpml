@@ -344,8 +344,17 @@ def equilibrium_preserving_latent_cnn_correction(
     *,
     depth: int,
     normalized_latent_delta: Array | None = None,
+    input_compression_scale: float = 0.0,
 ) -> Array:
-    """Return the direct CNN residual after removing its affine response."""
+    """Return the direct CNN residual after removing its affine response.
+
+    A positive ``input_compression_scale`` applies a smooth signed-asinh map
+    inside the nonlinear conditioner.  The subtraction below is still taken
+    with respect to the original inputs, so the complete correction has zero
+    value and Jacobian at equilibrium.
+    """
+    if float(input_compression_scale) < 0.0:
+        raise ValueError("input_compression_scale must be nonnegative")
     conditioned_resolved = normalized_resolved
     if normalized_latent_delta is not None:
         conditioned_resolved = jnp.concatenate(
@@ -355,6 +364,10 @@ def equilibrium_preserving_latent_cnn_correction(
     zero_latent = jnp.zeros_like(normalized_latent)
 
     def network(resolved, latent):
+        if float(input_compression_scale) > 0.0:
+            scale = jnp.asarray(input_compression_scale, dtype=resolved.dtype)
+            resolved = scale * jnp.arcsinh(resolved / scale)
+            latent = scale * jnp.arcsinh(latent / scale)
         return kinetic_latent_dynamics_correction(
             params,
             resolved,
@@ -1237,6 +1250,7 @@ def coupled_low_moment_latent_step(
     latent_readout_mode: str = "multiplicative",
     latent_gate_scale: float | Array = 0.1,
     latent_gate_power: int = 2,
+    equilibrium_input_compression_scale: float = 0.0,
     linear_baseline: str = "fitted_propagator",
     hermite_tail_damping: float = 10.0,
     hermite_tail_power: float = 6.0,
@@ -1306,6 +1320,7 @@ def coupled_low_moment_latent_step(
                 normalized_latent,
                 depth=depth,
                 normalized_latent_delta=normalized_latent_delta,
+                input_compression_scale=equilibrium_input_compression_scale,
             )
         elif latent_readout_mode == "multiplicative":
             correction = state_conditioned_latent_operator_correction(
@@ -1482,6 +1497,7 @@ def rollout_coupled_low_moment_latent(
     latent_readout_mode: str = "multiplicative",
     latent_gate_scale: float | Array = 0.1,
     latent_gate_power: int = 2,
+    equilibrium_input_compression_scale: float = 0.0,
     linear_baseline: str = "fitted_propagator",
     hermite_tail_damping: float = 10.0,
     hermite_tail_power: float = 6.0,
@@ -1522,6 +1538,7 @@ def rollout_coupled_low_moment_latent(
             latent_readout_mode=latent_readout_mode,
             latent_gate_scale=latent_gate_scale,
             latent_gate_power=latent_gate_power,
+            equilibrium_input_compression_scale=equilibrium_input_compression_scale,
             linear_baseline=linear_baseline,
             hermite_tail_damping=hermite_tail_damping,
             hermite_tail_power=hermite_tail_power,

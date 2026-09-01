@@ -13,6 +13,9 @@ esac
 if [[ -n "${COUPLED_LATENT_RESUME_TRAINING_STATE:-}" ]]; then
   set -- "$@" --resume-training-state "${COUPLED_LATENT_RESUME_TRAINING_STATE}"
 fi
+if [[ -n "${COUPLED_LATENT_INIT_CHECKPOINT:-}" ]]; then
+  set -- "$@" --init-checkpoint "${COUPLED_LATENT_INIT_CHECKPOINT}"
+fi
 case "${COUPLED_LATENT_CLOSURE_ALIGNED_OUTPUT:-0}" in
   1|true|TRUE|yes|YES) set -- "$@" --closure-aligned-output ;;
 esac
@@ -62,6 +65,7 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --latent-readout-mode "${COUPLED_LATENT_DYNAMICS_READOUT_MODE:-multiplicative}" \
   --latent-gate-scale "${COUPLED_LATENT_DYNAMICS_GATE_SCALE:-0.1}" \
   --latent-gate-power "${COUPLED_LATENT_DYNAMICS_GATE_POWER:-2}" \
+  --equilibrium-input-compression-scale "${COUPLED_LATENT_EQUILIBRIUM_INPUT_COMPRESSION_SCALE:-0.0}" \
   --latent-readout-ridge "${COUPLED_LATENT_DYNAMICS_READOUT_RIDGE:-1e-4}" \
   --latent-readout-initial-scale "${COUPLED_LATENT_DYNAMICS_READOUT_INITIAL_SCALE:-1.0}" \
   --latent-readout-trajectory-exponent "${COUPLED_LATENT_DYNAMICS_READOUT_TRAJECTORY_EXPONENT:-0.75}" \
@@ -96,7 +100,7 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --hermite-tail-power "${COUPLED_LATENT_HERMITE_TAIL_POWER:-6.0}" \
   --semilinear-kick-scale "${COUPLED_LATENT_SEMILINEAR_KICK_SCALE:-1.0}" \
   --semilinear-correction-location "${COUPLED_LATENT_SEMILINEAR_CORRECTION_LOCATION:-midpoint}" \
-  --latent-excursion-limit "${COUPLED_LATENT_EXCURSION_LIMIT:-100.0}" \
+  --latent-excursion-limit "${COUPLED_LATENT_EXCURSION_LIMIT:-1000.0}" \
   --linear-nonregression-limit "${COUPLED_LATENT_LINEAR_NONREGRESSION_LIMIT:-0.0}" \
   --gradient-chunk-steps "${COUPLED_LATENT_GRADIENT_CHUNK_STEPS:-300}" \
   --validation-every "${COUPLED_LATENT_VALIDATION_EVERY:-5}" \

@@ -10,6 +10,7 @@ from model.train.coupled_low_moment_latent import (
     _atomic_savez,
     _calibrate_smooth_correction_bounds,
     _clip_parameter_update,
+    _combine_gradients,
     _combine_conflict_safe_gradients,
     _combine_conflict_safe_updates,
     _combine_groupwise_conflict_safe_updates,
@@ -99,6 +100,24 @@ class CoupledLowMomentLatentLossTest(unittest.TestCase):
                 mode="direct_sum",
                 output_ratio=0.0,
                 internal_ratio=0.0,
+            )
+        )
+        np.testing.assert_allclose(combined["value"], np.asarray([0.5, 2.0]))
+        self.assertLess(float(cosine), 0.0)
+        self.assertAlmostEqual(float(contribution), np.sqrt(4.25), places=6)
+        self.assertTrue(bool(conflicting))
+        self.assertAlmostEqual(float(alignment), 0.5, places=6)
+
+    def test_direct_joint_gradient_keeps_conflicting_teacher_direction(self):
+        physical = {"value": jnp.asarray([1.0, 0.0])}
+        teacher = {"value": jnp.asarray([-0.5, 2.0])}
+        combined, _, _, cosine, contribution, conflicting, alignment = (
+            _combine_gradients(
+                physical,
+                teacher,
+                auxiliary_weight=1.0,
+                maximum_auxiliary_ratio=0.0,
+                mode="direct_sum",
             )
         )
         np.testing.assert_allclose(combined["value"], np.asarray([0.5, 2.0]))

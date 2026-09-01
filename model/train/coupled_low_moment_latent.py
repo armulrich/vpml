@@ -108,6 +108,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--latent-gate-scale", type=float, default=0.1)
     parser.add_argument("--latent-gate-power", type=int, default=2)
+    parser.add_argument("--equilibrium-input-compression-scale", type=float, default=0.0)
     parser.add_argument("--latent-readout-ridge", type=float, default=1e-4)
     parser.add_argument("--latent-readout-initial-scale", type=float, default=1.0)
     parser.add_argument(
@@ -169,11 +170,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("midpoint", "endpoint"),
         default="midpoint",
     )
-    parser.add_argument("--latent-excursion-limit", type=float, default=100.0)
+    parser.add_argument("--latent-excursion-limit", type=float, default=1000.0)
     parser.add_argument("--linear-nonregression-limit", type=float, default=0.0)
     parser.add_argument("--gradient-chunk-steps", type=int, default=300)
     parser.add_argument("--validation-every", type=int, default=5)
     parser.add_argument("--loss-ema-decay", type=float, default=0.95)
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help=(
+            "Load model parameters from a checkpoint while starting a fresh "
+            "optimizer and epoch count. Mutually exclusive with resume state."
+        ),
+    )
     parser.add_argument("--resume-training-state", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--seed", type=int, default=1729)
@@ -1971,6 +1980,58 @@ def _combine_conflict_safe_gradients(
     )
 
 
+def _combine_gradients(
+    physical_grads,
+    auxiliary_grads,
+    *,
+    auxiliary_weight: float,
+    maximum_auxiliary_ratio: float,
+    mode: str,
+):
+    """Combine physical and auxiliary gradients before a shared optimizer step."""
+    if mode == "conflict_safe":
+        return _combine_conflict_safe_gradients(
+            physical_grads,
+            auxiliary_grads,
+            auxiliary_weight=auxiliary_weight,
+            maximum_auxiliary_ratio=maximum_auxiliary_ratio,
+        )
+    if mode != "direct_sum":
+        raise ValueError(f"Unknown update-combination mode: {mode}")
+
+    physical_norm = _tree_l2_norm(physical_grads)
+    auxiliary_norm = _tree_l2_norm(auxiliary_grads)
+    weighted_auxiliary = jax.tree_util.tree_map(
+        lambda value: float(auxiliary_weight) * value,
+        auxiliary_grads,
+    )
+    weighted_auxiliary_norm = _tree_l2_norm(weighted_auxiliary)
+    inner_product = _tree_inner_product(physical_grads, weighted_auxiliary)
+    tiny = jnp.finfo(physical_norm.dtype).tiny
+    cosine = inner_product / jnp.maximum(
+        physical_norm * weighted_auxiliary_norm,
+        tiny,
+    )
+    combined = jax.tree_util.tree_map(
+        lambda physical, auxiliary: physical + auxiliary,
+        physical_grads,
+        weighted_auxiliary,
+    )
+    physical_alignment = _tree_inner_product(physical_grads, combined) / jnp.maximum(
+        jnp.square(physical_norm),
+        tiny,
+    )
+    return (
+        combined,
+        physical_norm,
+        auxiliary_norm,
+        cosine,
+        weighted_auxiliary_norm,
+        inner_product < 0.0,
+        physical_alignment,
+    )
+
+
 def _combine_conflict_safe_updates(
     physical_update,
     teacher_update,
@@ -2157,6 +2218,7 @@ def _make_functions(
     latent_readout_mode: str = "multiplicative",
     latent_gate_scale: float = 0.1,
     latent_gate_power: int = 2,
+    equilibrium_input_compression_scale: float = 0.0,
     autonomous_latent_weight: float = 0.0,
     electric_spectrum_weight: float = 0.0,
     electric_log_energy_weight: float = 0.0,
@@ -2260,6 +2322,10 @@ def _make_functions(
         raise ValueError("teacher_rollout_steps must be positive")
     if int(teacher_rollout_steps) > int(horizon):
         raise ValueError("teacher_rollout_steps may not exceed the horizon")
+    if float(equilibrium_input_compression_scale) < 0.0:
+        raise ValueError(
+            "equilibrium_input_compression_scale must be nonnegative"
+        )
     latent_residual_scale = jnp.asarray(
         latent_residual_scale, dtype=latent_scale.dtype
     )
@@ -2292,6 +2358,7 @@ def _make_functions(
             latent_readout_mode=latent_readout_mode,
             latent_gate_scale=latent_gate_scale,
             latent_gate_power=latent_gate_power,
+            equilibrium_input_compression_scale=equilibrium_input_compression_scale,
             linear_baseline=linear_baseline,
             hermite_tail_damping=hermite_tail_damping,
             hermite_tail_power=hermite_tail_power,
@@ -2762,6 +2829,7 @@ def _make_functions(
             latent_readout_mode=latent_readout_mode,
             latent_gate_scale=latent_gate_scale,
             latent_gate_power=latent_gate_power,
+            equilibrium_input_compression_scale=equilibrium_input_compression_scale,
             linear_baseline=linear_baseline,
             hermite_tail_damping=hermite_tail_damping,
             hermite_tail_power=hermite_tail_power,
@@ -3734,6 +3802,10 @@ def main() -> None:
         raise ValueError("latent_gate_scale must be finite and positive")
     if int(args.latent_gate_power) < 2 or int(args.latent_gate_power) % 2:
         raise ValueError("latent_gate_power must be a positive even integer")
+    if float(args.equilibrium_input_compression_scale) < 0.0:
+        raise ValueError(
+            "equilibrium_input_compression_scale must be nonnegative"
+        )
     if not np.isfinite(float(args.latent_readout_ridge)) or float(
         args.latent_readout_ridge
     ) < 0.0:
@@ -4107,6 +4179,41 @@ def main() -> None:
     }
     completed_epoch = 0
     resumed_history = []
+    if args.init_checkpoint is not None and args.resume_training_state is not None:
+        raise ValueError(
+            "--init-checkpoint and --resume-training-state cannot be combined"
+        )
+    if args.init_checkpoint is not None:
+        with np.load(args.init_checkpoint, allow_pickle=False) as checkpoint:
+            missing = [key for key in params if key not in checkpoint]
+            if missing:
+                raise ValueError(
+                    "Initialization checkpoint is missing model parameters: "
+                    + ", ".join(missing)
+                )
+            incompatible = [
+                key
+                for key, value in params.items()
+                if checkpoint[key].shape != value.shape
+            ]
+            if incompatible:
+                details = ", ".join(
+                    f"{key}: checkpoint{checkpoint[key].shape} != model{params[key].shape}"
+                    for key in incompatible
+                )
+                raise ValueError(
+                    "Initialization checkpoint is incompatible with the requested "
+                    f"model configuration ({details})"
+                )
+            params = {
+                key: jnp.asarray(checkpoint[key], dtype=value.dtype)
+                for key, value in params.items()
+            }
+        print(
+            f"[train] initialized parameters from {args.init_checkpoint}; "
+            "optimizer and epoch count are fresh",
+            flush=True,
+        )
     if args.resume_training_state is not None:
         params, optimizers, completed_epoch = _load_training_state(
             args.resume_training_state, params, optimizers
@@ -4157,6 +4264,9 @@ def main() -> None:
         latent_readout_mode=str(args.latent_readout_mode),
         latent_gate_scale=float(args.latent_gate_scale),
         latent_gate_power=int(args.latent_gate_power),
+        equilibrium_input_compression_scale=float(
+            args.equilibrium_input_compression_scale
+        ),
         autonomous_latent_weight=float(args.autonomous_latent_weight),
         electric_spectrum_weight=float(args.electric_spectrum_weight),
         electric_log_energy_weight=float(args.electric_log_energy_weight),
@@ -4197,6 +4307,9 @@ def main() -> None:
                 depth=int(args.depth),
                 normalized_latent_delta=(
                     normalized_latent_delta if args.latent_delay_input else None
+                ),
+                input_compression_scale=float(
+                    args.equilibrium_input_compression_scale
                 ),
             )
         if args.latent_readout_mode == "multiplicative":
@@ -4334,11 +4447,12 @@ def main() -> None:
             auxiliary_contribution_norm,
             gradient_conflict,
             physical_gradient_alignment,
-        ) = _combine_conflict_safe_gradients(
+        ) = _combine_gradients(
             physical_grads,
             teacher_residual_grads,
             auxiliary_weight=float(args.latent_residual_weight),
             maximum_auxiliary_ratio=float(args.latent_gradient_ratio),
+            mode=args.update_combination,
         )
         finite = (
             _tree_all_finite(physical_grads)
@@ -4348,6 +4462,10 @@ def main() -> None:
             & jnp.isfinite(physical_gradient_alignment)
         )
         group_norms = _gradient_group_norms(grads)
+        safe_grads = jax.tree_util.tree_map(
+            lambda value: jnp.where(finite, value, jnp.zeros_like(value)),
+            grads,
+        )
         safe_physical_grads = jax.tree_util.tree_map(
             lambda value: jnp.where(finite, value, jnp.zeros_like(value)),
             physical_grads,
@@ -4357,54 +4475,64 @@ def main() -> None:
             teacher_residual_grads,
         )
         optimizer_step = _adam_step if args.optimizer == "adam" else _sgd_step
-        physical_candidate, physical_optimizer, _ = optimizer_step(
-            model_params,
-            safe_physical_grads,
-            optimizer_states["physical"],
-            float(args.learning_rate),
-            float(args.grad_clip),
-        )
-        teacher_candidate, teacher_optimizer, _ = optimizer_step(
-            model_params,
-            safe_teacher_grads,
-            optimizer_states["teacher"],
-            float(args.teacher_learning_rate),
-            float(args.grad_clip),
-        )
-        physical_update = jax.tree_util.tree_map(
-            lambda candidate, old: candidate - old,
-            physical_candidate,
-            model_params,
-        )
-        teacher_update = _scale_auxiliary_update(
-            teacher_candidate,
-            model_params,
-            float(args.latent_residual_weight),
-        )
-        (
-            combined_update,
-            physical_update_norm,
-            teacher_update_norm,
-            update_cosine,
-            teacher_update_contribution_norm,
-            update_conflict,
-            physical_update_alignment,
-        ) = _combine_optimizer_updates(
-            physical_update,
-            teacher_update,
-            mode=str(args.update_combination),
-            output_ratio=float(args.latent_gradient_ratio),
-            internal_ratio=float(args.teacher_internal_update_ratio),
-        )
-        updated = jax.tree_util.tree_map(
-            lambda old, change: old + change,
-            model_params,
-            combined_update,
-        )
-        updated_optimizers = {
-            "physical": physical_optimizer,
-            "teacher": teacher_optimizer,
-        }
+        if args.training_objective == "joint":
+            # Preserve the physical/teacher gradient geometry through Adam.
+            # Combining separately preconditioned Adam displacements can reverse
+            # the positive raw-gradient alignment established above.
+            updated, joint_optimizer, _ = optimizer_step(
+                model_params,
+                safe_grads,
+                optimizer_states["physical"],
+                float(args.learning_rate),
+                float(args.grad_clip),
+            )
+            physical_update = jax.tree_util.tree_map(
+                lambda new, old: new - old, updated, model_params
+            )
+            physical_update_norm = _tree_l2_norm(physical_update)
+            teacher_update_norm = jnp.asarray(0.0, dtype=physical_update_norm.dtype)
+            update_cosine = jnp.asarray(0.0, dtype=physical_update_norm.dtype)
+            teacher_update_contribution_norm = jnp.asarray(
+                0.0, dtype=physical_update_norm.dtype
+            )
+            update_conflict = jnp.asarray(False)
+            physical_update_alignment = jnp.asarray(
+                1.0, dtype=physical_update_norm.dtype
+            )
+            updated_optimizers = {
+                "physical": joint_optimizer,
+                "teacher": optimizer_states["teacher"],
+            }
+        else:
+            teacher_candidate, teacher_optimizer, _ = optimizer_step(
+                model_params,
+                safe_teacher_grads,
+                optimizer_states["teacher"],
+                float(args.teacher_learning_rate),
+                float(args.grad_clip),
+            )
+            teacher_update = _scale_auxiliary_update(
+                teacher_candidate,
+                model_params,
+                float(args.latent_residual_weight),
+            )
+            updated = jax.tree_util.tree_map(
+                lambda old, change: old + change,
+                model_params,
+                teacher_update,
+            )
+            teacher_update_norm = _tree_l2_norm(teacher_update)
+            physical_update_norm = jnp.asarray(0.0, dtype=teacher_update_norm.dtype)
+            update_cosine = jnp.asarray(0.0, dtype=teacher_update_norm.dtype)
+            teacher_update_contribution_norm = teacher_update_norm
+            update_conflict = jnp.asarray(False)
+            physical_update_alignment = jnp.asarray(
+                0.0, dtype=teacher_update_norm.dtype
+            )
+            updated_optimizers = {
+                "physical": optimizer_states["physical"],
+                "teacher": teacher_optimizer,
+            }
         grad_norm = _tree_l2_norm(grads)
         updated, update_norm, clipped_update_norm = _clip_parameter_update(
             model_params,
@@ -4649,11 +4777,12 @@ def main() -> None:
         preflight_auxiliary_norm,
         preflight_conflict,
         preflight_alignment,
-    ) = _combine_conflict_safe_gradients(
+    ) = _combine_gradients(
         preflight_physical_grads,
         preflight_teacher_residual_grads,
         auxiliary_weight=float(args.latent_residual_weight),
         maximum_auxiliary_ratio=float(args.latent_gradient_ratio),
+        mode=args.update_combination,
     )
     preflight_group_norms = _gradient_group_norms(preflight_grads)
     preflight_finite = bool(

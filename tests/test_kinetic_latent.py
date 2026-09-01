@@ -636,6 +636,25 @@ class KineticLatentDynamicsTest(unittest.TestCase):
         self.assertGreater(doubled / small, 2.5)
         self.assertLess(doubled / small, 5.5)
 
+        def compressed_correction(scale):
+            return equilibrium_preserving_latent_cnn_correction(
+                params,
+                scale * resolved,
+                scale * latent,
+                depth=2,
+                normalized_latent_delta=scale * delta,
+                input_compression_scale=4.0,
+            )
+
+        compressed_small = float(jnp.linalg.norm(compressed_correction(1e-2)))
+        compressed_doubled = float(jnp.linalg.norm(compressed_correction(2e-2)))
+        self.assertTrue(
+            bool(jnp.allclose(compressed_correction(0.0), 0.0, atol=1e-8))
+        )
+        self.assertGreater(compressed_small, 0.0)
+        self.assertGreater(compressed_doubled / compressed_small, 2.5)
+        self.assertLess(compressed_doubled / compressed_small, 5.5)
+
     def test_operator_features_decode_to_the_reported_correction(self):
         params = init_state_conditioned_latent_operator(
             jax.random.PRNGKey(14),
