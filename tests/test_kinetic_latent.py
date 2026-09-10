@@ -5,6 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from vpml.kinetic_latent import (
+    _bounce_phase_features,
+    _history_frequency_activation,
     advance_coupled_semilinear_strang,
     apply_coupled_linear_propagator,
     apply_linear_latent_propagator,
@@ -37,6 +39,61 @@ from vpml.low_moment import electric_field_from_density
 
 
 class KineticLatentDynamicsTest(unittest.TestCase):
+    def test_history_frequency_deadband_is_compact_and_causal(self):
+        exposure = jnp.asarray(
+            [
+                [99.0, 98.0, 97.0, 96.0, 0.20, 0.25, 0.30, 0.35],
+                [0.0, 0.0, 0.0, 0.0, 0.20, 0.25, 0.30, 0.36],
+                [0.0, 0.0, 0.0, 0.0, 0.20, 0.25, 0.30, 0.37],
+            ],
+            dtype=jnp.float32,
+        )
+        activation = _history_frequency_activation(
+            exposure, jnp.asarray([0.35, 0.37]), dtype=jnp.float32
+        )
+        np.testing.assert_allclose(activation, [0.0, 0.5, 1.0], atol=2e-6)
+
+    def test_bounce_features_include_causal_cyclic_history_context(self):
+        nx = 16
+        x = 2.0 * jnp.pi * jnp.arange(nx) / float(nx)
+        density = 0.2 * jnp.cos(x)
+        momentum = 0.1 * jnp.sin(x)
+        state = jnp.stack((density, momentum, density), axis=0)[None]
+        k_arr = jnp.fft.rfftfreq(nx, d=1.0 / float(nx)).astype(jnp.float32)
+        phase = 0.75 * jnp.pi
+        low_history = _bounce_phase_features(
+            state, jnp.asarray([[phase, 0.1]], dtype=jnp.float32), k_arr
+        )
+        high_history = _bounce_phase_features(
+            state, jnp.asarray([[phase, 2.0]], dtype=jnp.float32), k_arr
+        )
+        self.assertEqual(low_history.shape, (1, 8))
+        np.testing.assert_allclose(low_history[:, :4], high_history[:, :4])
+        self.assertGreater(abs(float(high_history[0, 4])), abs(float(low_history[0, 4])))
+        self.assertGreater(abs(float(high_history[0, 5])), abs(float(low_history[0, 5])))
+        self.assertGreater(abs(float(high_history[0, 6])), abs(float(low_history[0, 6])))
+        self.assertGreater(abs(float(high_history[0, 7])), abs(float(low_history[0, 7])))
+
+    def test_bounce_features_include_periodic_pairwise_modal_phase(self):
+        nx = 16
+        x = 2.0 * jnp.pi * jnp.arange(nx) / float(nx)
+        density = sum(0.05 * jnp.cos(mode * x) for mode in range(1, 5))
+        momentum = sum(0.03 * jnp.sin(mode * x) for mode in range(1, 5))
+        state = jnp.stack((density, momentum, density), axis=0)[None]
+        k_arr = jnp.fft.rfftfreq(nx, d=1.0 / float(nx)).astype(jnp.float32)
+        phase = jnp.asarray([[0.2, 0.7, 1.1, 1.9]], dtype=jnp.float32)
+        maximum_frequency = jnp.ones_like(phase)
+        exposure = jnp.concatenate((phase, maximum_frequency), axis=1)
+        features = _bounce_phase_features(state, exposure, k_arr)
+        shifted = _bounce_phase_features(
+            state,
+            jnp.concatenate((phase + 2.0 * jnp.pi, maximum_frequency), axis=1),
+            k_arr,
+        )
+        self.assertEqual(features.shape, (1, 68))
+        np.testing.assert_allclose(features, shifted, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(features[0, 32:34], [jnp.sin(-0.5), jnp.cos(-0.5) - 1.0])
+
     def test_electric_kick_matches_quadratic_moment_forces(self):
         nx = 24
         x = 2.0 * jnp.pi * jnp.arange(nx) / float(nx)
@@ -713,6 +770,9 @@ class KineticLatentDynamicsTest(unittest.TestCase):
             0.30,
             places=6,
         )
+        np.testing.assert_array_equal(params["expert_phase_output_kernel"], 0.0)
+        np.testing.assert_array_equal(params["expert_phase_output_bias"], 0.0)
+        np.testing.assert_array_equal(params["expert_phase_gain"], 0.0)
 
     def test_operator_features_decode_to_the_reported_correction(self):
         params = init_state_conditioned_latent_operator(

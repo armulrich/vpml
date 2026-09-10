@@ -297,6 +297,7 @@ def build_interface_flux_rollout_reference_dataset(
     ic_modes: Sequence[float],
     Nv_targets: Sequence[int],
     min_projection_order: Optional[int] = None,
+    selected_case_ids: Optional[Sequence[str]] = None,
 ) -> Tuple[Dict[str, Dict[str, object]], int, Dict[str, object], Path]:
     """Build or resume one complex64 projected-history shard per complete IC."""
     max_projection_order = max(max(int(v) for v in Nv_targets) + 1, int(min_projection_order or 0))
@@ -329,6 +330,11 @@ def build_interface_flux_rollout_reference_dataset(
         "snapshot_times": [float(value) for value in snapshot_times],
         "solver_version": "semilagrangian_vlasov_poisson_strang_cubic_v1",
         "storage_dtype": np.dtype(np.complex64).name,
+        "selected_case_ids": (
+            sorted(str(value) for value in selected_case_ids)
+            if selected_case_ids is not None
+            else None
+        ),
     }
     cache_dir = reference_cache_directory(reference_cache_root, configuration)
     initialize_reference_cache(
@@ -369,7 +375,13 @@ def build_interface_flux_rollout_reference_dataset(
     x = np.asarray(config.x, dtype=np.float64)
     active = set(str(value) for value in regimes)
     selected_cases = [
-        case for case in manifest["cases"] if str(case["regime"]) in active
+        case
+        for case in manifest["cases"]
+        if str(case["regime"]) in active
+        and (
+            selected_case_ids is None
+            or str(case["case_id"]) in set(str(value) for value in selected_case_ids)
+        )
     ]
     for case_number, case in enumerate(selected_cases, start=1):
         case_id = str(case["case_id"])
@@ -431,9 +443,11 @@ def build_interface_flux_rollout_reference_dataset(
         del history, raw
         gc.collect()
 
+    selected_manifest = dict(manifest)
+    selected_manifest["cases"] = selected_cases
     dataset = load_sharded_reference(
         cache_dir,
-        manifest,
+        selected_manifest,
         coeff_key=coeff_key,
     )
     return dataset, max_projection_order, manifest, cache_dir

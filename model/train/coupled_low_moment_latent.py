@@ -58,6 +58,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-cache", type=Path, required=True)
     parser.add_argument("--projected-cache", type=Path, required=True)
+    parser.add_argument("--supplemental-strong-manifest", type=Path)
+    parser.add_argument("--supplemental-strong-case-ids", type=str, default="")
+    parser.add_argument(
+        "--supplemental-strong-case-prefix",
+        type=str,
+        default="discovery_",
+    )
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--latent-rank", type=int, default=32)
     parser.add_argument("--basis-modes", type=int, default=64)
@@ -82,6 +89,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--latent-residual-weight", type=float, default=1.0)
     parser.add_argument("--latent-state-residual-weight", type=float, default=1.0)
+    parser.add_argument("--low-mode-latent-residual-weight", type=float, default=0.0)
     parser.add_argument("--closure-residual-weight", type=float, default=0.0)
     parser.add_argument("--closure-aligned-output", action="store_true")
     parser.add_argument("--closure-correction-bound", type=float, default=40.0)
@@ -121,14 +129,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--electric-log-energy-weight", type=float, default=0.0)
     parser.add_argument("--electric-log-energy-floor-ratio", type=float, default=1e-8)
     parser.add_argument("--electric-chunk-log-growth-weight", type=float, default=0.0)
+    parser.add_argument("--electric-sliding-log-growth-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--electric-sliding-log-growth-direction",
+        choices=(
+            "balanced",
+            "balanced_episodes",
+            "growth",
+            "growth_episodes",
+            "damping",
+        ),
+        default="balanced",
+    )
     parser.add_argument("--electric-growth-window-steps", type=int, default=100)
     parser.add_argument("--electric-time-relative-weight", type=float, default=0.0)
+    parser.add_argument("--electric-transfer-weight", type=float, default=0.0)
     parser.add_argument(
         "--electric-time-relative-floor-ratio", type=float, default=1e-4
     )
     parser.add_argument("--post-minimum-log-energy-weight", type=float, default=0.0)
+    parser.add_argument("--post-minimum-field-weight", type=float, default=0.0)
+    parser.add_argument("--turnaround-field-weight", type=float, default=0.0)
     parser.add_argument("--post-peak-log-energy-weight", type=float, default=0.0)
     parser.add_argument("--peak-log-energy-weight", type=float, default=0.0)
+    parser.add_argument("--turnaround-log-ratio-weight", type=float, default=0.0)
+    parser.add_argument("--post-peak-retention-weight", type=float, default=0.0)
+    parser.add_argument("--post-peak-retention-floor", type=float, default=0.0)
     parser.add_argument("--linear-regime-weight", type=float, default=1.0)
     parser.add_argument("--weak-regime-weight", type=float, default=1.0)
     parser.add_argument("--strong-regime-weight", type=float, default=1.0)
@@ -189,7 +215,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-tail-output-from", type=int, default=0)
     parser.add_argument("--train-output-rows", type=str, default="")
     parser.add_argument("--train-expert-output-only", action="store_true")
+    parser.add_argument("--train-expert-phase-output-only", action="store_true")
+    parser.add_argument("--train-expert-gate-only", action="store_true")
+    parser.add_argument("--train-expert-cyclic-gate-only", action="store_true")
+    parser.add_argument("--train-expert-cyclic-output-only", action="store_true")
+    parser.add_argument("--train-cyclic-low-mode-closure-only", action="store_true")
+    parser.add_argument("--train-cyclic-low-mode-pressure-only", action="store_true")
+    parser.add_argument("--train-cyclic-modal-pressure-only", action="store_true")
+    parser.add_argument("--train-cyclic-low-mode-momentum-only", action="store_true")
+    parser.add_argument("--train-cyclic-feature-indices", type=str, default="")
     parser.add_argument("--train-expert-indices", type=str, default="")
+    parser.add_argument("--weak-train-case-ids", type=str, default="")
+    parser.add_argument("--strong-train-case-ids", type=str, default="")
     parser.add_argument("--linear-nonregression-limit", type=float, default=0.0)
     parser.add_argument("--gradient-chunk-steps", type=int, default=300)
     parser.add_argument("--validation-every", type=int, default=5)
@@ -214,6 +251,7 @@ def _load_complete_case(
     *,
     latent_rank: int,
     expected_samples: int,
+    dtype=np.float32,
 ) -> np.ndarray:
     values = np.load(
         projected_cache / "cases" / f"{case['case_id']}.npy",
@@ -224,7 +262,7 @@ def _load_complete_case(
             f"{case['case_id']} has {values.shape[0]} samples; "
             f"expected the complete {expected_samples}-sample trajectory"
         )
-    return np.asarray(values[:, : 3 + int(latent_rank)], dtype=np.float32)
+    return np.asarray(values[:, : 3 + int(latent_rank)], dtype=dtype)
 
 
 def _balanced_complete_batch(
@@ -1785,6 +1823,28 @@ def _electric_chunk_log_growth_error(
     return jnp.square(predicted_growth - target_growth)
 
 
+def _equal_contiguous_episode_weights(active):
+    """Give every contiguous true episode equal total mass per case."""
+    active = jnp.asarray(active, dtype=bool)
+    starts = active & jnp.concatenate(
+        (jnp.ones_like(active[:, :1]), ~active[:, :-1]), axis=1
+    )
+    episode_index = jnp.cumsum(starts.astype(jnp.int32), axis=1) - 1
+    memberships = jax.nn.one_hot(
+        episode_index, active.shape[1], dtype=jnp.float32
+    ) * active[:, :, None]
+    lengths = jnp.sum(memberships, axis=1)
+    exists = lengths > 0.0
+    episode_count = jnp.maximum(jnp.sum(exists, axis=1, keepdims=True), 1.0)
+    episode_mass = exists.astype(jnp.float32) / episode_count
+    return jnp.sum(
+        memberships
+        * episode_mass[:, None, :]
+        / jnp.maximum(lengths[:, None, :], 1.0),
+        axis=2,
+    ).astype(jnp.float32)
+
+
 def _turnaround_indices(target_energy, *, minimum_start_index: int = 50):
     """Select the local damping minimum with the strongest later regrowth."""
     target_energy = jnp.asarray(target_energy)
@@ -1982,29 +2042,200 @@ def _mask_tail_output_gradients(
     rows=(),
     *,
     expert_output_only: bool = False,
+    expert_phase_output_only: bool = False,
+    expert_gate_only: bool = False,
+    expert_cyclic_gate_only: bool = False,
+    expert_cyclic_output_only: bool = False,
+    cyclic_low_mode_closure_only: bool = False,
+    cyclic_low_mode_pressure_only: bool = False,
+    cyclic_modal_pressure_only: bool = False,
+    cyclic_low_mode_momentum_only: bool = False,
+    cyclic_feature_indices=(),
     expert_indices=(),
 ):
     """Freeze the learned core and update selected output channels or a tail."""
     selected = tuple(int(row) for row in rows)
-    if expert_output_only:
+    if (
+        expert_output_only
+        or expert_phase_output_only
+        or expert_gate_only
+        or expert_cyclic_gate_only
+        or expert_cyclic_output_only
+        or cyclic_low_mode_closure_only
+        or cyclic_low_mode_pressure_only
+        or cyclic_modal_pressure_only
+        or cyclic_low_mode_momentum_only
+    ):
         selected_experts = tuple(int(index) for index in expert_indices)
-        trainable_expert_keys = {
-            "expert_output_kernel",
-            "expert_output_bias",
-            "expert_gate_kernel",
-            "expert_gate_bias",
-        }
+        if cyclic_low_mode_momentum_only:
+            trainable_expert_keys = {"expert_cyclic_low_mode_momentum_gain"}
+        elif cyclic_modal_pressure_only:
+            trainable_expert_keys = {"expert_cyclic_modal_pressure_gain"}
+        elif cyclic_low_mode_pressure_only:
+            trainable_expert_keys = {
+                "expert_cyclic_low_mode_pressure_gain",
+                "expert_cyclic_modal_pressure_gain",
+            }
+        elif cyclic_low_mode_closure_only:
+            trainable_expert_keys = {"expert_cyclic_low_mode_closure_gain"}
+        elif expert_cyclic_output_only:
+            cyclic_output_prefix = (
+                "specialist_cyclic_output"
+                if "specialist_cyclic_output_kernel" in gradients
+                else "expert_cyclic_output"
+            )
+            trainable_expert_keys = {
+                f"{cyclic_output_prefix}_kernel",
+                f"{cyclic_output_prefix}_bias",
+            }
+        elif expert_cyclic_gate_only:
+            # The causal cyclic router is affine, b_e + w_e^T phi.  Keep the
+            # generic state-dependent gate frozen, but allow its intercepts so
+            # training can suppress a mismatched specialist at neutral phase.
+            trainable_expert_keys = {
+                "expert_gate_bias",
+                "expert_null_gate_bias",
+                "expert_bounce_gate_gain",
+            }
+        elif expert_gate_only:
+            trainable_expert_keys = {
+                "expert_gate_kernel",
+                "expert_gate_bias",
+                "expert_null_gate_bias",
+                "expert_bounce_gate_gain",
+            }
+        elif expert_phase_output_only:
+            trainable_expert_keys = {
+                "expert_phase_output_kernel",
+                "expert_phase_output_bias",
+            }
+        else:
+            trainable_expert_keys = {
+                "expert_output_kernel",
+                "expert_output_bias",
+                "expert_phase_output_kernel",
+                "expert_phase_output_bias",
+                "expert_phase_gain",
+                "expert_gate_kernel",
+                "expert_gate_bias",
+                "expert_null_gate_bias",
+                "expert_bounce_gate_gain",
+            }
         masked = {
             key: value if key in trainable_expert_keys else jnp.zeros_like(value)
             for key, value in gradients.items()
         }
+        if (cyclic_low_mode_closure_only or cyclic_low_mode_pressure_only or cyclic_modal_pressure_only or cyclic_low_mode_momentum_only) and cyclic_feature_indices:
+            feature_indices = jnp.asarray(
+                tuple(int(index) for index in cyclic_feature_indices)
+            )
+            gain_keys = (
+                ("expert_cyclic_low_mode_momentum_gain",)
+                if cyclic_low_mode_momentum_only
+                else (
+                    "expert_cyclic_low_mode_pressure_gain",
+                    "expert_cyclic_modal_pressure_gain",
+                )
+                if cyclic_low_mode_pressure_only
+                else ("expert_cyclic_modal_pressure_gain",)
+                if cyclic_modal_pressure_only
+                else ("expert_cyclic_low_mode_closure_gain",)
+            )
+            for gain_key in gain_keys:
+                if gain_key not in masked:
+                    continue
+                selected_value = jnp.zeros_like(masked[gain_key])
+                masked[gain_key] = selected_value.at[feature_indices].set(
+                    masked[gain_key][feature_indices]
+                )
         if selected_experts:
             indices = jnp.asarray(selected_experts)
-            for key in ("expert_output_kernel", "expert_output_bias"):
+            selected_keys = (
+                (
+                    "expert_gate_kernel",
+                    "expert_gate_bias",
+                    "expert_bounce_gate_gain",
+                )
+                if expert_gate_only
+                else (
+                    (
+                        f"{cyclic_output_prefix}_kernel",
+                        f"{cyclic_output_prefix}_bias",
+                    )
+                    if expert_cyclic_output_only
+                    else (
+                    (
+                        "expert_gate_bias",
+                        "expert_bounce_gate_gain",
+                    )
+                    if expert_cyclic_gate_only
+                    else (
+                    ("expert_phase_output_kernel", "expert_phase_output_bias")
+                    if expert_phase_output_only
+                    else (
+                    "expert_output_kernel",
+                    "expert_output_bias",
+                    "expert_phase_output_kernel",
+                    "expert_phase_output_bias",
+                    "expert_phase_gain",
+                    "expert_bounce_gate_gain",
+                    )
+                    )
+                    )
+                )
+            )
+            for key in selected_keys:
+                if key not in masked:
+                    continue
                 selected_value = jnp.zeros_like(masked[key])
                 masked[key] = selected_value.at[indices].set(masked[key][indices])
+            if expert_cyclic_gate_only and cyclic_feature_indices:
+                feature_indices = jnp.asarray(
+                    tuple(int(index) for index in cyclic_feature_indices)
+                )
+                key = "expert_bounce_gate_gain"
+                selected_value = jnp.zeros_like(masked[key])
+                selected_value = selected_value.at[
+                    indices[:, None], feature_indices[None, :]
+                ].set(masked[key][indices[:, None], feature_indices[None, :]])
+                masked[key] = selected_value
+            if expert_cyclic_output_only and cyclic_feature_indices:
+                feature_indices = jnp.asarray(
+                    tuple(int(index) for index in cyclic_feature_indices)
+                )
+                for key in (
+                    f"{cyclic_output_prefix}_kernel",
+                    f"{cyclic_output_prefix}_bias",
+                ):
+                    if key not in masked:
+                        continue
+                    selected_value = jnp.zeros_like(masked[key])
+                    selected_value = selected_value.at[
+                        indices[:, None], feature_indices[None, :]
+                    ].set(masked[key][indices[:, None], feature_indices[None, :]])
+                    masked[key] = selected_value
+            if expert_phase_output_only and selected:
+                output_indices = jnp.asarray(selected)
+                for key in (
+                    "expert_phase_output_kernel",
+                    "expert_phase_output_bias",
+                ):
+                    if key not in masked:
+                        continue
+                    selected_value = jnp.zeros_like(masked[key])
+                    selected_value = selected_value.at[
+                        indices[:, None], output_indices[None, :]
+                    ].set(masked[key][indices[:, None], output_indices[None, :]])
+                    masked[key] = selected_value
             for key in ("expert_gate_kernel", "expert_gate_bias"):
-                masked[key] = jnp.zeros_like(masked[key])
+                if key in masked:
+                    if expert_gate_only or expert_cyclic_gate_only:
+                        selected_value = jnp.zeros_like(masked[key])
+                        masked[key] = selected_value.at[indices].set(
+                            masked[key][indices]
+                        )
+                    else:
+                        masked[key] = jnp.zeros_like(masked[key])
         return masked
     if int(start) <= 0 and not selected:
         return gradients
@@ -2308,10 +2539,12 @@ def _make_functions(
     horizon: int,
     poisson_sign: float,
     gradient_chunk_steps: int,
+    latent_input_scale=None,
     correction_bounds=None,
     latent_residual_scale=None,
     latent_residual_weight: float = 0.0,
     latent_state_residual_weight: float = 1.0,
+    low_mode_latent_residual_weight: float = 0.0,
     closure_residual_scale: float = 1.0,
     closure_residual_weight: float = 0.0,
     closure_correction_bound: float = 40.0,
@@ -2330,15 +2563,24 @@ def _make_functions(
     electric_log_energy_weight: float = 0.0,
     electric_log_energy_floor_ratio: float = 1e-8,
     electric_chunk_log_growth_weight: float = 0.0,
+    electric_sliding_log_growth_weight: float = 0.0,
+    electric_sliding_log_growth_direction: str = "balanced",
     electric_growth_window_steps: int = 100,
     electric_time_relative_weight: float = 0.0,
+    electric_transfer_weight: float = 0.0,
     electric_time_relative_floor_ratio: float = 1e-4,
     post_minimum_log_energy_weight: float = 0.0,
+    post_minimum_field_weight: float = 0.0,
+    turnaround_field_weight: float = 0.0,
     post_peak_log_energy_weight: float = 0.0,
     peak_log_energy_weight: float = 0.0,
+    turnaround_log_ratio_weight: float = 0.0,
+    post_peak_retention_weight: float = 0.0,
+    post_peak_retention_floor: float = 0.0,
     post_minimum_energy_modes: int = 4,
     teacher_residual_stride: int = 1,
     teacher_rollout_steps: int = 1,
+    teacher_residual_causal_history: bool = False,
     linear_baseline: str = "fitted_propagator",
     hermite_tail_damping: float = 10.0,
     hermite_tail_power: float = 6.0,
@@ -2418,8 +2660,29 @@ def _make_functions(
         raise ValueError("electric_log_energy_weight must be nonnegative")
     if float(electric_chunk_log_growth_weight) < 0.0:
         raise ValueError("electric_chunk_log_growth_weight must be nonnegative")
+    if float(electric_sliding_log_growth_weight) < 0.0:
+        raise ValueError("electric_sliding_log_growth_weight must be nonnegative")
+    if electric_sliding_log_growth_direction not in {
+        "balanced",
+        "balanced_episodes",
+        "growth",
+        "growth_episodes",
+        "damping",
+    }:
+        raise ValueError(
+            "electric_sliding_log_growth_direction must be balanced, "
+            "balanced_episodes, growth, growth_episodes, or damping"
+        )
     if int(electric_growth_window_steps) <= 0:
         raise ValueError("electric_growth_window_steps must be positive")
+    if (
+        float(electric_sliding_log_growth_weight) > 0.0
+        and 2 * int(electric_growth_window_steps) > int(horizon) + 1
+    ):
+        raise ValueError(
+            "twice electric_growth_window_steps cannot exceed horizon + 1 when "
+            "the smoothed sliding log-growth loss is enabled"
+        )
     if (
         float(electric_chunk_log_growth_weight) > 0.0
         and int(gradient_chunk_steps) % int(electric_growth_window_steps) != 0
@@ -2436,6 +2699,10 @@ def _make_functions(
         raise ValueError("electric_log_energy_floor_ratio must lie in (0, 1)")
     if float(electric_time_relative_weight) < 0.0:
         raise ValueError("electric_time_relative_weight must be nonnegative")
+    if float(electric_transfer_weight) < 0.0:
+        raise ValueError("electric_transfer_weight must be nonnegative")
+    if float(low_mode_latent_residual_weight) < 0.0:
+        raise ValueError("low_mode_latent_residual_weight must be nonnegative")
     if not 0.0 < float(electric_time_relative_floor_ratio) < 1.0:
         raise ValueError("electric_time_relative_floor_ratio must lie in (0, 1)")
     if float(post_minimum_log_energy_weight) < 0.0:
@@ -2444,6 +2711,16 @@ def _make_functions(
         raise ValueError("post_peak_log_energy_weight must be nonnegative")
     if float(peak_log_energy_weight) < 0.0:
         raise ValueError("peak_log_energy_weight must be nonnegative")
+    if float(turnaround_log_ratio_weight) < 0.0:
+        raise ValueError("turnaround_log_ratio_weight must be nonnegative")
+    if float(post_peak_retention_weight) < 0.0:
+        raise ValueError("post_peak_retention_weight must be nonnegative")
+    if not 0.0 <= float(post_peak_retention_floor) <= 1.0:
+        raise ValueError("post_peak_retention_floor must lie in [0, 1]")
+    if float(post_minimum_field_weight) < 0.0:
+        raise ValueError("post_minimum_field_weight must be nonnegative")
+    if float(turnaround_field_weight) < 0.0:
+        raise ValueError("turnaround_field_weight must be nonnegative")
     if not 1 <= int(post_minimum_energy_modes) < int(k_arr.shape[0]):
         raise ValueError("post_minimum_energy_modes must select nonzero retained modes")
     if int(teacher_residual_stride) <= 0:
@@ -2465,7 +2742,7 @@ def _make_functions(
         closure_residual_scale, dtype=latent_scale.dtype
     )
 
-    def macro_step(params, state, latent, previous_latent):
+    def macro_step(params, state, latent, previous_latent, bounce_exposure=None):
         return coupled_low_moment_latent_step(
             params,
             state,
@@ -2474,10 +2751,12 @@ def _make_functions(
             basis,
             k_arr,
             previous_latent_state=(previous_latent if latent_delay_input else None),
+            bounce_exposure=bounce_exposure,
             resolved_center=resolved_center,
             resolved_scale=resolved_scale,
             latent_center=latent_center,
             latent_scale=latent_scale,
+            latent_input_scale=latent_input_scale,
             depth=depth,
             correction_bounds=correction_bounds,
             closure_residual_scale=closure_residual_scale,
@@ -2503,7 +2782,10 @@ def _make_functions(
             poisson_sign=poisson_sign,
         )
 
-    def teacher_residual_loss_function(params, trajectory):
+    def teacher_residual_loss_function(params, trajectory, *, return_errors=False,
+                                       return_channel_errors=False):
+        if return_channel_errors and linear_baseline not in {"projected_hermite", "semilinear_strang"}:
+            raise ValueError("Channel attribution requires a physical macro step")
         rollout_steps = int(teacher_rollout_steps)
         starts = list(
             range(
@@ -2548,22 +2830,45 @@ def _make_functions(
             trajectory.shape[-1],
         )
 
+        residual_history = None
+        if teacher_residual_causal_history:
+            if linear_baseline not in {"projected_hermite", "semilinear_strang"}:
+                raise ValueError("Causal residual history requires a physical macro step")
+            from model.train.teacher_prefix_history import teacher_prefix_history
+            shape = trajectory.shape
+            states = resolved_hermite_to_low_moment_state(
+                trajectory[:, :, :3].reshape(-1, 3, shape[-1])
+            ).reshape(shape[0], shape[1], 3, shape[-1])
+            history = teacher_prefix_history(states, k_arr, float(fine_steps) * float(fine_dt))
+            residual_history = jnp.stack(
+                [history[:, start:start + rollout_steps] for start in starts], axis=1
+            ).reshape(batch_size * chunks, rollout_steps, history.shape[-1])
+
         def teacher_latent_step(carry, inputs):
             latent, previous_latent = carry
-            resolved, target = inputs
+            resolved, target, history = inputs
             if linear_baseline in {"projected_hermite", "semilinear_strang"}:
                 _, updated = macro_step(
                     params,
                     resolved_hermite_to_low_moment_state(resolved),
                     latent,
                     previous_latent,
+                    history,
                 )
                 normalized_error = (updated - target) / (
                     latent_scale[None, :, None]
                     * latent_residual_scale[None, :, None]
                 )
+                if return_channel_errors:
+                    return (updated, latent), jnp.mean(jnp.square(normalized_error), axis=2)
                 latent_error = jnp.mean(
                     jnp.square(normalized_error), axis=(1, 2)
+                )
+                low_mode_error_hat = jnp.fft.rfft(
+                    normalized_error, axis=-1, norm="forward"
+                )[..., 1 : int(post_minimum_energy_modes) + 1]
+                low_mode_latent_error = jnp.mean(
+                    jnp.square(jnp.abs(low_mode_error_hat)), axis=(1, 2)
                 )
                 closure_error = jnp.einsum(
                     "r,brx->bx", basis[0], updated - target
@@ -2571,6 +2876,8 @@ def _make_functions(
                 closure_error = jnp.mean(jnp.square(closure_error), axis=1)
                 return (updated, latent), (
                     float(latent_state_residual_weight) * latent_error
+                    + float(low_mode_latent_residual_weight)
+                    * low_mode_latent_error
                     + float(closure_residual_weight) * closure_error
                 )
             linear = apply_coupled_linear_propagator(
@@ -2676,12 +2983,19 @@ def _make_functions(
                 * latent_residual_scale[None, :, None]
             )
             latent_error = jnp.mean(jnp.square(normalized_error), axis=(1, 2))
+            low_mode_error_hat = jnp.fft.rfft(
+                normalized_error, axis=-1, norm="forward"
+            )[..., 1 : int(post_minimum_energy_modes) + 1]
+            low_mode_latent_error = jnp.mean(
+                jnp.square(jnp.abs(low_mode_error_hat)), axis=(1, 2)
+            )
             closure_error = jnp.einsum(
                 "r,brx->bx", basis[0], updated - target
             ) / closure_residual_scale
             closure_error = jnp.mean(jnp.square(closure_error), axis=1)
             return (updated, latent), (
                 float(latent_state_residual_weight) * latent_error
+                + float(low_mode_latent_residual_weight) * low_mode_latent_error
                 + float(closure_residual_weight) * closure_error
             )
 
@@ -2691,8 +3005,14 @@ def _make_functions(
             (
                 jnp.swapaxes(current_resolved, 0, 1),
                 jnp.swapaxes(target_latent, 0, 1),
+                (jnp.swapaxes(residual_history, 0, 1)
+                 if residual_history is not None else None),
             ),
         )
+        if return_channel_errors:
+            return errors.reshape(rollout_steps, batch_size, chunks, -1).transpose(1, 2, 0, 3)
+        if return_errors:
+            return errors.reshape(rollout_steps, batch_size, chunks).transpose(1, 2, 0)
         return jnp.mean(errors)
 
     def loss_components_function(params, trajectory):
@@ -2716,6 +3036,15 @@ def _make_functions(
         target_low_mode_hat = jnp.fft.rfft(
             target_fields[:, :, 3], axis=-1, norm="forward"
         )[..., 1 : int(post_minimum_energy_modes) + 1]
+        target_momentum = target_states[:, 1].reshape(
+            target_shape[0], target_shape[1], target_shape[-1]
+        )
+        target_momentum_hat = jnp.fft.rfft(
+            target_momentum, axis=-1, norm="forward"
+        )[..., 1 : int(post_minimum_energy_modes) + 1]
+        complete_target_transfer = 2.0 * jnp.real(
+            target_low_mode_hat * jnp.conj(target_momentum_hat)
+        )
         complete_target_low_mode_energy = jnp.sum(
             jnp.square(jnp.abs(target_low_mode_hat)), axis=-1
         ).T
@@ -2762,10 +3091,25 @@ def _make_functions(
                 log_energy_error,
                 time_relative_error,
                 latent_error,
+                bounce_exposure,
             ) = carry
             old_latent = latent
+            density_hat = jnp.fft.rfft(state[:, 0], axis=-1, norm="forward")
+            bounce_mode_count = min(4, k_arr.shape[0] - 1)
+            bounce_modes = jnp.arange(1, bounce_mode_count + 1)
+            field_mode = (
+                1j
+                * density_hat[:, 1 : bounce_mode_count + 1]
+                / k_arr[bounce_modes][None, :]
+            )
+            bounce_increment = float(fine_steps) * float(fine_dt) * jnp.sqrt(
+                jnp.maximum(
+                    2.0 * k_arr[bounce_modes][None, :] * jnp.abs(field_mode),
+                    0.0,
+                )
+            ).astype(bounce_exposure.dtype)
             state, latent = macro_step(
-                params, state, latent, previous_latent
+                params, state, latent, previous_latent, bounce_exposure
             )
             (
                 numerator,
@@ -2796,6 +3140,12 @@ def _make_functions(
             predicted_low_mode_energy = jnp.sum(
                 jnp.square(jnp.abs(predicted_hat)), axis=-1
             )
+            predicted_momentum_hat = jnp.fft.rfft(
+                state[:, 1], axis=-1, norm="forward"
+            )[..., 1 : int(post_minimum_energy_modes) + 1]
+            predicted_transfer = 2.0 * jnp.real(
+                predicted_hat * jnp.conj(predicted_momentum_hat)
+            )
             return (
                 state,
                 latent,
@@ -2814,7 +3164,23 @@ def _make_functions(
                     ),
                     axis=(1, 2),
                 ),
-            ), (predicted_energy, predicted_low_mode_energy)
+                jnp.concatenate(
+                    (
+                        bounce_exposure[:, :bounce_mode_count] + bounce_increment,
+                        jnp.maximum(
+                            bounce_exposure[:, bounce_mode_count:],
+                            bounce_increment
+                            / (float(fine_steps) * float(fine_dt)),
+                        ),
+                    ),
+                    axis=1,
+                ),
+            ), (
+                predicted_energy,
+                predicted_low_mode_energy,
+                predicted_hat,
+                predicted_transfer,
+            )
 
         def chunk_body(carry, chunk_inputs):
             (
@@ -2822,10 +3188,11 @@ def _make_functions(
                 target_initial_energies,
                 target_final_energies,
             ) = chunk_inputs
-            state, latent, previous_latent = carry
+            state, latent, previous_latent, bounce_exposure = carry
             state = jax.lax.stop_gradient(state)
             latent = jax.lax.stop_gradient(latent)
             previous_latent = jax.lax.stop_gradient(previous_latent)
+            bounce_exposure = jax.lax.stop_gradient(bounce_exposure)
             initial_field = primitive_fields(
                 state,
                 k_arr,
@@ -2841,7 +3208,12 @@ def _make_functions(
                 (trajectory.shape[0],), dtype=trajectory.dtype
             )
             latent_zeros = jnp.zeros((trajectory.shape[0],), dtype=trajectory.dtype)
-            final, (predicted_energies, predicted_low_mode_energies) = jax.lax.scan(
+            final, (
+                predicted_energies,
+                predicted_low_mode_energies,
+                predicted_low_mode_fields,
+                predicted_transfers,
+            ) = jax.lax.scan(
                 jax.checkpoint(step_body),
                 (
                     state,
@@ -2854,6 +3226,7 @@ def _make_functions(
                     log_energy_zeros,
                     time_relative_zeros,
                     latent_zeros,
+                    bounce_exposure,
                 ),
                 chunk_targets,
             )
@@ -2871,7 +3244,7 @@ def _make_functions(
                 target_final_energies,
                 energy_floor,
             )
-            return (final[0], final[1], final[2]), (
+            return (final[0], final[1], final[2], final[10]), (
                 final[3],
                 final[4],
                 final[5],
@@ -2881,9 +3254,11 @@ def _make_functions(
                 final[9],
                 chunk_log_growth_error,
                 predicted_low_mode_energies,
+                predicted_low_mode_fields,
+                predicted_transfers,
             )
 
-        (_, _, _), (
+        (_, _, _, _), (
             chunk_numerators,
             chunk_denominators,
             chunk_spectral_numerators,
@@ -2893,9 +3268,19 @@ def _make_functions(
             chunk_latent_errors,
             chunk_log_growth_errors,
             chunk_low_mode_energies,
+            chunk_low_mode_fields,
+            chunk_transfers,
         ) = jax.lax.scan(
             chunk_body,
-            (initial_state, initial_latent, initial_latent),
+            (
+                initial_state,
+                initial_latent,
+                initial_latent,
+                jnp.zeros(
+                    (trajectory.shape[0], 2 * min(4, k_arr.shape[0] - 1)),
+                    dtype=trajectory.dtype,
+                ),
+            ),
             (
                 targets,
                 target_window_initial_energy,
@@ -2919,6 +3304,123 @@ def _make_functions(
         predicted_low_mode_energy = jnp.swapaxes(
             chunk_low_mode_energies.reshape(horizon, trajectory.shape[0]), 0, 1
         )
+        complete_predicted_low_mode_energy = jnp.concatenate(
+            (complete_target_low_mode_energy[:, :1], predicted_low_mode_energy),
+            axis=1,
+        )
+        low_mode_floor = jnp.maximum(
+            1e-6 * jnp.max(complete_target_low_mode_energy, axis=1, keepdims=True),
+            jnp.finfo(trajectory.dtype).tiny,
+        )
+        sliding_window = int(electric_growth_window_steps)
+        # A trailing average is causal and removes carrier-scale plasma
+        # oscillations before measuring sustained damping or growth.  The
+        # following lag is measured on that envelope, so every eligible
+        # window contributes without selecting a particular turnaround.
+        def trailing_mean(values):
+            prefix = jnp.concatenate(
+                (jnp.zeros_like(values[:, :1]), jnp.cumsum(values, axis=1)),
+                axis=1,
+            )
+            return (
+                prefix[:, sliding_window:] - prefix[:, :-sliding_window]
+            ) / float(sliding_window)
+
+        predicted_envelope = trailing_mean(complete_predicted_low_mode_energy)
+        target_envelope = trailing_mean(complete_target_low_mode_energy)
+        predicted_sliding_growth = (
+            jnp.log(predicted_envelope[:, sliding_window:] + low_mode_floor)
+            - jnp.log(predicted_envelope[:, :-sliding_window] + low_mode_floor)
+        )
+        target_sliding_growth = (
+            jnp.log(target_envelope[:, sliding_window:] + low_mode_floor)
+            - jnp.log(target_envelope[:, :-sliding_window] + low_mode_floor)
+        )
+        positive_growth_weight = jnp.maximum(target_sliding_growth, 0.0)
+        negative_growth_weight = jnp.maximum(-target_sliding_growth, 0.0)
+        positive_growth_weight = positive_growth_weight / jnp.maximum(
+            jnp.sum(positive_growth_weight, axis=1, keepdims=True),
+            jnp.finfo(trajectory.dtype).tiny,
+        )
+        negative_growth_weight = negative_growth_weight / jnp.maximum(
+            jnp.sum(negative_growth_weight, axis=1, keepdims=True),
+            jnp.finfo(trajectory.dtype).tiny,
+        )
+        if electric_sliding_log_growth_direction == "balanced_episodes":
+            sliding_growth_weight = 0.5 * (
+                _equal_contiguous_episode_weights(target_sliding_growth > 0.0)
+                + _equal_contiguous_episode_weights(target_sliding_growth < 0.0)
+            ).astype(trajectory.dtype)
+        elif electric_sliding_log_growth_direction == "growth":
+            sliding_growth_weight = positive_growth_weight
+        elif electric_sliding_log_growth_direction == "growth_episodes":
+            sliding_growth_weight = _equal_contiguous_episode_weights(
+                target_sliding_growth > 0.0
+            ).astype(trajectory.dtype)
+        elif electric_sliding_log_growth_direction == "damping":
+            sliding_growth_weight = negative_growth_weight
+        else:
+            sliding_growth_weight = 0.5 * (
+                positive_growth_weight + negative_growth_weight
+            )
+        sliding_log_growth_loss = weighted_case_mean(
+            jnp.sum(
+                sliding_growth_weight
+                * jnp.square(predicted_sliding_growth - target_sliding_growth),
+                axis=1,
+            )
+        )
+        predicted_low_mode_field = jnp.swapaxes(
+            chunk_low_mode_fields.reshape(
+                horizon, trajectory.shape[0], int(post_minimum_energy_modes)
+            ),
+            0,
+            1,
+        )
+        predicted_transfer = jnp.swapaxes(
+            chunk_transfers.reshape(
+                horizon, trajectory.shape[0], int(post_minimum_energy_modes)
+            ),
+            0,
+            1,
+        )
+        target_transfer = jnp.swapaxes(complete_target_transfer[1:], 0, 1)
+        transfer_scale = jnp.maximum(
+            jnp.mean(jnp.square(target_transfer), axis=1, keepdims=True),
+            jnp.finfo(trajectory.dtype).tiny,
+        )
+        positive_transfer_weight = jnp.sum(
+            jnp.maximum(target_transfer, 0.0), axis=-1
+        )
+        negative_transfer_weight = jnp.sum(
+            jnp.maximum(-target_transfer, 0.0), axis=-1
+        )
+        positive_transfer_weight = positive_transfer_weight / jnp.maximum(
+            jnp.sum(positive_transfer_weight, axis=1, keepdims=True),
+            jnp.finfo(trajectory.dtype).tiny,
+        )
+        negative_transfer_weight = negative_transfer_weight / jnp.maximum(
+            jnp.sum(negative_transfer_weight, axis=1, keepdims=True),
+            jnp.finfo(trajectory.dtype).tiny,
+        )
+        # Damping often dominates the raw transfer integral.  Equal directional
+        # mass prevents any number of later growth phases from being erased by
+        # a long initial damping interval.
+        transfer_time_weight = 0.5 * (
+            positive_transfer_weight + negative_transfer_weight
+        )
+        electric_transfer_loss = weighted_case_mean(
+            jnp.sum(
+                transfer_time_weight
+                * jnp.mean(
+                    jnp.square(predicted_transfer - target_transfer)
+                    / transfer_scale,
+                    axis=-1,
+                ),
+                axis=1,
+            )
+        )
+        target_low_mode_field = jnp.swapaxes(target_low_mode_hat[1:], 0, 1)
         target_low_mode_energy = complete_target_low_mode_energy[:, 1:]
         minimum_index, peak_index = _turnaround_indices(
             complete_target_low_mode_energy
@@ -2929,9 +3431,44 @@ def _make_functions(
         post_minimum_mask = post_minimum_mask / jnp.maximum(
             jnp.sum(post_minimum_mask, axis=1, keepdims=True), 1.0
         )
-        low_mode_floor = jnp.maximum(
-            1e-6 * jnp.max(complete_target_low_mode_energy, axis=1, keepdims=True),
-            jnp.finfo(trajectory.dtype).tiny,
+        post_minimum_field_loss = weighted_case_mean(
+            jnp.sum(
+                post_minimum_mask
+                * (
+                    jnp.sum(
+                        jnp.square(
+                            jnp.abs(
+                                predicted_low_mode_field - target_low_mode_field
+                            )
+                        ),
+                        axis=-1,
+                    )
+                    / (target_low_mode_energy + low_mode_floor)
+                ),
+                axis=1,
+            )
+        )
+        turnaround_mask = (
+            (jnp.arange(1, horizon + 1)[None, :] >= minimum_index[:, None])
+            & (jnp.arange(1, horizon + 1)[None, :] <= peak_index[:, None])
+        ).astype(trajectory.dtype)
+        turnaround_mask = turnaround_mask / jnp.maximum(
+            jnp.sum(turnaround_mask, axis=1, keepdims=True), 1.0
+        )
+        turnaround_field_loss = weighted_case_mean(
+            jnp.sum(
+                turnaround_mask
+                * (
+                    jnp.sum(
+                        jnp.square(
+                            jnp.abs(predicted_low_mode_field - target_low_mode_field)
+                        ),
+                        axis=-1,
+                    )
+                    / (target_low_mode_energy + low_mode_floor)
+                ),
+                axis=1,
+            )
         )
         post_minimum_log_energy_loss = weighted_case_mean(
             jnp.sum(
@@ -2961,6 +3498,19 @@ def _make_functions(
         )
         case_index = jnp.arange(trajectory.shape[0])
         predicted_peak_index = jnp.maximum(peak_index - 1, 0)
+        predicted_minimum_index = jnp.maximum(minimum_index - 1, 0)
+        predicted_peak_energy = predicted_low_mode_energy[
+            case_index, predicted_peak_index
+        ]
+        predicted_minimum_energy = predicted_low_mode_energy[
+            case_index, predicted_minimum_index
+        ]
+        target_peak_energy = target_low_mode_energy[
+            case_index, predicted_peak_index
+        ]
+        target_minimum_energy = target_low_mode_energy[
+            case_index, predicted_minimum_index
+        ]
         peak_log_energy_loss = weighted_case_mean(
             jnp.square(
                 jnp.log(
@@ -2970,6 +3520,33 @@ def _make_functions(
                 - jnp.log(
                     target_low_mode_energy[case_index, predicted_peak_index]
                     + low_mode_floor[:, 0]
+                )
+            )
+        )
+        turnaround_log_ratio_loss = weighted_case_mean(
+            jnp.square(
+                jnp.log(
+                    (predicted_peak_energy + low_mode_floor[:, 0])
+                    / (predicted_minimum_energy + low_mode_floor[:, 0])
+                )
+                - jnp.log(
+                    (target_peak_energy + low_mode_floor[:, 0])
+                    / (target_minimum_energy + low_mode_floor[:, 0])
+                )
+            )
+        )
+        post_peak_retention_loss = weighted_case_mean(
+            jnp.square(
+                jnp.log(
+                    (predicted_low_mode_energy[:, -1] + low_mode_floor[:, 0])
+                    / (predicted_peak_energy + low_mode_floor[:, 0])
+                )
+                - jnp.log(
+                    jnp.maximum(
+                        (target_low_mode_energy[:, -1] + low_mode_floor[:, 0])
+                        / (target_peak_energy + low_mode_floor[:, 0]),
+                        float(post_peak_retention_floor),
+                    )
                 )
             )
         )
@@ -2991,16 +3568,34 @@ def _make_functions(
             float(electric_chunk_log_growth_weight) * chunk_log_growth_loss
         )
         physical_loss = physical_loss + (
+            float(electric_sliding_log_growth_weight) * sliding_log_growth_loss
+        )
+        physical_loss = physical_loss + (
             float(electric_time_relative_weight) * time_relative_electric_loss
         )
         physical_loss = physical_loss + (
+            float(electric_transfer_weight) * electric_transfer_loss
+        )
+        physical_loss = physical_loss + (
             float(post_minimum_log_energy_weight) * post_minimum_log_energy_loss
+        )
+        physical_loss = physical_loss + (
+            float(post_minimum_field_weight) * post_minimum_field_loss
+        )
+        physical_loss = physical_loss + (
+            float(turnaround_field_weight) * turnaround_field_loss
         )
         physical_loss = physical_loss + (
             float(post_peak_log_energy_weight) * post_peak_log_energy_loss
         )
         physical_loss = physical_loss + (
             float(peak_log_energy_weight) * peak_log_energy_loss
+        )
+        physical_loss = physical_loss + (
+            float(turnaround_log_ratio_weight) * turnaround_log_ratio_loss
+        )
+        physical_loss = physical_loss + (
+            float(post_peak_retention_weight) * post_peak_retention_loss
         )
         teacher_residual_loss = teacher_residual_loss_function(params, trajectory)
         teacher_residual_loss = teacher_residual_loss + (
@@ -3030,6 +3625,7 @@ def _make_functions(
             resolved_scale=resolved_scale,
             latent_center=latent_center,
             latent_scale=latent_scale,
+            latent_input_scale=latent_input_scale,
             depth=depth,
             correction_bounds=correction_bounds,
             closure_residual_scale=closure_residual_scale,
@@ -3980,6 +4576,8 @@ def main() -> None:
         raise ValueError("latent_residual_weight must be nonnegative")
     if float(args.latent_state_residual_weight) < 0.0:
         raise ValueError("latent_state_residual_weight must be nonnegative")
+    if float(args.low_mode_latent_residual_weight) < 0.0:
+        raise ValueError("low_mode_latent_residual_weight must be nonnegative")
     if not np.isfinite(float(args.closure_correction_bound)) or float(
         args.closure_correction_bound
     ) <= 0.0:
@@ -4040,18 +4638,32 @@ def main() -> None:
         raise ValueError("electric_log_energy_weight must be nonnegative")
     if float(args.electric_chunk_log_growth_weight) < 0.0:
         raise ValueError("electric_chunk_log_growth_weight must be nonnegative")
+    if float(args.electric_sliding_log_growth_weight) < 0.0:
+        raise ValueError("electric_sliding_log_growth_weight must be nonnegative")
     if int(args.electric_growth_window_steps) <= 0:
         raise ValueError("electric_growth_window_steps must be positive")
     if not 0.0 < float(args.electric_log_energy_floor_ratio) < 1.0:
         raise ValueError("electric_log_energy_floor_ratio must lie in (0, 1)")
     if float(args.electric_time_relative_weight) < 0.0:
         raise ValueError("electric_time_relative_weight must be nonnegative")
+    if float(args.electric_transfer_weight) < 0.0:
+        raise ValueError("electric_transfer_weight must be nonnegative")
     if float(args.post_minimum_log_energy_weight) < 0.0:
         raise ValueError("post_minimum_log_energy_weight must be nonnegative")
+    if float(args.post_minimum_field_weight) < 0.0:
+        raise ValueError("post_minimum_field_weight must be nonnegative")
+    if float(args.turnaround_field_weight) < 0.0:
+        raise ValueError("turnaround_field_weight must be nonnegative")
     if float(args.post_peak_log_energy_weight) < 0.0:
         raise ValueError("post_peak_log_energy_weight must be nonnegative")
     if float(args.peak_log_energy_weight) < 0.0:
         raise ValueError("peak_log_energy_weight must be nonnegative")
+    if float(args.turnaround_log_ratio_weight) < 0.0:
+        raise ValueError("turnaround_log_ratio_weight must be nonnegative")
+    if float(args.post_peak_retention_weight) < 0.0:
+        raise ValueError("post_peak_retention_weight must be nonnegative")
+    if not 0.0 <= float(args.post_peak_retention_floor) <= 1.0:
+        raise ValueError("post_peak_retention_floor must lie in [0, 1]")
     regime_weights = (
         float(args.linear_regime_weight),
         float(args.weak_regime_weight),
@@ -4070,6 +4682,7 @@ def main() -> None:
     if (
         float(args.latent_residual_weight) > 0.0
         and float(args.latent_state_residual_weight) == 0.0
+        and float(args.low_mode_latent_residual_weight) == 0.0
         and float(args.closure_residual_weight) == 0.0
         and float(args.autonomous_latent_weight) == 0.0
     ):
@@ -4095,11 +4708,82 @@ def main() -> None:
         raise ValueError("conditioner_experts must be nonnegative")
     if args.train_expert_output_only and int(args.conditioner_experts) <= 0:
         raise ValueError("train_expert_output_only requires conditioner_experts")
+    if args.train_expert_phase_output_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_expert_phase_output_only requires conditioner_experts"
+        )
+    if args.train_expert_gate_only and int(args.conditioner_experts) <= 0:
+        raise ValueError("train_expert_gate_only requires conditioner_experts")
+    if args.train_expert_cyclic_gate_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_expert_cyclic_gate_only requires conditioner_experts"
+        )
+    if args.train_expert_cyclic_output_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_expert_cyclic_output_only requires conditioner_experts"
+        )
+    if args.train_cyclic_low_mode_closure_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_cyclic_low_mode_closure_only requires conditioner_experts"
+        )
+    if args.train_cyclic_low_mode_pressure_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_cyclic_low_mode_pressure_only requires conditioner_experts"
+        )
+    if args.train_cyclic_modal_pressure_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_cyclic_modal_pressure_only requires conditioner_experts"
+        )
+    if args.train_cyclic_low_mode_momentum_only and int(args.conditioner_experts) <= 0:
+        raise ValueError(
+            "train_cyclic_low_mode_momentum_only requires conditioner_experts"
+        )
+    if sum(
+        bool(value)
+        for value in (
+            args.train_expert_output_only,
+            args.train_expert_phase_output_only,
+            args.train_expert_gate_only,
+            args.train_expert_cyclic_gate_only,
+            args.train_expert_cyclic_output_only,
+            args.train_cyclic_low_mode_closure_only,
+            args.train_cyclic_low_mode_pressure_only,
+            args.train_cyclic_modal_pressure_only,
+            args.train_cyclic_low_mode_momentum_only,
+        )
+    ) > 1:
+        raise ValueError(
+            "expert output, phase-output, gate-only, cyclic-gate-only, and "
+            "cyclic-output-only, cyclic-low-mode-closure-only, and "
+            "cyclic-low-mode-pressure-only modes are exclusive"
+        )
     train_output_rows = tuple(
         int(value)
         for value in str(args.train_output_rows).split(",")
         if value.strip()
     )
+    train_cyclic_feature_indices = tuple(
+        int(value)
+        for value in str(args.train_cyclic_feature_indices).split(",")
+        if value.strip()
+    )
+    if len(set(train_cyclic_feature_indices)) != len(
+        train_cyclic_feature_indices
+    ) or any(index < 0 or index >= 68 for index in train_cyclic_feature_indices):
+        raise ValueError(
+            "train_cyclic_feature_indices must be unique indices in [0, 68)"
+        )
+    if train_cyclic_feature_indices and not (
+        args.train_expert_cyclic_gate_only
+        or args.train_expert_cyclic_output_only
+        or args.train_cyclic_low_mode_closure_only
+        or args.train_cyclic_low_mode_pressure_only
+        or args.train_cyclic_modal_pressure_only
+        or args.train_cyclic_low_mode_momentum_only
+    ):
+        raise ValueError(
+            "train_cyclic_feature_indices requires a cyclic gate/output mode"
+        )
     if len(set(train_output_rows)) != len(train_output_rows) or any(
         row < 0 or row >= int(args.latent_rank) for row in train_output_rows
     ):
@@ -4155,6 +4839,42 @@ def main() -> None:
     configuration = metadata["configuration"]
     manifest = load_ic_manifest(args.reference_cache / "ic_manifest.json")
     cases = [dict(case) for case in manifest["cases"]]
+    supplemental_case_ids = tuple(
+        value.strip()
+        for value in str(args.supplemental_strong_case_ids).split(",")
+        if value.strip()
+    )
+    if supplemental_case_ids:
+        if args.supplemental_strong_manifest is None:
+            raise ValueError(
+                "supplemental_strong_manifest is required when supplemental "
+                "strong case IDs are selected"
+            )
+        supplemental = load_ic_manifest(args.supplemental_strong_manifest)
+        by_id = {
+            str(case["case_id"]): dict(case)
+            for case in supplemental["cases"]
+            if str(case["regime"]) == "nonlinear_landau_strong"
+            and str(case["split"]) == "train"
+        }
+        if (
+            len(set(supplemental_case_ids)) != len(supplemental_case_ids)
+            or not set(supplemental_case_ids).issubset(by_id)
+        ):
+            raise ValueError(
+                "supplemental strong case IDs must uniquely select train-only "
+                "strong cases"
+            )
+        prefix = str(args.supplemental_strong_case_prefix)
+        existing_ids = {str(case["case_id"]) for case in cases}
+        for case_id in supplemental_case_ids:
+            case = by_id[case_id]
+            renamed = f"{prefix}{case_id}"
+            if renamed in existing_ids:
+                raise ValueError(f"supplemental case ID collision: {renamed}")
+            case["case_id"] = renamed
+            cases.append(case)
+            existing_ids.add(renamed)
     basis, resolved_center, resolved_scale, latent_center, latent_scale = (
         _load_or_build_projected_cache(
             args.reference_cache,
@@ -4167,6 +4887,14 @@ def main() -> None:
     cache_metadata = json.loads((args.projected_cache / "metadata.json").read_text())
     expected_samples = int(cache_metadata["time_samples"])
     horizon = expected_samples - 1
+    if (
+        float(args.electric_sliding_log_growth_weight) > 0.0
+        and 2 * int(args.electric_growth_window_steps) > horizon + 1
+    ):
+        raise ValueError(
+            "twice electric_growth_window_steps cannot exceed the projected-cache "
+            "horizon + 1 when electric_sliding_log_growth_weight is enabled"
+        )
     expected_horizon = int(round(float(configuration["T_final"]) / args.cadence))
     if horizon != expected_horizon:
         raise ValueError(
@@ -4195,6 +4923,46 @@ def main() -> None:
     train_by_regime = {
         regime: _selected_cases(cases, regime, "train") for regime in REGIMES
     }
+    weak_train_case_ids = tuple(
+        value.strip()
+        for value in str(args.weak_train_case_ids).split(",")
+        if value.strip()
+    )
+    if weak_train_case_ids:
+        weak_regime = "nonlinear_landau_weak"
+        available = {case["case_id"] for case in train_by_regime[weak_regime]}
+        if len(set(weak_train_case_ids)) != len(weak_train_case_ids) or not set(
+            weak_train_case_ids
+        ).issubset(available):
+            raise ValueError(
+                "weak_train_case_ids must uniquely select train-only weak cases"
+            )
+        selected_ids = set(weak_train_case_ids)
+        train_by_regime[weak_regime] = [
+            case
+            for case in train_by_regime[weak_regime]
+            if case["case_id"] in selected_ids
+        ]
+    strong_train_case_ids = tuple(
+        value.strip()
+        for value in str(args.strong_train_case_ids).split(",")
+        if value.strip()
+    )
+    if strong_train_case_ids:
+        strong_regime = "nonlinear_landau_strong"
+        available = {case["case_id"] for case in train_by_regime[strong_regime]}
+        if len(set(strong_train_case_ids)) != len(strong_train_case_ids) or not set(
+            strong_train_case_ids
+        ).issubset(available):
+            raise ValueError(
+                "strong_train_case_ids must uniquely select train-only strong cases"
+            )
+        selected_ids = set(strong_train_case_ids)
+        train_by_regime[strong_regime] = [
+            case
+            for case in train_by_regime[strong_regime]
+            if case["case_id"] in selected_ids
+        ]
     minimum_cases = min(len(rows) for rows in train_by_regime.values())
     if int(args.steps_per_epoch) > minimum_cases:
         raise ValueError(
@@ -4480,6 +5248,22 @@ def main() -> None:
                 )
                 for key, value in params.items()
             }
+            # Presence of a null logit changes the softmax denominator even at
+            # its zero initializer.  Legacy expert checkpoints without this
+            # optional leaf must retain their exact routing semantics.
+            if "expert_null_gate_bias" not in checkpoint:
+                params.pop("expert_null_gate_bias", None)
+            for key in checkpoint.files:
+                if key.startswith("specialist_") or key == (
+                    "expert_history_frequency_deadband"
+                ):
+                    params[key] = jnp.asarray(checkpoint[key])
+        # Optional checkpoint-defined router state changes the parameter tree,
+        # so its fresh optimizer state must be built after those leaves load.
+        optimizers = {
+            "physical": _adam_init(params),
+            "teacher": _adam_init(params),
+        }
         print(
             f"[train] initialized parameters from {args.init_checkpoint}; "
             "optimizer and epoch count are fresh",
@@ -4524,6 +5308,9 @@ def main() -> None:
         latent_residual_scale=latent_residual_scale,
         latent_residual_weight=float(args.latent_residual_weight),
         latent_state_residual_weight=float(args.latent_state_residual_weight),
+        low_mode_latent_residual_weight=float(
+            args.low_mode_latent_residual_weight
+        ),
         closure_residual_scale=closure_residual_scale,
         closure_residual_weight=float(args.closure_residual_weight),
         closure_correction_bound=float(args.closure_correction_bound),
@@ -4546,14 +5333,26 @@ def main() -> None:
         electric_chunk_log_growth_weight=float(
             args.electric_chunk_log_growth_weight
         ),
+        electric_sliding_log_growth_weight=float(
+            args.electric_sliding_log_growth_weight
+        ),
+        electric_sliding_log_growth_direction=str(
+            args.electric_sliding_log_growth_direction
+        ),
         electric_growth_window_steps=int(args.electric_growth_window_steps),
         electric_time_relative_weight=float(args.electric_time_relative_weight),
+        electric_transfer_weight=float(args.electric_transfer_weight),
         electric_time_relative_floor_ratio=float(
             args.electric_time_relative_floor_ratio
         ),
         post_minimum_log_energy_weight=float(args.post_minimum_log_energy_weight),
+        post_minimum_field_weight=float(args.post_minimum_field_weight),
+        turnaround_field_weight=float(args.turnaround_field_weight),
         post_peak_log_energy_weight=float(args.post_peak_log_energy_weight),
         peak_log_energy_weight=float(args.peak_log_energy_weight),
+        turnaround_log_ratio_weight=float(args.turnaround_log_ratio_weight),
+        post_peak_retention_weight=float(args.post_peak_retention_weight),
+        post_peak_retention_floor=float(args.post_peak_retention_floor),
         post_minimum_energy_modes=int(args.post_minimum_energy_modes),
         teacher_residual_stride=int(args.teacher_residual_stride),
         teacher_rollout_steps=int(args.teacher_rollout_steps),
@@ -4883,6 +5682,8 @@ def main() -> None:
         f"gradient_accumulation={args.gradient_accumulation_steps} "
         f"teacher_residual_weight={args.latent_residual_weight:.3e} "
         f"latent_state_residual_weight={args.latent_state_residual_weight:.3e} "
+        f"low_mode_latent_residual_weight="
+        f"{args.low_mode_latent_residual_weight:.3e} "
         f"closure_residual_weight={args.closure_residual_weight:.3e} "
         f"closure_correction_bound={args.closure_correction_bound:.3e} "
         f"closure_aligned_output={int(args.closure_aligned_output)} "
@@ -4893,9 +5694,16 @@ def main() -> None:
         f"electric_log_energy_floor_ratio={args.electric_log_energy_floor_ratio:.3e} "
         f"electric_chunk_log_growth_weight="
         f"{args.electric_chunk_log_growth_weight:.3e} "
+        f"electric_sliding_log_growth_weight="
+        f"{args.electric_sliding_log_growth_weight:.3e} "
+        f"electric_sliding_log_growth_direction="
+        f"{args.electric_sliding_log_growth_direction} "
         f"electric_growth_window_steps={args.electric_growth_window_steps} "
         f"electric_time_relative_weight={args.electric_time_relative_weight:.3e} "
+        f"electric_transfer_weight={args.electric_transfer_weight:.3e} "
         f"post_minimum_log_energy_weight={args.post_minimum_log_energy_weight:.3e} "
+        f"post_minimum_field_weight={args.post_minimum_field_weight:.3e} "
+        f"turnaround_field_weight={args.turnaround_field_weight:.3e} "
         f"post_peak_log_energy_weight={args.post_peak_log_energy_weight:.3e} "
         f"peak_log_energy_weight={args.peak_log_energy_weight:.3e} "
         f"post_minimum_energy_modes={args.post_minimum_energy_modes:d} "
@@ -5021,7 +5829,13 @@ def main() -> None:
         values["maximum_normalized_latent"]
         for values in initial_evaluation.values()
     )
-    if initial_latent_maximum > float(args.latent_excursion_limit):
+    excursion_tolerance = max(
+        1.0e-6,
+        1.0e-6 * float(args.latent_excursion_limit),
+    )
+    if initial_latent_maximum > (
+        float(args.latent_excursion_limit) + excursion_tolerance
+    ):
         raise FloatingPointError(
             "Initialized model exceeds the normalized latent excursion limit: "
             f"{initial_latent_maximum:.6e} > {args.latent_excursion_limit:.6e}"
@@ -5119,14 +5933,18 @@ def main() -> None:
             expected_samples=expected_samples,
         )
         trust_guard_arrays.append(guard_batch)
-    trust_guard_batch = jnp.asarray(np.concatenate(trust_guard_arrays, axis=0))
+    # Keep balanced batches separate. Each carries one linear, weak, and strong
+    # case, matching the three-entry regime weight vector used by the loss.
+    trust_guard_batches = tuple(jnp.asarray(batch) for batch in trust_guard_arrays)
 
     @jax.jit
     def trust_guard_objective(model_params):
-        components = loss_components_function(model_params, trust_guard_batch)
-        if args.trust_region_objective == "physical":
-            return components[1]
-        return components[0]
+        objective_index = 1 if args.trust_region_objective == "physical" else 0
+        values = tuple(
+            loss_components_function(model_params, batch)[objective_index]
+            for batch in trust_guard_batches
+        )
+        return jnp.mean(jnp.stack(values))
 
     trust_guard_loss = float(trust_guard_objective(params))
 
@@ -5261,6 +6079,29 @@ def main() -> None:
                     int(args.train_tail_output_from),
                     train_output_rows,
                     expert_output_only=bool(args.train_expert_output_only),
+                    expert_phase_output_only=bool(
+                        args.train_expert_phase_output_only
+                    ),
+                    expert_gate_only=bool(args.train_expert_gate_only),
+                    expert_cyclic_gate_only=bool(
+                        args.train_expert_cyclic_gate_only
+                    ),
+                    expert_cyclic_output_only=bool(
+                        args.train_expert_cyclic_output_only
+                    ),
+                    cyclic_low_mode_closure_only=bool(
+                        args.train_cyclic_low_mode_closure_only
+                    ),
+                    cyclic_low_mode_pressure_only=bool(
+                        args.train_cyclic_low_mode_pressure_only
+                    ),
+                    cyclic_modal_pressure_only=bool(
+                        args.train_cyclic_modal_pressure_only
+                    ),
+                    cyclic_low_mode_momentum_only=bool(
+                        args.train_cyclic_low_mode_momentum_only
+                    ),
+                    cyclic_feature_indices=train_cyclic_feature_indices,
                     expert_indices=train_expert_indices,
                 )
             )
@@ -5270,6 +6111,29 @@ def main() -> None:
                     int(args.train_tail_output_from),
                     train_output_rows,
                     expert_output_only=bool(args.train_expert_output_only),
+                    expert_phase_output_only=bool(
+                        args.train_expert_phase_output_only
+                    ),
+                    expert_gate_only=bool(args.train_expert_gate_only),
+                    expert_cyclic_gate_only=bool(
+                        args.train_expert_cyclic_gate_only
+                    ),
+                    expert_cyclic_output_only=bool(
+                        args.train_expert_cyclic_output_only
+                    ),
+                    cyclic_low_mode_closure_only=bool(
+                        args.train_cyclic_low_mode_closure_only
+                    ),
+                    cyclic_low_mode_pressure_only=bool(
+                        args.train_cyclic_low_mode_pressure_only
+                    ),
+                    cyclic_modal_pressure_only=bool(
+                        args.train_cyclic_modal_pressure_only
+                    ),
+                    cyclic_low_mode_momentum_only=bool(
+                        args.train_cyclic_low_mode_momentum_only
+                    ),
+                    cyclic_feature_indices=train_cyclic_feature_indices,
                     expert_indices=train_expert_indices,
                 )
             )
@@ -5555,7 +6419,7 @@ def main() -> None:
             )
             row["heldout_latent_excursion_passed"] = all(
                 values["maximum_normalized_latent"]
-                <= float(args.latent_excursion_limit)
+                <= float(args.latent_excursion_limit) + excursion_tolerance
                 for values in evaluation.values()
             )
             if not row["heldout_latent_excursion_passed"]:
@@ -5651,10 +6515,16 @@ def main() -> None:
     _atomic_write_json(args.outdir / "report.json", report)
     _write_training_artifacts(report, args.outdir)
     print(f"Saved coupled low-moment latent model to {args.outdir}", flush=True)
-    if not args.skip_evaluation:
+    best_checkpoint_path = args.outdir / "best_coupled_low_moment_latent.npz"
+    if not args.skip_evaluation and best_checkpoint_path.exists():
         from model.eval_coupled_low_moment_latent import evaluate
 
         evaluate(args.outdir)
+    elif not args.skip_evaluation:
+        print(
+            "Skipping final evaluation because no checkpoint passed the acceptance gate.",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

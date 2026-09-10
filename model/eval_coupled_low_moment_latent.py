@@ -40,6 +40,8 @@ from vpml.metrics import (
     FieldErrorConfig,
     SelfGeneratedFieldErrorMetric,
 )
+from vpml.metrics.trajectory import envelope_diagnostics, latent_saturation_diagnostics, matched_cadence_growth
+from model.train.coupled_run_support import file_digest
 
 
 def _assert_outputs_absent(paths: list[Path]) -> None:
@@ -49,10 +51,10 @@ def _assert_outputs_absent(paths: list[Path]) -> None:
         raise FileExistsError(f"Refusing to overwrite existing evaluation outputs: {joined}")
 
 
-def _load_saved_model(run_dir: Path):
+def _load_saved_model(run_dir: Path, checkpoint_name="best_coupled_low_moment_latent.npz"):
     report = json.loads((run_dir / "report.json").read_text())
     config = dict(report["configuration"])
-    checkpoint_path = run_dir / "best_coupled_low_moment_latent.npz"
+    checkpoint_path = run_dir / checkpoint_name
     operator_modes = int(config["operator_modes"])
     with np.load(checkpoint_path, allow_pickle=False) as payload:
         array_keys = [
@@ -65,6 +67,7 @@ def _load_saved_model(run_dir: Path):
             "k_arr",
         ]
         nonparameter_keys = set(array_keys) | {
+            "latent_input_scale",
             "correction_bounds",
             "latent_residual_scale",
             "closure_residual_scale",
@@ -79,6 +82,8 @@ def _load_saved_model(run_dir: Path):
             key: np.asarray(payload[key])
             for key in array_keys
         }
+        if "latent_input_scale" in payload.files:
+            arrays["latent_input_scale"] = np.asarray(payload["latent_input_scale"])
         arrays["correction_bounds"] = (
             np.asarray(payload["correction_bounds"])
             if "correction_bounds" in payload.files
@@ -146,21 +151,112 @@ def _turnaround_diagnostics(model_energy, teacher_energy, *, cadence: float):
     }
 
 
-def evaluate(run_dir: Path) -> None:
-    report, config, params, arrays = _load_saved_model(run_dir)
-    reference_cache = Path(config["reference_cache"])
-    projected_cache = Path(config["projected_cache"])
+def _full_transition_diagnostics(model_energy, teacher_energy, *, cadence: float):
+    """Score every significant envelope damping-to-growth transition."""
+    teacher = np.asarray(teacher_energy, dtype=np.float64)
+    model = np.asarray(model_energy, dtype=np.float64)
+    tiny = np.finfo(np.float64).tiny
+    # A five-time-unit Hann average suppresses carrier-scale plasma oscillations
+    # while retaining nonlinear envelope changes.
+    width = max(5, int(round(5.0 / cadence)) | 1)
+    kernel = np.hanning(width)
+    kernel /= np.sum(kernel)
+    log_envelope = np.convolve(np.log(np.maximum(teacher, tiny)), kernel, mode="same")
+    minima = np.flatnonzero(
+        (log_envelope[1:-1] <= log_envelope[:-2])
+        & (log_envelope[1:-1] < log_envelope[2:])
+    ) + 1
+    maxima = np.flatnonzero(
+        (log_envelope[1:-1] >= log_envelope[:-2])
+        & (log_envelope[1:-1] > log_envelope[2:])
+    ) + 1
+    transitions = []
+    floor = 1.0e-8 * max(float(np.max(teacher)), tiny)
+    for start in minima:
+        later = maxima[maxima > start]
+        if later.size == 0:
+            continue
+        end = int(later[0])
+        teacher_factor = float(teacher[end] / max(teacher[start], tiny))
+        duration = float((end - start) * cadence)
+        if teacher_factor < 2.0 or teacher[end] < floor or duration < 2.0:
+            continue
+        transitions.append(
+            {
+                "start_time": float(start * cadence),
+                "peak_time": float(end * cadence),
+                "duration": duration,
+                "teacher_factor": teacher_factor,
+                "model_factor": float(model[end] / max(model[start], tiny)),
+                "late_recurrence_candidate": bool(start >= 0.8 * (teacher.size - 1)),
+            }
+        )
+    return {
+        "significant_transition_count": len(transitions),
+        "significant_transitions": transitions,
+    }
+
+
+def evaluate(
+    run_dir: Path,
+    *,
+    selected_case_ids: tuple[str, ...] = (),
+    eval_subdir: str = "heldout_cases",
+    reference_cache_override: Path | None = None,
+    projected_cache_override: Path | None = None,
+    rollout_steps_override: int | None = None,
+    checkpoint_name: str = "best_coupled_low_moment_latent.npz",
+    float64: bool = False,
+) -> None:
+    if float64:
+        jax.config.update("jax_enable_x64", True)
+    report, config, params, arrays = _load_saved_model(run_dir, checkpoint_name)
+    if float64:
+        def promote(value):
+            value = np.asarray(value)
+            if np.iscomplexobj(value):
+                return value.astype(np.complex128)
+            if np.issubdtype(value.dtype, np.floating):
+                return value.astype(np.float64)
+            return value
+        params = {key: jnp.asarray(promote(value)) for key, value in params.items()}
+        arrays = {key: promote(value) for key, value in arrays.items()}
+    checkpoint_digest = file_digest(run_dir / checkpoint_name)
+    model_sources = (Path(__file__), Path("vpml/kinetic_latent.py"),
+                     Path("vpml/low_moment.py"), Path("vpml/metrics/early_growth.py"),
+                     Path("vpml/metrics/field_error.py"), Path("vpml/metrics/trajectory.py"),
+                     Path("model/train/coupled_low_moment_latent.py"))
+    source_digests = {str(p.resolve()): file_digest(p) for p in model_sources}
+    reference_cache = (
+        reference_cache_override
+        if reference_cache_override is not None
+        else Path(config["reference_cache"])
+    )
+    projected_cache = (
+        projected_cache_override
+        if projected_cache_override is not None
+        else Path(config["projected_cache"])
+    )
+    if rollout_steps_override is not None:
+        config["rollout_steps"] = int(rollout_steps_override)
     metadata = json.loads((reference_cache / "metadata.json").read_text())
     teacher = metadata["configuration"]
     manifest = load_ic_manifest(reference_cache / "ic_manifest.json")
     cases = [dict(case) for case in manifest["cases"]]
-    heldout = [
-        case
-        for regime in REGIMES
-        for case in _selected_cases(cases, regime, "heldout")
-    ]
+    if selected_case_ids:
+        requested = set(selected_case_ids)
+        heldout = [case for case in cases if str(case["case_id"]) in requested]
+        missing = requested - {str(case["case_id"]) for case in heldout}
+        if missing:
+            raise ValueError(f"Unknown selected case IDs: {sorted(missing)}")
+    else:
+        heldout = [
+            case
+            for regime in REGIMES
+            for case in _selected_cases(cases, regime, "heldout")
+        ]
     case_ids = [str(case["case_id"]) for case in heldout]
-    eval_root = run_dir / "heldout_cases"
+    eval_root = run_dir / eval_subdir
     _assert_outputs_absent(_case_plot_paths(eval_root, case_ids))
 
     expected_samples = int(config["rollout_steps"]) + 1
@@ -171,6 +267,7 @@ def evaluate(run_dir: Path) -> None:
                 case,
                 latent_rank=int(config["latent_rank"]),
                 expected_samples=expected_samples,
+                dtype=np.float64 if float64 else np.float32,
             )
             for case in heldout
         ]
@@ -189,6 +286,7 @@ def evaluate(run_dir: Path) -> None:
         resolved_scale=arrays["resolved_scale"],
         latent_center=arrays["latent_center"],
         latent_scale=arrays["latent_scale"],
+        latent_input_scale=arrays.get("latent_input_scale"),
         depth=int(config["depth"]),
         fine_steps=int(config["fine_steps"]),
         fine_dt=float(teacher["teacher_dt"]),
@@ -215,6 +313,9 @@ def evaluate(run_dir: Path) -> None:
         latent_gate_scale=float(config.get("latent_gate_scale", 0.1)),
         latent_gate_power=int(config.get("latent_gate_power", 2)),
         latent_state_bound=float(config.get("latent_state_bound", 0.0)),
+        equilibrium_input_compression_scale=float(
+            config.get("equilibrium_input_compression_scale", 0.0)
+        ),
         autonomous_latent_weight=float(config.get("autonomous_latent_weight", 0.0)),
         electric_spectrum_weight=float(config.get("electric_spectrum_weight", 0.0)),
         electric_log_energy_weight=float(config.get("electric_log_energy_weight", 0.0)),
@@ -224,22 +325,42 @@ def evaluate(run_dir: Path) -> None:
         electric_chunk_log_growth_weight=float(
             config.get("electric_chunk_log_growth_weight", 0.0)
         ),
+        electric_sliding_log_growth_weight=float(
+            config.get("electric_sliding_log_growth_weight", 0.0)
+        ),
+        electric_sliding_log_growth_direction=str(
+            config.get("electric_sliding_log_growth_direction", "balanced")
+        ),
         electric_growth_window_steps=int(
             config.get("electric_growth_window_steps", 100)
         ),
         electric_time_relative_weight=float(
             config.get("electric_time_relative_weight", 0.0)
         ),
+        electric_transfer_weight=float(config.get("electric_transfer_weight", 0.0)),
         electric_time_relative_floor_ratio=float(
             config.get("electric_time_relative_floor_ratio", 1e-4)
         ),
         post_minimum_log_energy_weight=float(
             config.get("post_minimum_log_energy_weight", 0.0)
         ),
+        post_minimum_field_weight=float(
+            config.get("post_minimum_field_weight", 0.0)
+        ),
+        turnaround_field_weight=float(config.get("turnaround_field_weight", 0.0)),
         post_peak_log_energy_weight=float(
             config.get("post_peak_log_energy_weight", 0.0)
         ),
         peak_log_energy_weight=float(config.get("peak_log_energy_weight", 0.0)),
+        turnaround_log_ratio_weight=float(
+            config.get("turnaround_log_ratio_weight", 0.0)
+        ),
+        post_peak_retention_weight=float(
+            config.get("post_peak_retention_weight", 0.0)
+        ),
+        post_peak_retention_floor=float(
+            config.get("post_peak_retention_floor", 0.0)
+        ),
         post_minimum_energy_modes=int(config.get("post_minimum_energy_modes", 4)),
         teacher_residual_stride=int(config.get("teacher_residual_stride", 50)),
         teacher_rollout_steps=int(config.get("teacher_rollout_steps", 10)),
@@ -265,14 +386,14 @@ def evaluate(run_dir: Path) -> None:
     ):
         raise FloatingPointError("Saved model produced a non-finite held-out rollout")
 
-    initial_density = target[:, 0, 0].astype(np.float32)
+    initial_density = target[:, 0, 0].astype(np.float64 if float64 else np.float32)
     density_history = np.concatenate(
         (initial_density[:, None], predicted_resolved[:, :, 0]), axis=1
     )
     field = np.asarray(
         electric_field_from_density(
             jnp.asarray(density_history.reshape(-1, int(config["nx"]))),
-            jnp.asarray(arrays["k_arr"], dtype=jnp.float32),
+            jnp.asarray(arrays["k_arr"], dtype=jnp.float64 if float64 else jnp.float32),
             poisson_sign=float(teacher["teacher_poisson_sign"]),
         )
     ).reshape(len(heldout), expected_samples, int(config["nx"]))
@@ -376,6 +497,11 @@ def evaluate(run_dir: Path) -> None:
             comparison_teacher_energy,
             cadence=float(config["cadence"]),
         )
+        transitions = _full_transition_diagnostics(
+            comparison_model_energy,
+            comparison_teacher_energy,
+            cadence=float(config["cadence"]),
+        )
         summary = {
             "case_id": case_id,
             "regime": regime,
@@ -383,6 +509,8 @@ def evaluate(run_dir: Path) -> None:
             "epsilon_grow": _json_float(growth.epsilon_grow),
             "gamma_hr": _json_float(growth.gamma_grow_hr),
             "gamma_theta": _json_float(growth.gamma_grow_theta),
+            **matched_cadence_growth(times, growth.gamma_grow_theta, hr_times, hr_energy,
+                                     fit_window=(growth.t_a, growth.t_b)),
             "epsilon_E": _json_float(field_error.epsilon_E),
             "epsilon_E_final_time": float(field_error.T),
             "minimum_density": _json_float(np.min(density)),
@@ -393,10 +521,21 @@ def evaluate(run_dir: Path) -> None:
             "latent_excursion_fraction_above_96": float(
                 np.mean(np.abs(normalized_latent) >= 96.0)
             ),
+            "latent_saturation": latent_saturation_diagnostics(
+                normalized_latent,
+                bound=float(config.get("latent_state_bound", 0.0)),
+                cadence=float(config["cadence"]),
+                initial_time=float(config["cadence"]),
+            ),
+            "full_envelope": envelope_diagnostics(
+                comparison_model_energy, comparison_teacher_energy,
+                cadence=float(config["cadence"]),
+            ),
             **regrowth,
             "model_post_rebound_retention": model_post_rebound_retention,
             "teacher_post_rebound_retention": teacher_post_rebound_retention,
             **turnaround,
+            **transitions,
         }
         case_dir = eval_root / case_id
         case_dir.mkdir(exist_ok=True)
@@ -439,6 +578,7 @@ def evaluate(run_dir: Path) -> None:
         sharex=True,
         constrained_layout=True,
     )
+    axes = np.atleast_1d(axes)
     for index, (case_id, hr_times, hr_energy, model_energy) in enumerate(metric1_traces):
         axes[index].semilogy(hr_times, hr_energy, color="#2463eb", label="kinetic teacher")
         axes[index].semilogy(times, model_energy, color="#6f3cc3", label="coupled latent model")
@@ -458,6 +598,7 @@ def evaluate(run_dir: Path) -> None:
         sharex=True,
         constrained_layout=True,
     )
+    axes = np.atleast_1d(axes)
     for index, (case_id, comparison_times, relative_field) in enumerate(metric2_traces):
         axes[index].semilogy(comparison_times, relative_field, color="#c44e52")
         axes[index].set_ylabel(case_id, rotation=0, ha="right", va="center", fontsize=8)
@@ -469,8 +610,19 @@ def evaluate(run_dir: Path) -> None:
 
     aggregate = {
         "source_checkpoint": str(
-            (run_dir / "best_coupled_low_moment_latent.npz").resolve()
+            (run_dir / checkpoint_name).resolve()
         ),
+        "source_checkpoint_sha256": checkpoint_digest,
+        "evaluation_precision": "float64" if float64 else "legacy",
+        "source_sha256": source_digests,
+        "reference_manifest_sha256": file_digest(reference_cache / "ic_manifest.json"),
+        "projected_metadata_sha256": file_digest(projected_cache / "metadata.json"),
+        "metric_protocol": {
+            "metric1": "early_growth_local_maxima_native_reference_times",
+            "matched_metric1": "reference_energy_interpolated_to_model_times_native_fit_window",
+            "metric2": "time_integrated_relative_field_l2",
+            "full_envelope": "projected_reference_trailing_mean_2.5_5_10_floor1e-8",
+        },
         "case_count": len(summaries),
         "bounded_cases": sum(row["bounded_to_final_time"] for row in summaries),
         "cases": summaries,
@@ -483,9 +635,26 @@ def evaluate(run_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--case-ids", default="")
+    parser.add_argument("--eval-subdir", default="heldout_cases")
+    parser.add_argument("--reference-cache", type=Path)
+    parser.add_argument("--projected-cache", type=Path)
+    parser.add_argument("--rollout-steps", type=int)
+    parser.add_argument("--checkpoint-name", default="best_coupled_low_moment_latent.npz")
+    parser.add_argument("--float64", action="store_true", help="Use float64 parameters, state and field arithmetic.")
     args = parser.parse_args()
     print_jax_runtime_summary(jax, context="coupled low-moment latent evaluation")
-    evaluate(args.run_dir)
+    selected_case_ids = tuple(value for value in args.case_ids.split(",") if value)
+    evaluate(
+        args.run_dir,
+        selected_case_ids=selected_case_ids,
+        eval_subdir=args.eval_subdir,
+        reference_cache_override=args.reference_cache,
+        projected_cache_override=args.projected_cache,
+        rollout_steps_override=args.rollout_steps,
+        checkpoint_name=args.checkpoint_name,
+        float64=args.float64,
+    )
 
 
 if __name__ == "__main__":

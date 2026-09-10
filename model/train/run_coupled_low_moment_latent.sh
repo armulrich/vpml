@@ -34,6 +34,27 @@ esac
 case "${COUPLED_LATENT_TRAIN_EXPERT_OUTPUT_ONLY:-0}" in
   1|true|TRUE|yes|YES) set -- "$@" --train-expert-output-only ;;
 esac
+case "${COUPLED_LATENT_TRAIN_EXPERT_PHASE_OUTPUT_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-expert-phase-output-only ;;
+esac
+case "${COUPLED_LATENT_TRAIN_EXPERT_GATE_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-expert-gate-only ;;
+esac
+case "${COUPLED_LATENT_TRAIN_EXPERT_CYCLIC_GATE_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-expert-cyclic-gate-only ;;
+esac
+case "${COUPLED_LATENT_TRAIN_EXPERT_CYCLIC_OUTPUT_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-expert-cyclic-output-only ;;
+esac
+case "${COUPLED_LATENT_TRAIN_CYCLIC_LOW_MODE_CLOSURE_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-cyclic-low-mode-closure-only ;;
+esac
+case "${COUPLED_LATENT_TRAIN_CYCLIC_LOW_MODE_PRESSURE_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-cyclic-low-mode-pressure-only ;;
+esac
+case "${COUPLED_LATENT_TRAIN_CYCLIC_LOW_MODE_MOMENTUM_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-cyclic-low-mode-momentum-only ;;
+esac
 
 exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --reference-cache "${COUPLED_LATENT_REFERENCE_CACHE:?set COUPLED_LATENT_REFERENCE_CACHE}" \
@@ -59,6 +80,7 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --multiplicative-output-initial-scale "${COUPLED_LATENT_MULTIPLICATIVE_OUTPUT_INITIAL_SCALE:-1.0}" \
   --latent-residual-weight "${COUPLED_LATENT_RESIDUAL_WEIGHT:-1.0}" \
   --latent-state-residual-weight "${COUPLED_LATENT_STATE_RESIDUAL_WEIGHT:-1.0}" \
+  --low-mode-latent-residual-weight "${COUPLED_LATENT_LOW_MODE_LATENT_RESIDUAL_WEIGHT:-0.0}" \
   --closure-residual-weight "${COUPLED_LATENT_CLOSURE_RESIDUAL_WEIGHT:-0.0}" \
   --closure-correction-bound "${COUPLED_LATENT_CLOSURE_CORRECTION_BOUND:-40.0}" \
   --closure-readout-mode "${COUPLED_LATENT_CLOSURE_READOUT_MODE:-multiplicative}" \
@@ -79,12 +101,20 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --electric-log-energy-weight "${COUPLED_LATENT_ELECTRIC_LOG_ENERGY_WEIGHT:-0.0}" \
   --electric-log-energy-floor-ratio "${COUPLED_LATENT_ELECTRIC_LOG_ENERGY_FLOOR_RATIO:-1e-8}" \
   --electric-chunk-log-growth-weight "${COUPLED_LATENT_ELECTRIC_CHUNK_LOG_GROWTH_WEIGHT:-0.0}" \
+  --electric-sliding-log-growth-weight "${COUPLED_LATENT_ELECTRIC_SLIDING_LOG_GROWTH_WEIGHT:-0.0}" \
+  --electric-sliding-log-growth-direction "${COUPLED_LATENT_ELECTRIC_SLIDING_LOG_GROWTH_DIRECTION:-balanced}" \
   --electric-growth-window-steps "${COUPLED_LATENT_ELECTRIC_GROWTH_WINDOW_STEPS:-100}" \
   --electric-time-relative-weight "${COUPLED_LATENT_ELECTRIC_TIME_RELATIVE_WEIGHT:-0.0}" \
+  --electric-transfer-weight "${COUPLED_LATENT_ELECTRIC_TRANSFER_WEIGHT:-0.0}" \
   --electric-time-relative-floor-ratio "${COUPLED_LATENT_ELECTRIC_TIME_RELATIVE_FLOOR_RATIO:-1e-4}" \
   --post-minimum-log-energy-weight "${COUPLED_LATENT_POST_MINIMUM_LOG_ENERGY_WEIGHT:-0.0}" \
+  --post-minimum-field-weight "${COUPLED_LATENT_POST_MINIMUM_FIELD_WEIGHT:-0.0}" \
+  --turnaround-field-weight "${COUPLED_LATENT_TURNAROUND_FIELD_WEIGHT:-0.0}" \
   --post-peak-log-energy-weight "${COUPLED_LATENT_POST_PEAK_LOG_ENERGY_WEIGHT:-0.0}" \
   --peak-log-energy-weight "${COUPLED_LATENT_PEAK_LOG_ENERGY_WEIGHT:-0.0}" \
+  --turnaround-log-ratio-weight "${COUPLED_LATENT_TURNAROUND_LOG_RATIO_WEIGHT:-0.0}" \
+  --post-peak-retention-weight "${COUPLED_LATENT_POST_PEAK_RETENTION_WEIGHT:-0.0}" \
+  --post-peak-retention-floor "${COUPLED_LATENT_POST_PEAK_RETENTION_FLOOR:-0.0}" \
   --linear-regime-weight "${COUPLED_LATENT_LINEAR_REGIME_WEIGHT:-1.0}" \
   --weak-regime-weight "${COUPLED_LATENT_WEAK_REGIME_WEIGHT:-1.0}" \
   --strong-regime-weight "${COUPLED_LATENT_STRONG_REGIME_WEIGHT:-1.0}" \
@@ -117,6 +147,9 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --train-tail-output-from "${COUPLED_LATENT_TRAIN_TAIL_OUTPUT_FROM:-0}" \
   --train-output-rows "${COUPLED_LATENT_TRAIN_OUTPUT_ROWS:-}" \
   --train-expert-indices "${COUPLED_LATENT_TRAIN_EXPERT_INDICES:-}" \
+  --train-cyclic-feature-indices "${COUPLED_LATENT_TRAIN_CYCLIC_FEATURE_INDICES:-}" \
+  --weak-train-case-ids "${COUPLED_LATENT_WEAK_TRAIN_CASE_IDS:-}" \
+  --strong-train-case-ids "${COUPLED_LATENT_STRONG_TRAIN_CASE_IDS:-}" \
   --linear-nonregression-limit "${COUPLED_LATENT_LINEAR_NONREGRESSION_LIMIT:-0.0}" \
   --gradient-chunk-steps "${COUPLED_LATENT_GRADIENT_CHUNK_STEPS:-300}" \
   --validation-every "${COUPLED_LATENT_VALIDATION_EVERY:-5}" \

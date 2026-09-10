@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from model.eval_coupled_low_moment_latent import _full_transition_diagnostics
+
 from model.train.coupled_low_moment_latent import (
     _aggregate_gradients,
     _atomic_savez,
@@ -17,6 +19,7 @@ from model.train.coupled_low_moment_latent import (
     _combine_groupwise_conflict_safe_updates,
     _combine_optimizer_updates,
     _electric_chunk_log_growth_error,
+    _equal_contiguous_episode_weights,
     _electric_spectral_amplitude_terms,
     _first_nonfinite_step,
     _gradient_group_norms,
@@ -44,6 +47,24 @@ from vpml.low_moment import primitive_fields
 
 
 class CoupledLowMomentLatentLossTest(unittest.TestCase):
+    def test_equal_contiguous_episode_weights_balance_all_growth_episodes(self):
+        active = jnp.asarray(
+            [[False, True, True, False, True, False], [False] * 6]
+        )
+        weights = np.asarray(_equal_contiguous_episode_weights(active))
+        np.testing.assert_allclose(weights[0], [0.0, 0.25, 0.25, 0.0, 0.5, 0.0])
+        np.testing.assert_array_equal(weights[1], 0.0)
+
+    def test_full_transition_diagnostics_filters_fast_oscillations(self):
+        time = np.arange(0.0, 80.0, 0.1)
+        envelope = np.exp(-0.08 * time)
+        envelope *= 1.0 + 0.05 * np.sin(8.0 * time)
+        envelope[400:] *= np.exp(0.12 * (time[400:] - time[400]))
+        envelope[650:] *= np.exp(-0.25 * (time[650:] - time[650]))
+        result = _full_transition_diagnostics(envelope * 0.9, envelope, cadence=0.1)
+        self.assertEqual(result["significant_transition_count"], 1)
+        self.assertGreater(result["significant_transitions"][0]["teacher_factor"], 2.0)
+
     def test_coordinate_median_gradient_rejects_single_outlier(self):
         gradients = [
             {"weight": jnp.asarray([1.0, 2.0])},
@@ -100,8 +121,13 @@ class CoupledLowMomentLatentLossTest(unittest.TestCase):
         gradients = {
             "expert_output_kernel": jnp.ones((4, 5, 2, 3)),
             "expert_output_bias": jnp.ones((4, 5)),
+            "expert_phase_output_kernel": jnp.ones((4, 5, 2, 3)),
+            "expert_phase_output_bias": jnp.ones((4, 5)),
+            "expert_phase_gain": jnp.ones((4, 5)),
+            "expert_phase_gain": jnp.ones((4, 5)),
             "expert_gate_kernel": jnp.ones((4, 2)),
             "expert_gate_bias": jnp.ones((4,)),
+            "expert_null_gate_bias": jnp.ones((1,)),
         }
         masked = _mask_tail_output_gradients(
             gradients,
@@ -114,11 +140,192 @@ class CoupledLowMomentLatentLossTest(unittest.TestCase):
             np.asarray(masked["expert_output_kernel"])[[0, 2, 3]], 0.0
         )
         np.testing.assert_array_equal(masked["expert_output_bias"][1], 1.0)
+        np.testing.assert_array_equal(masked["expert_phase_output_kernel"][1], 1.0)
+        np.testing.assert_array_equal(masked["expert_phase_output_bias"][1], 1.0)
+        np.testing.assert_array_equal(masked["expert_phase_gain"][1], 1.0)
+        np.testing.assert_array_equal(
+            np.asarray(masked["expert_phase_output_kernel"])[[0, 2, 3]], 0.0
+        )
+        np.testing.assert_array_equal(
+            np.asarray(masked["expert_phase_output_bias"])[[0, 2, 3]], 0.0
+        )
         np.testing.assert_array_equal(
             np.asarray(masked["expert_output_bias"])[[0, 2, 3]], 0.0
         )
         np.testing.assert_array_equal(masked["expert_gate_kernel"], 0.0)
         np.testing.assert_array_equal(masked["expert_gate_bias"], 0.0)
+
+    def test_expert_phase_gradient_mask_freezes_standard_expert_output(self):
+        gradients = {
+            "output_kernel": jnp.ones((5, 2, 3)),
+            "expert_output_kernel": jnp.ones((4, 5, 2, 3)),
+            "expert_phase_output_kernel": jnp.ones((4, 5, 2, 3)),
+            "expert_phase_output_bias": jnp.ones((4, 5)),
+            "expert_phase_gain": jnp.ones((4, 5)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            rows=(2,),
+            expert_phase_output_only=True,
+            expert_indices=(1,),
+        )
+        np.testing.assert_array_equal(masked["output_kernel"], 0.0)
+        np.testing.assert_array_equal(masked["expert_output_kernel"], 0.0)
+        self.assertEqual(np.count_nonzero(masked["expert_phase_output_kernel"]), 6)
+        self.assertEqual(np.count_nonzero(masked["expert_phase_output_bias"]), 1)
+        np.testing.assert_array_equal(masked["expert_phase_output_kernel"][1, 2], 1.0)
+        np.testing.assert_array_equal(masked["expert_phase_output_bias"][1, 2], 1.0)
+        np.testing.assert_array_equal(masked["expert_phase_gain"], 0.0)
+
+    def test_cyclic_gate_gradient_mask_trains_bias_but_freezes_generic_gate(self):
+        gradients = {
+            "output_kernel": jnp.ones((5, 2, 3)),
+            "expert_output_kernel": jnp.ones((4, 5, 2, 3)),
+            "expert_gate_kernel": jnp.ones((4, 2)),
+            "expert_gate_bias": jnp.ones((4,)),
+            "expert_null_gate_bias": jnp.ones((1,)),
+            "expert_bounce_gate_gain": jnp.ones((4, 4)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            expert_cyclic_gate_only=True,
+            expert_indices=(3,),
+        )
+        np.testing.assert_array_equal(masked["output_kernel"], 0.0)
+        np.testing.assert_array_equal(masked["expert_output_kernel"], 0.0)
+        np.testing.assert_array_equal(masked["expert_gate_kernel"], 0.0)
+        expected_bias = np.zeros(4)
+        expected_bias[3] = 1.0
+        np.testing.assert_array_equal(masked["expert_gate_bias"], expected_bias)
+        np.testing.assert_array_equal(masked["expert_null_gate_bias"], 1.0)
+        np.testing.assert_array_equal(masked["expert_bounce_gate_gain"][3], 1.0)
+        np.testing.assert_array_equal(
+            np.asarray(masked["expert_bounce_gate_gain"])[:3], 0.0
+        )
+
+    def test_cyclic_gate_gradient_mask_selects_expert_and_feature(self):
+        gradients = {
+            "expert_gate_kernel": jnp.ones((4, 2)),
+            "expert_gate_bias": jnp.ones((4,)),
+            "expert_null_gate_bias": jnp.ones((1,)),
+            "expert_bounce_gate_gain": jnp.ones((4, 6)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            expert_cyclic_gate_only=True,
+            expert_indices=(1, 3),
+            cyclic_feature_indices=(4, 5),
+        )
+        expected = np.zeros((4, 6))
+        expected[[1, 3], 4:] = 1.0
+        np.testing.assert_array_equal(masked["expert_bounce_gate_gain"], expected)
+        np.testing.assert_array_equal(masked["expert_gate_kernel"], 0.0)
+        expected_bias = np.zeros(4)
+        expected_bias[[1, 3]] = 1.0
+        np.testing.assert_array_equal(masked["expert_gate_bias"], expected_bias)
+        np.testing.assert_array_equal(masked["expert_null_gate_bias"], 1.0)
+
+    def test_cyclic_output_gradient_mask_selects_expert_and_feature(self):
+        gradients = {
+            "expert_cyclic_output_kernel": jnp.ones((4, 4, 5, 2, 3)),
+            "expert_cyclic_output_bias": jnp.ones((4, 4, 5)),
+            "expert_bounce_gate_gain": jnp.ones((4, 4)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            expert_cyclic_output_only=True,
+            expert_indices=(0,),
+            cyclic_feature_indices=(1,),
+        )
+        self.assertEqual(
+            np.count_nonzero(masked["expert_cyclic_output_kernel"]), 30
+        )
+        self.assertEqual(np.count_nonzero(masked["expert_cyclic_output_bias"]), 5)
+        np.testing.assert_array_equal(
+            masked["expert_cyclic_output_kernel"][0, 1], 1.0
+        )
+        np.testing.assert_array_equal(masked["expert_cyclic_output_bias"][0, 1], 1.0)
+        np.testing.assert_array_equal(masked["expert_bounce_gate_gain"], 0.0)
+
+    def test_cyclic_low_mode_closure_mask_selects_feature_only(self):
+        gradients = {
+            "expert_cyclic_low_mode_closure_gain": jnp.ones((6, 2)),
+            "expert_cyclic_output_bias": jnp.ones((4, 6, 5)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            cyclic_low_mode_closure_only=True,
+            cyclic_feature_indices=(4, 5),
+        )
+        expected = np.zeros((6, 2))
+        expected[4:] = 1.0
+        np.testing.assert_array_equal(
+            masked["expert_cyclic_low_mode_closure_gain"], expected
+        )
+        np.testing.assert_array_equal(masked["expert_cyclic_output_bias"], 0.0)
+
+    def test_cyclic_low_mode_pressure_mask_selects_feature_only(self):
+        gradients = {
+            "expert_cyclic_low_mode_pressure_gain": jnp.ones((8, 2)),
+            "expert_cyclic_output_bias": jnp.ones((4, 8, 5)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            cyclic_low_mode_pressure_only=True,
+            cyclic_feature_indices=(4, 5),
+        )
+        expected = np.zeros((8, 2))
+        expected[4:6] = 1.0
+        np.testing.assert_array_equal(
+            masked["expert_cyclic_low_mode_pressure_gain"], expected
+        )
+        np.testing.assert_array_equal(masked["expert_cyclic_output_bias"], 0.0)
+
+    def test_cyclic_modal_pressure_mask_selects_feature_only(self):
+        gradients = {
+            "expert_cyclic_low_mode_pressure_gain": jnp.ones((8, 2)),
+            "expert_cyclic_modal_pressure_gain": jnp.ones((8, 3, 2)),
+            "expert_cyclic_output_bias": jnp.ones((4, 8, 5)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            cyclic_modal_pressure_only=True,
+            cyclic_feature_indices=(4, 5),
+        )
+        expected = np.zeros((8, 3, 2))
+        expected[4:6] = 1.0
+        np.testing.assert_array_equal(
+            masked["expert_cyclic_modal_pressure_gain"], expected
+        )
+        np.testing.assert_array_equal(
+            masked["expert_cyclic_low_mode_pressure_gain"], 0.0
+        )
+        np.testing.assert_array_equal(masked["expert_cyclic_output_bias"], 0.0)
+
+    def test_cyclic_low_mode_momentum_mask_selects_feature_only(self):
+        gradients = {
+            "expert_cyclic_low_mode_momentum_gain": jnp.ones((8, 2)),
+            "expert_cyclic_output_bias": jnp.ones((4, 8, 5)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            cyclic_low_mode_momentum_only=True,
+            cyclic_feature_indices=(7,),
+        )
+        expected = np.zeros((8, 2))
+        expected[7] = 1.0
+        np.testing.assert_array_equal(
+            masked["expert_cyclic_low_mode_momentum_gain"], expected
+        )
+        np.testing.assert_array_equal(masked["expert_cyclic_output_bias"], 0.0)
 
     def test_modewise_matrix_square_root_recovers_propagator(self):
         propagator = np.stack(
