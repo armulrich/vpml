@@ -655,6 +655,65 @@ class KineticLatentDynamicsTest(unittest.TestCase):
         self.assertGreater(compressed_doubled / compressed_small, 2.5)
         self.assertLess(compressed_doubled / compressed_small, 5.5)
 
+    def test_zero_initialized_experts_preserve_direct_cnn_exactly(self):
+        params = init_state_conditioned_latent_operator(
+            jax.random.PRNGKey(194),
+            resolved_channels=3,
+            latent_rank=4,
+            width=8,
+            depth=2,
+            spectral_modes=9,
+            operator_rank=3,
+            kernel_size=3,
+            conditioner_output_channels=4,
+            conditioner_experts=4,
+            latent_delay_input=True,
+        )
+        base_params = {
+            key: value for key, value in params.items() if not key.startswith("expert_")
+        }
+        resolved = jax.random.normal(jax.random.PRNGKey(195), (2, 3, 16))
+        latent = jax.random.normal(jax.random.PRNGKey(196), (2, 4, 16))
+        delta = jax.random.normal(jax.random.PRNGKey(197), (2, 4, 16))
+        expected = equilibrium_preserving_latent_cnn_correction(
+            base_params,
+            resolved,
+            latent,
+            depth=2,
+            normalized_latent_delta=delta,
+            input_compression_scale=4.0,
+        )
+        actual = equilibrium_preserving_latent_cnn_correction(
+            params,
+            resolved,
+            latent,
+            depth=2,
+            normalized_latent_delta=delta,
+            input_compression_scale=4.0,
+        )
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_expert_amplitude_gate_selects_distinct_scales(self):
+        params = init_state_conditioned_latent_operator(
+            jax.random.PRNGKey(198),
+            resolved_channels=3,
+            latent_rank=4,
+            width=8,
+            depth=1,
+            spectral_modes=9,
+            operator_rank=3,
+            kernel_size=3,
+            conditioner_output_channels=4,
+            conditioner_experts=4,
+        )
+        centers = np.asarray(params["expert_gate_log_amplitude_centers"])
+        np.testing.assert_allclose(centers, (-3.0, -1.3, -0.7, 0.25))
+        self.assertAlmostEqual(
+            float(params["expert_gate_log_amplitude_width"]),
+            0.30,
+            places=6,
+        )
+
     def test_operator_features_decode_to_the_reported_correction(self):
         params = init_state_conditioned_latent_operator(
             jax.random.PRNGKey(14),

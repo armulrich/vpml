@@ -846,14 +846,32 @@ def low_moment_rk4_step(
     # Standard 2/3 pseudo-spectral filtering prevents unresolved products from
     # feeding the highest retained modes back into the fluid state.
     updated = _dealias(updated)
-    density_mean = 1.0 + jnp.mean(state[:, 0], axis=-1, keepdims=True)
-    floor = jnp.asarray(density_floor, state.dtype)
+    return limit_low_moment_state(
+        updated,
+        reference_state=state,
+        density_floor=density_floor,
+        pressure_floor=pressure_floor,
+    )
+
+
+def limit_low_moment_state(
+    updated: Array,
+    *,
+    reference_state: Array | None = None,
+    density_floor: float = DEFAULT_DENSITY_FLOOR,
+    pressure_floor: float = DEFAULT_PRESSURE_FLOOR,
+) -> Array:
+    """Enforce density/pressure admissibility while preserving density mass."""
+    updated = jnp.asarray(updated)
+    reference = updated if reference_state is None else jnp.asarray(reference_state)
+    density_mean = 1.0 + jnp.mean(reference[:, 0], axis=-1, keepdims=True)
+    floor = jnp.asarray(density_floor, updated.dtype)
     updated_density = 1.0 + updated[:, 0]
     density_excess = jnp.maximum(updated_density - floor, 0.0)
     mean_excess = jnp.mean(density_excess, axis=-1, keepdims=True)
     target_excess = jnp.maximum(density_mean - floor, 0.0)
     corrected_density = jnp.where(
-        mean_excess > jnp.finfo(state.dtype).eps,
+        mean_excess > jnp.finfo(updated.dtype).eps,
         floor + density_excess * target_excess / mean_excess,
         jnp.broadcast_to(density_mean, density_excess.shape),
     )
@@ -866,10 +884,10 @@ def low_moment_rk4_step(
     density = 1.0 + density_perturbation
     kinetic = momentum * momentum / density
     raw_pressure = 1.0 + updated[:, 2] - kinetic
-    pressure_floor_value = jnp.asarray(pressure_floor, state.dtype)
+    pressure_floor_value = jnp.asarray(pressure_floor, updated.dtype)
     rounding_margin = (
         8.0
-        * jnp.finfo(state.dtype).eps
+        * jnp.finfo(updated.dtype).eps
         * jnp.maximum(1.0, jnp.abs(kinetic))
     )
     corrected_second_perturbation = (

@@ -31,6 +31,9 @@ esac
 case "${COUPLED_LATENT_DELAY_INPUT:-0}" in
   1|true|TRUE|yes|YES) set -- "$@" --latent-delay-input ;;
 esac
+case "${COUPLED_LATENT_TRAIN_EXPERT_OUTPUT_ONLY:-0}" in
+  1|true|TRUE|yes|YES) set -- "$@" --train-expert-output-only ;;
+esac
 
 exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --reference-cache "${COUPLED_LATENT_REFERENCE_CACHE:?set COUPLED_LATENT_REFERENCE_CACHE}" \
@@ -44,12 +47,14 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --epochs "${COUPLED_LATENT_EPOCHS:-200}" \
   --steps-per-epoch "${COUPLED_LATENT_STEPS_PER_EPOCH:-16}" \
   --gradient-accumulation-steps "${COUPLED_LATENT_GRADIENT_ACCUMULATION_STEPS:-1}" \
+  --gradient-aggregation "${COUPLED_LATENT_GRADIENT_AGGREGATION:-mean}" \
   --width "${COUPLED_LATENT_WIDTH:-48}" \
   --depth "${COUPLED_LATENT_DEPTH:-4}" \
   --kernel-size "${COUPLED_LATENT_KERNEL_SIZE:-5}" \
   --operator-rank "${COUPLED_LATENT_OPERATOR_RANK:-16}" \
   --operator-modes "${COUPLED_LATENT_OPERATOR_MODES:-33}" \
   --operator-output-init-scale "${COUPLED_LATENT_OPERATOR_OUTPUT_INIT_SCALE:-1e-3}" \
+  --conditioner-experts "${COUPLED_LATENT_CONDITIONER_EXPERTS:-0}" \
   --multiplicative-output-ridge "${COUPLED_LATENT_MULTIPLICATIVE_OUTPUT_RIDGE:-1e-4}" \
   --multiplicative-output-initial-scale "${COUPLED_LATENT_MULTIPLICATIVE_OUTPUT_INITIAL_SCALE:-1.0}" \
   --latent-residual-weight "${COUPLED_LATENT_RESIDUAL_WEIGHT:-1.0}" \
@@ -77,6 +82,13 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --electric-growth-window-steps "${COUPLED_LATENT_ELECTRIC_GROWTH_WINDOW_STEPS:-100}" \
   --electric-time-relative-weight "${COUPLED_LATENT_ELECTRIC_TIME_RELATIVE_WEIGHT:-0.0}" \
   --electric-time-relative-floor-ratio "${COUPLED_LATENT_ELECTRIC_TIME_RELATIVE_FLOOR_RATIO:-1e-4}" \
+  --post-minimum-log-energy-weight "${COUPLED_LATENT_POST_MINIMUM_LOG_ENERGY_WEIGHT:-0.0}" \
+  --post-peak-log-energy-weight "${COUPLED_LATENT_POST_PEAK_LOG_ENERGY_WEIGHT:-0.0}" \
+  --peak-log-energy-weight "${COUPLED_LATENT_PEAK_LOG_ENERGY_WEIGHT:-0.0}" \
+  --linear-regime-weight "${COUPLED_LATENT_LINEAR_REGIME_WEIGHT:-1.0}" \
+  --weak-regime-weight "${COUPLED_LATENT_WEAK_REGIME_WEIGHT:-1.0}" \
+  --strong-regime-weight "${COUPLED_LATENT_STRONG_REGIME_WEIGHT:-1.0}" \
+  --post-minimum-energy-modes "${COUPLED_LATENT_POST_MINIMUM_ENERGY_MODES:-4}" \
   --latent-gradient-ratio "${COUPLED_LATENT_GRADIENT_RATIO:-1.0}" \
   --teacher-internal-update-ratio "${COUPLED_LATENT_INTERNAL_UPDATE_RATIO:-10.0}" \
   --teacher-residual-stride "${COUPLED_LATENT_TEACHER_RESIDUAL_STRIDE:-50}" \
@@ -101,6 +113,10 @@ exec "${PYTHON_BIN}" -m model.train.coupled_low_moment_latent \
   --semilinear-kick-scale "${COUPLED_LATENT_SEMILINEAR_KICK_SCALE:-1.0}" \
   --semilinear-correction-location "${COUPLED_LATENT_SEMILINEAR_CORRECTION_LOCATION:-midpoint}" \
   --latent-excursion-limit "${COUPLED_LATENT_EXCURSION_LIMIT:-1000.0}" \
+  --latent-state-bound "${COUPLED_LATENT_STATE_BOUND:-0.0}" \
+  --train-tail-output-from "${COUPLED_LATENT_TRAIN_TAIL_OUTPUT_FROM:-0}" \
+  --train-output-rows "${COUPLED_LATENT_TRAIN_OUTPUT_ROWS:-}" \
+  --train-expert-indices "${COUPLED_LATENT_TRAIN_EXPERT_INDICES:-}" \
   --linear-nonregression-limit "${COUPLED_LATENT_LINEAR_NONREGRESSION_LIMIT:-0.0}" \
   --gradient-chunk-steps "${COUPLED_LATENT_GRADIENT_CHUNK_STEPS:-300}" \
   --validation-every "${COUPLED_LATENT_VALIDATION_EVERY:-5}" \

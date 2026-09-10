@@ -1,0 +1,186 @@
+{
+  "status": "completed_provenance_replay_and_final_construction",
+  "isolated_worktree": "/Users/armin/Documents/NYU/vpml-sep6-replay-20260909",
+  "commit": "bbdb8c609f308586fa20b5979655f1766cea22cb",
+  "original_artifacts_modified": false,
+  "exact_replayed_stages": [
+    "rank32 random base E1/E3 selected epoch2",
+    "compressed Adam E1-E3 selected epoch2",
+    "rank32-to60 tensor lift",
+    "five cumulative tail updates",
+    "weak expert1 update",
+    "linear expert0 update",
+    "strong experts2/3 update",
+    "manual strong delta alpha0.5 composition"
+  ],
+  "final_specialist_boundary": "17 cyclic/router tensors were inherited from the archived September 6 branch and combined with the newly reproduced 33-tensor base; those specialist fits were not retrained in this run",
+  "final_checkpoint_array_equal_to_historical": true,
+  "heldout_case_count": 12,
+  "bounded_cases": 12,
+  "mean_epsilon_E": {
+    "linear_landau": 0.001971009519116761,
+    "nonlinear_landau_weak": 0.006384212219223653,
+    "nonlinear_landau_strong": 0.17246460703294442
+  },
+  "per_case_epsilon_E": {
+    "linear_landau_ic01": 0.0017059342076451427,
+    "linear_landau_ic09": 0.0018663525956054531,
+    "linear_landau_ic11": 0.0020657362989876583,
+    "linear_landau_ic17": 0.0022460149742287903,
+    "nonlinear_landau_weak_ic01": 0.0037735836394844307,
+    "nonlinear_landau_weak_ic09": 0.006239496091664819,
+    "nonlinear_landau_weak_ic10": 0.008723314596293458,
+    "nonlinear_landau_weak_ic16": 0.006800454549451906,
+    "nonlinear_landau_strong_ic02": 0.051298013688691725,
+    "nonlinear_landau_strong_ic08": 0.19194252128139638,
+    "nonlinear_landau_strong_ic12": 0.005140825786668485,
+    "nonlinear_landau_strong_ic17": 0.44147706737502107
+  },
+  "plot": "/Users/armin/Documents/NYU/vpml/out_bench/reproductions/sep6_faithful_20260909/stage6_reconstructed_E3splitSigns_high2x/heldout_cases/heldout_metric1_summary.png",
+  "checkpoint": "/Users/armin/Documents/NYU/vpml/out_bench/reproductions/sep6_faithful_20260909/stage6_reconstructed_E3splitSigns_high2x/best_coupled_low_moment_latent.npz",
+  "comparisons": {
+    "stage4_tail_e1_exactsource_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "new_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "historical_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "byte_equal": true,
+        "keys_equal": true,
+        "differences": []
+      },
+      "best_coupled_low_moment_latent.npz": {
+        "new_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "historical_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "byte_equal": true,
+        "keys_equal": true,
+        "differences": []
+      },
+      "latest_training_state.npz": {
+        "new_sha256": "52ef21a2bf832ae72436a2cc856458fa9aa96a2dfb0c105e31da7bb7fdcc099c",
+        "historical_sha256": "52ef21a2bf832ae72436a2cc856458fa9aa96a2dfb0c105e31da7bb7fdcc099c",
+        "byte_equal": true,
+        "keys_equal": true,
+        "differences": []
+      }
+    },
+    "stage4_tail_e3_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "new_sha256": "2641dd8ea7feb37ecdb66de3030a6dac6aeff3555e1ec84f65425dc97992cf29",
+        "historical_sha256": "2641dd8ea7feb37ecdb66de3030a6dac6aeff3555e1ec84f65425dc97992cf29",
+        "byte_equal": true,
+        "differing_arrays": []
+      },
+      "latest_training_state.npz": {
+        "new_sha256": "8a48161969c7e7f604e02cf0767d25580c5f45cf062c1a9abbf0c5546f38d07b",
+        "historical_sha256": "8a48161969c7e7f604e02cf0767d25580c5f45cf062c1a9abbf0c5546f38d07b",
+        "byte_equal": true,
+        "differing_arrays": []
+      }
+    },
+    "stage4_tail_e4_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "7008a79200163aa3f110414b1ea757d0f5a7cac1ec497ccb8c059236306c055d",
+        "historical_sha256": "7008a79200163aa3f110414b1ea757d0f5a7cac1ec497ccb8c059236306c055d",
+        "differing_arrays": []
+      },
+      "best_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "historical_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "differing_arrays": []
+      },
+      "latest_training_state.npz": {
+        "byte_equal": true,
+        "new_sha256": "dc9401fcb6ca6441c95a6132ae5f7590ebebc486dd74b07ae0c6ca3b740aebeb",
+        "historical_sha256": "dc9401fcb6ca6441c95a6132ae5f7590ebebc486dd74b07ae0c6ca3b740aebeb",
+        "differing_arrays": []
+      }
+    },
+    "stage4_tail_e5_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "69b003c69064e012896b7d6adaedd9fe779764e5c19aeed412cba762780fdd3c",
+        "historical_sha256": "69b003c69064e012896b7d6adaedd9fe779764e5c19aeed412cba762780fdd3c",
+        "differing_arrays": []
+      },
+      "best_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "historical_sha256": "dcd028d8627df7ff4fd61cdf56455c59d5464d963038b8b0e7b36d6084586b83",
+        "differing_arrays": []
+      },
+      "latest_training_state.npz": {
+        "byte_equal": true,
+        "new_sha256": "aee47a92544983d0c345dbea6a7183b4ba611e2c5fb50286903f982f378ea9ca",
+        "historical_sha256": "aee47a92544983d0c345dbea6a7183b4ba611e2c5fb50286903f982f378ea9ca",
+        "differing_arrays": []
+      }
+    },
+    "stage5_ordinary_alpha0p5_comparison": {
+      "byte_equal": true,
+      "new_sha256": "70558fe315d6a2ebfdf4f0bff938b3921aeb01228fbce70eddf520937b166def",
+      "historical_sha256": "70558fe315d6a2ebfdf4f0bff938b3921aeb01228fbce70eddf520937b166def",
+      "differing_arrays": []
+    },
+    "stage5_ordinary_linear_e2_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "10f191005e498676b5297a2dd8c36283952b08f3bfc88965f2b58e3cf72fc3e6",
+        "historical_sha256": "10f191005e498676b5297a2dd8c36283952b08f3bfc88965f2b58e3cf72fc3e6",
+        "differing_arrays": []
+      },
+      "best_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "10f191005e498676b5297a2dd8c36283952b08f3bfc88965f2b58e3cf72fc3e6",
+        "historical_sha256": "10f191005e498676b5297a2dd8c36283952b08f3bfc88965f2b58e3cf72fc3e6",
+        "differing_arrays": []
+      },
+      "latest_training_state.npz": {
+        "byte_equal": true,
+        "new_sha256": "bfee858b186674d3f724b7d9f79671d23b9e42e2fa2f57b79bc9b9ebed288e90",
+        "historical_sha256": "bfee858b186674d3f724b7d9f79671d23b9e42e2fa2f57b79bc9b9ebed288e90",
+        "differing_arrays": []
+      }
+    },
+    "stage5_ordinary_strong_e3_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "4907dcff5f0a1b28f401ee2bec080b2dc4563f541345c517ba0c81195a83f090",
+        "historical_sha256": "4907dcff5f0a1b28f401ee2bec080b2dc4563f541345c517ba0c81195a83f090",
+        "differing_arrays": []
+      },
+      "best_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "4907dcff5f0a1b28f401ee2bec080b2dc4563f541345c517ba0c81195a83f090",
+        "historical_sha256": "4907dcff5f0a1b28f401ee2bec080b2dc4563f541345c517ba0c81195a83f090",
+        "differing_arrays": []
+      },
+      "latest_training_state.npz": {
+        "byte_equal": true,
+        "new_sha256": "0c0303d7822a9361f9dce2a910c6e20d1e2b55fc240168a7a1188fa7ebf593fb",
+        "historical_sha256": "0c0303d7822a9361f9dce2a910c6e20d1e2b55fc240168a7a1188fa7ebf593fb",
+        "differing_arrays": []
+      }
+    },
+    "stage5_ordinary_weak_e1_comparison": {
+      "latest_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "73970295c0c1f6bb85adcaba391220a8401c3a7ed39cb8b6201b4cdf750d5591",
+        "historical_sha256": "73970295c0c1f6bb85adcaba391220a8401c3a7ed39cb8b6201b4cdf750d5591",
+        "differing_arrays": []
+      },
+      "best_coupled_low_moment_latent.npz": {
+        "byte_equal": true,
+        "new_sha256": "73970295c0c1f6bb85adcaba391220a8401c3a7ed39cb8b6201b4cdf750d5591",
+        "historical_sha256": "73970295c0c1f6bb85adcaba391220a8401c3a7ed39cb8b6201b4cdf750d5591",
+        "differing_arrays": []
+      },
+      "latest_training_state.npz": {
+        "byte_equal": true,
+        "new_sha256": "968496946e86680de67cae6e237bba176b7586de9ea1669678e98162f3d99949",
+        "historical_sha256": "968496946e86680de67cae6e237bba176b7586de9ea1669678e98162f3d99949",
+        "differing_arrays": []
+      }
+    }
+  }
+}

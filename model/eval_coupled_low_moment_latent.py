@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from model.train.coupled_low_moment_latent import (
+    _energy_regrowth_diagnostics,
     _load_complete_case,
     _make_functions,
     _matrix_square_root_propagator,
@@ -28,8 +29,11 @@ from model.train.low_moment_closure import (
     _restrict_rfft,
 )
 from vpml.jax_runtime import print_jax_runtime_summary
-from vpml.kinetic_latent import init_state_conditioned_latent_operator
-from vpml.low_moment import electric_field_from_density
+from vpml.kinetic_latent import (
+    init_state_conditioned_latent_operator,
+    resolved_hermite_to_low_moment_state,
+)
+from vpml.low_moment import electric_field_from_density, primitive_fields
 from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,
     EarlyGrowthConfig,
@@ -106,6 +110,42 @@ def _case_plot_paths(root: Path, case_ids: list[str]) -> list[Path]:
     return paths
 
 
+def _turnaround_diagnostics(model_energy, teacher_energy, *, cadence: float):
+    """Measure damping-minimum to later-peak growth and final retention."""
+    teacher_energy = np.asarray(teacher_energy, dtype=np.float64)
+    model_energy = np.asarray(model_energy, dtype=np.float64)
+    first = min(teacher_energy.size - 2, max(1, int(round(5.0 / cadence))))
+    local_minimum = np.zeros(teacher_energy.shape, dtype=bool)
+    local_minimum[1:-1] = (
+        (teacher_energy[1:-1] <= teacher_energy[:-2])
+        & (teacher_energy[1:-1] < teacher_energy[2:])
+    )
+    local_minimum[:first] = False
+    future_maximum = np.maximum.accumulate(teacher_energy[::-1])[::-1]
+    tiny = np.finfo(np.float64).tiny
+    score = np.full(teacher_energy.shape, -np.inf, dtype=np.float64)
+    score[local_minimum] = np.log(np.maximum(future_maximum[local_minimum], tiny)) - np.log(
+        np.maximum(teacher_energy[local_minimum], tiny)
+    )
+    minimum_index = int(np.argmax(score))
+    peak_index = minimum_index + int(np.argmax(teacher_energy[minimum_index:]))
+
+    def factor(values):
+        return float(values[peak_index] / max(values[minimum_index], tiny))
+
+    def retention(values):
+        return float(values[-1] / max(values[peak_index], tiny))
+
+    return {
+        "turnaround_start_time": float(minimum_index * cadence),
+        "turnaround_peak_time": float(peak_index * cadence),
+        "teacher_turnaround_factor": factor(teacher_energy),
+        "model_turnaround_factor": factor(model_energy),
+        "teacher_post_peak_retention": retention(teacher_energy),
+        "model_post_peak_retention": retention(model_energy),
+    }
+
+
 def evaluate(run_dir: Path) -> None:
     report, config, params, arrays = _load_saved_model(run_dir)
     reference_cache = Path(config["reference_cache"])
@@ -174,6 +214,7 @@ def evaluate(run_dir: Path) -> None:
         latent_readout_mode=str(config.get("latent_readout_mode", "multiplicative")),
         latent_gate_scale=float(config.get("latent_gate_scale", 0.1)),
         latent_gate_power=int(config.get("latent_gate_power", 2)),
+        latent_state_bound=float(config.get("latent_state_bound", 0.0)),
         autonomous_latent_weight=float(config.get("autonomous_latent_weight", 0.0)),
         electric_spectrum_weight=float(config.get("electric_spectrum_weight", 0.0)),
         electric_log_energy_weight=float(config.get("electric_log_energy_weight", 0.0)),
@@ -192,6 +233,14 @@ def evaluate(run_dir: Path) -> None:
         electric_time_relative_floor_ratio=float(
             config.get("electric_time_relative_floor_ratio", 1e-4)
         ),
+        post_minimum_log_energy_weight=float(
+            config.get("post_minimum_log_energy_weight", 0.0)
+        ),
+        post_peak_log_energy_weight=float(
+            config.get("post_peak_log_energy_weight", 0.0)
+        ),
+        peak_log_energy_weight=float(config.get("peak_log_energy_weight", 0.0)),
+        post_minimum_energy_modes=int(config.get("post_minimum_energy_modes", 4)),
         teacher_residual_stride=int(config.get("teacher_residual_stride", 50)),
         teacher_rollout_steps=int(config.get("teacher_rollout_steps", 10)),
         linear_baseline=str(config.get("linear_baseline", "fitted_propagator")),
@@ -288,6 +337,45 @@ def evaluate(run_dir: Path) -> None:
         second = state[:, 0] + math.sqrt(2.0) * state[:, 2]
         pressure = 1.0 + second - momentum * momentum / density
         normalized_latent = predicted_latent[index] / arrays["latent_scale"][None, :, None]
+        target_state = resolved_hermite_to_low_moment_state(
+            jnp.asarray(target[index, :, :3])
+        )
+        comparison_model_field = field[index]
+        comparison_teacher_field = np.asarray(
+            primitive_fields(
+                target_state,
+                jnp.asarray(arrays["k_arr"]),
+                poisson_sign=float(teacher["teacher_poisson_sign"]),
+            )[:, 3]
+        )
+        regrowth = _energy_regrowth_diagnostics(
+            comparison_model_field[1:],
+            comparison_teacher_field[1:],
+            cadence=float(config["cadence"]),
+        )
+        comparison_model_energy = np.mean(
+            np.square(comparison_model_field), axis=-1
+        )
+        comparison_teacher_energy = np.mean(
+            np.square(comparison_teacher_field), axis=-1
+        )
+        end_index = min(
+            comparison_model_energy.size - 1,
+            int(round(regrowth["regrowth_end_time"] / float(config["cadence"]))),
+        )
+        model_post_rebound_retention = float(
+            comparison_model_energy[-1]
+            / max(comparison_model_energy[end_index], np.finfo(np.float64).tiny)
+        )
+        teacher_post_rebound_retention = float(
+            comparison_teacher_energy[-1]
+            / max(comparison_teacher_energy[end_index], np.finfo(np.float64).tiny)
+        )
+        turnaround = _turnaround_diagnostics(
+            comparison_model_energy,
+            comparison_teacher_energy,
+            cadence=float(config["cadence"]),
+        )
         summary = {
             "case_id": case_id,
             "regime": regime,
@@ -305,6 +393,10 @@ def evaluate(run_dir: Path) -> None:
             "latent_excursion_fraction_above_96": float(
                 np.mean(np.abs(normalized_latent) >= 96.0)
             ),
+            **regrowth,
+            "model_post_rebound_retention": model_post_rebound_retention,
+            "teacher_post_rebound_retention": teacher_post_rebound_retention,
+            **turnaround,
         }
         case_dir = eval_root / case_id
         case_dir.mkdir(exist_ok=True)

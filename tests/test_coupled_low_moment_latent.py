@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from model.train.coupled_low_moment_latent import (
+    _aggregate_gradients,
     _atomic_savez,
     _calibrate_smooth_correction_bounds,
     _clip_parameter_update,
@@ -22,12 +23,14 @@ from model.train.coupled_low_moment_latent import (
     _load_training_state,
     _make_functions,
     _matrix_square_root_propagator,
+    _mask_tail_output_gradients,
     _mean_gradients,
     _scale_auxiliary_update,
     _sgd_step,
     _physical_sample_loss,
     _physical_trajectory_terms,
     _training_state_payload,
+    _turnaround_indices,
 )
 from model.train.kinetic_latent_dynamics_probe import _adam_init
 from vpml.kinetic_latent import (
@@ -41,6 +44,82 @@ from vpml.low_moment import primitive_fields
 
 
 class CoupledLowMomentLatentLossTest(unittest.TestCase):
+    def test_coordinate_median_gradient_rejects_single_outlier(self):
+        gradients = [
+            {"weight": jnp.asarray([1.0, 2.0])},
+            {"weight": jnp.asarray([1.2, 1.8])},
+            {"weight": jnp.asarray([-40.0, 50.0])},
+        ]
+        aggregated = _aggregate_gradients(
+            gradients, normalize=False, method="coordinate_median"
+        )
+        np.testing.assert_allclose(aggregated["weight"], (1.0, 2.0))
+
+    def test_turnaround_indices_select_strongest_local_regrowth(self):
+        energy = jnp.concatenate(
+            (
+                jnp.linspace(5.0, 2.0, 51),
+                jnp.asarray([1.0, 3.0, 2.0, 0.5, 4.0, 3.0]),
+            )
+        )[None, :]
+        minimum, peak = _turnaround_indices(energy, minimum_start_index=50)
+        self.assertEqual(int(minimum[0]), 54)
+        self.assertEqual(int(peak[0]), 55)
+
+    def test_tail_output_gradient_mask_freezes_core(self):
+        gradients = {
+            "output_kernel": jnp.ones((5, 2, 3)),
+            "output_bias": jnp.ones((5,)),
+            "block_0_kernel": jnp.ones((2, 2, 3)),
+        }
+        masked = _mask_tail_output_gradients(gradients, 3)
+        np.testing.assert_array_equal(masked["output_kernel"][:3], 0.0)
+        np.testing.assert_array_equal(masked["output_kernel"][3:], 1.0)
+        np.testing.assert_array_equal(masked["output_bias"][:3], 0.0)
+        np.testing.assert_array_equal(masked["output_bias"][3:], 1.0)
+        np.testing.assert_array_equal(masked["block_0_kernel"], 0.0)
+
+    def test_expert_gradient_mask_freezes_base_model(self):
+        gradients = {
+            "output_kernel": jnp.ones((5, 2, 3)),
+            "expert_output_kernel": jnp.ones((4, 5, 2, 3)),
+            "expert_gate_kernel": jnp.ones((4, 2)),
+            "expert_gate_log_amplitude_centers": jnp.ones((4,)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients, 0, expert_output_only=True
+        )
+        np.testing.assert_array_equal(masked["output_kernel"], 0.0)
+        np.testing.assert_array_equal(masked["expert_output_kernel"], 1.0)
+        np.testing.assert_array_equal(masked["expert_gate_kernel"], 1.0)
+        np.testing.assert_array_equal(
+            masked["expert_gate_log_amplitude_centers"], 0.0
+        )
+
+    def test_expert_gradient_mask_can_select_one_expert(self):
+        gradients = {
+            "expert_output_kernel": jnp.ones((4, 5, 2, 3)),
+            "expert_output_bias": jnp.ones((4, 5)),
+            "expert_gate_kernel": jnp.ones((4, 2)),
+            "expert_gate_bias": jnp.ones((4,)),
+        }
+        masked = _mask_tail_output_gradients(
+            gradients,
+            0,
+            expert_output_only=True,
+            expert_indices=(1,),
+        )
+        np.testing.assert_array_equal(masked["expert_output_kernel"][1], 1.0)
+        np.testing.assert_array_equal(
+            np.asarray(masked["expert_output_kernel"])[[0, 2, 3]], 0.0
+        )
+        np.testing.assert_array_equal(masked["expert_output_bias"][1], 1.0)
+        np.testing.assert_array_equal(
+            np.asarray(masked["expert_output_bias"])[[0, 2, 3]], 0.0
+        )
+        np.testing.assert_array_equal(masked["expert_gate_kernel"], 0.0)
+        np.testing.assert_array_equal(masked["expert_gate_bias"], 0.0)
+
     def test_modewise_matrix_square_root_recovers_propagator(self):
         propagator = np.stack(
             (

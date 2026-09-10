@@ -12,6 +12,7 @@ import numpy as np
 from vpml.low_moment import (
     electric_field_from_density,
     low_moment_rhs,
+    limit_low_moment_state,
     low_moment_rk4_step,
     spectral_derivative,
 )
@@ -112,6 +113,7 @@ def init_state_conditioned_latent_operator(
     conditioner_output_init_scale: float = 1e-2,
     closure_aligned_output: bool = False,
     latent_delay_input: bool = False,
+    conditioner_experts: int = 0,
     dtype=jnp.float32,
 ) -> Dict[str, Array]:
     """Initialize a low-rank, state-conditioned spectral propagator update."""
@@ -119,7 +121,7 @@ def init_state_conditioned_latent_operator(
         raise ValueError("spectral_modes and operator_rank must be positive")
     if float(output_projection_init_scale) < 0.0:
         raise ValueError("output_projection_init_scale must be nonnegative")
-    conditioner_key, projection_key = jax.random.split(key)
+    conditioner_key, projection_key, expert_key = jax.random.split(key, 3)
     params = init_kinetic_latent_dynamics(
         conditioner_key,
         resolved_channels=(
@@ -139,6 +141,54 @@ def init_state_conditioned_latent_operator(
         output_init_scale=float(conditioner_output_init_scale),
         dtype=dtype,
     )
+    if int(conditioner_experts) < 0:
+        raise ValueError("conditioner_experts must be nonnegative")
+    if int(conditioner_experts) > 0:
+        output_channels = int(
+            operator_rank
+            if conditioner_output_channels is None
+            else conditioner_output_channels
+        )
+        params["expert_output_kernel"] = jnp.zeros(
+            (
+                int(conditioner_experts),
+                output_channels,
+                int(width),
+                int(kernel_size),
+            ),
+            dtype=dtype,
+        )
+        params["expert_output_bias"] = jnp.zeros(
+            (int(conditioner_experts), output_channels), dtype=dtype
+        )
+        params["expert_gate_kernel"] = (
+            0.1
+            / math.sqrt(float(width))
+            * jax.random.normal(
+                expert_key,
+                (int(conditioner_experts), int(width)),
+                dtype=dtype,
+            )
+        )
+        params["expert_gate_bias"] = jnp.zeros(
+            (int(conditioner_experts),), dtype=dtype
+        )
+        # Give the experts distinct, state-observable responsibilities from the
+        # first update.  A small learned gate alone starts almost uniformly and
+        # therefore leaves all expert output gradients effectively identical.
+        # These centers partition the log10 RMS of the normalized state from
+        # late-time near-linear states through strongly nonlinear states.
+        default_centers = jnp.asarray((-3.0, -1.3, -0.7, 0.25), dtype=dtype)
+        if int(conditioner_experts) == 1:
+            centers = jnp.asarray((0.0,), dtype=dtype)
+        else:
+            centers = jnp.interp(
+                jnp.linspace(0.0, 3.0, int(conditioner_experts), dtype=dtype),
+                jnp.arange(4, dtype=dtype),
+                default_centers,
+            )
+        params["expert_gate_log_amplitude_centers"] = centers
+        params["expert_gate_log_amplitude_width"] = jnp.asarray(0.30, dtype=dtype)
     input_channels = int(resolved_channels) + int(latent_rank)
     if latent_delay_input:
         input_channels += int(latent_rank)
@@ -326,7 +376,7 @@ def kinetic_latent_dynamics_correction(
             )
         )
         hidden = (hidden + update) / math.sqrt(2.0)
-    return _periodic_convolution(
+    correction = _periodic_convolution(
         hidden,
         params["output_kernel"],
         (
@@ -335,6 +385,35 @@ def kinetic_latent_dynamics_correction(
             else params["output_bias"]
         ),
     )
+    if "expert_output_kernel" in params:
+        pooled_hidden = jnp.mean(hidden, axis=-1)
+        gate_logits = jnp.einsum(
+            "bw,ew->be", pooled_hidden, params["expert_gate_kernel"]
+        ) + params["expert_gate_bias"][None, :]
+        if "expert_gate_log_amplitude_centers" in params:
+            # Work with mean-square amplitude rather than RMS so the gate is
+            # smooth at equilibrium.  The floor only defines the limiting log
+            # amplitude and has zero first derivative there.
+            mean_square = jnp.mean(jnp.square(inputs), axis=(1, 2))
+            log_amplitude = 0.5 * jnp.log10(mean_square + 1.0e-8)
+            centers = params["expert_gate_log_amplitude_centers"]
+            width = params["expert_gate_log_amplitude_width"]
+            gate_logits = gate_logits - 0.5 * jnp.square(
+                (log_amplitude[:, None] - centers[None, :]) / width
+            )
+        gates = jax.nn.softmax(gate_logits, axis=1)
+        expert_corrections = jax.vmap(
+            lambda kernel, bias: _periodic_convolution(hidden, kernel, bias),
+            in_axes=(0, 0),
+            out_axes=1,
+        )(
+            params["expert_output_kernel"],
+            params["expert_output_bias"],
+        )
+        correction = correction + jnp.einsum(
+            "be,beox->box", gates, expert_corrections
+        )
+    return correction
 
 
 def equilibrium_preserving_latent_cnn_correction(
@@ -1205,10 +1284,13 @@ def advance_coupled_projected_hermite(
             fluid + dt_value * k3_fluid,
             latent + dt_value * k3_latent,
         )
-        updated_fluid = _dealias_state(
-            fluid
-            + (dt_value / 6.0)
-            * (k1_fluid + 2.0 * k2_fluid + 2.0 * k3_fluid + k4_fluid)
+        updated_fluid = limit_low_moment_state(
+            _dealias_state(
+                fluid
+                + (dt_value / 6.0)
+                * (k1_fluid + 2.0 * k2_fluid + 2.0 * k3_fluid + k4_fluid)
+            ),
+            reference_state=fluid,
         )
         updated_latent = _dealias_state(
             latent
@@ -1250,6 +1332,7 @@ def coupled_low_moment_latent_step(
     latent_readout_mode: str = "multiplicative",
     latent_gate_scale: float | Array = 0.1,
     latent_gate_power: int = 2,
+    latent_state_bound: float = 0.0,
     equilibrium_input_compression_scale: float = 0.0,
     linear_baseline: str = "fitted_propagator",
     hermite_tail_damping: float = 10.0,
@@ -1285,6 +1368,18 @@ def coupled_low_moment_latent_step(
         "gated_linear_residual",
     }:
         raise ValueError(f"Unsupported latent_readout_mode: {latent_readout_mode}")
+    if float(latent_state_bound) < 0.0:
+        raise ValueError("latent_state_bound must be nonnegative")
+
+    def bound_latent(value):
+        if float(latent_state_bound) == 0.0:
+            return value
+        scale = jnp.asarray(latent_scale, dtype=value.dtype)[None, :, None]
+        return jnp.clip(
+            value / scale,
+            -float(latent_state_bound),
+            float(latent_state_bound),
+        ) * scale
     resolved = low_moment_state_to_resolved_hermite(state)
     linear_state = apply_coupled_linear_propagator(
         propagator,
@@ -1396,7 +1491,7 @@ def coupled_low_moment_latent_step(
             basis,
         )
     if linear_baseline == "projected_hermite":
-        return advance_coupled_projected_hermite(
+        updated_state, updated_latent = advance_coupled_projected_hermite(
             state,
             latent_state,
             correction,
@@ -1408,8 +1503,9 @@ def coupled_low_moment_latent_step(
             tail_power=hermite_tail_power,
             poisson_sign=poisson_sign,
         )
+        return updated_state, bound_latent(updated_latent)
     if linear_baseline == "semilinear_strang":
-        return advance_coupled_semilinear_strang(
+        updated_state, updated_latent = advance_coupled_semilinear_strang(
             state,
             latent_state,
             correction,
@@ -1424,6 +1520,7 @@ def coupled_low_moment_latent_step(
             correction_location=semilinear_correction_location,
             poisson_sign=poisson_sign,
         )
+        return updated_state, bound_latent(updated_latent)
     updated_latent = linear_latent + correction
     linear_fluid_state = resolved_hermite_to_low_moment_state(linear_state[:, :3])
 
@@ -1467,7 +1564,7 @@ def coupled_low_moment_latent_step(
         (state, state),
     )
     updated_state = linear_fluid_state + nonlinear_fluid - baseline_fluid
-    return updated_state, updated_latent
+    return updated_state, bound_latent(updated_latent)
 
 
 def rollout_coupled_low_moment_latent(
@@ -1497,6 +1594,7 @@ def rollout_coupled_low_moment_latent(
     latent_readout_mode: str = "multiplicative",
     latent_gate_scale: float | Array = 0.1,
     latent_gate_power: int = 2,
+    latent_state_bound: float = 0.0,
     equilibrium_input_compression_scale: float = 0.0,
     linear_baseline: str = "fitted_propagator",
     hermite_tail_damping: float = 10.0,
@@ -1538,6 +1636,7 @@ def rollout_coupled_low_moment_latent(
             latent_readout_mode=latent_readout_mode,
             latent_gate_scale=latent_gate_scale,
             latent_gate_power=latent_gate_power,
+            latent_state_bound=latent_state_bound,
             equilibrium_input_compression_scale=equilibrium_input_compression_scale,
             linear_baseline=linear_baseline,
             hermite_tail_damping=hermite_tail_damping,

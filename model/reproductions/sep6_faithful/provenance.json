@@ -1,0 +1,51 @@
+{
+  "source_commit": "bbdb8c609f308586fa20b5979655f1766cea22cb",
+  "created_at": "2026-09-09",
+  "files": [
+    {
+      "path": "/Users/armin/Documents/NYU/vpml-sep6-replay-20260909/model/train/coupled_low_moment_latent.py",
+      "sha256": "69d26fa761e9e3fcb8cfbe4e176dff224a1c5feab131cfaa45196908e7f46ccd",
+      "bytes": 215254
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml-sep6-replay-20260909/vpml/kinetic_latent.py",
+      "sha256": "6ec465c36e0d66aecc644ef32a6e23b31d10f1f25bf315193286a3df3c07730a",
+      "bytes": 53112
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/coupled_projectedHermite_directEquilibriumCNN_fullBPTT1200_energyEnvelope_accum4_trainGuard4_E1_20260901/report.json",
+      "sha256": "3d936c5c56810e957997bcbd545b9ebea59c76498a8b896a96ebbb50b0c7a00c",
+      "bytes": 26495
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/coupled_projectedHermite_directEquilibriumCNN_fullBPTT1200_energyEnvelope_accum4_trainGuard4_E3_20260901/report.json",
+      "sha256": "4b443a59454d6600eb148dc787254886c001b87b560d6e743c5bb3e4c727152e",
+      "bytes": 72172
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/coupled_projectedHermite_compressedJointSingleAdam_E2_E3_20260901/report.json",
+      "sha256": "c043234f2779e714edaa8197a52934e542d92d7ff877e643eb4a1a1a491f87cc",
+      "bytes": 72305
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/diagnostics/fresh_family_20260908/historical_ancestry/pre_expert_baselines.json",
+      "sha256": "b097c4c76f597a0c3bf0803ac9ebaa37abd4c7ac3873b140939223472a9d70a3",
+      "bytes": 937
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/kinetic_latent_projected_cache_rank32_nx64_dt0p1/metadata.json",
+      "sha256": "ef9142b61cd4cda11185e19a6b9a3a89bfbe3fdc937c3209197960cdc9bdde47",
+      "bytes": 438
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/kinetic_latent_projected_cache_rank60_nx64_dt0p1/metadata.json",
+      "sha256": "5dece1455c687b6dc3114518af4d5efa900ef05bc7c871844b67ac92c615c8f5",
+      "bytes": 424
+    },
+    {
+      "path": "/Users/armin/Documents/NYU/vpml/out_bench/reference_cache/interface_flux_landau_T120_Nx1024_Nv8192_M4096/e376aa1efa28e754b5f6/metadata.json",
+      "sha256": "97276ce560c7f0037390ee554e0b4156bbe26fecc132d24c9b13acf374f0f5fc",
+      "bytes": 1146
+    }
+  ]
+}
