@@ -267,6 +267,7 @@ def init_window_fno_params(
     keys = iter(jax.random.split(key, 10 + 3 * depth))
     history_scale = 0.08 / math.sqrt(float(lags * channels))
     current_scale = 0.12 / math.sqrt(float(channels))
+    output_scale = 1.0e-4 / math.sqrt(float(width))
     params = {
         "history_local": history_scale
         * jax.random.normal(next(keys), (width, lags, channels), dtype=dtype),
@@ -280,10 +281,17 @@ def init_window_fno_params(
         * jax.random.normal(next(keys), (modes, width, channels), dtype=dtype),
         "current_spectral_imag": current_scale
         * jax.random.normal(next(keys), (modes, width, channels), dtype=dtype),
-        "output_local": jnp.zeros((1, width), dtype=dtype),
-        "output_spectral_real": jnp.zeros((modes, 1, width), dtype=dtype),
-        "output_spectral_imag": jnp.zeros((modes, 1, width), dtype=dtype),
-        "amplitude_gain": jnp.zeros((channels,), dtype=dtype),
+        # Keep the initial closure close to the unclosed fluid model while
+        # ensuring every trainable neural component starts from the recorded
+        # random seed.
+        "output_local": output_scale
+        * jax.random.normal(next(keys), (1, width), dtype=dtype),
+        "output_spectral_real": output_scale
+        * jax.random.normal(next(keys), (modes, 1, width), dtype=dtype),
+        "output_spectral_imag": output_scale
+        * jax.random.normal(next(keys), (modes, 1, width), dtype=dtype),
+        "amplitude_gain": 1.0e-5
+        * jax.random.normal(next(keys), (channels,), dtype=dtype),
     }
     local_scale = math.sqrt(1.0 / float(width))
     spectral_scale = 0.08 / math.sqrt(float(width))
@@ -299,6 +307,97 @@ def init_window_fno_params(
             spectral_scale
             * jax.random.normal(next(keys), (modes, width, width), dtype=dtype)
         )
+    return params
+
+
+def init_burles_latent_fno_params(
+    key: Array,
+    *,
+    width: int,
+    spectral_modes: int,
+    memory_steps: int,
+    depth: int = 8,
+    latent_dim: int = 6,
+    input_channels: int = 5,
+    dtype=jnp.float32,
+) -> Dict[str, Array]:
+    """Initialize a Burles-style history FNO with compact learned memory.
+
+    ``latent_dim=0`` is the matched history-only control.  Positive dimensions
+    add a learned state-space realization of unresolved memory; no Hermite
+    basis, projected kinetic propagator, or prescribed latent dynamics enter.
+    """
+    latent_dim = int(latent_dim)
+    if latent_dim < 0:
+        raise ValueError("latent_dim cannot be negative")
+    params = init_window_fno_params(
+        key,
+        width=width,
+        spectral_modes=spectral_modes,
+        memory_steps=memory_steps,
+        depth=depth,
+        input_channels=input_channels,
+        dtype=dtype,
+    )
+    # Preserve old SiLU checkpoints while matching the GELU nonlinearity in
+    # newly initialized Burles-family FNOs.
+    params["activation_gelu"] = jnp.zeros((0,), dtype=dtype)
+    width = int(width)
+    modes = int(spectral_modes)
+    extra = iter(jax.random.split(jax.random.fold_in(key, 0xB171E5), 14))
+    # Burles et al. append log(A_scale) as a spatially constant channel.  Keep
+    # it explicit rather than relying only on multiplicative normalization.
+    params["amplitude_local"] = (0.12 / math.sqrt(float(width))) * jax.random.normal(
+        next(extra), (width, 1), dtype=dtype
+    )
+    latent_lift_scale = 0.08 / math.sqrt(float(max(latent_dim, 1)))
+    params["compact_latent_local"] = latent_lift_scale * jax.random.normal(
+        next(extra), (width, latent_dim), dtype=dtype
+    )
+    params["compact_latent_spectral_real"] = latent_lift_scale * jax.random.normal(
+        next(extra), (modes, width, latent_dim), dtype=dtype
+    )
+    params["compact_latent_spectral_imag"] = latent_lift_scale * jax.random.normal(
+        next(extra), (modes, width, latent_dim), dtype=dtype
+    )
+    state_scale = 0.04 / math.sqrt(float(width))
+    params["compact_latent_init_local"] = state_scale * jax.random.normal(
+        next(extra), (latent_dim, width), dtype=dtype
+    )
+    params["compact_latent_init_spectral_real"] = state_scale * jax.random.normal(
+        next(extra), (modes, latent_dim, width), dtype=dtype
+    )
+    params["compact_latent_init_spectral_imag"] = state_scale * jax.random.normal(
+        next(extra), (modes, latent_dim, width), dtype=dtype
+    )
+    params["compact_latent_rhs_local"] = state_scale * jax.random.normal(
+        next(extra), (latent_dim, width), dtype=dtype
+    )
+    params["compact_latent_rhs_spectral_real"] = state_scale * jax.random.normal(
+        next(extra), (modes, latent_dim, width), dtype=dtype
+    )
+    params["compact_latent_rhs_spectral_imag"] = state_scale * jax.random.normal(
+        next(extra), (modes, latent_dim, width), dtype=dtype
+    )
+    # A stable random diagonal decay leaves all compact-memory dynamics
+    # trainable while avoiding an unstable random ODE at epoch zero.
+    target_decay = jnp.asarray(0.25, dtype=dtype)
+    inverse_softplus = jnp.log(jnp.expm1(target_decay))
+    params["compact_latent_decay_raw"] = inverse_softplus + 0.02 * jax.random.normal(
+        next(extra), (latent_dim,), dtype=dtype
+    )
+    # Unlike the earlier near-zero pilot head, this scale permits gradients to
+    # reach the deep FNO from the first update while remaining bounded.
+    output_scale = 0.04 / math.sqrt(float(width))
+    params["output_local"] = output_scale * jax.random.normal(
+        next(extra), (1, width), dtype=dtype
+    )
+    params["output_spectral_real"] = output_scale * jax.random.normal(
+        next(extra), (modes, 1, width), dtype=dtype
+    )
+    params["output_spectral_imag"] = output_scale * jax.random.normal(
+        next(extra), (modes, 1, width), dtype=dtype
+    )
     return params
 
 
@@ -443,7 +542,7 @@ def _normalized_closure_fields(
     return normalized * gain[:, :, None]
 
 
-def explicit_window_closure_step(
+def _window_fno_features(
     params: Dict[str, Array],
     state: Array,
     history: Array,
@@ -461,9 +560,9 @@ def explicit_window_closure_step(
     encoded_history: Array | None = None,
     input_scaling: str = FIXED_INPUT_SCALING,
     dynamic_amplitude_floor: float = 1e-6,
-    allow_uniform_heating: bool = False,
-) -> Array:
-    """Predict the closure from the current state and an explicit state window."""
+    compact_latent: Array | None = None,
+) -> Tuple[Array, Array]:
+    """Return FNO features and the physical amplitude used for output scaling."""
     state = jnp.asarray(state)
     history = jnp.asarray(history)
     batch, lag_count, _, nx = history.shape
@@ -481,7 +580,7 @@ def explicit_window_closure_step(
         input_scaling=input_scaling,
         dynamic_amplitude_floor=dynamic_amplitude_floor,
     )
-    current_amplitude = None
+    current_amplitude = jnp.asarray(amplitude, dtype=state.dtype)
     if input_scaling == DYNAMIC_INPUT_SCALING:
         current_fields = primitive_fields(state, k_arr, poisson_sign=poisson_sign)
         current_amplitude = jnp.maximum(
@@ -521,7 +620,25 @@ def explicit_window_closure_step(
         dtype=current_hat.dtype,
     ).at[..., :retained].set(encoded_hat)
     encoded = local + jnp.fft.irfft(full_hat, n=nx, axis=-1)
-    encoded = jax.nn.silu(encoded)
+    if "amplitude_local" in params:
+        log_amplitude = jnp.log(jnp.maximum(current_amplitude, 1e-8))
+        normalized_log_amplitude = (
+            log_amplitude - jnp.asarray(amplitude_center, dtype=state.dtype)
+        ) / jnp.asarray(max(float(amplitude_scale), 1e-8), dtype=state.dtype)
+        encoded = encoded + (
+            normalized_log_amplitude[:, None, None]
+            * params["amplitude_local"][:, 0][None, :, None]
+        )
+    if compact_latent is not None and "compact_latent_local" in params:
+        compact_latent = jnp.asarray(compact_latent, dtype=state.dtype)
+        encoded = encoded + spectral_channel_operator(
+            compact_latent,
+            params["compact_latent_local"],
+            params["compact_latent_spectral_real"],
+            params["compact_latent_spectral_imag"],
+        )
+    activation = jax.nn.gelu if "activation_gelu" in params else jax.nn.silu
+    encoded = activation(encoded)
     if "fno_block_0_local" in params:
         features = encoded
         block = 0
@@ -533,7 +650,7 @@ def explicit_window_closure_step(
                 params[f"fno_block_{block}_spectral_real"],
                 params[f"fno_block_{block}_spectral_imag"],
             )
-            features = features + residual_scale * jax.nn.silu(update)
+            features = features + residual_scale * activation(update)
             block += 1
     else:
         mixed = spectral_channel_operator(
@@ -542,7 +659,49 @@ def explicit_window_closure_step(
             params["mixer_spectral_real"],
             params["mixer_spectral_imag"],
         )
-        features = encoded + jax.nn.silu(mixed)
+        features = encoded + activation(mixed)
+    return features, current_amplitude
+
+
+def explicit_window_closure_step(
+    params: Dict[str, Array],
+    state: Array,
+    history: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    input_scale: Array,
+    heat_flux_gradient_scale: float,
+    amplitude_center: float,
+    amplitude_scale: float,
+    previous_heat_flux_gradient: Array | None = None,
+    heat_flux_gradient_history: Array | None = None,
+    poisson_sign: float = 1.0,
+    normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
+    encoded_history: Array | None = None,
+    input_scaling: str = FIXED_INPUT_SCALING,
+    dynamic_amplitude_floor: float = 1e-6,
+    allow_uniform_heating: bool = False,
+) -> Array:
+    """Predict the closure from the current state and an explicit state window."""
+    state = jnp.asarray(state)
+    features, current_amplitude = _window_fno_features(
+        params,
+        state,
+        history,
+        amplitude,
+        k_arr,
+        input_scale=input_scale,
+        heat_flux_gradient_scale=heat_flux_gradient_scale,
+        amplitude_center=amplitude_center,
+        amplitude_scale=amplitude_scale,
+        previous_heat_flux_gradient=previous_heat_flux_gradient,
+        heat_flux_gradient_history=heat_flux_gradient_history,
+        poisson_sign=poisson_sign,
+        encoded_history=encoded_history,
+        input_scaling=input_scaling,
+        dynamic_amplitude_floor=dynamic_amplitude_floor,
+    )
     raw = spectral_channel_operator(
         features,
         params["output_local"],
@@ -561,6 +720,123 @@ def explicit_window_closure_step(
     if allow_uniform_heating:
         return gradient
     return gradient - jnp.mean(gradient, axis=-1, keepdims=True)
+
+
+def initialize_burles_latent_state(
+    params: Dict[str, Array],
+    state: Array,
+    history: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    input_scale: Array,
+    heat_flux_gradient_scale: float,
+    amplitude_center: float,
+    amplitude_scale: float,
+    previous_heat_flux_gradient: Array | None = None,
+    heat_flux_gradient_history: Array | None = None,
+    poisson_sign: float = 1.0,
+    input_scaling: str = FIXED_INPUT_SCALING,
+    dynamic_amplitude_floor: float = 1e-6,
+) -> Array:
+    """Encode causal history into the compact learned memory at a reset."""
+    latent_dim = int(params["compact_latent_decay_raw"].shape[0])
+    if latent_dim == 0:
+        return jnp.zeros((state.shape[0], 0, state.shape[-1]), dtype=state.dtype)
+    features, _ = _window_fno_features(
+        params,
+        state,
+        history,
+        amplitude,
+        k_arr,
+        input_scale=input_scale,
+        heat_flux_gradient_scale=heat_flux_gradient_scale,
+        amplitude_center=amplitude_center,
+        amplitude_scale=amplitude_scale,
+        previous_heat_flux_gradient=previous_heat_flux_gradient,
+        heat_flux_gradient_history=heat_flux_gradient_history,
+        poisson_sign=poisson_sign,
+        input_scaling=input_scaling,
+        dynamic_amplitude_floor=dynamic_amplitude_floor,
+    )
+    raw = spectral_channel_operator(
+        features,
+        params["compact_latent_init_local"],
+        params["compact_latent_init_spectral_real"],
+        params["compact_latent_init_spectral_imag"],
+    )
+    return jnp.tanh(raw)
+
+
+def burles_latent_closure_rhs(
+    params: Dict[str, Array],
+    state: Array,
+    compact_latent: Array,
+    history: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    input_scale: Array,
+    heat_flux_gradient_scale: float,
+    amplitude_center: float,
+    amplitude_scale: float,
+    previous_heat_flux_gradient: Array,
+    heat_flux_gradient_history: Array,
+    poisson_sign: float = 1.0,
+    normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
+    input_scaling: str = FIXED_INPUT_SCALING,
+    dynamic_amplitude_floor: float = 1e-6,
+    allow_uniform_heating: bool = False,
+) -> Tuple[Array, Array]:
+    """Return the next effective closure and compact-memory time derivative."""
+    features, current_amplitude = _window_fno_features(
+        params,
+        state,
+        history,
+        amplitude,
+        k_arr,
+        input_scale=input_scale,
+        heat_flux_gradient_scale=heat_flux_gradient_scale,
+        amplitude_center=amplitude_center,
+        amplitude_scale=amplitude_scale,
+        previous_heat_flux_gradient=previous_heat_flux_gradient,
+        heat_flux_gradient_history=heat_flux_gradient_history,
+        poisson_sign=poisson_sign,
+        input_scaling=input_scaling,
+        dynamic_amplitude_floor=dynamic_amplitude_floor,
+        compact_latent=compact_latent,
+    )
+    raw_gradient = spectral_channel_operator(
+        features,
+        params["output_local"],
+        params["output_spectral_real"],
+        params["output_spectral_imag"],
+    )[:, 0]
+    bound = jnp.asarray(normalized_heat_flux_bound, dtype=state.dtype)
+    normalized_gradient = bound * jnp.tanh(raw_gradient / bound)
+    output_scale = (
+        current_amplitude
+        if input_scaling == DYNAMIC_INPUT_SCALING
+        else jnp.full(
+            (state.shape[0],), heat_flux_gradient_scale, dtype=state.dtype
+        )
+    )
+    gradient = output_scale[:, None] * normalized_gradient
+    if not allow_uniform_heating:
+        gradient = gradient - jnp.mean(gradient, axis=-1, keepdims=True)
+    latent_dim = int(compact_latent.shape[1])
+    if latent_dim == 0:
+        latent_rhs = jnp.zeros_like(compact_latent)
+    else:
+        forcing = spectral_channel_operator(
+            features,
+            params["compact_latent_rhs_local"],
+            params["compact_latent_rhs_spectral_real"],
+            params["compact_latent_rhs_spectral_imag"],
+        )
+        decay = jax.nn.softplus(params["compact_latent_decay_raw"])[None, :, None]
+        latent_rhs = jnp.tanh(forcing) - decay * compact_latent
+    return gradient, latent_rhs
 
 
 def encode_explicit_window_history(
@@ -1180,4 +1456,237 @@ def rollout_explicit_window_closure(
         final_encoded,
         final_counter,
         final_gradient,
+    )
+
+
+def rollout_burles_latent_closure(
+    params: Dict[str, Array],
+    initial_state: Array,
+    history: Array,
+    history_counter: Array,
+    amplitude: Array,
+    k_arr: Array,
+    *,
+    horizon: int,
+    dt: float,
+    memory_stride: int,
+    input_scale: Array,
+    heat_flux_gradient_scale: float,
+    amplitude_center: float,
+    amplitude_scale: float,
+    compact_latent: Array | None = None,
+    previous_heat_flux_gradient: Array | None = None,
+    heat_flux_gradient_history: Array | None = None,
+    poisson_sign: float = 1.0,
+    normalized_heat_flux_bound: float = DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
+    density_floor: float = DEFAULT_DENSITY_FLOOR,
+    pressure_floor: float = DEFAULT_PRESSURE_FLOOR,
+    scan_unroll: int = 1,
+    input_scaling: str = FIXED_INPUT_SCALING,
+    dynamic_amplitude_floor: float = 1e-6,
+    allow_uniform_heating: bool = False,
+    latent_bound: float = 8.0,
+) -> Tuple[Array, Tuple[Array, Array, Array, Array, Array, Array]]:
+    """Advance a Burles-compatible closure and compact learned memory.
+
+    The accepted history is sampled at ``memory_stride``.  The first SSPRK3
+    derivative uses the closure carried by the accepted state; the network is
+    then evaluated on each provisional stage to supply the next derivative.
+    """
+    stride = int(memory_stride)
+    unroll = int(scan_unroll)
+    if stride <= 0 or unroll <= 0:
+        raise ValueError("memory_stride and scan_unroll must be positive")
+    state = jnp.asarray(initial_state)
+    history = jnp.asarray(history, dtype=state.dtype)
+    if previous_heat_flux_gradient is None:
+        previous_heat_flux_gradient = jnp.zeros(
+            (state.shape[0], state.shape[-1]), dtype=state.dtype
+        )
+    if heat_flux_gradient_history is None:
+        heat_flux_gradient_history = jnp.zeros(
+            (history.shape[0], history.shape[1], history.shape[-1]),
+            dtype=state.dtype,
+        )
+    if compact_latent is None:
+        compact_latent = initialize_burles_latent_state(
+            params,
+            state,
+            history,
+            amplitude,
+            k_arr,
+            input_scale=input_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            amplitude_center=amplitude_center,
+            amplitude_scale=amplitude_scale,
+            previous_heat_flux_gradient=previous_heat_flux_gradient,
+            heat_flux_gradient_history=heat_flux_gradient_history,
+            poisson_sign=poisson_sign,
+            input_scaling=input_scaling,
+            dynamic_amplitude_floor=dynamic_amplitude_floor,
+        )
+    dt_value = jnp.asarray(dt, dtype=state.dtype)
+    latent_bound_value = jnp.asarray(latent_bound, dtype=state.dtype)
+
+    def bounded_latent(value):
+        return latent_bound_value * jnp.tanh(value / latent_bound_value)
+
+    def physical_stage(reference, value):
+        value = _dealias(value)
+        return limit_low_moment_state(
+            value,
+            reference_state=reference,
+            density_floor=density_floor,
+            pressure_floor=pressure_floor,
+        )
+
+    def closure_and_memory_rhs(fluid, latent, previous, window, closure_window):
+        return burles_latent_closure_rhs(
+            params,
+            fluid,
+            latent,
+            window,
+            amplitude,
+            k_arr,
+            input_scale=input_scale,
+            heat_flux_gradient_scale=heat_flux_gradient_scale,
+            amplitude_center=amplitude_center,
+            amplitude_scale=amplitude_scale,
+            previous_heat_flux_gradient=previous,
+            heat_flux_gradient_history=closure_window,
+            poisson_sign=poisson_sign,
+            normalized_heat_flux_bound=normalized_heat_flux_bound,
+            input_scaling=input_scaling,
+            dynamic_amplitude_floor=dynamic_amplitude_floor,
+            allow_uniform_heating=allow_uniform_heating,
+        )
+
+    def body(carry, _):
+        fluid0, latent0, window, closure_window, counter, closure0 = carry
+        closure1, latent_rhs0 = closure_and_memory_rhs(
+            fluid0, latent0, closure0, window, closure_window
+        )
+        fluid1 = physical_stage(
+            fluid0,
+            fluid0
+            + dt_value
+            * low_moment_rhs(
+                fluid0,
+                closure0,
+                k_arr,
+                poisson_sign=poisson_sign,
+                density_floor=density_floor,
+                pressure_floor=pressure_floor,
+            ),
+        )
+        latent1 = bounded_latent(latent0 + dt_value * latent_rhs0)
+
+        closure2, latent_rhs1 = closure_and_memory_rhs(
+            fluid1, latent1, closure1, window, closure_window
+        )
+        fluid2_candidate = fluid1 + dt_value * low_moment_rhs(
+            fluid1,
+            closure1,
+            k_arr,
+            poisson_sign=poisson_sign,
+            density_floor=density_floor,
+            pressure_floor=pressure_floor,
+        )
+        fluid2 = physical_stage(fluid0, 0.75 * fluid0 + 0.25 * fluid2_candidate)
+        latent2 = bounded_latent(
+            0.75 * latent0 + 0.25 * (latent1 + dt_value * latent_rhs1)
+        )
+
+        closure3, latent_rhs2 = closure_and_memory_rhs(
+            fluid2, latent2, closure2, window, closure_window
+        )
+        fluid3_candidate = fluid2 + dt_value * low_moment_rhs(
+            fluid2,
+            closure2,
+            k_arr,
+            poisson_sign=poisson_sign,
+            density_floor=density_floor,
+            pressure_floor=pressure_floor,
+        )
+        fluid3 = physical_stage(
+            fluid0, (1.0 / 3.0) * fluid0 + (2.0 / 3.0) * fluid3_candidate
+        )
+        latent3 = bounded_latent(
+            (1.0 / 3.0) * latent0
+            + (2.0 / 3.0) * (latent2 + dt_value * latent_rhs2)
+        )
+        closure_final, _ = closure_and_memory_rhs(
+            fluid3, latent3, closure3, window, closure_window
+        )
+
+        next_counter = counter + 1
+        should_sample = next_counter >= stride
+
+        def sample_window(_):
+            sampled_window = jnp.concatenate(
+                (window[:, 1:], fluid3[:, None]), axis=1
+            )
+            sampled_closure_window = jnp.concatenate(
+                (closure_window[:, 1:], closure_final[:, None]), axis=1
+            )
+            return (
+                sampled_window,
+                sampled_closure_window,
+                jnp.asarray(0, dtype=jnp.int32),
+            )
+
+        def retain_window(_):
+            return window, closure_window, next_counter
+
+        window_new, closure_window_new, counter_new = jax.lax.cond(
+            should_sample, sample_window, retain_window, operand=None
+        )
+        return (
+            fluid3,
+            latent3,
+            window_new,
+            closure_window_new,
+            counter_new,
+            closure_final,
+        ), fluid3
+
+    (
+        _,
+        final_latent,
+        final_window,
+        final_closure_window,
+        final_counter,
+        final_gradient,
+    ), states = jax.lax.scan(
+        jax.checkpoint(body),
+        (
+            state,
+            jnp.asarray(compact_latent, dtype=state.dtype),
+            history,
+            jnp.asarray(heat_flux_gradient_history, dtype=state.dtype),
+            jnp.asarray(history_counter, dtype=jnp.int32),
+            jnp.asarray(previous_heat_flux_gradient, dtype=state.dtype),
+        ),
+        xs=None,
+        length=int(horizon),
+        unroll=unroll,
+    )
+    final_encoded = encode_explicit_window_history(
+        params,
+        final_window,
+        k_arr,
+        input_scale=input_scale,
+        heat_flux_gradient_scale=heat_flux_gradient_scale,
+        heat_flux_gradient_history=final_closure_window,
+        poisson_sign=poisson_sign,
+        input_scaling=input_scaling,
+        dynamic_amplitude_floor=dynamic_amplitude_floor,
+    )
+    return jnp.swapaxes(states, 0, 1), (
+        final_window,
+        final_closure_window,
+        final_encoded,
+        final_counter,
+        final_gradient,
+        final_latent,
     )

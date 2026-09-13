@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import time
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
@@ -37,12 +38,14 @@ from vpml.low_moment import (
     electric_field_from_density,
     encode_explicit_window_history,
     explicit_window_closure_step,
+    init_burles_latent_fno_params,
     init_causal_spacetime_operator_params,
     init_explicit_window_params,
     init_spectral_memory_params,
     init_window_fno_params,
     primitive_fields,
     rollout_low_moment_closure,
+    rollout_burles_latent_closure,
     rollout_explicit_window_closure,
     spectral_memory_closure_step,
     warm_spectral_memory,
@@ -65,12 +68,66 @@ OBJECTIVE = "low_moment_trajectory"
 MODEL_BACKEND = "causal_translation_equivariant_spectral_memory"
 CHECKPOINT_SCHEMA = 2
 WINDOW_MEMORY_BACKENDS = frozenset(
-    ("explicit_window", "causal_spacetime_operator", "window_fno")
+    (
+        "explicit_window",
+        "causal_spacetime_operator",
+        "window_fno",
+        "burles_latent_fno",
+    )
 )
 
 
 def _uses_window_memory(memory_backend: str) -> bool:
     return memory_backend in WINDOW_MEMORY_BACKENDS
+
+
+def _uses_compact_latent(memory_backend: str) -> bool:
+    return memory_backend == "burles_latent_fno"
+
+
+def _rollout_window_memory(
+    params,
+    initial_state,
+    history,
+    history_counter,
+    amplitude,
+    k_arr,
+    *,
+    memory_backend: str,
+    compact_latent=None,
+    **kwargs,
+):
+    """Dispatch window rollouts without changing legacy backend semantics."""
+    if _uses_compact_latent(memory_backend):
+        kwargs.pop("encoded_history", None)
+        kwargs.pop("closure_history_input", None)
+        return rollout_burles_latent_closure(
+            params,
+            initial_state,
+            history,
+            history_counter,
+            amplitude,
+            k_arr,
+            compact_latent=compact_latent,
+            **kwargs,
+        )
+    return rollout_explicit_window_closure(
+        params,
+        initial_state,
+        history,
+        history_counter,
+        amplitude,
+        k_arr,
+        **kwargs,
+    )
+
+
+def _unpack_window_memory(memory, memory_backend: str):
+    if _uses_compact_latent(memory_backend):
+        history, closure, encoded, counter, gradient, latent = memory
+        return history, closure, encoded, counter, gradient, latent
+    history, closure, encoded, counter, gradient = memory
+    return history, closure, encoded, counter, gradient, None
 
 
 def _load_convergence_floor(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
@@ -99,6 +156,16 @@ def _block_relative_sample_loss(
     trajectory_target_norm=None,
 ):
     """Relative primitive-field error in fixed physical-time blocks."""
+    # Late-time linear Landau signals are far below the squared float32 range.
+    # Accumulate this diagnostic/training normalization in float64 so the
+    # measured teacher-grid convergence floor remains effective.
+    predicted_fields = jnp.asarray(predicted_fields, dtype=jnp.float64)
+    target_fields = jnp.asarray(target_fields, dtype=jnp.float64)
+    floor_rms = jnp.asarray(floor_rms, dtype=jnp.float64)
+    if trajectory_target_norm is not None:
+        trajectory_target_norm = jnp.asarray(
+            trajectory_target_norm, dtype=jnp.float64
+        )
     squared_error = jnp.sum(jnp.square(predicted_fields - target_fields), axis=-1)
     block_ids = jnp.minimum(
         jnp.maximum((target_indices - 1) // int(block_steps), 0),
@@ -125,7 +192,8 @@ def _block_relative_sample_loss(
         else jnp.maximum(trajectory_target_norm, floor_energy)
     )
     valid = sample_counts > 0
-    ratios = numerator / denominator
+    safe_denominator = jnp.where(valid[:, :, None], denominator, 1.0)
+    ratios = numerator / safe_denominator
     divisor = (
         int(block_count)
         if supplied_target_norm
@@ -331,7 +399,8 @@ def _gather_coefficients(
     coefficient_count: int,
 ) -> np.ndarray:
     cases, times = np.broadcast_arrays(
-        np.asarray(case_indices, dtype=np.int32), np.asarray(time_indices, dtype=np.int32)
+        np.asarray(case_indices, dtype=np.int32),
+        np.asarray(time_indices, dtype=np.float64),
     )
     sample = np.asarray(histories[0][0, :coefficient_count])
     output = np.empty(cases.shape + sample.shape, dtype=sample.dtype)
@@ -341,9 +410,19 @@ def _gather_coefficients(
     for case_index in np.unique(flat_cases):
         positions = np.flatnonzero(flat_cases == int(case_index))
         ordered = positions[np.argsort(flat_times[positions], kind="stable")]
-        flat_output[ordered] = histories[int(case_index)][
-            flat_times[ordered], :coefficient_count, :
-        ]
+        selected_times = flat_times[ordered]
+        left = np.floor(selected_times + 1e-10).astype(np.int64)
+        fraction = selected_times - left
+        right = np.minimum(left + 1, int(histories[int(case_index)].shape[0]) - 1)
+        left_values = histories[int(case_index)][left, :coefficient_count, :]
+        if np.all(np.abs(fraction) < 1e-12):
+            flat_output[ordered] = left_values
+        else:
+            right_values = histories[int(case_index)][right, :coefficient_count, :]
+            interpolated = left_values + fraction[:, None, None] * (
+                right_values - left_values
+            )
+            flat_output[ordered] = np.asarray(interpolated, dtype=sample.dtype)
     return output
 
 
@@ -694,6 +773,8 @@ def sample_batch(
     time_blocks: int = 6,
     heat_flux_gradient_case_scale_by_id: Optional[Mapping[str, float]] = None,
     include_heat_flux_gradient_history: bool = False,
+    autonomous_burnin_steps: int = 0,
+    reference_steps_per_solver_step: float = 1.0,
 ) -> Dict[str, np.ndarray]:
     amplitudes_by_id = _case_amplitudes(manifest)
     memories = []
@@ -736,11 +817,28 @@ def sample_batch(
                     left, right = 0, int(available.size)
                 selected_times.append(available[int(rng.integers(left, right))])
             times = np.asarray(selected_times, dtype=np.int32)
-        memory_offsets = int(memory_stride) * np.arange(
-            int(memory_steps), 0, -1, dtype=np.int32
+        burnin_steps = int(autonomous_burnin_steps)
+        reference_ratio = float(reference_steps_per_solver_step)
+        if reference_ratio <= 0.0:
+            raise ValueError("reference_steps_per_solver_step must be positive")
+        if burnin_steps:
+            # A random training reset supplies only the three physical moments.
+            # The closure history is then generated by the model itself before
+            # any scored target is observed.
+            memory_times = np.broadcast_to(
+                times[:, None], (times.size, int(memory_steps))
+            )
+        else:
+            memory_offsets = float(memory_stride) * reference_ratio * np.arange(
+                int(memory_steps), 0, -1, dtype=np.float64
+            )
+            raw_memory_times = times[:, None] - memory_offsets[None, :]
+            padded_memory = raw_memory_times < 0
+            memory_times = np.maximum(raw_memory_times, 0)
+        target_times = times[:, None] + reference_ratio * (
+            burnin_steps
+            + np.arange(1, int(horizon) + 1, dtype=np.float64)[None]
         )
-        memory_times = np.maximum(times[:, None] - memory_offsets[None, :], 0)
-        target_times = times[:, None] + np.arange(1, int(horizon) + 1, dtype=np.int32)[None]
         memory_coefficient_count = 4 if include_heat_flux_gradient_history else 3
         memory_coeff = _gather_coefficients(
             histories,
@@ -754,11 +852,18 @@ def sample_batch(
         target_coeff = _gather_coefficients(
             histories, cases[:, None], target_times, coefficient_count=3
         )
-        memories.append(
-            low_hermite_coefficients_to_conservative(
-                memory_coeff, source_nx=source_nx, target_nx=rollout_nx
-            )
+        memory_state = low_hermite_coefficients_to_conservative(
+            memory_coeff, source_nx=source_nx, target_nx=rollout_nx
         )
+        if burnin_steps:
+            # A random reset exposes only its current physical state. Generate
+            # the causal history from an equilibrium-padded buffer.
+            memory_state[...] = 0.0
+        else:
+            # Before t=0 the causal history is the centered equilibrium state,
+            # rather than a fictitious copy of the perturbed initial condition.
+            memory_state[padded_memory] = 0.0
+        memories.append(memory_state)
         initials.append(
             low_hermite_coefficients_to_conservative(
                 initial_coeff, source_nx=source_nx, target_nx=rollout_nx
@@ -805,13 +910,16 @@ def sample_batch(
                 source_nx=source_nx,
                 target_nx=rollout_nx,
             )
-            heat_flux_gradient_histories.append(
-                np.fft.irfft(
-                    1j * k_arr * np.fft.rfft(memory_heat_flux, axis=-1),
-                    n=int(rollout_nx),
-                    axis=-1,
-                )
+            memory_gradient = np.fft.irfft(
+                1j * k_arr * np.fft.rfft(memory_heat_flux, axis=-1),
+                n=int(rollout_nx),
+                axis=-1,
             )
+            if not burnin_steps:
+                memory_gradient[padded_memory] = 0.0
+            else:
+                memory_gradient[...] = 0.0
+            heat_flux_gradient_histories.append(memory_gradient)
         if heat_flux_gradient_case_scale_by_id is not None:
             heat_flux_gradient_case_scales.append(
                 np.asarray(
@@ -826,7 +934,9 @@ def sample_batch(
             np.asarray([amplitudes_by_id[str(case_ids[index])] for index in cases])
         )
         regime_indices.append(np.full((len(cases),), regime_index, dtype=np.int32))
-        start_indices.append(times)
+        start_indices.append(
+            np.rint(times / reference_ratio).astype(np.int32) + burnin_steps
+        )
     batch = {
         "memory": np.concatenate(memories, axis=0).astype(np.float32),
         "initial": np.concatenate(initials, axis=0).astype(np.float32),
@@ -896,6 +1006,99 @@ def build_complete_trajectory_case_batches(
     )
 
 
+def build_balanced_random_window_epoch(
+    rng: np.random.Generator,
+    anchors,
+    *,
+    split: str,
+    batch_size_per_regime: int,
+    time_blocks: int = 6,
+    deterministic_epoch: Optional[int] = None,
+) -> Sequence[Mapping[str, Tuple[np.ndarray, np.ndarray]]]:
+    """Cover every available IC exactly once with balanced random windows."""
+    batch_size = int(batch_size_per_regime)
+    if batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    cases_by_regime = {}
+    for regime in REGIMES:
+        case_pool = np.asarray(anchors[regime][f"{split}_cases"], dtype=np.int32)
+        unique = np.unique(case_pool)
+        cases_by_regime[regime] = (
+            unique if deterministic_epoch is not None else rng.permutation(unique)
+        )
+    counts = {len(value) for value in cases_by_regime.values()}
+    if len(counts) != 1:
+        raise ValueError(f"Balanced random windows require equal regime counts: {counts}")
+    count = counts.pop()
+    selections = []
+    for start in range(0, count, batch_size):
+        selection = {}
+        for regime in REGIMES:
+            cases = cases_by_regime[regime][start : start + batch_size]
+            case_pool = np.asarray(anchors[regime][f"{split}_cases"], dtype=np.int32)
+            time_pool = np.asarray(anchors[regime][f"{split}_times"], dtype=np.int32)
+            times = []
+            for offset, case_index in enumerate(cases):
+                available = time_pool[case_pool == int(case_index)]
+                if deterministic_epoch is not None:
+                    position = (
+                        int(deterministic_epoch) - 1 + 131 * int(case_index)
+                    ) % int(available.size)
+                    times.append(available[position])
+                    continue
+                block_count = max(int(time_blocks), 1)
+                block_index = (start // batch_size + offset) % block_count
+                edges = np.linspace(0, available.size, block_count + 1, dtype=np.int32)
+                left, right = int(edges[block_index]), int(edges[block_index + 1])
+                if right <= left:
+                    left, right = 0, int(available.size)
+                times.append(available[int(rng.integers(left, right))])
+            selection[regime] = (cases, np.asarray(times, dtype=np.int32))
+        selections.append(selection)
+    return tuple(selections)
+
+
+def build_balanced_full_anchor_epoch(
+    rng: np.random.Generator,
+    anchors,
+    *,
+    split: str,
+    batch_size_per_regime: int,
+) -> Sequence[Mapping[str, Tuple[np.ndarray, np.ndarray]]]:
+    """Shuffle and consume every anchor exactly once in balanced minibatches."""
+    batch_size = int(batch_size_per_regime)
+    if batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    shuffled = {}
+    counts = set()
+    for regime in REGIMES:
+        cases = np.asarray(anchors[regime][f"{split}_cases"], dtype=np.int32)
+        times = np.asarray(anchors[regime][f"{split}_times"], dtype=np.int32)
+        if cases.size != times.size or cases.size == 0:
+            raise ValueError(f"Invalid {split} anchor table for {regime}")
+        order = rng.permutation(cases.size)
+        shuffled[regime] = (cases[order], times[order])
+        counts.add(int(cases.size))
+    if len(counts) != 1:
+        raise ValueError(f"Balanced full sweep requires equal regime counts: {counts}")
+    count = counts.pop()
+    if count % batch_size:
+        raise ValueError(
+            "Full-anchor sweep requires the per-regime anchor count to be divisible "
+            f"by batch size; got {count} and {batch_size}"
+        )
+    return tuple(
+        {
+            regime: (
+                shuffled[regime][0][start : start + batch_size],
+                shuffled[regime][1][start : start + batch_size],
+            )
+            for regime in REGIMES
+        }
+        for start in range(0, count, batch_size)
+    )
+
+
 def sample_complete_trajectory_batch(
     rng: np.random.Generator,
     grouped,
@@ -935,17 +1138,14 @@ def sample_complete_trajectory_batch(
             if trajectory_steps is None
             else min(int(trajectory_steps), available_steps)
         )
-        memory_times = np.zeros((cases.size, int(memory_steps)), dtype=np.int32)
         initial_times = np.zeros((cases.size,), dtype=np.int32)
-        memory_coeff = _gather_coefficients(
-            histories, cases[:, None], memory_times, coefficient_count=3
-        )
         initial_coeff = _gather_coefficients(
             histories, cases, initial_times, coefficient_count=4
         )
         memories.append(
-            low_hermite_coefficients_to_conservative(
-                memory_coeff, source_nx=source_nx, target_nx=rollout_nx
+            np.zeros(
+                (cases.size, int(memory_steps), 3, int(rollout_nx)),
+                dtype=np.float64,
             )
         )
         initials.append(
@@ -1047,6 +1247,8 @@ def build_diagnostic_panel(
     domain_length: float,
     heat_flux_gradient_case_scale_by_id: Optional[Mapping[str, float]] = None,
     include_heat_flux_gradient_history: bool = False,
+    autonomous_burnin_steps: int = 0,
+    reference_dt: Optional[float] = None,
 ) -> Sequence[Dict[str, np.ndarray]]:
     amplitudes = _case_amplitudes(manifest)
     selections = {}
@@ -1065,13 +1267,24 @@ def build_diagnostic_panel(
             rows = rows[positions]
         selections[regime] = rows
     panel = []
+    reference_dt_value = float(dt if reference_dt is None else reference_dt)
+    reference_ratio = float(dt) / reference_dt_value
     for start_time in start_times:
-        time_index = int(round(float(start_time) / float(dt)))
+        time_index = int(round(float(start_time) / reference_dt_value))
         explicit = {}
         for regime in REGIMES:
             rows = selections[regime]
             histories = tuple(grouped[regime][coefficient_key])
-            if any(time_index + int(horizon) >= int(histories[row].shape[0]) for row in rows):
+            required_reference_steps = int(
+                math.ceil(
+                    (int(horizon) + int(autonomous_burnin_steps))
+                    * reference_ratio
+                )
+            )
+            if any(
+                time_index + required_reference_steps >= int(histories[row].shape[0])
+                for row in rows
+            ):
                 raise ValueError(
                     f"Diagnostic start t={start_time:g} exceeds the valid H={horizon} window"
                 )
@@ -1102,6 +1315,8 @@ def build_diagnostic_panel(
                 include_heat_flux_gradient_history=(
                     include_heat_flux_gradient_history
                 ),
+                autonomous_burnin_steps=autonomous_burnin_steps,
+                reference_steps_per_solver_step=reference_ratio,
             )
         )
     return panel
@@ -1112,12 +1327,34 @@ def _adam_init(params):
     return {"step": jnp.array(0, dtype=jnp.int32), "m": zeros, "v": zeros}
 
 
-def _adam_step(params, grads, state, learning_rate: float, grad_clip: float):
+def _cosine_learning_rate(
+    step: int, total_steps: int, initial_rate: float, final_rate: float
+) -> float:
+    if total_steps <= 1:
+        return float(final_rate)
+    fraction = min(max(float(step) / float(total_steps - 1), 0.0), 1.0)
+    weight = 0.5 * (1.0 + math.cos(math.pi * fraction))
+    return float(final_rate + (initial_rate - final_rate) * weight)
+
+
+def _adam_step(
+    params,
+    grads,
+    state,
+    learning_rate: float,
+    grad_clip: float,
+    weight_decay: float = 0.0,
+    update_norm_cap: float = 0.0,
+):
     norm = jnp.sqrt(
         sum(jnp.sum(jnp.square(leaf)) for leaf in jax.tree_util.tree_leaves(grads))
         + 1e-30
     )
-    scale = jnp.minimum(1.0, jnp.asarray(grad_clip, norm.dtype) / norm)
+    scale = (
+        jnp.asarray(1.0, dtype=norm.dtype)
+        if float(grad_clip) <= 0.0
+        else jnp.minimum(1.0, jnp.asarray(grad_clip, norm.dtype) / norm)
+    )
     grads = jax.tree_util.tree_map(lambda value: value * scale, grads)
     step = state["step"] + 1
     m = jax.tree_util.tree_map(
@@ -1128,14 +1365,40 @@ def _adam_step(params, grads, state, learning_rate: float, grad_clip: float):
     )
     bias_m = 1.0 - 0.9**step
     bias_v = 1.0 - 0.999**step
-    params = jax.tree_util.tree_map(
-        lambda value, m_value, v_value: value
-        - learning_rate * (m_value / bias_m) / (jnp.sqrt(v_value / bias_v) + 1e-8),
+    updates = jax.tree_util.tree_map(
+        lambda value, m_value, v_value: learning_rate
+        * (
+            (m_value / bias_m) / (jnp.sqrt(v_value / bias_v) + 1e-8)
+            + jnp.asarray(weight_decay, dtype=value.dtype) * value
+        ),
         params,
         m,
         v,
     )
-    return params, {"step": step, "m": m, "v": v}, norm
+    update_norm = jnp.sqrt(
+        sum(
+            jnp.sum(jnp.square(leaf))
+            for leaf in jax.tree_util.tree_leaves(updates)
+        )
+        + 1e-30
+    )
+    if float(update_norm_cap) > 0.0:
+        update_scale = jnp.minimum(
+            1.0, jnp.asarray(update_norm_cap, update_norm.dtype) / update_norm
+        )
+        updates = jax.tree_util.tree_map(
+            lambda value: value * update_scale, updates
+        )
+    else:
+        update_scale = jnp.asarray(1.0, dtype=update_norm.dtype)
+    params = jax.tree_util.tree_map(lambda value, update: value - update, params, updates)
+    return (
+        params,
+        {"step": step, "m": m, "v": v},
+        norm,
+        update_norm,
+        update_scale,
+    )
 
 
 def make_loss_function(
@@ -1154,6 +1417,7 @@ def make_loss_function(
     density_floor: float,
     pressure_floor: float,
     relative_trajectory_loss: bool = False,
+    global_relative_trajectory_loss: bool = False,
     closure_history_input: bool = False,
     relative_time_block_steps: int = 0,
     relative_time_block_count: int = 0,
@@ -1164,6 +1428,9 @@ def make_loss_function(
     input_scaling: str = FIXED_INPUT_SCALING,
     dynamic_amplitude_floor: float = 1e-6,
     allow_uniform_heating: bool = False,
+    autonomous_burnin_steps: int = 0,
+    log_energy_weight: float = 0.0,
+    log_growth_weight: float = 0.0,
 ):
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
@@ -1176,13 +1443,68 @@ def make_loss_function(
 
     def loss(params, batch):
         if _uses_window_memory(memory_backend):
-            rollout_result = rollout_explicit_window_closure(
+            initial_state = batch["initial"]
+            history = batch["memory"]
+            history_counter = jnp.asarray(0, dtype=jnp.int32)
+            closure_history = (
+                batch["heat_flux_gradient_history"]
+                if closure_history_input
+                else None
+            )
+            previous_gradient = (
+                closure_history[:, -1]
+                if closure_history is not None
+                else None
+            )
+            encoded_history = None
+            compact_latent = None
+            if int(autonomous_burnin_steps) > 0:
+                burnin_states, burnin_memory = _rollout_window_memory(
+                    params,
+                    initial_state,
+                    history,
+                    history_counter,
+                    batch["amplitude"],
+                    k_jax,
+                    memory_backend=memory_backend,
+                    horizon=int(autonomous_burnin_steps),
+                    dt=dt,
+                    memory_stride=memory_stride,
+                    input_scale=input_scale_jax,
+                    heat_flux_gradient_scale=heat_flux_gradient_scale,
+                    amplitude_center=amplitude_center,
+                    amplitude_scale=amplitude_scale,
+                    closure_history_input=closure_history_input,
+                    poisson_sign=poisson_sign,
+                    normalized_heat_flux_bound=normalized_heat_flux_bound,
+                    density_floor=density_floor,
+                    pressure_floor=pressure_floor,
+                    scan_unroll=scan_unroll,
+                    input_scaling=input_scaling,
+                    dynamic_amplitude_floor=dynamic_amplitude_floor,
+                    allow_uniform_heating=allow_uniform_heating,
+                )
+                initial_state = jax.lax.stop_gradient(burnin_states[:, -1])
+                (
+                    history,
+                    closure_history,
+                    encoded_history,
+                    history_counter,
+                    previous_gradient,
+                    compact_latent,
+                ) = _unpack_window_memory(
+                    jax.tree_util.tree_map(jax.lax.stop_gradient, burnin_memory),
+                    memory_backend,
+                )
+            rollout_result = _rollout_window_memory(
                 params,
-                batch["initial"],
-                batch["memory"],
-                jnp.asarray(0, dtype=jnp.int32),
+                initial_state,
+                history,
+                history_counter,
                 batch["amplitude"],
                 k_jax,
+                memory_backend=memory_backend,
+                compact_latent=compact_latent,
                 horizon=horizon,
                 dt=dt,
                 memory_stride=memory_stride,
@@ -1190,7 +1512,10 @@ def make_loss_function(
                 heat_flux_gradient_scale=heat_flux_gradient_scale,
                 amplitude_center=amplitude_center,
                 amplitude_scale=amplitude_scale,
+                previous_heat_flux_gradient=previous_gradient,
                 closure_history_input=closure_history_input,
+                encoded_history=encoded_history,
+                heat_flux_gradient_history=closure_history,
                 poisson_sign=poisson_sign,
                 normalized_heat_flux_bound=normalized_heat_flux_bound,
                 density_floor=density_floor,
@@ -1202,6 +1527,8 @@ def make_loss_function(
             )
             predicted = rollout_result[0]
         else:
+            if int(autonomous_burnin_steps) > 0:
+                raise ValueError("autonomous history burn-in requires window memory")
             warm_result = warm_spectral_memory(
                 params,
                 batch["memory"],
@@ -1279,10 +1606,52 @@ def make_loss_function(
                     jnp.mean(numerator / denominator, axis=1),
                     jnp.nan,
                 )
+        elif global_relative_trajectory_loss:
+            numerator = jnp.sum(
+                jnp.square(predicted_fields - target_fields), axis=(1, 2, 3)
+            )
+            denominator = jnp.sum(jnp.square(target_fields), axis=(1, 2, 3))
+            sample_loss = jnp.where(
+                denominator > 0.0,
+                numerator / denominator,
+                jnp.nan,
+            )
         else:
             scales = regime_scales_jax[batch["regime_index"]][:, None, :, None]
             normalized_error = (predicted_fields - target_fields) / scales
             sample_loss = jnp.mean(jnp.square(normalized_error), axis=(1, 2, 3))
+        if float(log_energy_weight) or float(log_growth_weight):
+            field_index = 3
+            predicted_field = jnp.asarray(
+                predicted_fields[:, :, field_index], dtype=jnp.float64
+            )
+            target_field = jnp.asarray(
+                target_fields[:, :, field_index], dtype=jnp.float64
+            )
+            energy_floor = jnp.asarray(1.0e-60, dtype=jnp.float64)
+            predicted_energy = jnp.maximum(
+                jnp.mean(jnp.square(predicted_field), axis=-1),
+                energy_floor,
+            )
+            target_energy = jnp.maximum(
+                jnp.mean(jnp.square(target_field), axis=-1),
+                energy_floor,
+            )
+            predicted_log = jnp.log(predicted_energy)
+            target_log = jnp.log(target_energy)
+            energy_loss = jnp.mean(jnp.square(predicted_log - target_log), axis=1)
+            growth_loss = jnp.mean(
+                jnp.square(
+                    jnp.diff(predicted_log, axis=1)
+                    - jnp.diff(target_log, axis=1)
+                ),
+                axis=1,
+            )
+            sample_loss = (
+                sample_loss
+                + jnp.asarray(log_energy_weight, dtype=sample_loss.dtype) * energy_loss
+                + jnp.asarray(log_growth_weight, dtype=sample_loss.dtype) * growth_loss
+            )
         regime_loss = jnp.stack(
             [
                 jnp.sum(
@@ -1367,6 +1736,7 @@ def make_continuous_chunk_loss_function(
                     (initial_state.shape[0], initial_state.shape[-1]),
                     dtype=initial_state.dtype,
                 )
+                compact_latent = None
             else:
                 (
                     history,
@@ -1374,14 +1744,17 @@ def make_continuous_chunk_loss_function(
                     encoded_history,
                     history_counter,
                     previous_gradient,
-                ) = memory_or_hidden
-            rollout_result = rollout_explicit_window_closure(
+                    compact_latent,
+                ) = _unpack_window_memory(memory_or_hidden, memory_backend)
+            rollout_result = _rollout_window_memory(
                 params,
                 initial_state,
                 history,
                 history_counter,
                 amplitude,
                 k_jax,
+                memory_backend=memory_backend,
+                compact_latent=compact_latent,
                 horizon=horizon,
                 dt=dt,
                 memory_stride=memory_stride,
@@ -1634,6 +2007,77 @@ def _load_checkpoint(path: Path):
     return params, metadata, stats
 
 
+def _save_training_state(
+    path: Path,
+    *,
+    params,
+    optimizer,
+    rng: np.random.Generator,
+    global_epoch: int,
+    loss_ema: Optional[float],
+    best_val: float,
+    histories: Mapping[str, object],
+) -> None:
+    payload = {f"param_{key}": np.asarray(value) for key, value in params.items()}
+    payload.update(
+        {f"optimizer_m_{key}": np.asarray(value) for key, value in optimizer["m"].items()}
+    )
+    payload.update(
+        {f"optimizer_v_{key}": np.asarray(value) for key, value in optimizer["v"].items()}
+    )
+    payload["optimizer_step"] = np.asarray(optimizer["step"])
+    payload["global_epoch"] = np.asarray(global_epoch, dtype=np.int64)
+    payload["loss_ema"] = np.asarray(
+        np.nan if loss_ema is None else loss_ema, dtype=np.float64
+    )
+    payload["best_val"] = np.asarray(best_val, dtype=np.float64)
+    payload["rng_state_json"] = np.asarray(
+        [json.dumps(rng.bit_generator.state, sort_keys=True)]
+    )
+    for key, value in histories.items():
+        payload[f"history_{key}"] = np.asarray(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp.npz")
+    np.savez(temporary, **payload)
+    os.replace(temporary, path)
+
+
+def _load_training_state(path: Path):
+    with np.load(path, allow_pickle=False) as payload:
+        params = {
+            key.removeprefix("param_"): jnp.asarray(payload[key])
+            for key in payload.files
+            if key.startswith("param_")
+        }
+        optimizer = {
+            "step": jnp.asarray(payload["optimizer_step"]),
+            "m": {
+                key.removeprefix("optimizer_m_"): jnp.asarray(payload[key])
+                for key in payload.files
+                if key.startswith("optimizer_m_")
+            },
+            "v": {
+                key.removeprefix("optimizer_v_"): jnp.asarray(payload[key])
+                for key in payload.files
+                if key.startswith("optimizer_v_")
+            },
+        }
+        histories = {
+            key.removeprefix("history_"): np.asarray(payload[key])
+            for key in payload.files
+            if key.startswith("history_")
+        }
+        state = {
+            "global_epoch": int(np.asarray(payload["global_epoch"])),
+            "loss_ema": float(np.asarray(payload["loss_ema"])),
+            "best_val": float(np.asarray(payload["best_val"])),
+            "rng_state": json.loads(str(np.asarray(payload["rng_state_json"]).reshape(-1)[0])),
+        }
+    if set(optimizer["m"]) != set(params) or set(optimizer["v"]) != set(params):
+        raise ValueError(f"Incomplete optimizer state: {path}")
+    return params, optimizer, histories, state
+
+
 def _plot_losses(
     train_loss,
     train_ema_loss,
@@ -1650,7 +2094,11 @@ def _plot_losses(
         train_loss,
         color="#8b93a1",
         alpha=0.55,
-        label="stochastic batch mean",
+        label=(
+            "changing-anchor batch mean"
+            if metadata and metadata.get("deterministic_anchor_cycle", False)
+            else "stochastic batch mean"
+        ),
     )
     if len(train_ema_loss):
         ax.semilogy(
@@ -1754,6 +2202,46 @@ def _json_float(value: float) -> Optional[float]:
     return value if math.isfinite(value) else None
 
 
+def _interpolate_time_series(
+    source_times: np.ndarray, source_values: np.ndarray, target_times: np.ndarray
+) -> np.ndarray:
+    source_times = np.asarray(source_times, dtype=np.float64)
+    target_times = np.asarray(target_times, dtype=np.float64)
+    values = np.asarray(source_values)
+    right = np.searchsorted(source_times, target_times, side="left")
+    right = np.clip(right, 0, source_times.size - 1)
+    left = np.maximum(right - 1, 0)
+    denominator = source_times[right] - source_times[left]
+    weight = np.divide(
+        target_times - source_times[left],
+        denominator,
+        out=np.zeros_like(target_times),
+        where=denominator > 0.0,
+    )
+    reshape = (target_times.size,) + (1,) * (values.ndim - 1)
+    return values[left] + weight.reshape(reshape) * (values[right] - values[left])
+
+
+def _energy_peak_angular_frequency(times, energy, *, final_time: float = 40.0):
+    """Estimate early oscillation frequency from successive energy maxima."""
+    times = np.asarray(times, dtype=np.float64)
+    energy = np.asarray(energy, dtype=np.float64)
+    indices = np.flatnonzero((times <= float(final_time)) & np.isfinite(energy))
+    if indices.size < 3:
+        return None
+    values = energy[indices]
+    maxima = indices[1:-1][
+        (values[1:-1] > values[:-2]) & (values[1:-1] >= values[2:])
+    ]
+    if maxima.size < 3:
+        return None
+    periods = np.diff(times[maxima])
+    periods = periods[periods > 0.0]
+    if periods.size < 2:
+        return None
+    return float(2.0 * math.pi / np.median(periods))
+
+
 def _evaluate_heldout(
     params,
     grouped,
@@ -1766,6 +2254,7 @@ def _evaluate_heldout(
     rollout_nx: int,
     domain_length: float,
     dt: float,
+    reference_dt: float,
     width: int,
     memory_steps: int,
     memory_stride: int,
@@ -1811,9 +2300,13 @@ def _evaluate_heldout(
         int(rollout_nx), d=float(domain_length) / float(rollout_nx)
     )
     k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
-    # Training clamps unavailable pre-t=0 history to the initial state. Apply
-    # the same causal initialization during autonomous held-out evaluation.
-    initial_history = jnp.repeat(state[:, None, :, :], int(memory_steps), axis=1)
+    # No trajectory exists before t=0. Use the centered equilibrium state as
+    # causal padding instead of pretending that the initial perturbation has
+    # already persisted for the full memory span.
+    initial_history = jnp.zeros(
+        (state.shape[0], int(memory_steps), state.shape[1], state.shape[-1]),
+        dtype=state.dtype,
+    )
     previous_gradient = jnp.zeros((state.shape[0], state.shape[-1]), dtype=state.dtype)
     if _uses_window_memory(memory_backend):
         initial_closure_history = jnp.zeros(
@@ -1839,6 +2332,8 @@ def _evaluate_heldout(
             jnp.asarray(0, dtype=jnp.int32),
             previous_gradient,
         )
+        if _uses_compact_latent(memory_backend):
+            model_memory = model_memory + (None,)
     else:
         hidden, previous_gradient = warm_spectral_memory(
             params,
@@ -1873,14 +2368,18 @@ def _evaluate_heldout(
 
     def run_chunk(current_state, current_memory, length: int):
         if _uses_window_memory(memory_backend):
-            window, closure_window, encoded, counter, gradient = current_memory
-            return rollout_explicit_window_closure(
+            window, closure_window, encoded, counter, gradient, compact_latent = (
+                _unpack_window_memory(current_memory, memory_backend)
+            )
+            return _rollout_window_memory(
                 params,
                 current_state,
                 window,
                 counter,
                 amplitude,
                 k_jax,
+                memory_backend=memory_backend,
+                compact_latent=compact_latent,
                 horizon=length,
                 dt=dt,
                 memory_stride=memory_stride,
@@ -1924,9 +2423,13 @@ def _evaluate_heldout(
         )
         return states, (final_hidden, final_gradient)
 
-    total_steps = int(round(float(manifest.get("T_final", 0.0)) / float(dt)))
-    if total_steps <= 0:
-        total_steps = int(case_records[0][3].shape[0]) - 1
+    reference_steps = int(case_records[0][3].shape[0]) - 1
+    final_time = reference_steps * float(reference_dt)
+    total_steps = int(round(final_time / float(dt)))
+    if total_steps <= 0 or not math.isclose(
+        total_steps * float(dt), final_time, abs_tol=1e-9
+    ):
+        raise ValueError("solver dt must divide the cached reference duration")
     completed = 0
     compiled = {}
     while completed < total_steps:
@@ -2013,6 +2516,15 @@ def _evaluate_heldout(
         )
         case_dir = eval_root / case_id
         case_dir.mkdir(exist_ok=True)
+        np.savez_compressed(
+            case_dir / "trajectory.npz",
+            times=times,
+            model_energy=learned_energy[row],
+            teacher_times=hr_times,
+            teacher_energy=hr_energy,
+            model_E_hat=learned_hat[row, :, :5],
+            teacher_E_hat=restricted_hr_hat[:, :5],
+        )
         fig, ax = plt.subplots(figsize=(9.0, 4.0), constrained_layout=True)
         ax.semilogy(hr_times, hr_energy, color="#2463eb", label="kinetic teacher")
         ax.semilogy(times, learned_energy[row], color="#6f3cc3", label="low-moment closure")
@@ -2026,11 +2538,17 @@ def _evaluate_heldout(
         fig.savefig(case_dir / "metric1_energy.png", dpi=200)
         plt.close(fig)
         learned_complex = np.asarray(learned_hat[row], dtype=np.complex128)
+        matched_reference_hat = _interpolate_time_series(
+            hr_times, restricted_hr_hat, times
+        )
         with np.errstate(over="ignore", invalid="ignore"):
             relative = np.sqrt(
-                np.sum(np.abs(learned_complex - restricted_hr_hat) ** 2, axis=-1)
+                np.sum(
+                    np.abs(learned_complex - matched_reference_hat) ** 2,
+                    axis=-1,
+                )
                 / np.maximum(
-                    np.sum(np.abs(restricted_hr_hat) ** 2, axis=-1), 1e-30
+                    np.sum(np.abs(matched_reference_hat) ** 2, axis=-1), 1e-30
                 )
             )
         fig, ax = plt.subplots(figsize=(9.0, 4.0), constrained_layout=True)
@@ -2048,6 +2566,10 @@ def _evaluate_heldout(
         ax.grid(alpha=0.25)
         fig.savefig(case_dir / "metric2_field_error.png", dpi=200)
         plt.close(fig)
+        model_frequency = _energy_peak_angular_frequency(
+            times[:finite_count], learned_energy[row, :finite_count]
+        )
+        teacher_frequency = _energy_peak_angular_frequency(hr_times, hr_energy)
         summary = {
             "case_id": case_id,
             "regime": regime,
@@ -2069,6 +2591,14 @@ def _evaluate_heldout(
             ),
             "pressure_limiter_fraction": float(
                 pressure_limiter_hits[row] / max(state_point_count, 1)
+            ),
+            "energy_peak_angular_frequency_model": model_frequency,
+            "energy_peak_angular_frequency_teacher": teacher_frequency,
+            "energy_peak_frequency_relative_error": (
+                None
+                if model_frequency is None or teacher_frequency in (None, 0.0)
+                else abs(model_frequency - teacher_frequency)
+                / abs(teacher_frequency)
             ),
         }
         with (case_dir / "summary.json").open("w", encoding="utf-8") as handle:
@@ -2118,6 +2648,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-cache", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--rollout-Nx", type=int, default=256)
+    parser.add_argument(
+        "--solver-dt",
+        type=float,
+        default=None,
+        help="Low-moment solver timestep; defaults to the reference-cache timestep",
+    )
     parser.add_argument("--rollout-horizon", type=int, default=1024)
     parser.add_argument(
         "--training-schedule",
@@ -2146,6 +2682,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "explicit_window",
             "causal_spacetime_operator",
             "window_fno",
+            "burles_latent_fno",
         ),
         default="latent_recurrent",
         help="Select recurrent, fixed-window, causal space-time, or window-FNO memory",
@@ -2153,9 +2690,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spacetime-depth", type=int, default=4)
     parser.add_argument("--temporal-kernel-size", type=int, default=5)
     parser.add_argument("--fno-depth", type=int, default=4)
+    parser.add_argument(
+        "--latent-memory-dim",
+        type=int,
+        default=6,
+        help="Compact learned memory channels; zero gives the matched Burles history-only control",
+    )
     parser.add_argument("--history-stride", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8, help="Per-regime batch size")
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument(
+        "--planned-epochs",
+        type=int,
+        default=None,
+        help="Length of the fixed learning-rate schedule, including later resumes",
+    )
+    parser.add_argument(
+        "--resume-run",
+        type=Path,
+        default=None,
+        help="Resume model, optimizer, RNG, counters, and metrics from a run directory",
+    )
     parser.add_argument("--supervised-warmup-epochs", type=int, default=0)
     parser.add_argument(
         "--supervised-only",
@@ -2163,6 +2718,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fit the exact heat-flux-gradient map without solver rollout",
     )
     parser.add_argument("--steps-per-epoch", type=int, default=30)
+    parser.add_argument(
+        "--training-passes-per-epoch",
+        type=int,
+        default=1,
+        help="Balanced random-window passes over every training IC per epoch",
+    )
+    parser.add_argument(
+        "--deterministic-anchor-cycle",
+        action="store_true",
+        help="Use one deterministic no-replacement temporal anchor per training IC and epoch",
+    )
+    parser.add_argument(
+        "--full-anchor-sweep",
+        action="store_true",
+        help="Shuffle and consume every valid training anchor exactly once per epoch",
+    )
+    parser.add_argument(
+        "--translation-augmentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Randomly translate each spatial training window",
+    )
     parser.add_argument(
         "--train-case-limits",
         type=str,
@@ -2174,11 +2751,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
+    parser.add_argument(
+        "--data-parallel-devices",
+        type=int,
+        default=1,
+        help="Number of equal balanced JAX devices used inside each minibatch",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--final-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--update-norm-cap",
+        type=float,
+        default=0.0,
+        help="Optional global L2 cap on each accepted AdamW parameter update",
+    )
+    parser.add_argument(
+        "--require-first-update-descent",
+        action="store_true",
+        help="Abort unless the first accepted update lowers its exact accumulated batch",
+    )
+    parser.add_argument(
+        "--report-every-update-descent",
+        action="store_true",
+        help="Re-evaluate each exact accumulated batch after its update and log before/after loss",
+    )
     parser.add_argument("--width", type=int, default=24)
     parser.add_argument("--spectral-modes", type=int, default=16)
     parser.add_argument("--closure-history-input", action="store_true")
+    parser.add_argument(
+        "--autonomous-history-burnin-steps",
+        type=int,
+        default=0,
+        help="Generate closure history autonomously before each scored random window",
+    )
     parser.add_argument(
         "--input-scaling",
         choices=tuple(sorted(INPUT_SCALING_KINDS)),
@@ -2200,6 +2807,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--relative-trajectory-loss", action="store_true")
+    parser.add_argument(
+        "--global-relative-trajectory-loss",
+        action="store_true",
+        help="Use one relative L2 ratio over all fields, times, and points",
+    )
+    parser.add_argument("--log-energy-weight", type=float, default=0.0)
+    parser.add_argument("--log-growth-weight", type=float, default=0.0)
     parser.add_argument(
         "--relative-time-block",
         type=float,
@@ -2258,11 +2872,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     print_jax_runtime_summary(jax, context="low-moment closure training")
     args = build_arg_parser().parse_args(argv)
+    planned_epochs = int(args.epochs if args.planned_epochs is None else args.planned_epochs)
+    if planned_epochs < int(args.epochs) or planned_epochs <= 0:
+        raise ValueError("planned-epochs must be positive and at least epochs")
     train_case_limits = parse_train_case_limits(args.train_case_limits)
     if args.rollout_horizon <= 0 or args.memory_steps <= 0 or args.scan_unroll <= 0:
         raise ValueError("rollout horizon, memory steps, and scan unroll must be positive")
-    if args.gradient_accumulation_steps <= 0:
-        raise ValueError("gradient accumulation steps must be positive")
+    if args.solver_dt is not None and args.solver_dt <= 0.0:
+        raise ValueError("solver-dt must be positive")
+    if args.autonomous_history_burnin_steps < 0:
+        raise ValueError("autonomous-history-burnin-steps cannot be negative")
+    if args.autonomous_history_burnin_steps and (
+        args.training_schedule != "random_windows"
+        or not _uses_window_memory(args.memory_backend)
+    ):
+        raise ValueError("autonomous history burn-in requires random-window window-memory training")
+    if min(args.learning_rate, args.final_learning_rate) <= 0.0:
+        raise ValueError("learning rates must be positive")
+    if args.final_learning_rate > args.learning_rate:
+        raise ValueError("final-learning-rate cannot exceed learning-rate")
+    if args.weight_decay < 0.0:
+        raise ValueError("weight-decay cannot be negative")
+    if args.grad_clip < 0.0:
+        raise ValueError("grad-clip cannot be negative; zero disables clipping")
+    if args.relative_trajectory_loss and args.global_relative_trajectory_loss:
+        raise ValueError("choose only one relative trajectory loss geometry")
+    if args.full_anchor_sweep and args.deterministic_anchor_cycle:
+        raise ValueError("full-anchor-sweep and deterministic-anchor-cycle are exclusive")
+    if args.full_anchor_sweep and args.training_schedule != "random_windows":
+        raise ValueError("full-anchor-sweep requires random-window training")
+    if args.full_anchor_sweep and int(args.training_passes_per_epoch) != 1:
+        raise ValueError("full-anchor-sweep requires one training pass per epoch")
+    if min(args.log_energy_weight, args.log_growth_weight) < 0.0:
+        raise ValueError("energy and growth weights cannot be negative")
+    if min(args.gradient_accumulation_steps, args.training_passes_per_epoch) <= 0:
+        raise ValueError("gradient accumulation and training passes must be positive")
+    if args.data_parallel_devices <= 0:
+        raise ValueError("data-parallel-devices must be positive")
+    if args.data_parallel_devices > len(jax.devices()):
+        raise ValueError(
+            f"Requested {args.data_parallel_devices} data-parallel devices, "
+            f"but JAX exposes {len(jax.devices())}"
+        )
+    if args.update_norm_cap < 0.0:
+        raise ValueError("update-norm-cap cannot be negative")
     if args.training_schedule == "continuous_trajectories":
         if args.horizon_curriculum.strip():
             raise ValueError("continuous trajectories require a fixed rollout horizon")
@@ -2273,8 +2926,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "continuous trajectories already accumulate every chunk; set "
                 "gradient-accumulation-steps=1"
             )
-    elif args.relative_trajectory_loss:
-        raise ValueError("relative trajectory loss requires continuous trajectories")
     if (
         _uses_window_memory(args.memory_backend)
         and args.supervised_warmup_epochs
@@ -2288,11 +2939,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
         if min(args.spacetime_depth, args.temporal_kernel_size) <= 0:
             raise ValueError("space-time depth and temporal kernel size must be positive")
-    if args.memory_backend == "window_fno":
-        if not args.closure_history_input:
-            raise ValueError("window-fno requires closure-history-input")
+    if args.memory_backend in ("window_fno", "burles_latent_fno"):
         if args.fno_depth <= 0:
             raise ValueError("window-fno depth must be positive")
+    if args.memory_backend == "burles_latent_fno":
+        if not args.closure_history_input:
+            raise ValueError("burles-latent-fno requires closure-history-input")
+        if args.latent_memory_dim < 0:
+            raise ValueError("compact latent dimension cannot be negative")
     if (
         args.input_scaling == DYNAMIC_INPUT_SCALING or args.allow_uniform_heating
     ) and not _uses_window_memory(args.memory_backend):
@@ -2339,7 +2993,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             curriculum = parse_horizon_curriculum(
                 args.horizon_curriculum,
                 final_horizon=args.rollout_horizon,
-                total_epochs=args.epochs - args.supervised_warmup_epochs,
+                total_epochs=planned_epochs - args.supervised_warmup_epochs,
             )
     grouped, manifest, cache_metadata, coefficient_key = _load_reference_cache(
         args.reference_cache
@@ -2347,7 +3001,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     configuration = dict(cache_metadata["configuration"])
     source_nx = int(configuration["teacher_Nx"])
     domain_length = float(configuration["teacher_L"])
-    dt = float(configuration["teacher_dt"])
+    reference_dt = float(configuration["teacher_dt"])
+    dt = reference_dt if args.solver_dt is None else float(args.solver_dt)
+    reference_steps_per_solver_step = dt / reference_dt
     poisson_sign = float(configuration["teacher_poisson_sign"])
     relative_time_block_steps = 0
     relative_time_block_count = 0
@@ -2421,7 +3077,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             source_nx=source_nx,
             rollout_nx=rollout_nx,
             domain_length=domain_length,
-            dt=dt,
+            dt=float(checkpoint_metadata.get("dt", reference_dt)),
+            reference_dt=reference_dt,
             width=int(checkpoint_metadata["width"]),
             memory_steps=int(checkpoint_metadata["memory_steps"]),
             memory_stride=int(checkpoint_metadata["memory_stride"]),
@@ -2479,13 +3136,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     checkpoint_metadata,
                 )
         return
-    if outdir.exists() and any(outdir.iterdir()):
+    if args.resume_run is not None and args.resume_run.resolve() != outdir:
+        raise ValueError("resume-run must name the same directory as outdir")
+    if args.resume_run is None and outdir.exists() and any(outdir.iterdir()):
         raise FileExistsError(f"Refusing to overwrite nonempty output directory {outdir}")
     outdir.mkdir(parents=True, exist_ok=True)
     anchors = _build_anchor_index(
         grouped,
         coefficient_key,
-        horizon=1 if args.supervised_only else args.rollout_horizon,
+        horizon=int(
+            math.ceil(
+                (
+                    1
+                    if args.supervised_only
+                    else args.rollout_horizon + args.autonomous_history_burnin_steps
+                )
+                * reference_steps_per_solver_step
+            )
+        ),
         history_stride=args.history_stride,
     )
     selected_training_cases: Dict[str, np.ndarray] = {
@@ -2573,8 +3241,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if args.memory_backend == "causal_spacetime_operator"
         else ""
     )
-    if args.memory_backend == "window_fno":
+    if args.memory_backend in ("window_fno", "burles_latent_fno"):
         spacetime_description = f" depth={args.fno_depth}"
+    if args.memory_backend == "burles_latent_fno":
+        spacetime_description += f" latent={args.latent_memory_dim}"
     print(
         f"[model] backend={args.memory_backend} width={args.width} "
         f"modes={args.spectral_modes}{spacetime_description} "
@@ -2596,6 +3266,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             input_channels=5,
             dtype=jnp.float32,
         )
+    elif args.memory_backend == "burles_latent_fno":
+        params = init_burles_latent_fno_params(
+            jax.random.PRNGKey(args.seed),
+            width=args.width,
+            spectral_modes=args.spectral_modes,
+            memory_steps=args.memory_steps,
+            depth=args.fno_depth,
+            latent_dim=args.latent_memory_dim,
+            input_channels=5,
+            dtype=jnp.float32,
+        )
     elif args.memory_backend == "window_fno":
         params = init_window_fno_params(
             jax.random.PRNGKey(args.seed),
@@ -2603,7 +3284,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             spectral_modes=args.spectral_modes,
             memory_steps=args.memory_steps,
             depth=args.fno_depth,
-            input_channels=5,
+            input_channels=5 if args.closure_history_input else 4,
             dtype=jnp.float32,
         )
     elif args.memory_backend == "explicit_window":
@@ -2646,6 +3327,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "spectral_modes": int(args.spectral_modes),
             "memory_backend": str(args.memory_backend),
         }
+        if args.memory_backend == "burles_latent_fno":
+            expected["latent_memory_dim"] = int(args.latent_memory_dim)
         mismatches = {
             key: (initialized_metadata.get(key), value)
             for key, value in expected.items()
@@ -2660,6 +3343,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     validation_rng = np.random.default_rng(args.seed + 1)
     train_history = []
     train_ema_history = []
+    train_update_norm_history = []
+    train_update_scale_min_history = []
     train_eval_history = []
     train_eval_regime_history = []
     train_eval_epochs = []
@@ -2684,6 +3369,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "source_Nx": source_nx,
         "rollout_Nx": args.rollout_Nx,
         "dt": dt,
+        "reference_dt": reference_dt,
+        "reference_steps_per_solver_step": reference_steps_per_solver_step,
         "rollout_horizon": args.rollout_horizon,
         "training_schedule": args.training_schedule,
         "continuous_trajectory_final_time": (
@@ -2708,7 +3395,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             else None
         ),
         "fno_depth": (
-            int(args.fno_depth) if args.memory_backend == "window_fno" else None
+            int(args.fno_depth)
+            if args.memory_backend in ("window_fno", "burles_latent_fno")
+            else None
+        ),
+        "latent_memory_dim": (
+            int(args.latent_memory_dim)
+            if args.memory_backend == "burles_latent_fno"
+            else None
+        ),
+        "closure_integration": (
+            "ssprk3_carried_then_provisional"
+            if args.memory_backend == "burles_latent_fno"
+            else "legacy_backend"
         ),
         "spacetime_depth": (
             args.spacetime_depth
@@ -2734,6 +3433,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             for regime in REGIMES
         },
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "data_parallel_devices": args.data_parallel_devices,
+        "training_passes_per_epoch": args.training_passes_per_epoch,
+        "steps_per_epoch": args.steps_per_epoch,
+        "deterministic_anchor_cycle": args.deterministic_anchor_cycle,
+        "full_anchor_sweep": args.full_anchor_sweep,
+        "translation_augmentation": args.translation_augmentation,
+        "planned_epochs": planned_epochs,
+        "seed": args.seed,
+        "learning_rate": args.learning_rate,
+        "final_learning_rate": args.final_learning_rate,
+        "weight_decay": args.weight_decay,
+        "update_norm_cap": args.update_norm_cap,
+        "require_first_update_descent": args.require_first_update_descent,
+        "report_every_update_descent": args.report_every_update_descent,
+        "grad_clip": args.grad_clip,
+        "optimizer": "adamw_cosine",
+        "autonomous_history_burnin_steps": args.autonomous_history_burnin_steps,
+        "training_history_source": (
+            "model_generated_from_low_moment_reset"
+            if args.autonomous_history_burnin_steps
+            else "teacher_low_moment_history_at_random_reset"
+        ),
+        "teacher_heat_flux_history_input": bool(
+            args.closure_history_input
+            and not args.autonomous_history_burnin_steps
+        ),
+        "log_energy_weight": args.log_energy_weight,
+        "log_growth_weight": args.log_growth_weight,
         "nonfinite_trajectory_penalty": args.nonfinite_trajectory_penalty,
         "init_checkpoint": (
             None
@@ -2757,6 +3484,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "allow_uniform_heating": args.allow_uniform_heating,
         "closure_history_input": args.closure_history_input,
         "relative_trajectory_loss": args.relative_trajectory_loss,
+        "global_relative_trajectory_loss": args.global_relative_trajectory_loss,
         "relative_time_block": args.relative_time_block,
         "convergence_floor_file": (
             None
@@ -2765,8 +3493,98 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ),
         "convergence_floor_metadata": convergence_floor_metadata,
     }
+    immutable_resume_keys = (
+        "manifest_sha256",
+        "rollout_Nx",
+        "dt",
+        "reference_dt",
+        "rollout_horizon",
+        "horizon_curriculum",
+        "memory_steps",
+        "memory_stride",
+        "memory_backend",
+        "fno_depth",
+        "latent_memory_dim",
+        "input_scaling",
+        "width",
+        "spectral_modes",
+        "batch_size_per_regime",
+        "gradient_accumulation_steps",
+        "data_parallel_devices",
+        "training_passes_per_epoch",
+        "steps_per_epoch",
+        "deterministic_anchor_cycle",
+        "full_anchor_sweep",
+        "translation_augmentation",
+        "planned_epochs",
+        "learning_rate",
+        "final_learning_rate",
+        "weight_decay",
+        "grad_clip",
+        "report_every_update_descent",
+        "update_norm_cap",
+        "autonomous_history_burnin_steps",
+        "log_energy_weight",
+        "log_growth_weight",
+        "global_relative_trajectory_loss",
+    )
+    configuration_path = outdir / "run_configuration.json"
+    resumed_histories = None
+    resumed_state = None
+    if args.resume_run is not None:
+        if not configuration_path.is_file():
+            raise FileNotFoundError(f"Missing resume configuration: {configuration_path}")
+        saved_configuration = json.loads(configuration_path.read_text(encoding="utf-8"))
+        mismatches = {
+            key: (saved_configuration.get(key), metadata.get(key))
+            for key in immutable_resume_keys
+            if saved_configuration.get(key) != metadata.get(key)
+        }
+        if mismatches:
+            raise ValueError(f"Resume configuration mismatch: {mismatches}")
+        params, optimizer, resumed_histories, resumed_state = _load_training_state(
+            outdir / "training_state.npz"
+        )
+        rng.bit_generator.state = resumed_state["rng_state"]
+        print(
+            f"[train] resumed exact state at epoch={resumed_state['global_epoch']} "
+            f"optimizer_step={int(np.asarray(optimizer['step']))}"
+        )
+    else:
+        configuration_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     started = time.perf_counter()
-    global_epoch = 0
+    global_epoch = 0 if resumed_state is None else int(resumed_state["global_epoch"])
+    if global_epoch >= int(args.epochs):
+        raise ValueError(
+            f"Resume epoch {global_epoch} has already reached requested epoch {args.epochs}"
+        )
+    if resumed_histories is not None:
+        train_history = resumed_histories["train_loss"].tolist()
+        train_ema_history = resumed_histories["train_ema_loss"].tolist()
+        train_update_norm_history = resumed_histories.get(
+            "train_update_norm", np.asarray([], dtype=np.float64)
+        ).tolist()
+        train_update_scale_min_history = resumed_histories.get(
+            "train_update_scale_min", np.asarray([], dtype=np.float64)
+        ).tolist()
+        train_eval_epochs = resumed_histories["train_eval_epochs"].astype(int).tolist()
+        train_eval_history = resumed_histories["train_eval_loss"].tolist()
+        train_eval_regime_history = resumed_histories[
+            "train_eval_regime_loss"
+        ].tolist()
+        val_epochs = resumed_histories["val_epochs"].astype(int).tolist()
+        val_history = resumed_histories["val_loss"].tolist()
+        val_regime_history = resumed_histories["val_regime_loss"].tolist()
+        autonomous_val_epochs = resumed_histories[
+            "autonomous_val_epochs"
+        ].astype(int).tolist()
+        autonomous_val_history = resumed_histories["autonomous_val_loss"].tolist()
+        autonomous_val_regime_history = resumed_histories[
+            "autonomous_val_regime_loss"
+        ].tolist()
+        best_val = float(resumed_state["best_val"])
     supervised_epochs = (
         int(args.epochs) if args.supervised_only else int(args.supervised_warmup_epochs)
     )
@@ -2809,6 +3627,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 heat_flux_gradient_case_scale_by_id
             ),
             include_heat_flux_gradient_history=args.closure_history_input,
+            reference_dt=reference_dt,
         )
         warmup_validation_panel_jax = tuple(
             {key: jnp.asarray(value) for key, value in batch.items()}
@@ -2844,17 +3663,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         heat_flux_gradient_case_scale_by_id
                     ),
                     include_heat_flux_gradient_history=args.closure_history_input,
+                    reference_steps_per_solver_step=(
+                        reference_steps_per_solver_step
+                    ),
                 )
                 batch_jax = {key: jnp.asarray(value) for key, value in batch.items()}
                 (loss_value, regime_value), grads = warmup_value_and_grad(
                     params, batch_jax
                 )
-                params, optimizer, grad_norm = _adam_step(
+                params, optimizer, grad_norm, _, _ = _adam_step(
                     params,
                     grads,
                     optimizer,
                     args.learning_rate,
                     args.grad_clip,
+                    update_norm_cap=args.update_norm_cap,
                 )
                 epoch_losses.append(float(loss_value))
                 epoch_regime_losses.append(
@@ -2907,7 +3730,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 + ") "
                 f"grad={float(grad_norm):.3e} elapsed={elapsed / 60.0:.1f}m"
             )
+    curriculum_epoch_offset = int(args.supervised_warmup_epochs)
     for stage_horizon, stage_epochs in curriculum:
+        stage_end_epoch = curriculum_epoch_offset + int(stage_epochs)
+        if global_epoch >= stage_end_epoch:
+            curriculum_epoch_offset = stage_end_epoch
+            continue
         loss_fn = make_loss_function(
             k_arr=k_arr,
             width=args.width,
@@ -2923,6 +3751,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             density_floor=args.density_floor,
             pressure_floor=args.pressure_floor,
             relative_trajectory_loss=args.relative_trajectory_loss,
+            global_relative_trajectory_loss=args.global_relative_trajectory_loss,
             closure_history_input=args.closure_history_input,
             relative_time_block_steps=relative_time_block_steps,
             relative_time_block_count=relative_time_block_count,
@@ -2933,8 +3762,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             input_scaling=args.input_scaling,
             dynamic_amplitude_floor=args.dynamic_amplitude_floor,
             allow_uniform_heating=args.allow_uniform_heating,
+            autonomous_burnin_steps=args.autonomous_history_burnin_steps,
+            log_energy_weight=args.log_energy_weight,
+            log_growth_weight=args.log_growth_weight,
         )
         value_and_grad = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
+        parallel_value_and_grad = None
+        if int(args.data_parallel_devices) > 1:
+            def parallel_loss_and_grad(parallel_params, parallel_batch):
+                (value, regime_value), gradients = jax.value_and_grad(
+                    loss_fn, has_aux=True
+                )(parallel_params, parallel_batch)
+                value = jax.lax.pmean(value, axis_name="data")
+                regime_value = jax.lax.pmean(regime_value, axis_name="data")
+                gradients = jax.tree_util.tree_map(
+                    lambda leaf: jax.lax.pmean(leaf, axis_name="data"), gradients
+                )
+                return (value, regime_value), gradients
+
+            parallel_value_and_grad = jax.pmap(
+                parallel_loss_and_grad,
+                axis_name="data",
+                in_axes=(None, 0),
+                devices=jax.devices()[: int(args.data_parallel_devices)],
+            )
         evaluate_loss = jax.jit(loss_fn)
         validation_panel = build_diagnostic_panel(
             validation_rng,
@@ -2952,6 +3803,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             source_nx=source_nx,
             rollout_nx=args.rollout_Nx,
             domain_length=domain_length,
+            autonomous_burnin_steps=args.autonomous_history_burnin_steps,
+            include_heat_flux_gradient_history=args.closure_history_input,
+            reference_dt=reference_dt,
         )
         training_diagnostic_panel = build_diagnostic_panel(
             np.random.default_rng(args.seed + 2),
@@ -2969,6 +3823,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             source_nx=source_nx,
             rollout_nx=args.rollout_Nx,
             domain_length=domain_length,
+            autonomous_burnin_steps=args.autonomous_history_burnin_steps,
+            include_heat_flux_gradient_history=args.closure_history_input,
+            reference_dt=reference_dt,
         )
         validation_panel_jax = tuple(
             {key: jnp.asarray(value) for key, value in batch.items()}
@@ -3276,14 +4133,54 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 + ",".join(f"{value:.3e}" for value in initial_autonomous_regime)
                 + ")"
             )
-        loss_ema = None
-        for _ in range(stage_epochs):
+        loss_ema = (
+            None
+            if resumed_state is None or not math.isfinite(resumed_state["loss_ema"])
+            else float(resumed_state["loss_ema"])
+        )
+        if args.resume_run is None and global_epoch == 0:
+            _save_checkpoint(
+                outdir / "epoch000_low_moment_closure.npz", params, metadata, stats
+            )
+            _save_training_state(
+                outdir / "training_state.npz",
+                params=params,
+                optimizer=optimizer,
+                rng=rng,
+                global_epoch=0,
+                loss_ema=loss_ema,
+                best_val=best_val,
+                histories={
+                    "train_loss": train_history,
+                    "train_ema_loss": train_ema_history,
+                    "train_update_norm": train_update_norm_history,
+                    "train_update_scale_min": train_update_scale_min_history,
+                    "train_eval_epochs": train_eval_epochs,
+                    "train_eval_loss": train_eval_history,
+                    "train_eval_regime_loss": train_eval_regime_history,
+                    "val_epochs": val_epochs,
+                    "val_loss": val_history,
+                    "val_regime_loss": val_regime_history,
+                    "autonomous_val_epochs": autonomous_val_epochs,
+                    "autonomous_val_loss": autonomous_val_history,
+                    "autonomous_val_regime_loss": autonomous_val_regime_history,
+                },
+            )
+        while global_epoch < min(stage_end_epoch, int(args.epochs)):
             global_epoch += 1
             epoch_losses = []
             epoch_regime_losses = []
             epoch_grad_norms = []
+            epoch_update_norms = []
+            epoch_update_scales = []
             epoch_failed_batches = 0
             epoch_earliest_failure_step = None
+            learning_rate = _cosine_learning_rate(
+                int(np.asarray(optimizer["step"])),
+                planned_epochs * int(args.steps_per_epoch),
+                args.learning_rate,
+                args.final_learning_rate,
+            )
             if args.training_schedule == "continuous_trajectories":
                 training_steps = build_complete_trajectory_case_batches(
                     rng,
@@ -3294,6 +4191,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
             else:
                 training_steps = range(int(args.steps_per_epoch))
+                if args.full_anchor_sweep:
+                    epoch_window_selections = build_balanced_full_anchor_epoch(
+                        rng,
+                        anchors,
+                        split="train",
+                        batch_size_per_regime=args.batch_size,
+                    )
+                else:
+                    epoch_window_selections = tuple(
+                        selection
+                        for _ in range(int(args.training_passes_per_epoch))
+                        for selection in build_balanced_random_window_epoch(
+                            rng,
+                            anchors,
+                            split="train",
+                            batch_size_per_regime=args.batch_size,
+                            deterministic_epoch=(
+                                global_epoch if args.deterministic_anchor_cycle else None
+                            ),
+                        )
+                    )
+                expected_batches = int(args.steps_per_epoch) * int(
+                    args.gradient_accumulation_steps
+                )
+                if len(epoch_window_selections) != expected_batches:
+                    raise ValueError(
+                        "steps-per-epoch * gradient-accumulation-steps must cover "
+                        f"the configured balanced IC passes: expected {len(epoch_window_selections)}, "
+                        f"configured {expected_batches}"
+                    )
+                epoch_window_iterator = iter(epoch_window_selections)
             for step_selection in training_steps:
                 if args.training_schedule == "continuous_trajectories":
                     batch = sample_complete_trajectory_batch(
@@ -3306,7 +4234,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         memory_stride=args.memory_stride,
                         source_nx=source_nx,
                         rollout_nx=args.rollout_Nx,
-                        translation_augmentation=True,
+                        translation_augmentation=args.translation_augmentation,
                         primitive_target_histories=primitive_target_histories,
                         trajectory_target_norm_by_id=trajectory_target_norm_by_id,
                     )
@@ -3329,12 +4257,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         epoch_losses.append(optimizer_step_loss)
                         epoch_regime_losses.append(optimizer_step_regime)
                         continue
-                    params, optimizer, grad_norm = _adam_step(
+                    (
+                        params,
+                        optimizer,
+                        grad_norm,
+                        update_norm,
+                        update_scale,
+                    ) = _adam_step(
                         params,
                         grads,
                         optimizer,
                         args.learning_rate,
                         args.grad_clip,
+                        update_norm_cap=args.update_norm_cap,
                     )
                     epoch_losses.append(optimizer_step_loss)
                     epoch_regime_losses.append(optimizer_step_regime)
@@ -3345,10 +4280,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         + (1.0 - args.loss_ema_decay) * optimizer_step_loss
                     )
                     epoch_grad_norms.append(float(grad_norm))
+                    epoch_update_norms.append(float(update_norm))
+                    epoch_update_scales.append(float(update_scale))
                     continue
                 accumulated_grads = None
                 optimizer_step_losses = []
+                optimizer_step_batches = []
                 for _ in range(int(args.gradient_accumulation_steps)):
+                    window_selection = next(epoch_window_iterator)
                     batch = sample_batch(
                         rng,
                         grouped,
@@ -3363,18 +4302,75 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         source_nx=source_nx,
                         rollout_nx=args.rollout_Nx,
                         domain_length=domain_length,
-                        translation_augmentation=True,
+                        translation_augmentation=args.translation_augmentation,
+                        explicit_selection=window_selection,
+                        autonomous_burnin_steps=args.autonomous_history_burnin_steps,
+                        include_heat_flux_gradient_history=args.closure_history_input,
+                        reference_steps_per_solver_step=(
+                            reference_steps_per_solver_step
+                        ),
                     )
-                    batch_jax = {
-                        key: jnp.asarray(value) for key, value in batch.items()
-                    }
-                    (loss_value, regime_value), grads = value_and_grad(
-                        params, batch_jax
-                    )
+                    if parallel_value_and_grad is None:
+                        batch_jax = {
+                            key: jnp.asarray(value) for key, value in batch.items()
+                        }
+                    else:
+                        device_count = int(args.data_parallel_devices)
+                        regime_indices = np.asarray(batch["regime_index"])
+                        per_device_indices = [[] for _ in range(device_count)]
+                        for regime_index in range(len(REGIMES)):
+                            rows = np.flatnonzero(regime_indices == regime_index)
+                            if rows.size % device_count:
+                                raise ValueError(
+                                    "Each regime's minibatch must divide evenly across "
+                                    "data-parallel devices"
+                                )
+                            for device_index, chunk in enumerate(
+                                np.split(rows, device_count)
+                            ):
+                                per_device_indices[device_index].extend(chunk.tolist())
+                        ordered_indices = np.asarray(
+                            [row for rows in per_device_indices for row in rows],
+                            dtype=np.int32,
+                        )
+                        batch_jax = {
+                            key: jnp.asarray(value[ordered_indices]).reshape(
+                                device_count,
+                                len(ordered_indices) // device_count,
+                                *value.shape[1:],
+                            )
+                            for key, value in batch.items()
+                        }
+                    optimizer_step_batches.append(batch_jax)
+                    if parallel_value_and_grad is None:
+                        (loss_value, regime_value), grads = value_and_grad(
+                            params, batch_jax
+                        )
+                    else:
+                        (replicated_loss, replicated_regime), replicated_grads = (
+                            parallel_value_and_grad(params, batch_jax)
+                        )
+                        loss_value = replicated_loss[0]
+                        regime_value = replicated_regime[0]
+                        grads = jax.tree_util.tree_map(
+                            lambda leaf: leaf[0], replicated_grads
+                        )
                     loss_float = float(loss_value)
                     if not math.isfinite(loss_float):
+                        selection_text = {
+                            regime: {
+                                "case_rows": np.asarray(value[0]).tolist(),
+                                "reset_times": (
+                                    np.asarray(value[1], dtype=np.float64)
+                                    * reference_dt
+                                ).tolist(),
+                            }
+                            for regime, value in window_selection.items()
+                        }
                         raise FloatingPointError(
-                            f"Non-finite loss at epoch {global_epoch}, H={stage_horizon}"
+                            f"Non-finite loss at epoch {global_epoch}, H={stage_horizon}, "
+                            f"regime_loss={np.asarray(regime_value).tolist()}, "
+                            f"selection={selection_text}"
                         )
                     optimizer_step_losses.append(loss_float)
                     epoch_losses.append(loss_float)
@@ -3394,13 +4390,58 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     lambda value: value / float(args.gradient_accumulation_steps),
                     accumulated_grads,
                 )
-                params, optimizer, grad_norm = _adam_step(
+                learning_rate = _cosine_learning_rate(
+                    int(np.asarray(optimizer["step"])),
+                    planned_epochs * int(args.steps_per_epoch),
+                    args.learning_rate,
+                    args.final_learning_rate,
+                )
+                (
+                    params,
+                    optimizer,
+                    grad_norm,
+                    update_norm,
+                    update_scale,
+                ) = _adam_step(
                     params,
                     grads,
                     optimizer,
-                    args.learning_rate,
+                    learning_rate,
                     args.grad_clip,
+                    args.weight_decay,
+                    args.update_norm_cap,
                 )
+                should_report_update = args.report_every_update_descent or (
+                    args.require_first_update_descent
+                    and int(np.asarray(optimizer["step"])) == 1
+                )
+                if should_report_update:
+                    post_update_loss = float(
+                        np.mean(
+                            [
+                                float(evaluate_loss(params, selected_batch)[0])
+                                for selected_batch in optimizer_step_batches
+                            ]
+                        )
+                    )
+                    pre_update_loss = float(np.mean(optimizer_step_losses))
+                    print(
+                        "[update-check] exact-batch "
+                        f"step={int(np.asarray(optimizer['step']))} "
+                        f"before={pre_update_loss:.6e} after={post_update_loss:.6e} "
+                        f"ratio={post_update_loss / max(pre_update_loss, 1e-30):.6f}"
+                    )
+                    if (
+                        args.require_first_update_descent
+                        and int(np.asarray(optimizer["step"])) == 1
+                        and (
+                            not math.isfinite(post_update_loss)
+                            or post_update_loss >= pre_update_loss
+                        )
+                    ):
+                        raise FloatingPointError(
+                            "First accepted update did not lower its exact accumulated batch"
+                        )
                 optimizer_step_loss = float(np.mean(optimizer_step_losses))
                 loss_ema = (
                     optimizer_step_loss
@@ -3409,10 +4450,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     + (1.0 - args.loss_ema_decay) * optimizer_step_loss
                 )
                 epoch_grad_norms.append(float(grad_norm))
+                epoch_update_norms.append(float(update_norm))
+                epoch_update_scales.append(float(update_scale))
             mean_loss = float(np.mean(epoch_losses))
             mean_regime_loss = np.mean(epoch_regime_losses, axis=0)
             train_history.append(mean_loss)
             train_ema_history.append(float(loss_ema))
+            train_update_norm_history.append(float(np.mean(epoch_update_norms)))
+            train_update_scale_min_history.append(float(np.min(epoch_update_scales)))
             val_text = ""
             should_validate = (
                 global_epoch == 1
@@ -3477,6 +4522,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 +
                 f"grad_mean={np.mean(epoch_grad_norms):.3e} "
                 f"grad_max={np.max(epoch_grad_norms):.3e} "
+                f"update_mean={np.mean(epoch_update_norms):.3e} "
+                f"update_scale_min={np.min(epoch_update_scales):.3e} "
                 f"elapsed={elapsed / 60.0:.1f}m"
             )
             if should_validate:
@@ -3493,12 +4540,56 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         + ",".join(f"{value:.3e}" for value in autonomous_regime)
                         + ")"
                     )
+            completed_metadata = dict(metadata)
+            completed_metadata["completed_epochs"] = global_epoch
+            completed_metadata["optimizer_steps"] = int(np.asarray(optimizer["step"]))
+            completed_metadata["current_learning_rate"] = float(learning_rate)
+            _save_checkpoint(
+                outdir / f"epoch{global_epoch:03d}_low_moment_closure.npz",
+                params,
+                completed_metadata,
+                stats,
+            )
+            _save_training_state(
+                outdir / "training_state.npz",
+                params=params,
+                optimizer=optimizer,
+                rng=rng,
+                global_epoch=global_epoch,
+                loss_ema=loss_ema,
+                best_val=best_val,
+                histories={
+                    "train_loss": train_history,
+                    "train_ema_loss": train_ema_history,
+                    "train_update_norm": train_update_norm_history,
+                    "train_update_scale_min": train_update_scale_min_history,
+                    "train_eval_epochs": train_eval_epochs,
+                    "train_eval_loss": train_eval_history,
+                    "train_eval_regime_loss": train_eval_regime_history,
+                    "val_epochs": val_epochs,
+                    "val_loss": val_history,
+                    "val_regime_loss": val_regime_history,
+                    "autonomous_val_epochs": autonomous_val_epochs,
+                    "autonomous_val_loss": autonomous_val_history,
+                    "autonomous_val_regime_loss": autonomous_val_regime_history,
+                },
+            )
+        curriculum_epoch_offset = stage_end_epoch
     checkpoint = outdir / "low_moment_closure.npz"
-    _save_checkpoint(checkpoint, params, metadata, stats)
+    final_epoch_checkpoint = outdir / f"epoch{global_epoch:03d}_low_moment_closure.npz"
+    if final_epoch_checkpoint.is_file():
+        # The epoch checkpoint already materialized every device array.  Copy
+        # that durable artifact instead of triggering a second large JAX host
+        # transfer after the final accepted update.
+        shutil.copy2(final_epoch_checkpoint, checkpoint)
+    else:
+        _save_checkpoint(checkpoint, params, metadata, stats)
     np.savez(
         outdir / "training_metrics.npz",
         train_loss=np.asarray(train_history),
         train_ema_loss=np.asarray(train_ema_history),
+        train_update_norm=np.asarray(train_update_norm_history),
+        train_update_scale_min=np.asarray(train_update_scale_min_history),
         train_eval_epochs=np.asarray(train_eval_epochs),
         train_eval_loss=np.asarray(train_eval_history),
         train_eval_regime_loss=np.asarray(train_eval_regime_history),
@@ -3533,6 +4624,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             rollout_nx=args.rollout_Nx,
             domain_length=domain_length,
             dt=dt,
+            reference_dt=reference_dt,
             width=args.width,
             memory_steps=args.memory_steps,
             memory_stride=args.memory_stride,

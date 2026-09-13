@@ -12,10 +12,19 @@ from model.diagnostics.low_moment_resonance_identifiability import (
     mode_bounce_exposure,
 )
 from model.train.low_moment_closure import (
+    _adam_init,
+    _adam_step,
     _block_relative_sample_loss,
+    _cosine_learning_rate,
     _electric_field_energy,
+    _gather_coefficients,
+    _interpolate_time_series,
+    _load_training_state,
     _load_or_build_primitive_target_cache,
     _primitive_numpy,
+    _save_training_state,
+    build_balanced_random_window_epoch,
+    build_balanced_full_anchor_epoch,
     build_complete_trajectory_case_batches,
     build_diagnostic_panel,
     limit_training_anchors,
@@ -25,6 +34,7 @@ from model.train.low_moment_closure import (
     parse_horizon_curriculum,
     parse_train_case_limits,
     sample_complete_trajectory_batch,
+    sample_batch,
 )
 from vpml.low_moment import (
     DYNAMIC_INPUT_SCALING,
@@ -32,6 +42,7 @@ from vpml.low_moment import (
     _causal_temporal_convolution,
     electric_field_from_density,
     explicit_window_closure_step,
+    init_burles_latent_fno_params,
     init_causal_spacetime_operator_params,
     init_explicit_window_params,
     init_spectral_memory_params,
@@ -42,10 +53,490 @@ from vpml.low_moment import (
     spectral_derivative,
     spectral_memory_closure_step,
     rollout_explicit_window_closure,
+    rollout_burles_latent_closure,
 )
 
 
 class LowMomentClosureTests(unittest.TestCase):
+    def test_gather_coefficients_interpolates_fractional_reference_steps(self) -> None:
+        history = np.zeros((5, 2, 3), dtype=np.complex64)
+        history[:, 0, :] = np.arange(5, dtype=np.float32)[:, None]
+        gathered = _gather_coefficients(
+            (history,),
+            np.asarray([0, 0, 0]),
+            np.asarray([0.0, 1.5, 3.25]),
+            coefficient_count=1,
+        )
+        np.testing.assert_allclose(
+            gathered[:, 0, 0], np.asarray([0.0, 1.5, 3.25]), rtol=0, atol=1e-7
+        )
+
+    def test_interpolate_time_series_matches_solver_times(self) -> None:
+        source_times = np.asarray([0.0, 0.01, 0.02, 0.03])
+        source = np.stack((source_times, 2.0 * source_times), axis=-1)
+        matched = _interpolate_time_series(
+            source_times, source, np.asarray([0.0, 0.025, 0.03])
+        )
+        np.testing.assert_allclose(
+            matched,
+            np.asarray([[0.0, 0.0], [0.025, 0.05], [0.03, 0.06]]),
+            rtol=0,
+            atol=1e-12,
+        )
+
+    def test_burles_latent_fno_is_random_finite_equivariant_and_resumable(self) -> None:
+        nx = 16
+        memory_steps = 4
+        shift = 3
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=4.0 * jnp.pi / nx)
+        params = init_burles_latent_fno_params(
+            jax.random.PRNGKey(207),
+            width=6,
+            spectral_modes=5,
+            memory_steps=memory_steps,
+            depth=2,
+            latent_dim=3,
+        )
+        self.assertTrue(all("hermite" not in key for key in params))
+        self.assertGreater(float(jnp.linalg.norm(params["output_local"])), 0.0)
+        state = 1e-3 * jax.random.normal(
+            jax.random.PRNGKey(208), (1, 3, nx), dtype=jnp.float32
+        )
+        history = jnp.repeat(state[:, None], memory_steps, axis=1)
+        closure_history = jnp.zeros((1, memory_steps, nx), dtype=jnp.float32)
+        common = dict(
+            dt=0.01,
+            memory_stride=2,
+            input_scale=jnp.ones((4,), dtype=jnp.float32),
+            heat_flux_gradient_scale=0.1,
+            amplitude_center=-2.0,
+            amplitude_scale=1.0,
+            heat_flux_gradient_history=closure_history,
+            input_scaling=DYNAMIC_INPUT_SCALING,
+        )
+        full_states, full_memory = rollout_burles_latent_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=4,
+            **common,
+        )
+        self.assertTrue(np.all(np.isfinite(np.asarray(full_states))))
+        self.assertEqual(full_memory[-1].shape, (1, 3, nx))
+        first_states, first_memory = rollout_burles_latent_closure(
+            params,
+            state,
+            history,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            **common,
+        )
+        window, closure, _, counter, gradient, latent = first_memory
+        second_states, second_memory = rollout_burles_latent_closure(
+            params,
+            first_states[:, -1],
+            window,
+            counter,
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=2,
+            compact_latent=latent,
+            previous_heat_flux_gradient=gradient,
+            heat_flux_gradient_history=closure,
+            **{key: value for key, value in common.items() if key != "heat_flux_gradient_history"},
+        )
+        np.testing.assert_allclose(
+            np.asarray(jnp.concatenate((first_states, second_states), axis=1)),
+            np.asarray(full_states),
+            rtol=2e-6,
+            atol=2e-7,
+        )
+        shifted_states, _ = rollout_burles_latent_closure(
+            params,
+            jnp.roll(state, shift, axis=-1),
+            jnp.roll(history, shift, axis=-1),
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray([0.1]),
+            k_arr,
+            horizon=4,
+            heat_flux_gradient_history=jnp.roll(closure_history, shift, axis=-1),
+            **{key: value for key, value in common.items() if key != "heat_flux_gradient_history"},
+        )
+        np.testing.assert_allclose(
+            np.asarray(shifted_states),
+            np.roll(np.asarray(full_states), shift, axis=-1),
+            rtol=3e-5,
+            atol=3e-6,
+        )
+
+    def test_burles_first_stage_uses_carried_closure(self) -> None:
+        nx = 8
+        history_steps = 2
+        state = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        history = jnp.zeros((1, history_steps, 3, nx), dtype=jnp.float32)
+        carried = jnp.full((1, nx), 0.02, dtype=jnp.float32)
+        proposed = jnp.full((1, nx), 0.07, dtype=jnp.float32)
+        latent = jnp.zeros((1, 1, nx), dtype=jnp.float32)
+        k_arr = 2.0 * jnp.pi * jnp.fft.rfftfreq(nx, d=1.0 / nx)
+
+        def fake_closure_rhs(params, fluid, latent_state, *args, **kwargs):
+            del params, fluid, args, kwargs
+            return proposed, jnp.zeros_like(latent_state)
+
+        def closure_only_rhs(fluid, closure, *args, **kwargs):
+            del args, kwargs
+            return jnp.zeros_like(fluid).at[:, 2].set(closure)
+
+        with mock.patch(
+            "vpml.low_moment.burles_latent_closure_rhs",
+            side_effect=fake_closure_rhs,
+        ), mock.patch(
+            "vpml.low_moment.low_moment_rhs",
+            side_effect=closure_only_rhs,
+        ), mock.patch(
+            "vpml.low_moment.encode_explicit_window_history",
+            return_value=jnp.zeros((1, 1, nx), dtype=jnp.float32),
+        ):
+            states, _ = rollout_burles_latent_closure(
+                {},
+                state,
+                history,
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray([0.1]),
+                k_arr,
+                horizon=1,
+                dt=0.1,
+                memory_stride=1,
+                input_scale=jnp.ones((4,), dtype=jnp.float32),
+                heat_flux_gradient_scale=1.0,
+                amplitude_center=0.0,
+                amplitude_scale=1.0,
+                compact_latent=latent,
+                previous_heat_flux_gradient=carried,
+                heat_flux_gradient_history=jnp.zeros(
+                    (1, history_steps, nx), dtype=jnp.float32
+                ),
+            )
+
+        expected = (2.0 / 3.0) * 0.1 * (0.25 * (0.02 + 0.07) + 0.07)
+        np.testing.assert_allclose(
+            np.asarray(states[0, 0, 2]), expected, rtol=2e-6, atol=2e-7
+        )
+
+    def test_window_loss_passes_teacher_closure_history_at_random_reset(self) -> None:
+        nx = 8
+        memory_steps = 3
+        horizon = 2
+        initial = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        memory = jnp.zeros((1, memory_steps, 3, nx), dtype=jnp.float32)
+        closure_history = jnp.arange(
+            memory_steps * nx, dtype=jnp.float32
+        ).reshape(1, memory_steps, nx)
+        predicted = jnp.repeat(initial[:, None], horizon, axis=1)
+        batch = {
+            "initial": initial,
+            "memory": memory,
+            "heat_flux_gradient_history": closure_history,
+            "targets": predicted,
+            "amplitude": jnp.asarray([0.1], dtype=jnp.float32),
+            "regime_index": jnp.asarray([0], dtype=jnp.int32),
+            "start_index": jnp.asarray([0], dtype=jnp.int32),
+        }
+        loss_fn = make_loss_function(
+            k_arr=np.asarray(
+                2.0 * np.pi * np.fft.rfftfreq(nx, d=1.0 / nx),
+                dtype=np.float32,
+            ),
+            width=4,
+            horizon=horizon,
+            dt=0.01,
+            input_scale=np.ones((4,), dtype=np.float32),
+            regime_scales=np.ones((3, 4), dtype=np.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=0.0,
+            amplitude_scale=1.0,
+            poisson_sign=1.0,
+            normalized_heat_flux_bound=128.0,
+            density_floor=1e-4,
+            pressure_floor=1e-4,
+            closure_history_input=True,
+            memory_backend="burles_latent_fno",
+            memory_stride=1,
+        )
+
+        with mock.patch(
+            "model.train.low_moment_closure._rollout_window_memory",
+            return_value=(predicted, ()),
+        ) as rollout:
+            loss_fn({}, batch)
+
+        kwargs = rollout.call_args.kwargs
+        np.testing.assert_array_equal(
+            np.asarray(kwargs["heat_flux_gradient_history"]),
+            np.asarray(closure_history),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(kwargs["previous_heat_flux_gradient"]),
+            np.asarray(closure_history[:, -1]),
+        )
+
+    def test_window_loss_uses_global_relative_trajectory_objective(self) -> None:
+        nx = 8
+        horizon = 2
+        memory_steps = 3
+        x = jnp.linspace(0.0, 2.0 * jnp.pi, nx, endpoint=False)
+        initial = jnp.zeros((1, 3, nx), dtype=jnp.float32)
+        predicted = jnp.repeat(initial[:, None], horizon, axis=1).at[:, :, 0].set(
+            0.2 * jnp.cos(x)
+        )
+        targets = jnp.repeat(initial[:, None], horizon, axis=1).at[:, :, 0].set(
+            0.1 * jnp.cos(x)
+        )
+        batch = {
+            "initial": initial,
+            "memory": jnp.zeros(
+                (1, memory_steps, 3, nx), dtype=jnp.float32
+            ),
+            "targets": targets,
+            "amplitude": jnp.asarray([0.1], dtype=jnp.float32),
+            "regime_index": jnp.asarray([0], dtype=jnp.int32),
+            "start_index": jnp.asarray([0], dtype=jnp.int32),
+        }
+        k_arr = np.asarray(
+            2.0 * np.pi * np.fft.rfftfreq(nx, d=2.0 * np.pi / nx),
+            dtype=np.float32,
+        )
+        loss_fn = make_loss_function(
+            k_arr=k_arr,
+            width=4,
+            horizon=horizon,
+            dt=0.01,
+            input_scale=np.ones((4,), dtype=np.float32),
+            regime_scales=100.0 * np.ones((3, 4), dtype=np.float32),
+            heat_flux_gradient_scale=1.0,
+            amplitude_center=0.0,
+            amplitude_scale=1.0,
+            poisson_sign=1.0,
+            normalized_heat_flux_bound=128.0,
+            density_floor=1e-4,
+            pressure_floor=1e-4,
+            global_relative_trajectory_loss=True,
+            memory_backend="burles_latent_fno",
+            memory_stride=1,
+        )
+
+        with mock.patch(
+            "model.train.low_moment_closure._rollout_window_memory",
+            return_value=(predicted, ()),
+        ):
+            loss_value, regime_loss = loss_fn({}, batch)
+
+        predicted_fields = primitive_fields(
+            predicted.reshape(-1, 3, nx), jnp.asarray(k_arr)
+        ).reshape(1, horizon, 4, nx)
+        target_fields = primitive_fields(
+            targets.reshape(-1, 3, nx), jnp.asarray(k_arr)
+        ).reshape(1, horizon, 4, nx)
+        expected = jnp.sum(jnp.square(predicted_fields - target_fields)) / jnp.sum(
+            jnp.square(target_fields)
+        )
+        self.assertAlmostEqual(float(loss_value), float(expected), places=6)
+        self.assertAlmostEqual(float(regime_loss[0]), float(expected), places=6)
+
+    def test_adam_update_norm_cap_limits_parameter_step(self) -> None:
+        params = {"weight": jnp.zeros((4,), dtype=jnp.float32)}
+        grads = {"weight": jnp.ones((4,), dtype=jnp.float32)}
+        updated, _, grad_norm, raw_update_norm, update_scale = _adam_step(
+            params,
+            grads,
+            _adam_init(params),
+            learning_rate=0.1,
+            grad_clip=10.0,
+            update_norm_cap=0.01,
+        )
+        self.assertAlmostEqual(float(grad_norm), 2.0, places=5)
+        self.assertGreater(float(raw_update_norm), 0.01)
+        self.assertLess(float(update_scale), 1.0)
+        self.assertAlmostEqual(float(jnp.linalg.norm(updated["weight"])), 0.01, places=5)
+
+    def test_cosine_schedule_uses_fixed_planned_prefix(self) -> None:
+        self.assertAlmostEqual(_cosine_learning_rate(0, 100, 1e-3, 1e-5), 1e-3)
+        self.assertAlmostEqual(_cosine_learning_rate(99, 100, 1e-3, 1e-5), 1e-5)
+        self.assertGreater(
+            _cosine_learning_rate(20, 100, 1e-3, 1e-5),
+            _cosine_learning_rate(40, 100, 1e-3, 1e-5),
+        )
+
+    def test_balanced_random_epoch_covers_every_case_once(self) -> None:
+        anchors = {}
+        for regime in (
+            "linear_landau",
+            "nonlinear_landau_weak",
+            "nonlinear_landau_strong",
+        ):
+            anchors[regime] = {
+                "train_cases": np.repeat(np.arange(4, dtype=np.int32), 3),
+                "train_times": np.tile(np.asarray([0, 10, 20], dtype=np.int32), 4),
+            }
+        selections = build_balanced_random_window_epoch(
+            np.random.default_rng(1729),
+            anchors,
+            split="train",
+            batch_size_per_regime=2,
+        )
+        self.assertEqual(len(selections), 2)
+        for regime in anchors:
+            observed = np.concatenate([selection[regime][0] for selection in selections])
+            np.testing.assert_array_equal(np.sort(observed), np.arange(4))
+
+    def test_deterministic_anchor_cycle_advances_without_replacement(self) -> None:
+        anchors = {}
+        for regime in (
+            "linear_landau",
+            "nonlinear_landau_weak",
+            "nonlinear_landau_strong",
+        ):
+            anchors[regime] = {
+                "train_cases": np.repeat(np.arange(4, dtype=np.int32), 3),
+                "train_times": np.tile(np.asarray([0, 10, 20], dtype=np.int32), 4),
+            }
+        first = build_balanced_random_window_epoch(
+            np.random.default_rng(1),
+            anchors,
+            split="train",
+            batch_size_per_regime=2,
+            deterministic_epoch=1,
+        )
+        second = build_balanced_random_window_epoch(
+            np.random.default_rng(999),
+            anchors,
+            split="train",
+            batch_size_per_regime=2,
+            deterministic_epoch=2,
+        )
+        for regime in anchors:
+            first_times = np.concatenate([item[regime][1] for item in first])
+            second_times = np.concatenate([item[regime][1] for item in second])
+            self.assertTrue(np.all(first_times != second_times))
+
+    def test_full_anchor_epoch_consumes_every_anchor_once(self) -> None:
+        anchors = {}
+        for regime in (
+            "linear_landau",
+            "nonlinear_landau_weak",
+            "nonlinear_landau_strong",
+        ):
+            anchors[regime] = {
+                "train_cases": np.repeat(np.arange(2, dtype=np.int32), 4),
+                "train_times": np.tile(np.arange(4, dtype=np.int32), 2),
+            }
+        selections = build_balanced_full_anchor_epoch(
+            np.random.default_rng(1729),
+            anchors,
+            split="train",
+            batch_size_per_regime=2,
+        )
+        self.assertEqual(len(selections), 4)
+        for regime in anchors:
+            observed = sorted(
+                zip(
+                    np.concatenate([item[regime][0] for item in selections]),
+                    np.concatenate([item[regime][1] for item in selections]),
+                )
+            )
+            expected = sorted(
+                zip(anchors[regime]["train_cases"], anchors[regime]["train_times"])
+            )
+            self.assertEqual(observed, expected)
+
+    def test_random_window_uses_equilibrium_for_preinitial_history(self) -> None:
+        regimes = (
+            "linear_landau",
+            "nonlinear_landau_weak",
+            "nonlinear_landau_strong",
+        )
+        nx = 4
+        grouped = {}
+        anchors = {}
+        cases = []
+        selection = {}
+        for regime_index, regime in enumerate(regimes):
+            coefficients = np.zeros((4, 4, nx // 2 + 1), dtype=np.complex64)
+            coefficients[:, 0, 0] = nx * (5.0 + np.arange(4, dtype=np.float32))
+            case_id = f"{regime}_ic00"
+            grouped[regime] = {
+                "case_ids": np.asarray([case_id]),
+                "case_splits": np.asarray(["train"]),
+                "coefficients": (coefficients,),
+            }
+            anchors[regime] = {
+                "train_cases": np.asarray([0], dtype=np.int32),
+                "train_times": np.asarray([1], dtype=np.int32),
+            }
+            cases.append({"case_id": case_id, "epsilon": 0.1 + regime_index})
+            selection[regime] = (
+                np.asarray([0], dtype=np.int32),
+                np.asarray([1], dtype=np.int32),
+            )
+        batch = sample_batch(
+            np.random.default_rng(2),
+            grouped,
+            anchors=anchors,
+            manifest={"cases": cases},
+            coefficient_key="coefficients",
+            split="train",
+            batch_size_per_regime=1,
+            horizon=1,
+            memory_steps=2,
+            memory_stride=2,
+            source_nx=nx,
+            rollout_nx=nx,
+            domain_length=1.0,
+            translation_augmentation=False,
+            explicit_selection=selection,
+        )
+        np.testing.assert_allclose(batch["memory"][:, 0], 0.0)
+        np.testing.assert_allclose(batch["memory"][:, 1], 0.0)
+        self.assertGreater(float(np.linalg.norm(batch["initial"][:, 0])), 0.0)
+
+    def test_training_state_roundtrip_preserves_optimizer_rng_and_history(self) -> None:
+        params = {"weight": jnp.asarray([1.0, 2.0], dtype=jnp.float32)}
+        optimizer = {
+            "step": jnp.asarray(7, dtype=jnp.int32),
+            "m": {"weight": jnp.asarray([0.1, 0.2], dtype=jnp.float32)},
+            "v": {"weight": jnp.asarray([0.3, 0.4], dtype=jnp.float32)},
+        }
+        rng = np.random.default_rng(1729)
+        rng.random(3)
+        expected_next = rng.random()
+        rng = np.random.default_rng(1729)
+        rng.random(3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.npz"
+            _save_training_state(
+                path,
+                params=params,
+                optimizer=optimizer,
+                rng=rng,
+                global_epoch=5,
+                loss_ema=0.25,
+                best_val=0.5,
+                histories={"train_loss": [1.0, 0.5]},
+            )
+            loaded_params, loaded_optimizer, histories, state = _load_training_state(path)
+        np.testing.assert_array_equal(loaded_params["weight"], params["weight"])
+        self.assertEqual(int(loaded_optimizer["step"]), 7)
+        self.assertEqual(state["global_epoch"], 5)
+        restored = np.random.default_rng()
+        restored.bit_generator.state = state["rng_state"]
+        self.assertAlmostEqual(restored.random(), expected_next)
+        np.testing.assert_array_equal(histories["train_loss"], [1.0, 0.5])
+
     def test_mode_bounce_exposure_integrates_constant_frequency(self) -> None:
         density_hat = np.zeros((4, 3), dtype=np.complex128)
         density_hat[:, 1] = 4.0
@@ -609,6 +1100,9 @@ class LowMomentClosureTests(unittest.TestCase):
         batch = {
             "initial": initial,
             "memory": memory,
+            "heat_flux_gradient_history": jnp.zeros(
+                (3, memory_steps, nx), dtype=jnp.float32
+            ),
             "targets": targets,
             "amplitude": jnp.asarray([0.01, 0.08, 0.4], dtype=jnp.float32),
             "regime_index": jnp.asarray([0, 1, 2], dtype=jnp.int32),
@@ -916,6 +1410,27 @@ class LowMomentClosureTests(unittest.TestCase):
             floor_rms=jnp.ones((3, 4), dtype=jnp.float32),
         )
         np.testing.assert_allclose(np.asarray(value), [1.0], rtol=1e-6)
+
+    def test_block_relative_loss_has_finite_gradient_with_empty_blocks(self) -> None:
+        target = jnp.zeros((1, 2, 4, 2), dtype=jnp.float32)
+        floor = jnp.full((3, 4), 1e-14, dtype=jnp.float32)
+
+        def scalar(predicted):
+            return jnp.sum(
+                _block_relative_sample_loss(
+                    predicted,
+                    target,
+                    jnp.asarray([0], dtype=jnp.int32),
+                    jnp.asarray([[41, 42]], dtype=jnp.int32),
+                    block_steps=2,
+                    block_count=60,
+                    floor_rms=floor,
+                )
+            )
+
+        value, gradient = jax.value_and_grad(scalar)(jnp.ones_like(target) * 1e-15)
+        self.assertTrue(np.isfinite(float(value)))
+        self.assertTrue(np.all(np.isfinite(np.asarray(gradient))))
 
     def test_block_relative_chunk_losses_sum_to_complete_loss(self) -> None:
         target = jnp.ones((1, 4, 4, 2), dtype=jnp.float32)
