@@ -454,6 +454,33 @@ class LowMomentClosureTests(unittest.TestCase):
             )
             self.assertEqual(observed, expected)
 
+    def test_full_anchor_epoch_can_resume_from_saved_epoch_rng(self) -> None:
+        anchors = {}
+        for regime in (
+            "linear_landau",
+            "nonlinear_landau_weak",
+            "nonlinear_landau_strong",
+        ):
+            anchors[regime] = {
+                "train_cases": np.repeat(np.arange(2, dtype=np.int32), 4),
+                "train_times": np.tile(np.arange(4, dtype=np.int32), 2),
+            }
+        rng = np.random.default_rng(1729)
+        epoch_rng_state = rng.bit_generator.state
+        uninterrupted = build_balanced_full_anchor_epoch(
+            rng, anchors, split="train", batch_size_per_regime=2
+        )
+        restored = np.random.default_rng()
+        restored.bit_generator.state = epoch_rng_state
+        replayed = build_balanced_full_anchor_epoch(
+            restored, anchors, split="train", batch_size_per_regime=2
+        )
+        for original, resumed in zip(uninterrupted[2:], replayed[2:]):
+            for regime in anchors:
+                np.testing.assert_array_equal(original[regime][0], resumed[regime][0])
+                np.testing.assert_array_equal(original[regime][1], resumed[regime][1])
+        self.assertEqual(rng.bit_generator.state, restored.bit_generator.state)
+
     def test_random_window_uses_equilibrium_for_preinitial_history(self) -> None:
         regimes = (
             "linear_landau",
@@ -527,6 +554,16 @@ class LowMomentClosureTests(unittest.TestCase):
                 loss_ema=0.25,
                 best_val=0.5,
                 histories={"train_loss": [1.0, 0.5]},
+                in_epoch={
+                    "number": 6,
+                    "completed_steps": 3,
+                    "rng_state": rng.bit_generator.state,
+                    "losses": [0.4, 0.3, 0.2],
+                    "regime_losses": np.ones((3, 3)),
+                    "grad_norms": [3.0, 2.0, 1.0],
+                    "update_norms": [0.3, 0.2, 0.1],
+                    "update_scales": [1.0, 1.0, 1.0],
+                },
             )
             loaded_params, loaded_optimizer, histories, state = _load_training_state(path)
         np.testing.assert_array_equal(loaded_params["weight"], params["weight"])
@@ -536,6 +573,9 @@ class LowMomentClosureTests(unittest.TestCase):
         restored.bit_generator.state = state["rng_state"]
         self.assertAlmostEqual(restored.random(), expected_next)
         np.testing.assert_array_equal(histories["train_loss"], [1.0, 0.5])
+        self.assertEqual(state["in_epoch"]["number"], 6)
+        self.assertEqual(state["in_epoch"]["completed_steps"], 3)
+        np.testing.assert_array_equal(state["in_epoch"]["losses"], [0.4, 0.3, 0.2])
 
     def test_mode_bounce_exposure_integrates_constant_frequency(self) -> None:
         density_hat = np.zeros((4, 3), dtype=np.complex128)

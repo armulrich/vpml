@@ -2017,6 +2017,7 @@ def _save_training_state(
     loss_ema: Optional[float],
     best_val: float,
     histories: Mapping[str, object],
+    in_epoch: Optional[Mapping[str, object]] = None,
 ) -> None:
     payload = {f"param_{key}": np.asarray(value) for key, value in params.items()}
     payload.update(
@@ -2036,6 +2037,14 @@ def _save_training_state(
     )
     for key, value in histories.items():
         payload[f"history_{key}"] = np.asarray(value)
+    if in_epoch is not None:
+        for key, value in in_epoch.items():
+            if key == "rng_state":
+                payload["in_epoch_rng_state_json"] = np.asarray(
+                    [json.dumps(value, sort_keys=True)]
+                )
+            else:
+                payload[f"in_epoch_{key}"] = np.asarray(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp.npz")
     np.savez(temporary, **payload)
@@ -2073,6 +2082,21 @@ def _load_training_state(path: Path):
             "best_val": float(np.asarray(payload["best_val"])),
             "rng_state": json.loads(str(np.asarray(payload["rng_state_json"]).reshape(-1)[0])),
         }
+        if "in_epoch_number" in payload.files:
+            state["in_epoch"] = {
+                "number": int(np.asarray(payload["in_epoch_number"])),
+                "completed_steps": int(
+                    np.asarray(payload["in_epoch_completed_steps"])
+                ),
+                "rng_state": json.loads(
+                    str(np.asarray(payload["in_epoch_rng_state_json"]).reshape(-1)[0])
+                ),
+                "losses": np.asarray(payload["in_epoch_losses"]),
+                "regime_losses": np.asarray(payload["in_epoch_regime_losses"]),
+                "grad_norms": np.asarray(payload["in_epoch_grad_norms"]),
+                "update_norms": np.asarray(payload["in_epoch_update_norms"]),
+                "update_scales": np.asarray(payload["in_epoch_update_scales"]),
+            }
     if set(optimizer["m"]) != set(params) or set(optimizer["v"]) != set(params):
         raise ValueError(f"Incomplete optimizer state: {path}")
     return params, optimizer, histories, state
@@ -2719,6 +2743,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--steps-per-epoch", type=int, default=30)
     parser.add_argument(
+        "--checkpoint-every-updates",
+        type=int,
+        default=0,
+        help=(
+            "Persist exact within-epoch state this often; currently supported "
+            "for full-anchor sweeps without translation augmentation"
+        ),
+    )
+    parser.add_argument(
         "--training-passes-per-epoch",
         type=int,
         default=1,
@@ -2903,6 +2936,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("full-anchor-sweep requires random-window training")
     if args.full_anchor_sweep and int(args.training_passes_per_epoch) != 1:
         raise ValueError("full-anchor-sweep requires one training pass per epoch")
+    if args.checkpoint_every_updates < 0:
+        raise ValueError("checkpoint-every-updates cannot be negative")
+    if args.checkpoint_every_updates and (
+        not args.full_anchor_sweep
+        or args.training_schedule != "random_windows"
+        or args.translation_augmentation
+    ):
+        raise ValueError(
+            "within-epoch checkpoints require a full-anchor random-window sweep "
+            "without translation augmentation"
+        )
     if min(args.log_energy_weight, args.log_growth_weight) < 0.0:
         raise ValueError("energy and growth weights cannot be negative")
     if min(args.gradient_accumulation_steps, args.training_passes_per_epoch) <= 0:
@@ -3550,6 +3594,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"[train] resumed exact state at epoch={resumed_state['global_epoch']} "
             f"optimizer_step={int(np.asarray(optimizer['step']))}"
         )
+        if "in_epoch" in resumed_state:
+            print(
+                "[train] found resumable partial epoch "
+                f"{resumed_state['in_epoch']['number']} after "
+                f"{resumed_state['in_epoch']['completed_steps']} updates"
+            )
     else:
         configuration_path.write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -4168,11 +4218,40 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
         while global_epoch < min(stage_end_epoch, int(args.epochs)):
             global_epoch += 1
-            epoch_losses = []
-            epoch_regime_losses = []
-            epoch_grad_norms = []
-            epoch_update_norms = []
-            epoch_update_scales = []
+            partial_epoch = (
+                None if resumed_state is None else resumed_state.get("in_epoch")
+            )
+            if partial_epoch is not None:
+                if int(partial_epoch["number"]) != global_epoch:
+                    raise ValueError(
+                        "Partial-epoch state does not follow the last completed epoch"
+                    )
+                completed_epoch_steps = int(partial_epoch["completed_steps"])
+                if not 0 < completed_epoch_steps < int(args.steps_per_epoch):
+                    raise ValueError("Invalid partial-epoch completed step count")
+                rng.bit_generator.state = partial_epoch["rng_state"]
+                epoch_losses = partial_epoch["losses"].astype(float).tolist()
+                epoch_regime_losses = (
+                    partial_epoch["regime_losses"].astype(float).tolist()
+                )
+                epoch_grad_norms = partial_epoch["grad_norms"].astype(float).tolist()
+                epoch_update_norms = (
+                    partial_epoch["update_norms"].astype(float).tolist()
+                )
+                epoch_update_scales = (
+                    partial_epoch["update_scales"].astype(float).tolist()
+                )
+                print(
+                    f"[train] resuming epoch {global_epoch} at update "
+                    f"{completed_epoch_steps}/{args.steps_per_epoch}"
+                )
+            else:
+                completed_epoch_steps = 0
+                epoch_losses = []
+                epoch_regime_losses = []
+                epoch_grad_norms = []
+                epoch_update_norms = []
+                epoch_update_scales = []
             epoch_failed_batches = 0
             epoch_earliest_failure_step = None
             learning_rate = _cosine_learning_rate(
@@ -4190,7 +4269,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     shuffle=True,
                 )
             else:
-                training_steps = range(int(args.steps_per_epoch))
+                epoch_rng_state = json.loads(
+                    json.dumps(rng.bit_generator.state, sort_keys=True)
+                )
+                training_steps = range(
+                    completed_epoch_steps, int(args.steps_per_epoch)
+                )
                 if args.full_anchor_sweep:
                     epoch_window_selections = build_balanced_full_anchor_epoch(
                         rng,
@@ -4222,7 +4306,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         f"configured {expected_batches}"
                     )
                 epoch_window_iterator = iter(epoch_window_selections)
-            for step_selection in training_steps:
+                for _ in range(
+                    completed_epoch_steps * int(args.gradient_accumulation_steps)
+                ):
+                    next(epoch_window_iterator)
+            for epoch_step, step_selection in enumerate(
+                training_steps, start=completed_epoch_steps
+            ):
                 if args.training_schedule == "continuous_trajectories":
                     batch = sample_complete_trajectory_batch(
                         rng,
@@ -4452,6 +4542,54 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 epoch_grad_norms.append(float(grad_norm))
                 epoch_update_norms.append(float(update_norm))
                 epoch_update_scales.append(float(update_scale))
+                completed_steps = epoch_step + 1
+                if (
+                    args.checkpoint_every_updates
+                    and completed_steps < int(args.steps_per_epoch)
+                    and completed_steps % int(args.checkpoint_every_updates) == 0
+                ):
+                    resume_rng = np.random.default_rng()
+                    resume_rng.bit_generator.state = epoch_rng_state
+                    _save_training_state(
+                        outdir / "training_state.npz",
+                        params=params,
+                        optimizer=optimizer,
+                        rng=resume_rng,
+                        global_epoch=global_epoch - 1,
+                        loss_ema=loss_ema,
+                        best_val=best_val,
+                        histories={
+                            "train_loss": train_history,
+                            "train_ema_loss": train_ema_history,
+                            "train_update_norm": train_update_norm_history,
+                            "train_update_scale_min": train_update_scale_min_history,
+                            "train_eval_epochs": train_eval_epochs,
+                            "train_eval_loss": train_eval_history,
+                            "train_eval_regime_loss": train_eval_regime_history,
+                            "val_epochs": val_epochs,
+                            "val_loss": val_history,
+                            "val_regime_loss": val_regime_history,
+                            "autonomous_val_epochs": autonomous_val_epochs,
+                            "autonomous_val_loss": autonomous_val_history,
+                            "autonomous_val_regime_loss": autonomous_val_regime_history,
+                        },
+                        in_epoch={
+                            "number": global_epoch,
+                            "completed_steps": completed_steps,
+                            "rng_state": epoch_rng_state,
+                            "losses": epoch_losses,
+                            "regime_losses": epoch_regime_losses,
+                            "grad_norms": epoch_grad_norms,
+                            "update_norms": epoch_update_norms,
+                            "update_scales": epoch_update_scales,
+                        },
+                    )
+                    os.sync()
+                    print(
+                        f"[checkpoint] epoch {global_epoch} partial update "
+                        f"{completed_steps}/{args.steps_per_epoch}"
+                    )
+            resumed_state = None
             mean_loss = float(np.mean(epoch_losses))
             mean_regime_loss = np.mean(epoch_regime_losses, axis=0)
             train_history.append(mean_loss)
