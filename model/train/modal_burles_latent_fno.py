@@ -58,7 +58,9 @@ image = (
 )
 
 
-def latent_train_arguments(stop_epoch: int) -> list[str]:
+def latent_train_arguments(
+    stop_epoch: int, *, train_dir: Path = TRAIN_DIR
+) -> list[str]:
     if not 1 <= int(stop_epoch) <= 1000:
         raise ValueError("stop_epoch must be in [1, 1000]")
     arguments = [
@@ -68,7 +70,7 @@ def latent_train_arguments(stop_epoch: int) -> list[str]:
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",
-        str(TRAIN_DIR),
+        str(train_dir),
         "--rollout-Nx",
         "128",
         "--solver-dt",
@@ -134,14 +136,16 @@ def latent_train_arguments(stop_epoch: int) -> list[str]:
         "1729",
         "--skip-evaluation",
     ]
-    if (TRAIN_DIR / "training_state.npz").exists():
-        arguments.extend(("--resume-run", str(TRAIN_DIR)))
+    if (train_dir / "training_state.npz").exists():
+        arguments.extend(("--resume-run", str(train_dir)))
     return arguments
 
 
-def evaluation_arguments(epoch: int) -> list[str]:
-    checkpoint = TRAIN_DIR / f"epoch{int(epoch):03d}_low_moment_closure.npz"
-    evaluation_dir = RUN_DIR / "evaluations" / f"epoch{int(epoch):03d}"
+def evaluation_arguments(
+    epoch: int, *, train_dir: Path = TRAIN_DIR, run_dir: Path = RUN_DIR
+) -> list[str]:
+    checkpoint = train_dir / f"epoch{int(epoch):03d}_low_moment_closure.npz"
+    evaluation_dir = run_dir / "evaluations" / f"epoch{int(epoch):03d}"
     return [
         sys.executable,
         "-m",
