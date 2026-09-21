@@ -1,6 +1,8 @@
 # Matched linear-only closure experiment
 
-Status: implementation and preflight, before launch.
+Status: stopped on 21 September 2026 after workspace budget exhaustion.
+History completed E13, latent completed E15. No E20 result exists. Both Modal
+apps are stopped with zero tasks. No further remote compute is planned.
 
 The preserved history and latent models had inaccurate late linear damping.
 This controlled pair asks whether removing nonlinear examples from optimization
@@ -32,9 +34,11 @@ committed as part of this experiment.
   rejection. The authorized stopping point is E20.
 - Fixed normalization copied from the preserved history E0 statistics only.
   No old neural parameters initialize either run.
-- All epoch checkpoints evaluated autonomously from t = 0 through T = 120.
-  An E1 stop/resume permits early trajectory inspection and preserves optimizer,
-  RNG and schedule state. It is not a new training phase.
+- E0 and E1 were evaluated remotely from t = 0 through T = 120. An E1
+  stop/resume preserved optimizer, RNG and schedule state. Later evaluation
+  was scheduled after E20 and was not reached. Selected frozen checkpoints
+  were instead evaluated locally after the budget stop. Not every saved epoch
+  has an autonomous evaluation.
 
 ## Known limitation retained deliberately
 
@@ -52,13 +56,14 @@ Remote run directories are
 `/mnt/vpml/runs/linear_only_pair_20260921_v1_history_E20` and
 `/mnt/vpml/runs/linear_only_pair_20260921_v1_latent_E20`.
 Creation refuses existing directories unless explicit resume is requested with
-matching source/configuration hashes. Original checkpoint fingerprints are
-checked before and after the run. Each process has a private derived-cache
+matching source/configuration hashes. After the interrupted run, client-side Volume reads verified all 126
+historical checkpoint/configuration/state fingerprints against the pre-run list. Each process has a private derived-cache
 metadata directory while reading the preserved reference arrays.
 
 Local records are under
 `/Users/armin/Documents/NYU/vpml/out_bench/linear_only_pair_20260921_v1`.
-Downloaded checkpoints and evaluations will be checked against remote hashes.
+All 132 downloaded files matched SHA256 hashes computed from remote Volume
+reads after stopping the apps. This launched no remote compute.
 `out_bench` remains Git ignored.
 
 ## Launch
@@ -84,3 +89,61 @@ linear behavior differs, inspect the added memory coupling. If both fail,
 investigate shared scaling, closure timing, loss sensitivity and optimization.
 None of these outcomes alone proves that additional memory or more epochs are
 necessary or sufficient. A smooth loss curve is not the acceptance metric.
+
+
+## Budget-stop qualification
+
+| Model | Complete epoch | Complete updates | Partial state | Durable updates |
+|---|---:|---:|---|---:|
+| History | 13 | 6,838 | E14: 450/526 | 7,288 |
+| Latent | 15 | 7,890 | E16: 400/526 | 8,290 |
+
+The durable `training_state.npz` contains the complete loss history and exact
+partial-epoch resume state. The separately exported `training_metrics.npz` is
+stale at E1 because orderly finalization was interrupted. Loss figures use the
+state history and omit incomplete epoch averages. Run directory names ending in
+E20 record the intended target, not the achieved epoch.
+
+| Checkpoint | Window validation | Full field error | Log-energy RMSE (decades) |
+|---|---:|---:|---:|
+| History E2 | 0.03237 | 0.48278 | 2.34116 |
+| History E13 | 0.71888 | 1.19047 | 7.90653 |
+| Latent E13 | 0.03056 | 0.40703 | 2.35614 |
+| Latent E15 | 0.02783 | 0.42225 | 1.44012 |
+
+All values average four linear validation ICs. Field and energy diagnostics use
+the complete autonomous T=0 to 120 interval. E13 provides equal update exposure.
+History E2 and latent E15 minimize their completed window-validation histories,
+not necessarily autonomous error across every saved checkpoint. All evaluated
+rollouts were finite with zero density/pressure limiter activation.
+
+The latent model retains damping longer at E15 but still develops an incorrect
+late floor. History deteriorated after a large finite E8 gradient/loss spike.
+Latent also spiked at E6 and E10, then recovered. Removing nonlinear examples
+therefore did not remove optimization instability or guarantee late damping.
+No clipping or update cap was active. Adam's retained second moment can still
+reduce effective step sizes after large gradients.
+
+The initializer-specific output head has zero trajectory-loss gradient under
+detached preparation. Its six Adam m/v arrays remain exactly zero through saved
+update 8,290. A synthetic counterfactual restored a gradient norm of 8.3416e-7
+without any forward or loss change. This establishes the disconnected path,
+not that it explains all damping errors. Shared initializer features still train.
+History-only failure requires an additional explanation.
+
+Recommended next work is a targeted gradient-path repair and bounded checks of
+late-time field sensitivity and coupled linear response. No further paid run,
+update cap, architecture change or optimizer reset was performed. This is one
+seed and an interrupted comparison, not an impossibility result for history-only
+closure or proof that memory solves linear kinetics.
+
+The full report and figures are preserved at:
+`/Users/armin/Documents/NYU/vpml/out_bench/linear_only_pair_20260921_v1/REPORT.md`.
+The artifact directory also includes per-case metrics, optimizer accounting,
+CPU/GPU evaluation parity, all downloads and the storage integrity manifest.
+CPU and GPU E1 evaluations differ by at most 3.4e-5 relative field L2 and 0.00050
+decades energy RMSE, much smaller than the reported checkpoint differences.
+
+Launched source commit: `af7ad4f3eec5da0872102a0dd97f96158fb230d7`.
+Model/vpml source hash:
+`21fd6a60a96c16e475e0675024491816e03a1164cd4f5a53d0238c40bb0b784a`.
