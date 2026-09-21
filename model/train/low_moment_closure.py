@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -75,6 +76,43 @@ WINDOW_MEMORY_BACKENDS = frozenset(
         "burles_latent_fno",
     )
 )
+
+
+def parse_training_regimes(value: str) -> Tuple[str, ...]:
+    if value == "all3":
+        return REGIMES
+    if value == "linear_landau":
+        return ("linear_landau",)
+    raise ValueError(f"Unsupported training regimes: {value!r}")
+
+
+def _checkpoint_regimes(metadata: Mapping[str, object]) -> Tuple[str, ...]:
+    """Old checkpoints predate selection and therefore expose all three regimes."""
+    regimes = tuple(metadata.get("regimes", REGIMES))
+    if regimes not in (REGIMES, ("linear_landau",)):
+        raise ValueError(f"Unsupported checkpoint regimes: {regimes}")
+    if "training_regimes" in metadata and parse_training_regimes(
+        str(metadata["training_regimes"])
+    ) != regimes:
+        raise ValueError("Checkpoint training_regimes and regimes disagree")
+    return regimes
+
+
+def _validate_regime_resume_configuration(saved, current) -> None:
+    if _checkpoint_regimes(saved) != _checkpoint_regimes(current):
+        raise ValueError("Resume configuration mismatch: training regimes changed")
+    # Missing fields in legacy all3 runs mean the original all3 statistics.
+    for key, default in (
+        ("normalization_policy", "fixed_all3_training_statistics"),
+        ("normalization_regimes", list(REGIMES)),
+        ("normalization_checkpoint", None),
+        ("normalization_checkpoint_sha256", None),
+    ):
+        if saved.get(key, default) != current.get(key, default):
+            raise ValueError(f"Resume configuration mismatch: {key}")
+    for key in ("stats_stride", "normalization_statistics_sha256"):
+        if key in saved and saved[key] != current.get(key):
+            raise ValueError(f"Resume configuration mismatch: {key}")
 
 
 def _uses_window_memory(memory_backend: str) -> bool:
@@ -313,11 +351,12 @@ def _build_anchor_index(
     grouped: Mapping[str, Mapping[str, object]],
     coefficient_key: str,
     *,
+    regimes: Sequence[str] = REGIMES,
     horizon: int,
     history_stride: int,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     result: Dict[str, Dict[str, np.ndarray]] = {}
-    for regime in REGIMES:
+    for regime in regimes:
         group = grouped[regime]
         histories = tuple(group[coefficient_key])
         splits = np.asarray(group["case_splits"], dtype=np.str_)
@@ -368,11 +407,13 @@ def limit_training_anchors(
     anchors: Mapping[str, Mapping[str, np.ndarray]],
     case_limits: Mapping[str, int],
     *,
+    regimes: Sequence[str] = REGIMES,
     seed: int,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, np.ndarray]]:
     limited: Dict[str, Dict[str, np.ndarray]] = {}
     selected_cases: Dict[str, np.ndarray] = {}
-    for regime_index, regime in enumerate(REGIMES):
+    for regime in regimes:
+        regime_index = REGIMES.index(regime)
         payload = {
             key: np.asarray(value).copy()
             for key, value in anchors[regime].items()
@@ -751,6 +792,74 @@ def load_or_compute_training_statistics(
     return stats
 
 
+def _load_normalization_statistics(
+    path: Path,
+    *,
+    manifest: Mapping[str, object],
+    source_nx: int,
+    rollout_nx: int,
+) -> Tuple[Dict[str, np.ndarray], str]:
+    """Read stats only; canonical regime axes are independent of active regimes."""
+    with Path(path).open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        handle.seek(0)
+        with np.load(handle, allow_pickle=False) as payload:
+            metadata = json.loads(str(np.asarray(payload["metadata_json"]).reshape(-1)[0]))
+            stats = {
+                key.removeprefix("stat_"): np.asarray(payload[key])
+                for key in payload.files if key.startswith("stat_")
+            }
+    expected = {
+        "schema_version": CHECKPOINT_SCHEMA,
+        "manifest_sha256": str(manifest["sha256"]),
+        "source_Nx": int(source_nx),
+        "rollout_Nx": int(rollout_nx),
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise ValueError(f"Normalization checkpoint incompatible {key}: {metadata.get(key)!r}")
+    if metadata.get("normalization_policy", "fixed_all3_training_statistics") != (
+        "fixed_all3_training_statistics"
+    ) or tuple(metadata.get("normalization_regimes", metadata.get("regimes", REGIMES))) != REGIMES:
+        raise ValueError("Normalization checkpoint must contain fixed all3 statistics")
+    shapes = {
+        "input_scale": (4,),
+        "regime_scales": (len(REGIMES), 4),
+        "heat_flux_gradient_scale": (1,),
+        "heat_flux_gradient_regime_scales": (len(REGIMES),),
+        "heat_flux_gradient_max_abs": (1,),
+        "amplitude_center": (1,),
+        "amplitude_scale": (1,),
+    }
+    for key, shape in shapes.items():
+        if key not in stats or stats[key].shape != shape:
+            raise ValueError(f"Normalization statistic {key} must have shape {shape}")
+        value = stats[key]
+        if not np.issubdtype(value.dtype, np.number) or np.iscomplexobj(value):
+            raise ValueError(f"Normalization statistic {key} must be real numeric")
+        if not np.all(np.isfinite(value)):
+            raise ValueError(f"Normalization statistic {key} must be finite")
+        if key.endswith("scale") or key.endswith("scales"):
+            if np.any(value <= 0):
+                raise ValueError(f"Normalization statistic {key} must be positive")
+    if stats["heat_flux_gradient_max_abs"][0] < 0:
+        raise ValueError("Normalization heat_flux_gradient_max_abs must be nonnegative")
+    ids = stats.get("heat_flux_gradient_case_ids", np.asarray([]))
+    scales = stats.get("heat_flux_gradient_case_scales", np.asarray([]))
+    expected_ids = {str(case["case_id"]) for case in manifest["cases"]}
+    if (
+        ids.ndim != 1 or ids.dtype.kind not in "US"
+        or len(set(ids.tolist())) != ids.size
+        or set(ids.tolist()) != expected_ids
+        or scales.shape != ids.shape
+        or not np.issubdtype(scales.dtype, np.number)
+        or np.iscomplexobj(scales)
+        or not np.all(np.isfinite(scales)) or np.any(scales <= 0)
+    ):
+        raise ValueError("Normalization case IDs/scales must cover the manifest with positive RMS")
+    return stats, digest
+
+
 def sample_batch(
     rng: np.random.Generator,
     grouped,
@@ -758,6 +867,7 @@ def sample_batch(
     manifest,
     coefficient_key: str,
     *,
+    regimes: Sequence[str] = REGIMES,
     split: str,
     batch_size_per_regime: int,
     horizon: int,
@@ -786,7 +896,8 @@ def sample_batch(
     heat_flux_gradient_histories = []
     heat_flux_gradient_case_scales = []
     start_indices = []
-    for regime_index, regime in enumerate(REGIMES):
+    for regime in regimes:
+        regime_index = REGIMES.index(regime)
         group = grouped[regime]
         histories = tuple(group[coefficient_key])
         case_ids = np.asarray(group["case_ids"], dtype=np.str_)
@@ -976,6 +1087,7 @@ def build_complete_trajectory_case_batches(
     rng: np.random.Generator,
     grouped,
     *,
+    regimes: Sequence[str] = REGIMES,
     split: str,
     batch_size_per_regime: int,
     shuffle: bool,
@@ -983,7 +1095,7 @@ def build_complete_trajectory_case_batches(
     """Return balanced case batches that cover every IC in a split once."""
     split_value = IC_SPLIT_TRAIN if split == "train" else IC_SPLIT_HELDOUT
     rows_by_regime = {}
-    for regime in REGIMES:
+    for regime in regimes:
         rows = np.flatnonzero(
             np.asarray(grouped[regime]["case_splits"], dtype=np.str_) == split_value
         ).astype(np.int32)
@@ -1000,7 +1112,7 @@ def build_complete_trajectory_case_batches(
     return tuple(
         {
             regime: rows_by_regime[regime][start : start + batch_size]
-            for regime in REGIMES
+            for regime in regimes
         }
         for start in range(0, case_count, batch_size)
     )
@@ -1010,6 +1122,7 @@ def build_balanced_random_window_epoch(
     rng: np.random.Generator,
     anchors,
     *,
+    regimes: Sequence[str] = REGIMES,
     split: str,
     batch_size_per_regime: int,
     time_blocks: int = 6,
@@ -1020,7 +1133,7 @@ def build_balanced_random_window_epoch(
     if batch_size <= 0:
         raise ValueError("batch size must be positive")
     cases_by_regime = {}
-    for regime in REGIMES:
+    for regime in regimes:
         case_pool = np.asarray(anchors[regime][f"{split}_cases"], dtype=np.int32)
         unique = np.unique(case_pool)
         cases_by_regime[regime] = (
@@ -1033,7 +1146,7 @@ def build_balanced_random_window_epoch(
     selections = []
     for start in range(0, count, batch_size):
         selection = {}
-        for regime in REGIMES:
+        for regime in regimes:
             cases = cases_by_regime[regime][start : start + batch_size]
             case_pool = np.asarray(anchors[regime][f"{split}_cases"], dtype=np.int32)
             time_pool = np.asarray(anchors[regime][f"{split}_times"], dtype=np.int32)
@@ -1058,10 +1171,26 @@ def build_balanced_random_window_epoch(
     return tuple(selections)
 
 
+def _full_anchor_steps_per_epoch(anchors, regimes, batch_size, accumulation_steps):
+    """Count complete selected-regime updates without consuming the training RNG."""
+    counts = {int(anchors[regime]["train_cases"].size) for regime in regimes}
+    if len(counts) != 1 or min(counts) <= 0:
+        raise ValueError(f"Full-anchor sweep requires equal nonempty regime counts: {counts}")
+    count = counts.pop()
+    samples_per_update = int(batch_size) * int(accumulation_steps)
+    if samples_per_update <= 0 or count % samples_per_update:
+        raise ValueError(
+            "Full-anchor count must divide by batch size * gradient accumulation; "
+            f"got {count} and {samples_per_update}"
+        )
+    return count // samples_per_update
+
+
 def build_balanced_full_anchor_epoch(
     rng: np.random.Generator,
     anchors,
     *,
+    regimes: Sequence[str] = REGIMES,
     split: str,
     batch_size_per_regime: int,
 ) -> Sequence[Mapping[str, Tuple[np.ndarray, np.ndarray]]]:
@@ -1071,7 +1200,7 @@ def build_balanced_full_anchor_epoch(
         raise ValueError("batch size must be positive")
     shuffled = {}
     counts = set()
-    for regime in REGIMES:
+    for regime in regimes:
         cases = np.asarray(anchors[regime][f"{split}_cases"], dtype=np.int32)
         times = np.asarray(anchors[regime][f"{split}_times"], dtype=np.int32)
         if cases.size != times.size or cases.size == 0:
@@ -1093,7 +1222,7 @@ def build_balanced_full_anchor_epoch(
                 shuffled[regime][0][start : start + batch_size],
                 shuffled[regime][1][start : start + batch_size],
             )
-            for regime in REGIMES
+            for regime in regimes
         }
         for start in range(0, count, batch_size)
     )
@@ -1106,6 +1235,7 @@ def sample_complete_trajectory_batch(
     coefficient_key: str,
     case_rows: Mapping[str, np.ndarray],
     *,
+    regimes: Sequence[str] = REGIMES,
     memory_steps: int,
     memory_stride: int,
     source_nx: int,
@@ -1127,7 +1257,8 @@ def sample_complete_trajectory_batch(
     amplitudes = []
     regime_indices = []
     trajectory_steps = None
-    for regime_index, regime in enumerate(REGIMES):
+    for regime in regimes:
+        regime_index = REGIMES.index(regime)
         group = grouped[regime]
         histories = tuple(group[coefficient_key])
         case_ids = np.asarray(group["case_ids"], dtype=np.str_)
@@ -1235,6 +1366,7 @@ def build_diagnostic_panel(
     manifest,
     coefficient_key: str,
     *,
+    regimes: Sequence[str] = REGIMES,
     split: str,
     start_times: Sequence[float],
     cases_per_regime: Optional[int],
@@ -1252,7 +1384,7 @@ def build_diagnostic_panel(
 ) -> Sequence[Dict[str, np.ndarray]]:
     amplitudes = _case_amplitudes(manifest)
     selections = {}
-    for regime in REGIMES:
+    for regime in regimes:
         group = grouped[regime]
         split_value = IC_SPLIT_TRAIN if split == "train" else IC_SPLIT_HELDOUT
         rows = np.flatnonzero(np.asarray(group["case_splits"]) == split_value)
@@ -1272,7 +1404,7 @@ def build_diagnostic_panel(
     for start_time in start_times:
         time_index = int(round(float(start_time) / reference_dt_value))
         explicit = {}
-        for regime in REGIMES:
+        for regime in regimes:
             rows = selections[regime]
             histories = tuple(grouped[regime][coefficient_key])
             required_reference_steps = int(
@@ -1299,8 +1431,9 @@ def build_diagnostic_panel(
                 anchors,
                 manifest,
                 coefficient_key,
+                regimes=regimes,
                 split=split,
-                batch_size_per_regime=len(selections[REGIMES[0]]),
+                batch_size_per_regime=len(selections[regimes[0]]),
                 horizon=horizon,
                 memory_steps=memory_steps,
                 memory_stride=memory_stride,
@@ -1403,6 +1536,7 @@ def _adam_step(
 
 def make_loss_function(
     *,
+    regimes: Sequence[str] = REGIMES,
     k_arr: np.ndarray,
     width: int,
     horizon: int,
@@ -1658,7 +1792,7 @@ def make_loss_function(
                     jnp.where(batch["regime_index"] == index, sample_loss, 0.0)
                 )
                 / jnp.maximum(jnp.sum(batch["regime_index"] == index), 1)
-                for index in range(len(REGIMES))
+                for index in (REGIMES.index(regime) for regime in regimes)
             ]
         )
         return jnp.mean(sample_loss), regime_loss
@@ -1668,6 +1802,7 @@ def make_loss_function(
 
 def make_continuous_chunk_loss_function(
     *,
+    regimes: Sequence[str] = REGIMES,
     k_arr: np.ndarray,
     width: int,
     horizon: int,
@@ -1873,7 +2008,7 @@ def make_continuous_chunk_loss_function(
             [
                 jnp.sum(jnp.where(regime_index == index, sample_loss, 0.0))
                 / jnp.maximum(jnp.sum(regime_index == index), 1)
-                for index in range(len(REGIMES))
+                for index in (REGIMES.index(regime) for regime in regimes)
             ]
         )
         return jnp.mean(sample_loss), (
@@ -1887,6 +2022,7 @@ def make_continuous_chunk_loss_function(
 
 def make_supervised_heat_flux_loss(
     *,
+    regimes: Sequence[str] = REGIMES,
     k_arr: np.ndarray,
     width: int,
     input_scale: np.ndarray,
@@ -1973,7 +2109,7 @@ def make_supervised_heat_flux_loss(
             [
                 jnp.sum(jnp.where(batch["regime_index"] == index, sample_loss, 0.0))
                 / jnp.maximum(jnp.sum(batch["regime_index"] == index), 1)
-                for index in range(len(REGIMES))
+                for index in (REGIMES.index(regime) for regime in regimes)
             ]
         )
         return jnp.mean(regime_loss), regime_loss
@@ -2274,6 +2410,7 @@ def _evaluate_heldout(
     cache_dir: Path,
     outdir: Path,
     *,
+    regimes: Sequence[str] = REGIMES,
     source_nx: int,
     rollout_nx: int,
     domain_length: float,
@@ -2301,7 +2438,7 @@ def _evaluate_heldout(
     amplitudes_by_id = _case_amplitudes(manifest)
     initial_states = []
     case_records = []
-    for regime in REGIMES:
+    for regime in regimes:
         group = grouped[regime]
         histories = tuple(group[coefficient_key])
         for case_index, (case_id, split) in enumerate(
@@ -2316,6 +2453,8 @@ def _evaluate_heldout(
             )
             initial_states.append(state)
             case_records.append((regime, str(case_id), case_index, histories[case_index]))
+    if not initial_states:
+        raise ValueError(f"No held-out cases for selected regimes: {regimes}")
     state = jnp.asarray(np.stack(initial_states), dtype=jnp.float32)
     amplitude = jnp.asarray(
         [amplitudes_by_id[record[1]] for record in case_records], dtype=jnp.float32
@@ -2641,6 +2780,7 @@ def _evaluate_heldout(
         sharex=True,
         constrained_layout=True,
     )
+    axes = np.atleast_1d(axes)
     for index, (case_id, hr_times, hr_energy, model_energy, failure_time) in enumerate(
         metric1_traces
     ):
@@ -2658,6 +2798,8 @@ def _evaluate_heldout(
     fig.savefig(eval_root / "heldout_metric1_summary.png", dpi=180)
     plt.close(fig)
     aggregate = {
+        "regimes": list(regimes),
+        "canonical_regimes": list(REGIMES),
         "bounded_cases": sum(case["bounded_to_final_time"] for case in summaries),
         "case_count": len(summaries),
         "cases": summaries,
@@ -2671,6 +2813,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-cache", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
+    parser.add_argument(
+        "--training-regimes",
+        choices=("all3", "linear_landau"),
+        default="all3",
+        help=(
+            "Regimes exposed to training and diagnostics; normalization remains fixed "
+            "to all3 training statistics. Checkpoint evaluation uses saved regimes."
+        ),
+    )
     parser.add_argument("--rollout-Nx", type=int, default=256)
     parser.add_argument(
         "--solver-dt",
@@ -2860,6 +3011,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="NPZ containing regime/channel RMS teacher-grid disagreement",
     )
     parser.add_argument("--stats-stride", type=int, default=20)
+    parser.add_argument(
+        "--normalization-checkpoint",
+        type=Path,
+        default=None,
+        help="Load only fixed all3 statistics from a compatible checkpoint, never weights",
+    )
     parser.add_argument("--validation-every", type=int, default=5)
     parser.add_argument("--training-diagnostic-cases-per-regime", type=int, default=4)
     parser.add_argument(
@@ -2905,10 +3062,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     print_jax_runtime_summary(jax, context="low-moment closure training")
     args = build_arg_parser().parse_args(argv)
+    training_regimes = parse_training_regimes(args.training_regimes)
     planned_epochs = int(args.epochs if args.planned_epochs is None else args.planned_epochs)
     if planned_epochs < int(args.epochs) or planned_epochs <= 0:
         raise ValueError("planned-epochs must be positive and at least epochs")
     train_case_limits = parse_train_case_limits(args.train_case_limits)
+    if set(train_case_limits) - set(training_regimes):
+        raise ValueError("training-case limits must refer to selected training regimes")
     if args.rollout_horizon <= 0 or args.memory_steps <= 0 or args.scan_unroll <= 0:
         raise ValueError("rollout horizon, memory steps, and scan unroll must be positive")
     if args.solver_dt is not None and args.solver_dt <= 0.0:
@@ -3118,6 +3278,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             coefficient_key,
             Path(args.reference_cache),
             outdir,
+            regimes=_checkpoint_regimes(checkpoint_metadata),
             source_nx=source_nx,
             rollout_nx=rollout_nx,
             domain_length=domain_length,
@@ -3188,6 +3349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     anchors = _build_anchor_index(
         grouped,
         coefficient_key,
+        regimes=training_regimes,
         horizon=int(
             math.ceil(
                 (
@@ -3201,15 +3363,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         history_stride=args.history_stride,
     )
     selected_training_cases: Dict[str, np.ndarray] = {
-        regime: np.unique(anchors[regime]["train_cases"]) for regime in REGIMES
+        regime: np.unique(anchors[regime]["train_cases"]) for regime in training_regimes
     }
     if train_case_limits:
         anchors, selected_training_cases = limit_training_anchors(
             anchors,
             train_case_limits,
+            regimes=training_regimes,
             seed=args.seed,
         )
-    for regime in REGIMES:
+    for regime in training_regimes:
         selected_case_ids = np.asarray(grouped[regime]["case_ids"], dtype=np.str_)[
             selected_training_cases[regime]
         ]
@@ -3218,16 +3381,33 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"heldout_anchors={anchors[regime]['val_times'].size} "
             f"selected_train_cases={','.join(selected_case_ids.tolist())}"
         )
-    stats = load_or_compute_training_statistics(
-        args.reference_cache,
-        grouped,
-        manifest,
-        coefficient_key,
-        source_nx=source_nx,
-        rollout_nx=args.rollout_Nx,
-        domain_length=domain_length,
-        stats_stride=args.stats_stride,
-    )
+    if args.full_anchor_sweep and training_regimes != REGIMES:
+        args.steps_per_epoch = _full_anchor_steps_per_epoch(
+            anchors, training_regimes, args.batch_size, args.gradient_accumulation_steps
+        )
+        print(f"[data] selected full sweep: {args.steps_per_epoch} optimizer updates/epoch")
+    # Preserve the original all3 normalization, independent of training exposure.
+    # Matched history-only/latent runs share these exact cached statistics.
+    normalization_checkpoint_sha256 = None
+    if args.normalization_checkpoint is not None:
+        stats, normalization_checkpoint_sha256 = _load_normalization_statistics(
+            args.normalization_checkpoint,
+            manifest=manifest,
+            source_nx=source_nx,
+            rollout_nx=args.rollout_Nx,
+        )
+        print(f"[data] fixed normalization from {args.normalization_checkpoint}")
+    else:
+        stats = load_or_compute_training_statistics(
+            args.reference_cache,
+            grouped,
+            manifest,
+            coefficient_key,
+            source_nx=source_nx,
+            rollout_nx=args.rollout_Nx,
+            domain_length=domain_length,
+            stats_stride=args.stats_stride,
+        )
     print(
         "[data] low-moment input scales: "
         + ", ".join(f"{value:.4e}" for value in stats["input_scale"])
@@ -3474,12 +3654,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             regime: np.asarray(grouped[regime]["case_ids"], dtype=np.str_)[
                 selected_training_cases[regime]
             ].tolist()
-            for regime in REGIMES
+            for regime in training_regimes
         },
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "data_parallel_devices": args.data_parallel_devices,
         "training_passes_per_epoch": args.training_passes_per_epoch,
         "steps_per_epoch": args.steps_per_epoch,
+        "steps_per_epoch_source": (
+            "selected_full_anchor_count"
+            if args.full_anchor_sweep and training_regimes != REGIMES
+            else "configured"
+        ),
         "deterministic_anchor_cycle": args.deterministic_anchor_cycle,
         "full_anchor_sweep": args.full_anchor_sweep,
         "translation_augmentation": args.translation_augmentation,
@@ -3494,6 +3679,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "grad_clip": args.grad_clip,
         "optimizer": "adamw_cosine",
         "autonomous_history_burnin_steps": args.autonomous_history_burnin_steps,
+        "autonomous_history_burnin_detached": bool(args.autonomous_history_burnin_steps),
+        "compact_latent_initializer_gradient_disconnected": bool(
+            args.memory_backend == "burles_latent_fno"
+            and args.latent_memory_dim > 0
+            and args.autonomous_history_burnin_steps > 0
+        ),
         "training_history_source": (
             "model_generated_from_low_moment_reset"
             if args.autonomous_history_burnin_steps
@@ -3515,7 +3706,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "training_diagnostic_cases_per_regime": (
             args.training_diagnostic_cases_per_regime
         ),
-        "regimes": list(REGIMES),
+        "regimes": list(training_regimes),
+        "training_regimes": args.training_regimes,
+        "canonical_regimes": list(REGIMES),
+        "regime_indices": [REGIMES.index(regime) for regime in training_regimes],
+        "normalization_checkpoint": (
+            str(args.normalization_checkpoint.resolve())
+            if args.normalization_checkpoint is not None else None
+        ),
+        "normalization_checkpoint_sha256": normalization_checkpoint_sha256,
+        "normalization_policy": "fixed_all3_training_statistics",
+        "normalization_regimes": list(REGIMES),
+        "stats_stride": args.stats_stride,
+        "normalization_statistics_sha256": sha256_json(
+            {key: np.asarray(value).tolist() for key, value in stats.items()}
+        ),
         "normalized_heat_flux_bound": args.normalized_heat_flux_bound,
         "density_floor": args.density_floor,
         "pressure_floor": args.pressure_floor,
@@ -3537,6 +3742,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ),
         "convergence_floor_metadata": convergence_floor_metadata,
     }
+    if metadata["compact_latent_initializer_gradient_disconnected"]:
+        print(
+            "[train] known limitation: detached autonomous burn-in disconnects "
+            "compact_latent_init_* from the scored rollout gradient; preserved "
+            "for the controlled comparison"
+        )
     immutable_resume_keys = (
         "manifest_sha256",
         "rollout_Nx",
@@ -3553,6 +3764,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "width",
         "spectral_modes",
         "batch_size_per_regime",
+        "train_case_limits",
+        "selected_training_case_ids",
         "gradient_accumulation_steps",
         "data_parallel_devices",
         "training_passes_per_epoch",
@@ -3579,6 +3792,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if not configuration_path.is_file():
             raise FileNotFoundError(f"Missing resume configuration: {configuration_path}")
         saved_configuration = json.loads(configuration_path.read_text(encoding="utf-8"))
+        _validate_regime_resume_configuration(saved_configuration, metadata)
         mismatches = {
             key: (saved_configuration.get(key), metadata.get(key))
             for key in immutable_resume_keys
@@ -3640,6 +3854,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     if supervised_epochs > 0:
         warmup_loss = make_supervised_heat_flux_loss(
+            regimes=training_regimes,
             k_arr=k_arr,
             width=args.width,
             input_scale=stats["input_scale"],
@@ -3663,6 +3878,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             anchors,
             manifest,
             coefficient_key,
+            regimes=training_regimes,
             split="val",
             start_times=diagnostic_start_times,
             cases_per_regime=None,
@@ -3700,6 +3916,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     anchors,
                     manifest,
                     coefficient_key,
+                    regimes=training_regimes,
                     split="train",
                     batch_size_per_regime=args.batch_size,
                     horizon=1,
@@ -3787,6 +4004,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             curriculum_epoch_offset = stage_end_epoch
             continue
         loss_fn = make_loss_function(
+            regimes=training_regimes,
             k_arr=k_arr,
             width=args.width,
             horizon=stage_horizon,
@@ -3843,6 +4061,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             anchors,
             manifest,
             coefficient_key,
+            regimes=training_regimes,
             split="val",
             start_times=diagnostic_start_times,
             cases_per_regime=None,
@@ -3863,6 +4082,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             anchors,
             manifest,
             coefficient_key,
+            regimes=training_regimes,
             split="train",
             start_times=diagnostic_start_times,
             cases_per_regime=args.training_diagnostic_cases_per_regime,
@@ -3903,6 +4123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             cache = continuous_grad_fns if gradients else continuous_eval_fns
             if key not in cache:
                 chunk_loss = make_continuous_chunk_loss_function(
+                    regimes=training_regimes,
                     k_arr=k_arr,
                     width=args.width,
                     horizon=chunk_length,
@@ -4006,7 +4227,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
             accumulated_grads = None
             accumulated_loss = 0.0
-            accumulated_regime = np.zeros((len(REGIMES),), dtype=np.float64)
+            accumulated_regime = np.zeros((len(training_regimes),), dtype=np.float64)
             completed = 0
             first_chunk = True
             failure_step = None
@@ -4093,6 +4314,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             case_batches = build_complete_trajectory_case_batches(
                 np.random.default_rng(args.seed + (3 if split == "train" else 4)),
                 grouped,
+                regimes=training_regimes,
                 split=split,
                 batch_size_per_regime=args.batch_size,
                 shuffle=False,
@@ -4109,6 +4331,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     manifest,
                     coefficient_key,
                     case_rows,
+                    regimes=training_regimes,
                     memory_steps=args.memory_steps,
                     memory_stride=args.memory_stride,
                     source_nx=source_nx,
@@ -4129,7 +4352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     )
                 values.append(value)
                 regime_values.append(per_regime)
-                weights.append(int(case_rows[REGIMES[0]].size))
+                weights.append(int(case_rows[training_regimes[0]].size))
             return (
                 float(np.average(values, weights=weights)),
                 np.average(np.asarray(regime_values), axis=0, weights=weights),
@@ -4264,6 +4487,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 training_steps = build_complete_trajectory_case_batches(
                     rng,
                     grouped,
+                    regimes=training_regimes,
                     split="train",
                     batch_size_per_regime=args.batch_size,
                     shuffle=True,
@@ -4279,6 +4503,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     epoch_window_selections = build_balanced_full_anchor_epoch(
                         rng,
                         anchors,
+                        regimes=training_regimes,
                         split="train",
                         batch_size_per_regime=args.batch_size,
                     )
@@ -4289,6 +4514,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         for selection in build_balanced_random_window_epoch(
                             rng,
                             anchors,
+                            regimes=training_regimes,
                             split="train",
                             batch_size_per_regime=args.batch_size,
                             deterministic_epoch=(
@@ -4320,6 +4546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         manifest,
                         coefficient_key,
                         step_selection,
+                        regimes=training_regimes,
                         memory_steps=args.memory_steps,
                         memory_stride=args.memory_stride,
                         source_nx=source_nx,
@@ -4384,6 +4611,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         anchors,
                         manifest,
                         coefficient_key,
+                        regimes=training_regimes,
                         split="train",
                         batch_size_per_regime=args.batch_size,
                         horizon=stage_horizon,
@@ -4408,7 +4636,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         device_count = int(args.data_parallel_devices)
                         regime_indices = np.asarray(batch["regime_index"])
                         per_device_indices = [[] for _ in range(device_count)]
-                        for regime_index in range(len(REGIMES)):
+                        for regime_index in (REGIMES.index(regime) for regime in training_regimes):
                             rows = np.flatnonzero(regime_indices == regime_index)
                             if rows.size % device_count:
                                 raise ValueError(
@@ -4758,6 +4986,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             coefficient_key,
             Path(args.reference_cache),
             outdir,
+            regimes=training_regimes,
             source_nx=source_nx,
             rollout_nx=args.rollout_Nx,
             domain_length=domain_length,
