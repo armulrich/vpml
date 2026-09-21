@@ -17,6 +17,8 @@ import sys
 import modal
 
 _path = Path(__file__).with_name("modal_burles_latent_fno.py")
+if not _path.is_file():
+    _path = Path("/root/vpml/model/train/modal_burles_latent_fno.py")
 _spec = importlib.util.spec_from_file_location("linear_pair_support", _path)
 assert _spec and _spec.loader
 _support = importlib.util.module_from_spec(_spec)
