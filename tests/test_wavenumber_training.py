@@ -54,6 +54,15 @@ class WavenumberTests(unittest.TestCase):
         singles=[float(live(p,{k:v[i:i+1] for k,v in b.items()})) for i in range(2)]
         self.assertAlmostEqual(float(lv),np.mean(singles),places=7)
 
+    def test_continuous_evaluation_chunk_parity(self):
+        from model.train.wavenumber_evaluation import rollout_factory,autonomous_case
+        c,b,s=tiny();p=initialize(c)
+        case=dict(case_id='small',domain_length=2*np.pi/.3,epsilon=.01)
+        a,z=autonomous_case(p,case,b['initial'][0],c,rollout_factory(c,s,2),horizon=.1,chunk_steps=2)
+        full,_=autonomous_case(p,case,b['initial'][0],c,rollout_factory(c,s,4),horizon=.1,chunk_steps=4)
+        np.testing.assert_allclose(a,full,rtol=1e-6,atol=1e-8)
+        self.assertEqual(a.shape,(5,3,16))
+
     def test_exact_resume_and_overwrite_refusal(self):
         c,b,s=tiny();p=initialize(c);o=base._adam_init(p);step=update_factory(c,s)
         p,o,*rest=step(p,o,b,.001);self.assertTrue(bool(rest[-1]))

@@ -1,0 +1,62 @@
+{
+  "compile_and_first_update_seconds": 58.051549124,
+  "config": {
+    "depth": 8,
+    "detach_preparation": false,
+    "dt": 0.025,
+    "final_learning_rate": 1e-05,
+    "horizon": 400,
+    "latent_dim": 6,
+    "learning_rate": 0.001,
+    "memory_steps": 50,
+    "memory_stride": 4,
+    "modes": 32,
+    "nx": 128,
+    "planned_epochs": 1000,
+    "preparation_steps": 200,
+    "seed": 1729,
+    "weight_decay": 0.0001,
+    "width": 64
+  },
+  "detached_loss": 60.25755310058594,
+  "devices": [
+    "cuda:0"
+  ],
+  "grad_norm": 149.76072692871094,
+  "initial_parameter_sha256": "48e5607c405d7559e4788d8706dc98c46ad98bc9eb00192e06f84acb9b3c66ab",
+  "initializer_gradient": 0.05240224301815033,
+  "loss_after": 47.73198699951172,
+  "loss_before": 60.25749969482422,
+  "manifest_sha256": "0c1179a2a2be17961e4eca157e6cceb7b42ab5746996907fdfada0c5c86f8fa6",
+  "memory_stats": {
+    "bytes_in_use": 183972864,
+    "bytes_limit": 63821119488,
+    "bytes_reserved": 0,
+    "largest_alloc_size": 4691450112,
+    "largest_free_block_bytes": 0,
+    "num_allocs": 773769,
+    "peak_bytes_in_use": 4918673664,
+    "peak_bytes_reserved": 0,
+    "peak_pool_bytes": 63821119488,
+    "pool_bytes": 63821119488
+  },
+  "pilot_hours": 0.038194686218611114,
+  "projected_dollars_excluding_reserve": 807.2144722622344,
+  "projected_dollars_with_reserve": 1018.6573667146812,
+  "reference_benchmark": {
+    "compile_seconds": 6.902447093000006,
+    "nv": 8192,
+    "nx": 1024,
+    "seconds": 1.9365249680000147,
+    "seconds_per_step": 0.19365249680000146,
+    "steps": 10
+  },
+  "reference_hours": 137.49327272800102,
+  "resume_bitwise": true,
+  "source_sha256": "d64da671c08316f7bc43ace5dcc96e1c052614e8e6265f2072969540e9ee1e94",
+  "status": "pilot_complete",
+  "training_E20_hours": 76.89956530617772,
+  "update_norm": 1.6240889387436364,
+  "update_seconds": 6.012998155999995,
+  "within_budget": false
+}

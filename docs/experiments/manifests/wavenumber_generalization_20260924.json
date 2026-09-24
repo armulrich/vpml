@@ -1,0 +1,6984 @@
+{
+  "anchor_spacing": 0.2,
+  "anchors_per_case": 526,
+  "cases": [
+    {
+      "case_id": "linear_landau_ic00",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.005647109827076616,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.03257195219618899,
+        0.07185777630341715,
+        0.41492644200010853,
+        -0.9064279208210589
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        2.4764051521393804,
+        1.947563171037829,
+        6.103455337937088
+      ],
+      "shape_normalization": 0.729615433248883,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic01",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.005802776526620381,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.5646589430607561,
+        0.021577512811949036,
+        -0.7311132187721447,
+        -0.3823194348957346
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        3.313507989884986,
+        2.7603439622466546,
+        0.25529356321489516
+      ],
+      "shape_normalization": 0.6091955490768605,
+      "split": "heldout"
+    },
+    {
+      "case_id": "linear_landau_ic02",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.006863111914714365,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.4405316190481576,
+        0.1013780994416198,
+        0.42535259212350224,
+        -0.7840469028994576
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        0.14427080738460063,
+        4.639713521029892,
+        1.3111537746351942
+      ],
+      "shape_normalization": 0.6694923597313321,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic03",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.007811346161158429,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.013607540428339965,
+        0.5450099351384894,
+        0.040545178830108365,
+        0.8373381001229223
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        2.639157978852957,
+        2.2625420145685453,
+        2.4085504896701124
+      ],
+      "shape_normalization": 0.6992329997010174,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic04",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.008112546774257655,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.5859200739942144,
+        -0.4824874099803537,
+        0.27709858411963584,
+        0.5891688559148028
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        5.629118241124916,
+        3.213970310419702,
+        5.863305197938504
+      ],
+      "shape_normalization": 0.9233523198405411,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic05",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.008974268509594974,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.4408819379912131,
+        0.035642334612637355,
+        0.5118928644209457,
+        -0.7364227292061212
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        5.174995355699763,
+        5.645495430819782,
+        4.761240746151833
+      ],
+      "shape_normalization": 0.7072033508226496,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic06",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.00996735681311247,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.30871359250203834,
+        0.8181330597062619,
+        -0.13857671357857781,
+        -0.46492011020595403
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        0.8535937525351383,
+        3.6770388892441925,
+        4.257047079965755
+      ],
+      "shape_normalization": 0.595369381116868,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic07",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.010445974534977072,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.09716240346439517,
+        0.6878769195374884,
+        0.1745480658121245,
+        0.6977949438351384
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        1.199908376278282,
+        5.077060065159866,
+        4.419322038223028
+      ],
+      "shape_normalization": 0.7150670243985072,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic08",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.011606315192825267,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.06699916906894436,
+        0.5611872485395024,
+        0.08236302163399083,
+        0.8208509706932511
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        2.505198241441349,
+        1.2377999249843228,
+        0.3935439308039399
+      ],
+      "shape_normalization": 0.7700907418716749,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic09",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.012023369197551585,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.26620130612210385,
+        -0.937488300129968,
+        0.16147516100627402,
+        -0.15549380732462234
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        4.86856063376541,
+        5.6990480709583995,
+        3.8284298140058617
+      ],
+      "shape_normalization": 0.7813823717197713,
+      "split": "heldout"
+    },
+    {
+      "case_id": "linear_landau_ic10",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.013165977378049545,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.05713441375198052,
+        0.5522565530867621,
+        -0.15609491002158712,
+        0.8169349652226292
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        1.705933542040862,
+        0.8395187082665281,
+        2.1037538871128625
+      ],
+      "shape_normalization": 0.7025103444149539,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic11",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.013495326098821262,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.4203498640538041,
+        0.5773038327993032,
+        -0.4723781567834867,
+        -0.5166092850685305
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        5.27259527944739,
+        0.5625028303796871,
+        5.407101339665353
+      ],
+      "shape_normalization": 0.7291428056857286,
+      "split": "heldout"
+    },
+    {
+      "case_id": "linear_landau_ic12",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.0143588058245065,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.48102519973438257,
+        0.7326539961311066,
+        -0.3816823761391954,
+        0.2935156604311865
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        0.9005214381366262,
+        5.8696138045491235,
+        5.1877488262260405
+      ],
+      "shape_normalization": 0.7002465290668363,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic13",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.01492278395131734,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.4614418723328319,
+        -0.25451481553022864,
+        -0.8102862464402552,
+        0.2563782478357831
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        1.5452423669050097,
+        5.187080324950528,
+        3.1367055434326807
+      ],
+      "shape_normalization": 0.6820002703507461,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic14",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.015817748235413813,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.7814899630767267,
+        0.12369895864397965,
+        -0.49764355419766637,
+        -0.3554193272829232
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        0.5621785341246293,
+        5.479338326252432,
+        3.566830533592075
+      ],
+      "shape_normalization": 0.7631782665462146,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic15",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.016842744659349526,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.109875573619478,
+        0.9269249891595155,
+        0.13211765768540823,
+        0.3335900887633566
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        0.3736406244712924,
+        2.8328143786258932,
+        5.669984448122388
+      ],
+      "shape_normalization": 0.8131249998921084,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic16",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.017656016583394992,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.678862393318892,
+        0.2691831851224828,
+        -0.2070242821136034,
+        -0.6510201305643386
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        3.2931581044360962,
+        5.3745411539095,
+        0.6231428670486725
+      ],
+      "shape_normalization": 0.6049793996803977,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic17",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.01804692225699585,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.37519936464021164,
+        -0.5920644241177004,
+        -0.5338377846625671,
+        -0.47297185342715664
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        3.0386641353352606,
+        3.7517129500985753,
+        1.431530037898801
+      ],
+      "shape_normalization": 0.6996652970742081,
+      "split": "heldout"
+    },
+    {
+      "case_id": "linear_landau_ic18",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.01898090533137892,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.26813759912214585,
+        0.32747491746428764,
+        -0.6238875450101027,
+        0.6569830572777631
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        5.232101839164851,
+        1.75927073526422,
+        0.5576163674295511
+      ],
+      "shape_normalization": 0.8383545255454687,
+      "split": "train"
+    },
+    {
+      "case_id": "linear_landau_ic19",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.01983849187812404,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.20814518023350256,
+        -0.4309203869150488,
+        0.8240542728335368,
+        0.3031794180206469
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0,
+        5.401970045374824,
+        0.3180283302615958,
+        1.7410316726302817
+      ],
+      "shape_normalization": 0.7258310619933683,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic00",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.025424564626379372,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.205786699652856,
+        -0.10090356460651022,
+        0.6237840595976974,
+        -0.7472374133349463
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        3.338188969566221,
+        1.782767869713302,
+        1.9210293193643402
+      ],
+      "shape_normalization": 0.6860209348785856,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic01",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.029604861918822216,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.37822251516823274,
+        -0.5655722754449197,
+        -0.4502561110320059,
+        -0.5782258769254502
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        4.217023251568487,
+        1.6433580250543587,
+        0.1097387454874783
+      ],
+      "shape_normalization": 0.7546378138408525,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic02",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.04232191373186801,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.3067622338483558,
+        0.35474888309485764,
+        -0.5624182809861277,
+        -0.6809815262104596
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        0.2866680947026117,
+        5.860494277762127,
+        0.1816024560704399
+      ],
+      "shape_normalization": 0.660506278679901,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic03",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.05218084880785606,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.8354608949672705,
+        0.03364280909462798,
+        -0.5182264252534191,
+        -0.17976269508931064
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        4.9843493915113575,
+        3.9682424402489893,
+        3.828999713963235
+      ],
+      "shape_normalization": 0.7730340413155772,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic04",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.06106661744691175,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.16562668742139108,
+        -0.21118457165202487,
+        -0.6656316421830625,
+        -0.6963500513640011
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        3.3317688693320395,
+        3.8775109180837664,
+        0.994055956548145
+      ],
+      "shape_normalization": 0.716187543992076,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic05",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.06563725490477901,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.4822330446439031,
+        -0.21184260826824572,
+        -0.8338823757833416,
+        0.16496721896639893
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        0.48550016043898325,
+        5.107903889281604,
+        0.3527189263895565
+      ],
+      "shape_normalization": 0.7147942200242685,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic06",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.07526816052344433,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.028080512082952334,
+        0.6581952028210997,
+        0.46767031553582566,
+        -0.5893004630840468
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        1.6632398703610418,
+        2.3338462010386416,
+        3.8089726281752485
+      ],
+      "shape_normalization": 0.6818243788343241,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic07",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.08455214917914367,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.24420628221950158,
+        0.7373401781538206,
+        -0.555400997772348,
+        0.29702270128409625
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        1.191689834074527,
+        3.6064778267245927,
+        4.2996857685175875
+      ],
+      "shape_normalization": 0.6550879074551582,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic08",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.09754017438311392,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.8101404175056155,
+        0.25769622126852043,
+        0.053171003130646294,
+        0.5238683096865407
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        2.94439330241726,
+        4.097055885224728,
+        2.49695387929383
+      ],
+      "shape_normalization": 0.6360244507498746,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic09",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.10978147683183063,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.5143546877133686,
+        -0.3909120515246009,
+        0.7553087431672617,
+        0.11016226983501375
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        3.6548072697161293,
+        0.9103234004051224,
+        2.6879677446241637
+      ],
+      "shape_normalization": 0.6066261796300354,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic10",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.1167586081476288,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.8663225906538828,
+        -0.3684224824401716,
+        0.10746280221051878,
+        -0.319690146073396
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        3.6037558487753003,
+        5.799623154457393,
+        4.9054230985407585
+      ],
+      "shape_normalization": 0.6744114856335556,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic11",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.12038600320866692,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.32888104922530725,
+        -0.3603308023206679,
+        0.0725961326924719,
+        0.8699015863173845
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        2.6605247189572996,
+        3.9304753296213897,
+        3.7276648320510652
+      ],
+      "shape_normalization": 0.7450905749332074,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic12",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.1297932088496211,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.10382737397311982,
+        -0.16375815016296874,
+        0.41313796826612814,
+        -0.8897865833142149
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        5.401956213422598,
+        1.6247629888463857,
+        0.684653849476617
+      ],
+      "shape_normalization": 0.8227057385261688,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic13",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.14165900229656592,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.8112463132735281,
+        -0.4133330438440858,
+        -0.32244462156857645,
+        0.2589684924622861
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        0.1869149264556631,
+        0.2775949592228155,
+        0.6367759459513316
+      ],
+      "shape_normalization": 0.856877405543078,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic14",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.14833711396257965,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.7770550254590829,
+        -0.2571639856575445,
+        -0.2979765655468665,
+        0.4911844238922934
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        5.104291568421768,
+        3.1302509326883836,
+        1.0876759809339482
+      ],
+      "shape_normalization": 0.6633351520807897,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic15",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.16213209310486845,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.2289067236125801,
+        -0.6882240471505833,
+        0.6883740155068135,
+        0.009517750976517175
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        2.909262667524223,
+        1.1745760087803907,
+        3.2167891984398924
+      ],
+      "shape_normalization": 0.7360164817374767,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic16",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.1724484441788667,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.5347218840820452,
+        0.7030921751229565,
+        -0.4686411401999673,
+        0.01045856953374389
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        1.0481577139949403,
+        4.183047297518305,
+        2.259754056073149
+      ],
+      "shape_normalization": 0.6077824676157662,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic17",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.17810013250374254,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.19161548600241168,
+        -0.6843438272453098,
+        0.7019928509650069,
+        0.04650880378297125
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        6.257711630681885,
+        0.9881991625294795,
+        5.721201298333639
+      ],
+      "shape_normalization": 0.6992641022632062,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic18",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.19093713149266442,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.696979112773161,
+        0.3468962295364108,
+        -0.42828918683662787,
+        0.458749926136429
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        1.744823932247277,
+        4.1532005019546165,
+        1.3836527013851025
+      ],
+      "shape_normalization": 0.581832013559329,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_weak_ic19",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.19995856529171419,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.2677561369216959,
+        -0.24455441327191002,
+        0.18137486778835693,
+        -0.914113202740644
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0,
+        1.2274034119179729,
+        3.8030209972638143,
+        5.259185676411715
+      ],
+      "shape_normalization": 0.6908590517626106,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic00",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.2008709762740328,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.46837871356228783,
+        -0.827487028181886,
+        0.17398783674540833,
+        0.25615392157275274
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        2.882618134771639,
+        3.1044244251911213,
+        4.034147316048651
+      ],
+      "shape_normalization": 0.7836418179964141,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic01",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.2343159667340778,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.3584892540602001,
+        -0.27865542809109556,
+        -0.7398681880778688,
+        -0.4964188467303604
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        1.3424305104975258,
+        3.5391364880621965,
+        4.210959440875223
+      ],
+      "shape_normalization": 0.6399110578134752,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic02",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.2493549932119583,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.45764827689922066,
+        -0.04270857129954789,
+        -0.17503610757847213,
+        0.8706873110551819
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        6.028007568733813,
+        0.5040349400320432,
+        2.6938652950040183
+      ],
+      "shape_normalization": 0.7505076955423459,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic03",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.27736515363033964,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.46007677752240894,
+        -0.6465926431736335,
+        0.5980884981423182,
+        0.1119708040883708
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        4.611221766676977,
+        0.46928789372359603,
+        3.179531109007778
+      ],
+      "shape_normalization": 0.7265474468995974,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic04",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.2928091736191938,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.5770490459542268,
+        -0.6609420243098041,
+        0.23844675361785553,
+        -0.4163090015285292
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        2.9018296454587222,
+        5.5026384899006615,
+        0.7722426311392727
+      ],
+      "shape_normalization": 0.7716110159274799,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic05",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.3211269882119103,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.3205403291588892,
+        0.8051500380449416,
+        -0.49785414789537624,
+        -0.033594062605006136
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        3.3013286547630694,
+        3.694413009540183,
+        1.952945819809047
+      ],
+      "shape_normalization": 0.6185525843884297,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic06",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.3441613211842252,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.968949160612064,
+        -0.024105172097197283,
+        -0.07536690972540913,
+        -0.23425689690120813
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        0.35130508931417204,
+        1.5317744382943435,
+        6.132699580956356
+      ],
+      "shape_normalization": 0.8148505315701638,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic07",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.37443589219903683,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.11912759820155895,
+        -0.9420452865198508,
+        -0.10195592347918359,
+        -0.29658773265252736
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        4.530036163100314,
+        4.938660754383131,
+        3.773405626448838
+      ],
+      "shape_normalization": 0.7499264221062154,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic08",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.3958197385613883,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.5526602366689471,
+        -0.2560747140285215,
+        -0.24981978641424182,
+        0.7527167315505727
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        2.5474358121196063,
+        5.0163178153594785,
+        4.628487956235403
+      ],
+      "shape_normalization": 0.5678895618694625,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic09",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.4123998380659198,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.44974558514227303,
+        -0.7972278879180752,
+        -0.40264234475164346,
+        -0.0059787610437399274
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        4.514899864012348,
+        3.987668164392291,
+        2.3192630346031144
+      ],
+      "shape_normalization": 0.6838632688534958,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic10",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.44361501259748803,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.07002000955559286,
+        0.1594938994502659,
+        -0.8373761386177536,
+        0.5181313508885599
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        0.5964585997432552,
+        0.48806863890991714,
+        1.4813802451072036
+      ],
+      "shape_normalization": 0.6675398974070748,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic11",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.453647345449457,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.10983839341692203,
+        0.9731412046076544,
+        -0.11685078109161348,
+        0.16515937207628448
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        4.3455508436307095,
+        0.0363753390419026,
+        2.0043912941543134
+      ],
+      "shape_normalization": 0.7659409867020992,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic12",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.48213285738056544,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.08489505877844343,
+        0.07670824112607914,
+        0.7970891080849738,
+        0.592922953266821
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        4.256961099904582,
+        2.4585958466199656,
+        5.279812292896979
+      ],
+      "shape_normalization": 0.7299079437122131,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic13",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.5105147166630782,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.27854978657911206,
+        0.6202732261516872,
+        0.5320044063162931,
+        0.5046210984254996
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        3.143763490109942,
+        0.4657877629653484,
+        3.1885433370871397
+      ],
+      "shape_normalization": 0.5263100610654436,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic14",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.5246855368110408,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.641488232443486,
+        -0.5095831843899086,
+        0.13603728105937668,
+        0.5570562664449118
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        5.860791959482238,
+        3.7128761987089973,
+        4.462215807344995
+      ],
+      "shape_normalization": 0.7060671890919846,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic15",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.5445342591903581,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.5976680073724812,
+        0.5442231420571302,
+        -0.45651060188697923,
+        0.37176900755396564
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        1.9444382350851512,
+        6.208979522772271,
+        5.872448156570108
+      ],
+      "shape_normalization": 0.8329304085590703,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic16",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.567034434536402,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        -0.9296666132822626,
+        0.07908822357621438,
+        0.3561987173883869,
+        0.05086762006143694
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        3.406630616827394,
+        0.9222536450256955,
+        5.067502183097818
+      ],
+      "shape_normalization": 0.9047319548070281,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic17",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.5900163369598483,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.8932163420083961,
+        -0.08819103426224119,
+        0.3266488021432151,
+        -0.2961206982014244
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        3.4896695169273855,
+        5.696735529220959,
+        4.053060557659837
+      ],
+      "shape_normalization": 0.6921391106262559,
+      "split": "heldout"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic18",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.6262272531214246,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.6009830588574614,
+        0.6161243029158503,
+        -0.1495155917213078,
+        -0.4866778135019244
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        3.878312703118021,
+        4.1953414671131295,
+        2.179552228132934
+      ],
+      "shape_normalization": 0.5731171972812206,
+      "split": "train"
+    },
+    {
+      "case_id": "nonlinear_landau_strong_ic19",
+      "domain_length": 12.566370614359172,
+      "epsilon": 0.6308345568961061,
+      "family": "mixture",
+      "fundamental": 0.5,
+      "mode_weights": [
+        0.5353923742421975,
+        -0.6456463429627168,
+        0.5196440205095004,
+        0.16268342684764903
+      ],
+      "modes": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "panel": "original",
+      "provenance": "original",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0,
+        4.558147436624048,
+        0.07052527063787695,
+        0.5226499345298468
+      ],
+      "shape_normalization": 0.6804943254951833,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_train_01",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.25
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_train_02",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.5
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_train_03",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.75
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_train_04",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.0
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_train_05",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.7939504470452664,
+        1.0762519098518086
+      ],
+      "modes": [
+        0.25,
+        0.75
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        5.104283038043147,
+        6.134627650508636
+      ],
+      "shape_normalization": 0.534701497039678,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_train_06",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.4158917151276609,
+        0.8600432317365586,
+        0.5532312745027682
+      ],
+      "modes": [
+        0.25,
+        0.5,
+        0.75
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        1.0147425043096026,
+        1.6558776108254925,
+        4.31189317028241
+      ],
+      "shape_normalization": 0.35346102765104526,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_0_familiar_domain_00",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0100083270510987,
+        1.4469638122966182,
+        0.6357901954091968,
+        0.8662405314344498
+      ],
+      "modes": [
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        2.0384532468954224,
+        1.4136921913990441,
+        4.371430286565556,
+        4.099775970473626
+      ],
+      "shape_normalization": 0.2525888547693877,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k025_1_train_01",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.25
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_1_train_02",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.5
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_1_train_03",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.75
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_1_train_04",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.0
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_1_train_05",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.5606237804583384,
+        1.0301321230484919,
+        0.8628324815329642,
+        0.8845182232058272
+      ],
+      "modes": [
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        4.1251343482495715,
+        2.1000253567016918,
+        1.2563084574190464,
+        3.036601035690051
+      ],
+      "shape_normalization": 0.29957101955037946,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_1_train_06",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.997835870664793,
+        0.8926547145035117
+      ],
+      "modes": [
+        0.5,
+        0.75
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        6.245321065983422,
+        4.3160696006077
+      ],
+      "shape_normalization": 0.528963226712379,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_1_familiar_domain_00",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.9082762893930764,
+        0.5897292423716923,
+        1.1672754362427957,
+        1.2965967673139633
+      ],
+      "modes": [
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        3.8789870815159038,
+        3.6283560203394107,
+        1.62404955694822,
+        4.467095427174778
+      ],
+      "shape_normalization": 0.2524055679670904,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k025_2_train_01",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.25
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_2_train_02",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.5
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_2_train_03",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.75
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_2_train_04",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.25,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.0
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_2_train_05",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.5606266651080624,
+        0.5338039151504433,
+        0.5855503633841878
+      ],
+      "modes": [
+        0.25,
+        0.75,
+        1.0
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        4.9420479955772345,
+        5.69888969935499,
+        3.611920956230031
+      ],
+      "shape_normalization": 0.5952448471419596,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_2_train_06",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.9022588190084334,
+        1.070608638842996,
+        0.6940837103587363,
+        0.9530298407925882
+      ],
+      "modes": [
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        1.2377605214404097,
+        5.7740411280674095,
+        4.904653076061301,
+        4.059812696662593
+      ],
+      "shape_normalization": 0.27624454313794417,
+      "split": "train"
+    },
+    {
+      "case_id": "k025_2_familiar_domain_00",
+      "domain_length": 25.132741228718345,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.25,
+      "mode_weights": [
+        0.5105371624705426,
+        0.5433883553675083,
+        0.6471862146765697,
+        1.4973897441042985
+      ],
+      "modes": [
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.4851951918720084,
+        3.67954286909803,
+        3.561474570023711,
+        5.463648841948936
+      ],
+      "shape_normalization": 0.3126464087354691,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k027_0_train_01",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.27
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_0_train_02",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.54
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_0_train_03",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.81
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_0_train_04",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_0_train_05",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.8733727937428569,
+        0.9730632583515703
+      ],
+      "modes": [
+        0.54,
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        1.8385374296861867,
+        5.597844447161154
+      ],
+      "shape_normalization": 0.5415838793147978,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_0_train_06",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.934649186471939,
+        0.8003964395839764,
+        0.7678345353288537
+      ],
+      "modes": [
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        5.862719996915728,
+        3.9898747172218227,
+        4.898808069066458
+      ],
+      "shape_normalization": 0.39953970446860293,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_0_familiar_domain_00",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.6153144073970762,
+        0.8184552320733851,
+        0.7684224933758302,
+        1.4458932810643943
+      ],
+      "modes": [
+        0.27,
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        2.42351820963486,
+        2.9379963088958903,
+        4.256032317025603,
+        0.9369951249651413
+      ],
+      "shape_normalization": 0.27411638888356427,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k027_1_train_01",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.27
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_1_train_02",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.54
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_1_train_03",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.81
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_1_train_04",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_1_train_05",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0669347286918436,
+        0.9898123471550249,
+        1.2896883959867984,
+        0.9211616304324779
+      ],
+      "modes": [
+        0.27,
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.1882747502744415,
+        5.983351283097273,
+        0.11742942981546325,
+        1.9802742358494845
+      ],
+      "shape_normalization": 0.2343239007892728,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_1_train_06",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.5292345290305415,
+        0.9105828684159902
+      ],
+      "modes": [
+        0.27,
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        4.056027577714614,
+        0.8615255768258663
+      ],
+      "shape_normalization": 0.6945325162575939,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_1_familiar_domain_00",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.288597715321587,
+        0.6763910448395352,
+        1.2295974509614938,
+        0.8173542520550151
+      ],
+      "modes": [
+        0.27,
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        5.318246600814402,
+        1.1822045543608906,
+        4.569697438715073,
+        0.8019677368950525
+      ],
+      "shape_normalization": 0.2492559421502373,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k027_2_train_01",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.27
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_2_train_02",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.54
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_2_train_03",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.81
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_2_train_04",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.27,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_2_train_05",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.7333839317893409,
+        0.8194179782529843,
+        0.5443048168751828
+      ],
+      "modes": [
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        1.215359618800853,
+        2.8854022505119055,
+        5.376686718499264
+      ],
+      "shape_normalization": 0.47684745233251835,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_2_train_06",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.7821004547043342,
+        0.5791254926926638,
+        1.396164578167121,
+        1.4840971608687463
+      ],
+      "modes": [
+        0.27,
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        3.202094468760676,
+        2.0067692129018857,
+        2.4473383926307495,
+        1.0663549301605098
+      ],
+      "shape_normalization": 0.23576633340199799,
+      "split": "train"
+    },
+    {
+      "case_id": "k027_2_familiar_domain_00",
+      "domain_length": 23.271056693257727,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.27,
+      "mode_weights": [
+        0.9241108964603492,
+        0.7135104307132032,
+        0.7194043313037811,
+        0.5217985539006382
+      ],
+      "modes": [
+        0.27,
+        0.54,
+        0.81,
+        1.08
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.633151398023536,
+        1.3040455950949492,
+        1.8625706528657213,
+        0.24561529533444518
+      ],
+      "shape_normalization": 0.3473640369218578,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k031_0_train_01",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.31
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_0_train_02",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.62
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_0_train_03",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.9299999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_0_train_04",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_0_train_05",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.1127003437076604,
+        1.2500812447040124
+      ],
+      "modes": [
+        0.62,
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.612147353918823,
+        1.4790647506485948
+      ],
+      "shape_normalization": 0.4232299781344698,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_0_train_06",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.4251191541209631,
+        0.8930853802196462,
+        1.3090195458489502
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        3.886829311661187,
+        1.7592553034983014,
+        0.34446564052834333
+      ],
+      "shape_normalization": 0.27569292050678595,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_0_familiar_domain_00",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0630244364740182,
+        1.0372052291348577,
+        0.7764236944444182,
+        1.4366594567663524
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        0.9299999999999999,
+        1.24
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.799317158930433,
+        1.5122532814020795,
+        3.426490993059776,
+        4.321085173972139
+      ],
+      "shape_normalization": 0.23184036087077364,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k031_1_train_01",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.31
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_1_train_02",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.62
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_1_train_03",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.9299999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_1_train_04",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_1_train_05",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.1622095772364225,
+        0.7781440077988183,
+        1.3067628457349452,
+        0.8138024601213429
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        0.9299999999999999,
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        5.226328754749919,
+        5.7299695472878245,
+        0.44804869778186923,
+        2.7959519252618836
+      ],
+      "shape_normalization": 0.2462496855681994,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_1_train_06",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0772902182480824,
+        1.3602893769827964
+      ],
+      "modes": [
+        0.9299999999999999,
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        6.181690477488759,
+        4.24208939052416
+      ],
+      "shape_normalization": 0.41024301399490654,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_1_familiar_domain_00",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.2395640146647209,
+        0.7795500464312082,
+        0.833942395816526,
+        0.5355216375256414
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        0.9299999999999999,
+        1.24
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.11662488995310748,
+        4.46911683928261,
+        1.1108244715212112,
+        0.738389133796081
+      ],
+      "shape_normalization": 0.2951090316145784,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k031_2_train_01",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.31
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_2_train_02",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.62
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_2_train_03",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.9299999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_2_train_04",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.31,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_2_train_05",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        0.6822557155128766,
+        1.2478421405318358,
+        1.4875063236048587
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        0.9299999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.8037895673452353,
+        5.704945616603703,
+        2.7455700627816797
+      ],
+      "shape_normalization": 0.2926026384080957,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_2_train_06",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        0.703609301599086,
+        0.6915251591938975,
+        1.3746461316964438,
+        1.3315323225481785
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        0.9299999999999999,
+        1.24
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.010708359395224,
+        2.3340060023671687,
+        2.341619823006967,
+        1.306220168415313
+      ],
+      "shape_normalization": 0.24382436081223294,
+      "split": "train"
+    },
+    {
+      "case_id": "k031_2_familiar_domain_00",
+      "domain_length": 20.26833970057931,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.31,
+      "mode_weights": [
+        0.608181007718527,
+        0.7985973960642735,
+        1.2711685348641004,
+        0.6493728574894049
+      ],
+      "modes": [
+        0.31,
+        0.62,
+        0.9299999999999999,
+        1.24
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.547763425796403,
+        5.389368236244239,
+        2.8017264849758123,
+        4.864494235696454
+      ],
+      "shape_normalization": 0.3005421965033848,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k033_0_train_01",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.33
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_0_train_02",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.66
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_0_train_03",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.99
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_0_train_04",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_0_train_05",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.1621949944003678,
+        0.9387178532528728
+      ],
+      "modes": [
+        0.66,
+        0.99
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.584598839113895,
+        3.7886895878357167
+      ],
+      "shape_normalization": 0.47598357119716744,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_0_train_06",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.243750054612089,
+        1.4338489162926051,
+        0.8478358722300615
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.7874084919078973,
+        0.8806018591199989,
+        4.681102261756052
+      ],
+      "shape_normalization": 0.2836529519038898,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_0_familiar_domain_00",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0147176285144104,
+        1.4041044065769706,
+        0.7964828216509827,
+        0.9598590442929088
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        0.99,
+        1.32
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        6.202025425348956,
+        6.245343481511582,
+        2.4355940067787825,
+        0.2316933161438628
+      ],
+      "shape_normalization": 0.23951155540314004,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k033_1_train_01",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.33
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_1_train_02",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.66
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_1_train_03",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.99
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_1_train_04",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_1_train_05",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        0.6987847335829777,
+        0.6543700429839786,
+        0.7344189469914926,
+        0.8346109197241658
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        0.99,
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.342841833800849,
+        5.251698840884477,
+        4.120744789734486,
+        3.320287381741325
+      ],
+      "shape_normalization": 0.3422097239128111,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_1_train_06",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        0.7450329535833232,
+        1.3888882800017615
+      ],
+      "modes": [
+        0.66,
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        4.073483393760181,
+        3.090922464377668
+      ],
+      "shape_normalization": 0.4686208582872361,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_1_familiar_domain_00",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.4477849413396235,
+        0.6668843695751646,
+        1.0882725378120894,
+        1.264536432685576
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        0.99,
+        1.32
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        5.622967722129835,
+        5.4519939451768655,
+        3.5008283313582,
+        0.02729197347616066
+      ],
+      "shape_normalization": 0.22383992422764198,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k033_2_train_01",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.33
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_2_train_02",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.66
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_2_train_03",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.99
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_2_train_04",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_2_train_05",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.4788491045296381,
+        0.8715099622009816,
+        0.9785568845900657
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.6659753691198999,
+        2.227570212563636,
+        3.253085443465204
+      ],
+      "shape_normalization": 0.3003980919383887,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_2_train_06",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        0.8728624794021231,
+        1.0573830159581985,
+        0.7454775088596899,
+        0.5962672571967217
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        0.99,
+        1.32
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        6.270393145214471,
+        4.776287711819227,
+        0.39758650505168264,
+        1.3409860839009864
+      ],
+      "shape_normalization": 0.305624381524599,
+      "split": "train"
+    },
+    {
+      "case_id": "k033_2_familiar_domain_00",
+      "domain_length": 19.039955476301774,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.33,
+      "mode_weights": [
+        1.4159654664113153,
+        1.4127785485794528,
+        0.5414204841875397,
+        1.443745188582617
+      ],
+      "modes": [
+        0.33,
+        0.66,
+        0.99,
+        1.32
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.6811862762950771,
+        0.6801086604119368,
+        0.8809127565200726,
+        3.1446619836298106
+      ],
+      "shape_normalization": 0.20773135867971096,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k037_0_train_01",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.37
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_0_train_02",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.74
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_0_train_03",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.1099999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_0_train_04",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_0_train_05",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0248139646763315,
+        1.0050249409423224
+      ],
+      "modes": [
+        0.74,
+        1.1099999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        1.6430603241045887,
+        5.840990394783017
+      ],
+      "shape_normalization": 0.4926499325793641,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_0_train_06",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        0.8532960426952654,
+        0.9517504753542997,
+        0.7545846623698785
+      ],
+      "modes": [
+        0.74,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.38505987371744405,
+        2.320570607606357,
+        5.72426074190949
+      ],
+      "shape_normalization": 0.39068128551088027,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_0_familiar_domain_00",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        0.5320673394378519,
+        0.6987156631873092,
+        0.6807838698737249,
+        1.1169596104377595
+      ],
+      "modes": [
+        0.37,
+        0.74,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.6585201992788251,
+        1.8584886572285717,
+        2.648604894451278,
+        5.934136255859855
+      ],
+      "shape_normalization": 0.3301935794962369,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k037_1_train_01",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.37
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_1_train_02",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.74
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_1_train_03",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.1099999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_1_train_04",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_1_train_05",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.4043737180007958,
+        0.8251844515593151,
+        1.400144896045703,
+        0.7737601335610825
+      ],
+      "modes": [
+        0.37,
+        0.74,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.50308224343145,
+        5.620390787602428,
+        4.500259700180956,
+        2.459843549346961
+      ],
+      "shape_normalization": 0.22709398370564168,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_1_train_06",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        0.9438535340034732,
+        0.5313289710587845
+      ],
+      "modes": [
+        0.37,
+        1.1099999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.30013495285561,
+        5.8773705979436075
+      ],
+      "shape_normalization": 0.6778822258048652,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_1_familiar_domain_00",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.2765130475915887,
+        0.5906176254580185,
+        0.6285324064146424,
+        1.1922464971926523
+      ],
+      "modes": [
+        0.37,
+        0.74,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        1.4604655332620513,
+        1.7711412402159072,
+        0.10210701769570431,
+        3.780267802411339
+      ],
+      "shape_normalization": 0.27115632290163205,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k037_2_train_01",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.37
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_2_train_02",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.74
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_2_train_03",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.1099999999999999
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_2_train_04",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_2_train_05",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.0483724926805533,
+        0.8894296662338382,
+        1.2133252525678313
+      ],
+      "modes": [
+        0.37,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.5515656728714298,
+        1.5702110876586726,
+        1.5534382355965803
+      ],
+      "shape_normalization": 0.3173467363954101,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_2_train_06",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        1.325343931666528,
+        1.0140760796916757,
+        1.291780075707051,
+        0.8870685090199663
+      ],
+      "modes": [
+        0.37,
+        0.74,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        5.018314946913708,
+        4.324723597126736,
+        2.7155041815845555,
+        4.097016306285992
+      ],
+      "shape_normalization": 0.22132371698009132,
+      "split": "train"
+    },
+    {
+      "case_id": "k037_2_familiar_domain_00",
+      "domain_length": 16.98158191129618,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.37,
+      "mode_weights": [
+        0.9597611342496021,
+        0.5800596574726622,
+        1.4787367580990127,
+        0.5176541114920284
+      ],
+      "modes": [
+        0.37,
+        0.74,
+        1.1099999999999999,
+        1.48
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.0130161462192575,
+        2.5940533700250237,
+        4.4592320085460555,
+        4.698096021068963
+      ],
+      "shape_normalization": 0.2827885024361388,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k039_0_train_01",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.39
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_0_train_02",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.78
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_0_train_03",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.17
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_0_train_04",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.56
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_0_train_05",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        0.9441429279603312,
+        0.797841204599268
+      ],
+      "modes": [
+        0.39,
+        0.78
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.6110119590809875,
+        2.516206553769632
+      ],
+      "shape_normalization": 0.5740580418092796,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_0_train_06",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0369064736416518,
+        0.5067903935507071,
+        0.6699552737413228
+      ],
+      "modes": [
+        0.39,
+        0.78,
+        1.17
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.737626989004734,
+        2.9348775461900627,
+        2.5213741456310674
+      ],
+      "shape_normalization": 0.45174216016533497,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_0_familiar_domain_00",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        0.8739088964470832,
+        1.2643475484115019,
+        0.624085835225646,
+        0.8855940439328915
+      ],
+      "modes": [
+        0.39,
+        0.78,
+        1.17,
+        1.56
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        5.743685095198617,
+        5.587276254486143,
+        4.826293967050112,
+        2.1045568140305826
+      ],
+      "shape_normalization": 0.2741275919253974,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k039_1_train_01",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.39
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_1_train_02",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.78
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_1_train_03",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.17
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_1_train_04",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.56
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_1_train_05",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.2428829363556853,
+        0.642438642080883,
+        1.2174684590922902,
+        1.0003239587056223
+      ],
+      "modes": [
+        0.39,
+        0.78,
+        1.17,
+        1.56
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        3.5904562342455715,
+        5.571918380458555,
+        4.240322425505751,
+        1.5578622446914896
+      ],
+      "shape_normalization": 0.243717332961678,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_1_train_06",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        0.7953062672950347,
+        0.6447328073943908
+      ],
+      "modes": [
+        0.39,
+        0.78
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.103646863339778,
+        2.7163336870698696
+      ],
+      "shape_normalization": 0.694425601066187,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_1_familiar_domain_00",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        0.9169608016670767,
+        1.0082896665140635,
+        0.841016113539363,
+        1.0832875944587839
+      ],
+      "modes": [
+        0.39,
+        0.78,
+        1.17,
+        1.56
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        4.1653100275081325,
+        6.174255360337025,
+        4.231487115245519,
+        4.708615278109072
+      ],
+      "shape_normalization": 0.25977034072878225,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k039_2_train_01",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.39
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_2_train_02",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.78
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_2_train_03",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.17
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_2_train_04",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.56
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_2_train_05",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.3891023211403588,
+        0.735966991962799,
+        1.462475087392872
+      ],
+      "modes": [
+        0.39,
+        1.17,
+        1.56
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        5.646342783758607,
+        6.053550952409119,
+        5.118711645161575
+      ],
+      "shape_normalization": 0.27874219476189216,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_2_train_06",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.115405928193054,
+        0.7254450442350742,
+        1.181245119615175,
+        1.4243650995163564
+      ],
+      "modes": [
+        0.39,
+        0.78,
+        1.17,
+        1.56
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        4.2332347560104555,
+        2.9058037470908897,
+        2.540609250537555,
+        3.7046894576921368
+      ],
+      "shape_normalization": 0.22489794848501438,
+      "split": "train"
+    },
+    {
+      "case_id": "k039_2_familiar_domain_00",
+      "domain_length": 16.110731556870732,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.39,
+      "mode_weights": [
+        1.1984035444243153,
+        0.6529950556154321,
+        1.4518933859192564,
+        0.8832601823663155
+      ],
+      "modes": [
+        0.39,
+        0.78,
+        1.17,
+        1.56
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.09698103554604037,
+        2.451895349854204,
+        2.211850242578541,
+        1.55278280479461
+      ],
+      "shape_normalization": 0.23886003560777655,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k043_0_train_01",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.43
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_0_train_02",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.86
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_0_train_03",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.29
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_0_train_04",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_0_train_05",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        0.98986468771275,
+        1.463126270849298
+      ],
+      "modes": [
+        0.86,
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.016271248041179447,
+        5.596934617001914
+      ],
+      "shape_normalization": 0.40766558739629577,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_0_train_06",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.1225331094375663,
+        0.9420217838447065,
+        0.6014575523305535
+      ],
+      "modes": [
+        0.43,
+        0.86,
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        2.0314556444363965,
+        2.36325241041572,
+        3.4560328653955317
+      ],
+      "shape_normalization": 0.375092022411821,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_0_familiar_domain_00",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.4448716042447196,
+        0.6200351975420085,
+        1.0136414886161476,
+        0.5769658061516988
+      ],
+      "modes": [
+        0.43,
+        0.86,
+        1.29,
+        1.72
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        1.6894326378598934,
+        2.318104061855758,
+        4.379786937527576,
+        6.02535833428782
+      ],
+      "shape_normalization": 0.27355933354012457,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k043_1_train_01",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.43
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_1_train_02",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.86
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_1_train_03",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.29
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_1_train_04",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_1_train_05",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.4765572182275006,
+        1.3588306500406606,
+        0.7960016339377303,
+        1.2530657897729607
+      ],
+      "modes": [
+        0.43,
+        0.86,
+        1.29,
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.14443331607772256,
+        6.245433338048041,
+        5.822538293008384,
+        0.7316595160196439
+      ],
+      "shape_normalization": 0.2047311194847414,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_1_train_06",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.126510217408857,
+        0.8258259108449999
+      ],
+      "modes": [
+        0.43,
+        1.29
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        5.288918294526885,
+        0.9260431691351365
+      ],
+      "shape_normalization": 0.5122068815549639,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_1_familiar_domain_00",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        0.7811611240849518,
+        1.3766372625031429,
+        0.5976855895603311,
+        0.7425974900129897
+      ],
+      "modes": [
+        0.43,
+        0.86,
+        1.29,
+        1.72
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.0754358333608898,
+        3.2913888184288593,
+        1.7117419233827265,
+        2.8185958756035374
+      ],
+      "shape_normalization": 0.2858709866175129,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k043_2_train_01",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.43
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_2_train_02",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.86
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_2_train_03",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.29
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_2_train_04",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.43,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_2_train_05",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        0.922253432942574,
+        0.7188545893815486,
+        0.6402361051202691
+      ],
+      "modes": [
+        0.43,
+        1.29,
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.673836714682376,
+        1.8881020536542137,
+        6.2684702455996115
+      ],
+      "shape_normalization": 0.4383380779646867,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_2_train_06",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        0.5451978069342132,
+        1.1359535250548998,
+        1.1531989256709134,
+        1.3854806882243687
+      ],
+      "modes": [
+        0.43,
+        0.86,
+        1.29,
+        1.72
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.6567311986366096,
+        0.032026258999004575,
+        2.2341461405883094,
+        6.272276977269904
+      ],
+      "shape_normalization": 0.23697631796726382,
+      "split": "train"
+    },
+    {
+      "case_id": "k043_2_familiar_domain_00",
+      "domain_length": 14.612058853906015,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.43,
+      "mode_weights": [
+        0.9790237333565966,
+        0.6869178208687585,
+        1.0704136032114666,
+        1.3630514730464642
+      ],
+      "modes": [
+        0.43,
+        0.86,
+        1.29,
+        1.72
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        2.35372177952866,
+        0.44056576011156356,
+        0.46406772957452586,
+        2.183987188914127
+      ],
+      "shape_normalization": 0.24393774273671126,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k045_0_train_01",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.45
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_0_train_02",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.9
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_0_train_03",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.35
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_0_train_04",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_0_train_05",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.1332219449671905,
+        1.4076077843899755
+      ],
+      "modes": [
+        0.9,
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.7710283405358044,
+        5.324789216655247
+      ],
+      "shape_normalization": 0.3935722210921239,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_0_train_06",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0699066492880163,
+        0.7112483161788699,
+        0.5283354842774279
+      ],
+      "modes": [
+        0.45,
+        1.35,
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.85373658637207,
+        5.023024498105535,
+        6.24844890365898
+      ],
+      "shape_normalization": 0.4329959451058613,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_0_familiar_domain_00",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.25526992024778,
+        1.1497285736960068,
+        0.9812179466746301,
+        0.7036750289406571
+      ],
+      "modes": [
+        0.45,
+        0.9,
+        1.35,
+        1.8
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        3.015782892451112,
+        1.9347500062706458,
+        0.12484180655802161,
+        0.6493679263613935
+      ],
+      "shape_normalization": 0.2445052655902893,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k045_1_train_01",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.45
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_1_train_02",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.9
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_1_train_03",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.35
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_1_train_04",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_1_train_05",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        0.7752562567985679,
+        1.1205894587733687,
+        1.4610890827942655,
+        1.1624130958756795
+      ],
+      "modes": [
+        0.45,
+        0.9,
+        1.35,
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        1.8224227532616832,
+        4.0771548986992086,
+        4.12936915898762,
+        1.6209094626854192
+      ],
+      "shape_normalization": 0.2212708610625227,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_1_train_06",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        0.8285851742085105,
+        1.1155400830522515
+      ],
+      "modes": [
+        0.9,
+        1.35
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        5.440778467468268,
+        6.028698011686122
+      ],
+      "shape_normalization": 0.51437014989918,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_1_familiar_domain_00",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        0.6963841030280601,
+        0.8455985006246128,
+        1.3719783075628964,
+        1.2091533408990212
+      ],
+      "modes": [
+        0.45,
+        0.9,
+        1.35,
+        1.8
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        1.4778348729390067,
+        5.526005816995774,
+        6.02720038460784,
+        2.8155479800139807
+      ],
+      "shape_normalization": 0.2425351175963988,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k045_2_train_01",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.45
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_2_train_02",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.9
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_2_train_03",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.35
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_2_train_04",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_2_train_05",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        0.9886636993736989,
+        0.5211589005436811,
+        1.4006938141955394
+      ],
+      "modes": [
+        0.45,
+        0.9,
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        3.861970081821933,
+        1.7237768702266345,
+        4.942138162125712
+      ],
+      "shape_normalization": 0.3435816390352791,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_2_train_06",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.2062089927210713,
+        1.011872249646136,
+        1.3256155362263744,
+        1.1187527086183793
+      ],
+      "modes": [
+        0.45,
+        0.9,
+        1.35,
+        1.8
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        4.190629062682673,
+        3.906863049943148,
+        2.7428308639955365,
+        5.405158255609686
+      ],
+      "shape_normalization": 0.2144795354336326,
+      "split": "train"
+    },
+    {
+      "case_id": "k045_2_familiar_domain_00",
+      "domain_length": 13.962634015954636,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.45,
+      "mode_weights": [
+        1.376964506726925,
+        1.387535820684994,
+        1.3597943520504396,
+        0.8092975682926157
+      ],
+      "modes": [
+        0.45,
+        0.9,
+        1.35,
+        1.8
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        1.238512788433446,
+        4.703927082686908,
+        0.18879389494523785,
+        2.5788292224696625
+      ],
+      "shape_normalization": 0.20269206488538832,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k049_0_train_01",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.49
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_0_train_02",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.98
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_0_train_03",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.47
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_0_train_04",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.96
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_0_train_05",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0524296917216902,
+        0.92354448830765
+      ],
+      "modes": [
+        0.49,
+        1.47
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.306418436835788,
+        1.0129842298126805
+      ],
+      "shape_normalization": 0.5060794873266773,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_0_train_06",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        0.6617993968653969,
+        0.7583164543065627,
+        1.0176915809436826
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.96
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        3.613164520590991,
+        0.716606827548681,
+        3.5555564188780777
+      ],
+      "shape_normalization": 0.4102046727834256,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_0_familiar_domain_00",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        0.7610220549832725,
+        0.6483036750520653,
+        1.253071493037912,
+        1.2930728000823768
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.47,
+        1.96
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        1.117224671921116,
+        3.5533783020663368,
+        2.446959087002664,
+        4.181319594942151
+      ],
+      "shape_normalization": 0.25281445546191045,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k049_1_train_01",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.49
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_1_train_02",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.98
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_1_train_03",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.47
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_1_train_04",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.96
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_1_train_05",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.3364054321027699,
+        1.3172799247759215,
+        1.2035218314353258,
+        1.4525964135504996
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.47,
+        1.96
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        5.198978322903013,
+        5.3656476040330805,
+        5.699794220733954,
+        1.525428552335898
+      ],
+      "shape_normalization": 0.18833088283130733,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_1_train_06",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        0.6095179228444806,
+        0.7898557550623357
+      ],
+      "modes": [
+        0.98,
+        1.47
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        2.2745890487644522,
+        4.042944537211819
+      ],
+      "shape_normalization": 0.71460540939701,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_1_familiar_domain_00",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.1245843738149524,
+        1.2342165382161925,
+        1.4609602312437298,
+        1.162441474237984
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.47,
+        1.96
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        1.5602312622077308,
+        2.9230639945932784,
+        1.1939126853776427,
+        2.3533185070526517
+      ],
+      "shape_normalization": 0.20071443832591562,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k049_2_train_01",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.49
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_2_train_02",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.98
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_2_train_03",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.47
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_2_train_04",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.49,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        1.96
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_2_train_05",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        0.6475769801015483,
+        0.8143357775932853,
+        1.2095095451131113
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.47
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        1.3978098870140339,
+        4.324236485176881,
+        6.1901974809401406
+      ],
+      "shape_normalization": 0.374332429189086,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_2_train_06",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        0.8664686036022301,
+        0.9215098335694845,
+        0.7708878950391446,
+        0.9095842154498681
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.47,
+        1.96
+      ],
+      "panel": "train",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        5.858218839478409,
+        3.517081698160989,
+        5.8075987478814834,
+        0.9607917020822954
+      ],
+      "shape_normalization": 0.28831317796197015,
+      "split": "train"
+    },
+    {
+      "case_id": "k049_2_familiar_domain_00",
+      "domain_length": 12.82282715750936,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.49,
+      "mode_weights": [
+        0.6014829408651796,
+        0.8440743453023887,
+        1.1294326412661397,
+        0.966183248851356
+      ],
+      "modes": [
+        0.49,
+        0.98,
+        1.47,
+        1.96
+      ],
+      "panel": "familiar_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        6.265407934156812,
+        0.6098061902364905,
+        3.273581490382696,
+        1.0413211169412078
+      ],
+      "shape_normalization": 0.28239228928336946,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k029_0_unseen_domain_00",
+      "domain_length": 21.666156231653748,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.29,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.29
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k029_0_unseen_domain_01",
+      "domain_length": 21.666156231653748,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.29,
+      "mode_weights": [
+        1.2223699113802815,
+        0.5489560624689289,
+        0.6060343842713678,
+        1.1466714373152902
+      ],
+      "modes": [
+        0.29,
+        0.58,
+        0.8699999999999999,
+        1.16
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        3.8781639364177964,
+        2.965614472574101,
+        3.0491754245791123,
+        3.2946755131506325
+      ],
+      "shape_normalization": 0.2837658846594815,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k029_1_unseen_domain_00",
+      "domain_length": 21.666156231653748,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.29,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.29
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k029_1_unseen_domain_01",
+      "domain_length": 21.666156231653748,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.29,
+      "mode_weights": [
+        0.5215756764308651,
+        1.330185765465741,
+        1.2131802866176264,
+        1.1387687902146342
+      ],
+      "modes": [
+        0.29,
+        0.58,
+        0.8699999999999999,
+        1.16
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        1.575909836666705,
+        2.497358687349788,
+        3.682834793649043,
+        3.9694165118507447
+      ],
+      "shape_normalization": 0.23788507689687052,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k029_2_unseen_domain_00",
+      "domain_length": 21.666156231653748,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.29,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.29
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k029_2_unseen_domain_01",
+      "domain_length": 21.666156231653748,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.29,
+      "mode_weights": [
+        1.2589123104760995,
+        1.154106406613808,
+        0.7866303425975829,
+        1.3986775253794672
+      ],
+      "modes": [
+        0.29,
+        0.58,
+        0.8699999999999999,
+        1.16
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        4.827542043115075,
+        5.04988147039097,
+        1.9200549024923916,
+        0.23332100106777293
+      ],
+      "shape_normalization": 0.21747041700941708,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k035_0_unseen_domain_00",
+      "domain_length": 17.951958020513104,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.35,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.35
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k035_0_unseen_domain_01",
+      "domain_length": 17.951958020513104,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.35,
+      "mode_weights": [
+        1.1555435656534387,
+        0.7272193626200434,
+        0.901073395071414,
+        0.7102132334271852
+      ],
+      "modes": [
+        0.35,
+        0.7,
+        1.0499999999999998,
+        1.4
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        2.796893054976105,
+        1.5228166458056538,
+        2.480543645624671,
+        2.189865405302794
+      ],
+      "shape_normalization": 0.2862008634255987,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k035_1_unseen_domain_00",
+      "domain_length": 17.951958020513104,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.35,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.35
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k035_1_unseen_domain_01",
+      "domain_length": 17.951958020513104,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.35,
+      "mode_weights": [
+        1.0356874507364782,
+        1.3471515358912551,
+        0.6254497466180474,
+        0.7512402576683542
+      ],
+      "modes": [
+        0.35,
+        0.7,
+        1.0499999999999998,
+        1.4
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.2830251495706929,
+        0.6727104673896781,
+        5.722549851957322,
+        1.3234188832831733
+      ],
+      "shape_normalization": 0.26599076703937014,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k035_2_unseen_domain_00",
+      "domain_length": 17.951958020513104,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.35,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.35
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k035_2_unseen_domain_01",
+      "domain_length": 17.951958020513104,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.35,
+      "mode_weights": [
+        0.8002972281727291,
+        1.2925069111668483,
+        1.387521901800596,
+        0.6898382047521803
+      ],
+      "modes": [
+        0.35,
+        0.7,
+        1.0499999999999998,
+        1.4
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.12714000899007927,
+        3.0179403754731715,
+        0.2515248023583077,
+        2.4859853537414462
+      ],
+      "shape_normalization": 0.23979870840459303,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k041_0_unseen_domain_00",
+      "domain_length": 15.324842212633138,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.41,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.41
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k041_0_unseen_domain_01",
+      "domain_length": 15.324842212633138,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.41,
+      "mode_weights": [
+        0.8668155626999839,
+        0.5299902513245198,
+        0.6675915183343979,
+        0.5394491192614719
+      ],
+      "modes": [
+        0.41,
+        0.82,
+        1.23,
+        1.64
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        4.052575334394326,
+        5.972204649962626,
+        3.321548334907886,
+        5.0107565082161685
+      ],
+      "shape_normalization": 0.38404722343658165,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k041_1_unseen_domain_00",
+      "domain_length": 15.324842212633138,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.41,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.41
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k041_1_unseen_domain_01",
+      "domain_length": 15.324842212633138,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.41,
+      "mode_weights": [
+        0.5524236343101592,
+        1.3099509896061914,
+        1.228023059615523,
+        0.7647448833306646
+      ],
+      "modes": [
+        0.41,
+        0.82,
+        1.23,
+        1.64
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.9785787757364875,
+        4.930453361469795,
+        0.5265212789607281,
+        2.0627597908442006
+      ],
+      "shape_normalization": 0.2593937792588143,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k041_2_unseen_domain_00",
+      "domain_length": 15.324842212633138,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.41,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.41
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k041_2_unseen_domain_01",
+      "domain_length": 15.324842212633138,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.41,
+      "mode_weights": [
+        0.5686390761881737,
+        0.7315045945873835,
+        1.0247275424570823,
+        1.4822827588919296
+      ],
+      "modes": [
+        0.41,
+        0.82,
+        1.23,
+        1.64
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        5.654496045754402,
+        2.378595201597649,
+        2.6997627524625605,
+        1.6217705079401137
+      ],
+      "shape_normalization": 0.2626633982554568,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k047_0_unseen_domain_00",
+      "domain_length": 13.368479376977843,
+      "epsilon": 0.001,
+      "family": "isolated",
+      "fundamental": 0.47,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.47
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k047_0_unseen_domain_01",
+      "domain_length": 13.368479376977843,
+      "epsilon": 0.001,
+      "family": "mixture",
+      "fundamental": 0.47,
+      "mode_weights": [
+        0.7834422657375181,
+        1.0281123033139121,
+        0.6615802402287057,
+        0.7369853905114457
+      ],
+      "modes": [
+        0.47,
+        0.94,
+        1.41,
+        1.88
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "linear_landau",
+      "relative_phases": [
+        1.9653138173155489,
+        1.9680376625610965,
+        1.1320751356951062,
+        5.565694737424937
+      ],
+      "shape_normalization": 0.31151481494833916,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k047_1_unseen_domain_00",
+      "domain_length": 13.368479376977843,
+      "epsilon": 0.03,
+      "family": "isolated",
+      "fundamental": 0.47,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.47
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k047_1_unseen_domain_01",
+      "domain_length": 13.368479376977843,
+      "epsilon": 0.03,
+      "family": "mixture",
+      "fundamental": 0.47,
+      "mode_weights": [
+        0.9694860207157299,
+        1.410954990794727,
+        1.4186424073909993,
+        1.0655070563936444
+      ],
+      "modes": [
+        0.47,
+        0.94,
+        1.41,
+        1.88
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_weak",
+      "relative_phases": [
+        0.020172595237745443,
+        5.4286716764446705,
+        2.932455186796394,
+        4.023779046419657
+      ],
+      "shape_normalization": 0.2055671500157137,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k047_2_unseen_domain_00",
+      "domain_length": 13.368479376977843,
+      "epsilon": 0.3,
+      "family": "isolated",
+      "fundamental": 0.47,
+      "mode_weights": [
+        1.0
+      ],
+      "modes": [
+        0.47
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        0.0
+      ],
+      "shape_normalization": 1.0,
+      "split": "heldout"
+    },
+    {
+      "case_id": "k047_2_unseen_domain_01",
+      "domain_length": 13.368479376977843,
+      "epsilon": 0.3,
+      "family": "mixture",
+      "fundamental": 0.47,
+      "mode_weights": [
+        0.9651353889798063,
+        1.270105496682894,
+        1.2589539776796352,
+        1.0842898584782497
+      ],
+      "modes": [
+        0.47,
+        0.94,
+        1.41,
+        1.88
+      ],
+      "panel": "unseen_domain",
+      "provenance": "expanded",
+      "regime": "nonlinear_landau_strong",
+      "relative_phases": [
+        1.9965578878680166,
+        0.24412308697760016,
+        2.5711115511423657,
+        1.4363122459744528
+      ],
+      "shape_normalization": 0.2184128725458236,
+      "split": "heldout"
+    }
+  ],
+  "development_count": 63,
+  "format": "vpml_multi_domain_v1",
+  "fundamentals": [
+    0.25,
+    0.27,
+    0.29,
+    0.31,
+    0.33,
+    0.35,
+    0.37,
+    0.39,
+    0.41,
+    0.43,
+    0.45,
+    0.47,
+    0.49
+  ],
+  "heldout_fundamentals": [
+    0.29,
+    0.35,
+    0.41,
+    0.47
+  ],
+  "horizon": 120.0,
+  "manifest_sha256": "0c1179a2a2be17961e4eca157e6cceb7b42ab5746996907fdfada0c5c86f8fa6",
+  "original_manifest_sha256": "4f60b9bac866f927d908b93eeb7b57e6a0dbaaf6d49ee52a0e47e3519d7e435b",
+  "preparation": 5.0,
+  "scored_horizon": 10.0,
+  "seed": 1729,
+  "train_count": 210
+}

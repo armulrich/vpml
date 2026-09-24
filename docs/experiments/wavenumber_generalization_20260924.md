@@ -4,13 +4,14 @@
 
 - [x] Back up dirty legacy source without changing it; hash 107 preserved checkpoints.
 - [x] Commit and push preserved Hermite E100 diagnostics and archive tag.
-- [ ] Integrate maintained history FNO, latent FNO and Hermite paths into main; test and push.
-- [ ] Freeze domain-family manifest and train/development separation.
-- [ ] Implement per-example geometry, differentiable preparation, complete anchor exposure and exact resume.
-- [ ] Pass gradient, geometry, solver, reference, resume and artifact-protection preflight.
-- [ ] Run bounded A100 pilot (maximum $25); measure total projection against $750 cap.
-- [ ] Generate new references if qualification and cost permit.
-- [ ] Train and monitor through at most E20; download and verify checkpoints and figures.
+- [x] Integrate maintained history FNO, latent FNO and Hermite paths into main; test and push.
+- [x] Freeze domain-family manifest and train/development separation.
+- [x] Implement per-example geometry, differentiable preparation, complete anchor exposure and exact resume.
+- [x] Pass bounded gradient, geometry, finite-update, exact-resume and artifact-protection checks.
+- [ ] Full-duration reference convergence and production evaluation qualification (pending budget gate).
+- [x] Run bounded A100 pilot (maximum $25); measured total projection exceeds $750 cap.
+- [ ] BLOCKED by cost gate: generate new references if qualification and cost permit.
+- [ ] BLOCKED by cost gate: complete production orchestration, train through at most E20, and download/verify checkpoints and figures.
 
 ## Preservation
 
@@ -35,3 +36,29 @@ Stop immediately on nonfinite parameters, optimizer or trajectories, inconsisten
 Early success may stop training only after two successive full evaluations meet all of: new-domain mean field and log-energy errors improve at least 20% over frozen E40 evaluated on the same new panel; at least 75% of new cases improve in field error; each regime's original-panel mean field and energy error stays within 10% of frozen E40. Include k0=0.35 separately. These are operational qualification criteria, not claims of general success or untouched final evidence.
 
 The pilot must measure gradient throughput, peak memory, reference throughput and evaluation cost before reference generation or E20 is launched. The $750 cap includes pilot, references, training and evaluations. Do not top up account billing or automatically increase any workspace budget. If access/budget blocks allocation, preserve the prepared source and report the exact blocker.
+
+## Completed pilot and decision
+
+The maintained closure integration passed 90 tests and was pushed to main at `9a80a77`. The new branch is `exp/broader-wavenumber-latent`. Launched source commit `ad3aab0`, model/vpml SHA256 `d64da671c08316f7bc43ace5dcc96e1c052614e8e6265f2072969540e9ee1e94`. The pilot used Modal app `ap-abFcM9uc1Urzc7wSaBlkWl` and a new volume `vpml-wavenumber-generalization-20260924`. It completed and stopped with zero tasks on 24 September 2026.
+
+| Observation | Measured result |
+|---|---:|
+| Fixed-batch loss before update | 60.257500 |
+| Same-batch loss after update | 47.731987 |
+| Initializer-specific gradient norm | 0.0524022 |
+| Uncapped parameter update norm | 1.624089 |
+| Connected vs detached forward loss relative difference | 0.000000886 |
+| Stop/resume next update | Bitwise identical parameters and Adam moments |
+| Median update time, batch 48, 600 differentiated solver steps | 6.0130 s |
+| Peak JAX live allocation | 4.58 GiB |
+| Kinetic reference step, Nx1024/Nv8192, dt0.01 | 0.19365 s |
+
+The loss control uses 48 real windows from three preserved original training cases, at multiple times. It tests wiring and throughput, not expanded-family learning or generalization. One update is saved. Repeated fixed-state benchmarks and a second-update resume comparison are diagnostic computations, not an epoch. GPU forward values agree to numerical roundoff; the local small test is tighter. No update clipping or backtracking was introduced.
+
+At 2302 updates/epoch, the training projection is 3.845 hours/epoch, or 76.90 hours through E20. Generating 213 new kinetic reference trajectories at the unchanged resolution projects to 137.49 hours. These are extrapolations from short benchmarks, not completed work. At the verified Modal resource rate of $3.764448/hour, training plus references and pilot project to $807.21 before evaluation. A 20 percent reserve plus $50 gives $1018.66. This exceeds the approved $750 limit even before the reserve. Reference generation and E20 were therefore not launched.
+
+The decision is computational, not evidence against the expanded dataset. The next decision concerns reducing reference-generation cost while validating unchanged physical accuracy, or increasing the budget. Neither reference resolution nor the scientific training specification was silently reduced. Full-duration convergence, reference-output parity, production orchestration and E20 qualification remain pending. The available segmented trainer and evaluator are components, not a validated ready-to-launch E20 pipeline.
+
+All 93 shared/adaptation tests pass; a separate chunked/uninterrupted evaluation test also passes (94 total). The common `vpml.low_moment` architecture source is unchanged. The pilot has 5 individually downloaded files with matching hashes in `pilot_verified/`. A first recursive CLI transfer produced an unusable combined local stream; it is retained separately and is not used as evidence. All 107 previously hashed local checkpoint files are unchanged. Key remote E20/E30/E40 files are compared separately to their preserved local copies.
+
+Artifact root: `/Users/armin/Documents/NYU/vpml/out_bench/wavenumber_generalization_20260924_v1`. Results and data remain ignored by Git. Price source checked on 24 September: https://modal.com/pricing.
