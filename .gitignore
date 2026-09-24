@@ -211,7 +211,7 @@ __marimo__/
 # Project outputs
 runs/
 figures/
-out_bench/
+out_bench
 *.npz
 *.png
 

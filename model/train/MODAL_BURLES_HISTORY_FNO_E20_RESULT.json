@@ -1,0 +1,25 @@
+{
+  "accepted_adamw_updates": 10520,
+  "artifact_sha256": {
+    "epoch020_low_moment_closure.npz": "05a68f41681a180effcf87c9bb8607818baef5d697954325be623e5b57e192a9",
+    "epoch020_metric1_plot.png": "fc242c27d626ba44d21336897e092bb69247e4a02808ebdf802d0524c13c350a",
+    "training_state.npz": "29f008d77eca8180a9edb74b7cc5db86c07e468920938a1c52a63e77642efecd"
+  },
+  "completed_epochs": 20,
+  "completed_utc": "2026-09-13T22:40:00Z",
+  "full_trajectory_e20": {
+    "bounded_cases": 12,
+    "case_count": 12,
+    "mean_epsilon_E": 0.508409,
+    "mean_epsilon_grow": 0.416223
+  },
+  "history_only": true,
+  "latent_memory_dim": 0,
+  "local_artifact_root": "out_bench/modal_downloads/history_fno_random1729_full_anchor_E1000/history_fno_random1729_full_anchor_E1000",
+  "modal_app_id": "ap-lecMI0AM3vBlXDvWXkYkGW",
+  "modal_run_path": "/runs/history_fno_random1729_full_anchor_E1000",
+  "modal_volume": "vpml-low-moment-burles",
+  "random_seed": 1729,
+  "source_tree_sha256": "6eb49804a0f590167f10c30b787e0ed1b9f58bb932be4880415f4287dbf78614",
+  "training_windows": 504960
+}

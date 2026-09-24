@@ -1,0 +1,39 @@
+{
+  "accepted_adamw_updates": 10520,
+  "artifact_sha256": {
+    "epoch020_evaluation_summary.json": "a21ac46290ad49a59ca749f3fe88c83c957991557eef7ff7133f51e812bbd00d",
+    "epoch020_low_moment_closure.npz": "ac395a6c0a497667b453d66d39cc3771941dc00d538de0e73de44bd70e060396",
+    "epoch020_metric1_plot.png": "0a5a7d2c3030de5e4c81db29d6eca34a0e4a2cd3be29c442640ad00adb8c5d17",
+    "long_horizon_audit_summary.md": "e49a8723c381673f6da7245cb6517f153af944965854391cb877f1519b62c5bd",
+    "training_state.npz": "4eaed7fa0d9260199636d4ac63bfe8aa8b758e103f606dcf471c0f1777cad956"
+  },
+  "completed_epochs": 20,
+  "full_trajectory_e20": {
+    "bounded_cases": 12,
+    "case_count": 12,
+    "mean_epsilon_E": 0.381937,
+    "mean_epsilon_grow": 0.18313,
+    "strong_ic08_epsilon_E": 0.389314,
+    "strong_ic17_epsilon_E": 0.754305,
+    "worst_epsilon_E": 0.754305
+  },
+  "history_only": false,
+  "latent_memory_dim": 6,
+  "local_artifact_root": "out_bench/modal_downloads/history_latent6_random1729_full_anchor_resumable_E1000",
+  "local_audit_root": "out_bench/diagnostics/latent6_E15_E20_long_horizon_audit_20260914",
+  "matched_history_only_e20": {
+    "mean_epsilon_E": 0.508409,
+    "mean_epsilon_grow": 0.416223,
+    "strong_ic08_epsilon_E": 0.570192,
+    "strong_ic17_epsilon_E": 1.008817,
+    "worst_epsilon_E": 1.008817
+  },
+  "modal_run_path": "/runs/history_latent6_random1729_full_anchor_resumable_E1000",
+  "modal_volume": "vpml-low-moment-burles",
+  "random_seed": 1729,
+  "reference_manifest_sha256": "503a47ee5be541a5b16ee32f018eab6ee6a44ee123f98fab3935599add017e52",
+  "source_tree_sha256": "5118eb0a0e5c65c4e5fe04c6cdffae380a0d15c70a25095ea0f3184b5bffb7e0",
+  "training_horizon_physical_time": 10.0,
+  "training_windows": 504960,
+  "uniform_heating_allowed": true
+}
