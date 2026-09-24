@@ -1563,10 +1563,11 @@ def make_loss_function(
     dynamic_amplitude_floor: float = 1e-6,
     allow_uniform_heating: bool = False,
     autonomous_burnin_steps: int = 0,
+    detach_autonomous_burnin: bool = True,
     log_energy_weight: float = 0.0,
     log_growth_weight: float = 0.0,
 ):
-    k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
+    default_k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
     regime_scales_jax = jnp.asarray(regime_scales, dtype=jnp.float32)
     convergence_floor_jax = (
@@ -1576,6 +1577,7 @@ def make_loss_function(
     )
 
     def loss(params, batch):
+        k_jax = batch.get("k_arr", default_k_jax)
         if _uses_window_memory(memory_backend):
             initial_state = batch["initial"]
             history = batch["memory"]
@@ -1618,7 +1620,10 @@ def make_loss_function(
                     dynamic_amplitude_floor=dynamic_amplitude_floor,
                     allow_uniform_heating=allow_uniform_heating,
                 )
-                initial_state = jax.lax.stop_gradient(burnin_states[:, -1])
+                initial_state = burnin_states[:, -1]
+                if detach_autonomous_burnin:
+                    initial_state = jax.lax.stop_gradient(initial_state)
+                    burnin_memory = jax.tree_util.tree_map(jax.lax.stop_gradient, burnin_memory)
                 (
                     history,
                     closure_history,
@@ -1627,7 +1632,7 @@ def make_loss_function(
                     previous_gradient,
                     compact_latent,
                 ) = _unpack_window_memory(
-                    jax.tree_util.tree_map(jax.lax.stop_gradient, burnin_memory),
+                    burnin_memory,
                     memory_backend,
                 )
             rollout_result = _rollout_window_memory(
