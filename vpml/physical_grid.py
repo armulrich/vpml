@@ -210,6 +210,16 @@ def cubic_bspline_prefilter_constant(
     return jax.vmap(solve_col, in_axes=1, out_axes=1)(values).astype(jnp.float64)
 
 
+def cubic_bspline_prefilter_constant_batched(
+    values: Array, sub: Array, diag: Array, sup: Array
+) -> Array:
+    """The identical spline system solved for all spatial columns together."""
+    values = jnp.asarray(values, dtype=jnp.float64)
+    lower = jnp.concatenate((jnp.zeros((1,), dtype=diag.dtype), sub))
+    upper = jnp.concatenate((sup, jnp.zeros((1,), dtype=diag.dtype)))
+    return jax.lax.linalg.tridiagonal_solve(lower, diag, upper, 6.0 * values)
+
+
 def cubic_bspline_interp_periodic(coeffs: Array, coords: Array) -> Array:
     coeffs = jnp.asarray(coeffs, dtype=jnp.float64)
     coords = jnp.asarray(coords, dtype=jnp.float64)
@@ -301,7 +311,10 @@ def advect_v_cubic(
     E_phys: Array,
     tau: float,
 ) -> Array:
-    coeffs = cubic_bspline_prefilter_constant(
+    prefilter = (cubic_bspline_prefilter_constant_batched
+                 if ops.get('batched_v_prefilter', False)
+                 else cubic_bspline_prefilter_constant)
+    coeffs = prefilter(
         f_phys,
         ops["v_prefilter_sub"],
         ops["v_prefilter_diag"],

@@ -12,6 +12,43 @@ FUNDAMENTALS = tuple(i / 100 for i in range(25, 50, 2))
 HELDOUT_FUNDAMENTALS = FUNDAMENTALS[2::3]
 TRAIN_FUNDAMENTALS = tuple(k for k in FUNDAMENTALS if k not in HELDOUT_FUNDAMENTALS)
 ANCHORS = 526
+SMALL_TRAIN_FUNDAMENTALS = (.30, .40, .50)
+SMALL_HELDOUT_FUNDAMENTALS = (.35, .45)
+
+
+def build_five_epoch_manifest(original: dict, seed: int = 1729) -> dict:
+    """Fixed 54/21 study. Keep the original cases as a separate evaluation panel."""
+    rng = np.random.default_rng(seed)
+    cases = []
+    def add(k, regime_i, harmonics, split, panel, serial):
+        isolated = len(harmonics) == 1
+        weights = np.ones(len(harmonics)) if isolated else rng.uniform(.5, 1.5, len(harmonics))
+        phases = np.zeros(len(harmonics)) if isolated else rng.uniform(0, 2*math.pi, len(harmonics))
+        cases.append(dict(case_id=f'v2_k{round(k*100):03d}_r{regime_i}_{panel}_{serial:02d}',
+            regime=REGIMES[regime_i], epsilon=AMPLITUDES[regime_i],
+            modes=(np.asarray(harmonics)*k).tolist(), mode_weights=weights.tolist(),
+            relative_phases=phases.tolist(), shape_normalization=1/float(np.sum(abs(weights))),
+            domain_length=2*math.pi/k, fundamental=k, split=split, panel=panel,
+            family='isolated' if isolated else 'mixture', provenance='expanded_v2'))
+    for k in SMALL_TRAIN_FUNDAMENTALS:
+        for r in range(3):
+            for j in range(1,5): add(k,r,[j],'train','train',j)
+            add(k,r,[1,3],'train','train',5)
+            add(k,r,[1,2,3,4],'train','train',6)
+            add(k,r,[1,2,4],'heldout','familiar_domain',0)
+    for k in SMALL_HELDOUT_FUNDAMENTALS:
+        for r in range(3):
+            add(k,r,[1],'heldout','unseen_domain',0)
+            add(k,r,[1,2,3,4],'heldout','unseen_domain',1)
+    result=dict(format='vpml_multi_domain_v2_e5',seed=seed,cases=cases,
+        original_manifest_sha256=sha256_json(original),
+        train_fundamentals=list(SMALL_TRAIN_FUNDAMENTALS),
+        heldout_fundamentals=list(SMALL_HELDOUT_FUNDAMENTALS),
+        train_count=54,development_count=21,anchors_per_case=ANCHORS,
+        anchor_spacing=.2,horizon=120.,preparation=5.,scored_horizon=10.)
+    validate_manifest(result)
+    result['manifest_sha256']=sha256_json(result)
+    return result
 
 
 def build_manifest(original: dict, seed: int = 1729) -> dict:
@@ -70,13 +107,15 @@ def validate_manifest(manifest):
         indices = np.asarray(c['modes']) * c['domain_length']/(2*math.pi)
         if not np.allclose(indices, np.rint(indices), rtol=0, atol=1e-12):
             raise ValueError('Nonperiodic wavenumber')
-        if c['provenance']=='expanded' and c['split']=='train' and c['fundamental'] in HELDOUT_FUNDAMENTALS:
+        heldout = (SMALL_HELDOUT_FUNDAMENTALS if manifest['format']=='vpml_multi_domain_v2_e5' else HELDOUT_FUNDAMENTALS)
+        if c['provenance'].startswith('expanded') and c['split']=='train' and c['fundamental'] in heldout:
             raise ValueError('Held-out domain leaked into training')
         x = np.arange(1024) * c['domain_length']/1024
         if np.min(1+evaluate_manifest_case(c,x)) <= 0:
             raise ValueError('Invalid IC density')
     counts = [sum(c['split']=='train' and c['regime']==r for c in cases) for r in REGIMES]
-    if counts != [70,70,70] or sum(c['split']=='heldout' for c in cases)!=63:
+    expected = ([18,18,18],21) if manifest['format']=='vpml_multi_domain_v2_e5' else ([70,70,70],63)
+    if counts != expected[0] or sum(c['split']=='heldout' for c in cases)!=expected[1]:
         raise ValueError(f'Unexpected manifest exposure: {counts}')
 
 

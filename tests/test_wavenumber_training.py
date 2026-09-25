@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 import numpy as np
-from model.train.wavenumber_data import build_manifest,epoch_batches,REGIMES,write_new_json
+from model.train.wavenumber_data import build_manifest,build_five_epoch_manifest,epoch_batches,REGIMES,write_new_json
 from model.train.wavenumber_training import (Configuration,initialize,loss_factory,tree_hash,
     save_snapshot,load_snapshot,update_factory,base)
 import jax
@@ -29,6 +29,17 @@ def tiny():
 
 
 class WavenumberTests(unittest.TestCase):
+    def test_five_epoch_manifest_and_sweep(self):
+        m=build_five_epoch_manifest(original())
+        self.assertEqual((m['train_count'],m['development_count']),(54,21))
+        self.assertEqual(len(list(epoch_batches(m,1))),592)
+        rows=np.concatenate(list(epoch_batches(m,1)))
+        self.assertEqual(len(rows),54*526)
+        self.assertEqual(len(set(map(tuple,rows))),len(rows))
+        self.assertEqual({m['cases'][i]['fundamental'] for i,a in rows},{.3,.4,.5})
+        self.assertEqual({c['fundamental'] for c in m['cases'] if c['panel']=='unseen_domain'},{.35,.45})
+        self.assertEqual(m,build_five_epoch_manifest(original()))
+
     def test_complete_sweep_and_domain_split(self):
         m=build_manifest(original());batches=list(epoch_batches(m,1))
         self.assertEqual(len(batches),2302);self.assertEqual(len(batches[-1]),12)
