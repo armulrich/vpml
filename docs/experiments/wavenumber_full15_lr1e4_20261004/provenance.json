@@ -1,0 +1,643 @@
+{
+  "run_name": "wavenumber_full_window_lr1e4_e5_20261004",
+  "local_root": "/Users/armin/Documents/NYU/vpml/out_bench/wavenumber_full_window_lr1e4_e5_20261004",
+  "remote_volume": "vpml-wavenumber-generalization-v2-20260925",
+  "remote_root": "wavenumber_full_window_lr1e4_e5_20261004",
+  "protocol_file_sha256": "e1f88b9d62acb6495ca8e65179fe7e256ca837e15320ea6cceedb1274eeaf6fa",
+  "canonical_protocol_sha256": "a344037e0a424e41232776270f21d04cfa333d100b35256e49bb1197abb706d5",
+  "scientific_source_sha256": "39f23173cdce9ac1a895985c96b432fab6e11d0258bf896ee22925da17773cc6",
+  "source_files_sha256": {
+    "model/__init__.py": "dd8bd97d8464a02e10d96bf5cebd2d1e3dc8ebe2ecab99165b3b45174fa1fc60",
+    "model/diagnostics/__init__.py": "6fd97cd520ebd338d494ddb6d055da671b722aee1c7d8c47c2b74a49fd1c07ea",
+    "model/diagnostics/landau_resolution_report.py": "d79cec315cca3effdbda6502600bbb56e85dbc18dcda1cf71f8762068d0a6b25",
+    "model/diagnostics/low_moment_nonlinear_residual.py": "1936a7501826638371f38396996b746a52fc5d1f8e88f9f4e1b81e453073c192",
+    "model/diagnostics/low_moment_resonance_identifiability.py": "76e5bbddf34f599290cbaa1ea030b5f48d1b548fc9a1ddadee76545af6ebf7c4",
+    "model/diagnostics/phase_space.py": "c1306b06b02768dc77542fc350c1f168de8122c2893dcc872e6d3faf007c089e",
+    "model/diagnostics/physical_grid_2d_convergence.py": "70a58b4d23dede5ca0e566375fc61395ef6eb32dd6d76c4e13f211f6310f84f5",
+    "model/diagnostics/physical_spatial_grid_convergence.py": "4f6365909834afa41c950ab0c096ae943dee1adaa6296b1d7cc9e3c23beb6008",
+    "model/diagnostics/physical_velocity_grid_convergence.py": "dc76288b821589a07c4d0fdb8ff85ae62ec9dea1cefb839ef1be01512a0788ce",
+    "model/diagnostics/plot_hermite_spectrum.py": "df23355a9eb2bc3c48fd14005f424e7523e59e8960730690a04df3c8b7749683",
+    "model/diagnostics/plot_low_moment_training_validation_loss.py": "1af1cc057195b2d3e9ef24d92f7c9b1b4d06c321b7a8e886537bba5d89751da4",
+    "model/diagnostics/plot_training_loss.py": "a287719b9c97b0ee15eb966405b9a0fff82a9cb8bcfc1787ae734eedd031e326",
+    "model/diagnostics/projection_quadrature_convergence.py": "9a45c8e94b12a0436c2e599da7a3aa4b1cc85c99116f927d0c023a80a011c874",
+    "model/diagnostics/render_phase_space_triptych_video.py": "b9d08a03251acc5d9b0fc56b4432a19a0183732ad631152516a34102fe98fd1f",
+    "model/eval.py": "96b7d68224163c60c08349cd6464c5e37ffb57bfbb0737c3924fcd0fc6b48a16",
+    "model/eval_nv_sweep.py": "9e407a84609aba83ee70d646e4d9e0740dc24c0cfe30da3da368fc7794aba350",
+    "model/eval_training_cases.py": "2f0406a3c5ac23e8b99c6640c696f3c1c5e0f2a40b407b2cd3723abe31f1fb5c",
+    "model/model.py": "6b2359d546a5d51c27e85e5a0b8721a6ab0653740612e37d680e30fb74cb912f",
+    "model/train/__init__.py": "64a512013acd2df2e6759bc9051149c3fc7d0f2fb27dcd11aa0cb51a36976db6",
+    "model/train/interface_flux_data.py": "945bc9ee6afaf77f3d6b834f906ac3383e6161e4e59ba15bfefa38336812044c",
+    "model/train/interface_flux_rollout.py": "8263efd50488f3b68ec3b6fac918a00b3ae0cc330841d209c01c349172c9ba42",
+    "model/train/low_moment_closure.py": "13f2a231f873c5e7a63b19e41d42052a5bbd27f941f1aed03ea812ac2bc0faed",
+    "model/train/modal_burles_history_fno.py": "08014eef7515fc68956b43fece1c9214f3b43d0602dea641e1fea108f7e17a15",
+    "model/train/modal_burles_latent_fno.py": "1968d7dd0146e86781f2822524fa3554f1a5b27777ceedf7a6f153337cf14a3c",
+    "model/train/modal_burles_latent_fno_e30.py": "e8cf367e02c698089fa515dc3e98299aa9bcdbece6ae75685bca210012616061",
+    "model/train/modal_burles_latent_fno_e40.py": "fa1e6593ad507cc6acdabbcd2b22978307d1cdffe9b98c87ca3da9f70247d5a9",
+    "model/train/modal_wavenumber.py": "9998db7fef4717548094212bfb46721aad1b3c617e2e7d400a659b0a205c07fb",
+    "model/train/modal_wavenumber_e5.py": "68bc00adcb34114147333ec470a6e80b9824c97a98b96cce46b73fc782538ef2",
+    "model/train/prepare_modal_low_moment_cache.py": "4477344d09535812336977924d65fce602d5ca42b20366c159959484c46cee41",
+    "model/train/wavenumber_data.py": "75fe91cb6b3ac948073d01964b21585dc3e6910de7ec6d8b3bbf60fff2239928",
+    "model/train/wavenumber_evaluation.py": "ca352781b0dce272ab558b048186696a961f61342d27410e4a2fb13c48e42388",
+    "model/train/wavenumber_reference.py": "153a826ab6dba1f7ab4786afc36d08055bb1b7a7511ecf84b6ae1134e99144b9",
+    "model/train/wavenumber_training.py": "2cd44a019cc67158c5e508d978311cc235342a5f18b293d97a21917ffc74edf9",
+    "vpml/__init__.py": "28c92eabe75290f8ee7445b0c534c9cc88e58700462b1d17c1b3c17ca54ef07d",
+    "vpml/core.py": "7fe792aa0d65723baacf3f980ff2eb8ed90feb900fe926cb3eaeaeb4233cbe21",
+    "vpml/jax_runtime.py": "6b3a51e87028106cca68c52835850b159f88cfd07e6acb984bc9238900b642d6",
+    "vpml/linear_landau.py": "385977d45d69253b1688a650b2fb4862b3067367c178319e1557017325d4e41f",
+    "vpml/low_moment.py": "0f832f7efdba1d2625559b92c84431fc6a995da7d9c366839a4677caaad13e52",
+    "vpml/metrics/__init__.py": "c727c08e65b777d0bfdccbac046b421050f88e821e90d51936c93d70b58fe288",
+    "vpml/metrics/early_growth.py": "2a73b5cc5ed79a2a4b5e64812df16bb6d21044b7fe59b3d109fc8cf776bee1c9",
+    "vpml/metrics/field_error.py": "9bab7762a9e2cf586d52d8e9cfae039b58b99b6ae7bb6659183e4f47a4443faf",
+    "vpml/metrics/trajectory.py": "f0703e60c2b7c86f51e96b547acce6533856ed539e791b1a7b61e8000b08af7e",
+    "vpml/nonlinear_landau.py": "be16d4caf2f6af88867d1e3979bf9d1cf6b69213f2e2921f3346fb8f32c448be",
+    "vpml/physical_grid.py": "3d3228d9ed285650b57efdd62c0f6db08591e65f4a65df516c7ab53b750c9853",
+    "vpml/visualization/__init__.py": "1375bde0f07e4bd4bf39756d7b9e3a261fb7856d84b45c083d557b39c482d107",
+    "vpml/visualization/benchmarks.py": "e1dcee9f26bbf822697ee67a96d25d2df2ed4c06b2a5ef2a3ed0955bad22a7db",
+    "vpml/visualization/common.py": "7d5b8749ac4abeef3bb18f1d6a00347ce8e7cc85a7adca839905b8c592694f33",
+    "vpml/visualization/metrics.py": "bb4bab86be975689773b2d496057ace23d49adcfbfc1b98dbfa50d68af63b926",
+    "vpml/visualization/nonlinear.py": "e21c685a60eebff68faa26c5042bdb3fa56ae4e1bfc41dbe2ab19f87f683d3d8",
+    "vpml/visualization/training.py": "2b83717ccf96b42f43844136760a336312ef426f36f97aa74ae94b5adab31605",
+    "scripts/modal_precision_e5.py": "bcc3b7baf029933e7b88e1f80e57624c5634e5145ed24d01eb995ed91d1a4330",
+    "scripts/wavenumber_retry_evaluation.py": "2208f6a3e8b9d79f6a8a46f66d96868523f20e09387cd57856a36033228e9b70"
+  },
+  "accepted_updates": 2960,
+  "complete_epochs": 5,
+  "training_windows": 142020,
+  "differentiated_solver_steps": 85212000,
+  "complete_epoch_train_losses": [
+    0.13787305627647858,
+    0.0776656001353479,
+    0.06488950573617021,
+    0.05730834646673575,
+    0.052361132108155066
+  ],
+  "evaluations": [
+    {
+      "accepted_updates": 0,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 4.043488550797592,
+      "mean_log_energy_rmse": 3.5882059086483635,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.8771517607386613,
+        "full15_l2": 0.59179130648407
+      }
+    },
+    {
+      "accepted_updates": 3,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 3.694631424059667,
+      "mean_log_energy_rmse": 3.516201588986056,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.8576052189399942,
+        "full15_l2": 0.5792134792586103
+      }
+    },
+    {
+      "accepted_updates": 50,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 1.2240338740582999,
+      "mean_log_energy_rmse": 2.587383853926636,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.5361928896352566,
+        "full15_l2": 0.3943341645652015
+      }
+    },
+    {
+      "accepted_updates": 150,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.7378068040027362,
+      "mean_log_energy_rmse": 1.6788169819278786,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.26393840140735836,
+        "full15_l2": 0.24064770993280318
+      }
+    },
+    {
+      "accepted_updates": 300,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.49767085013683804,
+      "mean_log_energy_rmse": 1.3235466290737286,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.21125224793908565,
+        "full15_l2": 0.20195283372921174
+      }
+    },
+    {
+      "accepted_updates": 592,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.4435884966206376,
+      "mean_log_energy_rmse": 1.6106858468525882,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.1757482657556171,
+        "full15_l2": 0.1656223222969765
+      }
+    },
+    {
+      "accepted_updates": 1184,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.3812797244288523,
+      "mean_log_energy_rmse": 1.4906430807130249,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.1596947095195928,
+        "full15_l2": 0.14558305219905437
+      }
+    },
+    {
+      "accepted_updates": 1776,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.2994892004011888,
+      "mean_log_energy_rmse": 1.4134675672621306,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.14011057548897635,
+        "full15_l2": 0.1279111401627367
+      }
+    },
+    {
+      "accepted_updates": 2368,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.3341838812399064,
+      "mean_log_energy_rmse": 1.6505242561969287,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.13614716065076746,
+        "full15_l2": 0.12439208913849369
+      }
+    },
+    {
+      "accepted_updates": 2960,
+      "finite_count": 21,
+      "nonfinite_count": 0,
+      "mean_epsilon_E": 0.29839556702505476,
+      "mean_log_energy_rmse": 1.3580930255114234,
+      "validation_losses": {
+        "legacy_scored10_l2": 0.1272642511309006,
+        "full15_l2": 0.11659991352343446
+      }
+    }
+  ],
+  "checkpoint_selection": {
+    "last": 2960,
+    "lowest_field_error": 2960,
+    "lowest_log_energy_error": 300,
+    "lowest_mean_early_growth_error": 1184
+  },
+  "checkpoints": [
+    {
+      "file": "training/state_00000000.npz",
+      "sha256": "53b5572f021140cb9e274ee0322d5e05b8f46f57fe218c61278b715e82be4903",
+      "accepted_updates": 0,
+      "windows": 0
+    },
+    {
+      "file": "training/state_00000001.npz",
+      "sha256": "b3c2c89047c2411d73ec3f446c0a3e52c09fe7f82ff1d8ec950a22388a789ade",
+      "accepted_updates": 1,
+      "windows": 48
+    },
+    {
+      "file": "training/state_00000002.npz",
+      "sha256": "cc8c0d354b0441dc2649ffe8c3d17db1d96f80322cb5c172aa5d377fe4fcff8f",
+      "accepted_updates": 2,
+      "windows": 96
+    },
+    {
+      "file": "training/state_00000003.npz",
+      "sha256": "f4a1e25e6203668c8b8de91b505d9a7abcdd7d77785b1cf1685e2f7bcad4c5c3",
+      "accepted_updates": 3,
+      "windows": 144
+    },
+    {
+      "file": "training/state_00000050.npz",
+      "sha256": "53158e095c7a55b8d1d635e397f6399156af90e370819384ba1d233a8d068f06",
+      "accepted_updates": 50,
+      "windows": 2400
+    },
+    {
+      "file": "training/state_00000100.npz",
+      "sha256": "b087b5cbba3f13099b71d09f61052336939ebda2436a696d57cd070b0248a942",
+      "accepted_updates": 100,
+      "windows": 4800
+    },
+    {
+      "file": "training/state_00000150.npz",
+      "sha256": "52f29e4f566d05b5302de3e0194b650201aa7928c78d84ed2724076bf86f0508",
+      "accepted_updates": 150,
+      "windows": 7200
+    },
+    {
+      "file": "training/state_00000200.npz",
+      "sha256": "d0aa0afecbead577025156f6162fee6b07ff85d87799c766ec3639e52f2b0411",
+      "accepted_updates": 200,
+      "windows": 9600
+    },
+    {
+      "file": "training/state_00000250.npz",
+      "sha256": "f9449a7fbf756134c309fa8da00240a5ba5ebdf2b2275b7f37d44247218ff474",
+      "accepted_updates": 250,
+      "windows": 12000
+    },
+    {
+      "file": "training/state_00000300.npz",
+      "sha256": "4fe46c933ffeba200ae177d7fef5a6008b9c168a3159968065d6c55c6c547fb7",
+      "accepted_updates": 300,
+      "windows": 14400
+    },
+    {
+      "file": "training/state_00000350.npz",
+      "sha256": "ac1ef3290b8dcac298143ce475930588e9ac2cbbb899477f0e5addf690f69001",
+      "accepted_updates": 350,
+      "windows": 16800
+    },
+    {
+      "file": "training/state_00000400.npz",
+      "sha256": "b1109b749a777caafa858bcd5edff1a97c124e93e7862fb21ff262183e224470",
+      "accepted_updates": 400,
+      "windows": 19200
+    },
+    {
+      "file": "training/state_00000450.npz",
+      "sha256": "a3eb36e8eb3e1d23d4d8c45c6eea52150aa0df2c1f7059ba908ec81dd3064058",
+      "accepted_updates": 450,
+      "windows": 21600
+    },
+    {
+      "file": "training/state_00000500.npz",
+      "sha256": "18a99b14febfa3469f1c327ab85e4510857394cd2ed80794b940fefff55a2560",
+      "accepted_updates": 500,
+      "windows": 24000
+    },
+    {
+      "file": "training/state_00000550.npz",
+      "sha256": "9aefb39de885e812977245c0c90680f76a85ddf13f6244e20e184a2445c350f8",
+      "accepted_updates": 550,
+      "windows": 26400
+    },
+    {
+      "file": "training/state_00000592.npz",
+      "sha256": "9101e19a7cf0223134e7153bf52356901840edab59c5b190dd1a80b12547d68e",
+      "accepted_updates": 592,
+      "windows": 28404
+    },
+    {
+      "file": "training/state_00000600.npz",
+      "sha256": "67e4dce251a693c8150c196e203311d4040e0d64bd7e0bab787339af77462a26",
+      "accepted_updates": 600,
+      "windows": 28788
+    },
+    {
+      "file": "training/state_00000650.npz",
+      "sha256": "0401db109dbe83cbbfc548219139c0746feb237a78e9c0141ab5cd9d9876baff",
+      "accepted_updates": 650,
+      "windows": 31188
+    },
+    {
+      "file": "training/state_00000700.npz",
+      "sha256": "22bdacc6221748d43f6241a82f30b623d1a575025b734a5a46ece82b32b8d6c5",
+      "accepted_updates": 700,
+      "windows": 33588
+    },
+    {
+      "file": "training/state_00000750.npz",
+      "sha256": "3bc1d2a7cb27bc1139e58d42f35d2c6a330473ad9d11c6130327e2fa717d88df",
+      "accepted_updates": 750,
+      "windows": 35988
+    },
+    {
+      "file": "training/state_00000800.npz",
+      "sha256": "ce7a6e450f87aab02925c804a319bf86c8f59d143d297acf004cb96aa949d05f",
+      "accepted_updates": 800,
+      "windows": 38388
+    },
+    {
+      "file": "training/state_00000850.npz",
+      "sha256": "6e8cee9124907e2efdfa1fe6fa543617b8e534d4a3a25c67bf28eca1f38c68dd",
+      "accepted_updates": 850,
+      "windows": 40788
+    },
+    {
+      "file": "training/state_00000900.npz",
+      "sha256": "73b8132f283730d71d667de67da48e1af65d5304bf4e28999bec7af64cecc89a",
+      "accepted_updates": 900,
+      "windows": 43188
+    },
+    {
+      "file": "training/state_00000950.npz",
+      "sha256": "affd58fc863d876c7ccdfde1b21f5389c5cc1b64afc7caf99f353668d561e639",
+      "accepted_updates": 950,
+      "windows": 45588
+    },
+    {
+      "file": "training/state_00001000.npz",
+      "sha256": "0b579a62dccd96a0c9f9c8a9d1585ed60ba16f041ace49f95a533dcf9a5096f4",
+      "accepted_updates": 1000,
+      "windows": 47988
+    },
+    {
+      "file": "training/state_00001050.npz",
+      "sha256": "364a4eb8247db0170308d14ed17ccddd58566a6924814b143c24b6d352ea27d6",
+      "accepted_updates": 1050,
+      "windows": 50388
+    },
+    {
+      "file": "training/state_00001100.npz",
+      "sha256": "d931efb78cbe1f4cfaec1b5b1766d29a3b33cf3472414c17a442b9cde65b28b1",
+      "accepted_updates": 1100,
+      "windows": 52788
+    },
+    {
+      "file": "training/state_00001150.npz",
+      "sha256": "aa0af36d9e7e993cd21d7885e8542775e6a03daf7333f7a33752efb1893769c3",
+      "accepted_updates": 1150,
+      "windows": 55188
+    },
+    {
+      "file": "training/state_00001184.npz",
+      "sha256": "8ff8d05f4ef0d9de029032c6971e0728f1a3fc95cf647dad149e9147b05b1c9f",
+      "accepted_updates": 1184,
+      "windows": 56808
+    },
+    {
+      "file": "training/state_00001200.npz",
+      "sha256": "aa5af9a189a0f2d5a3eec4302d8dea59ee6113bcf65301dc8f3fc9c2e07cca92",
+      "accepted_updates": 1200,
+      "windows": 57576
+    },
+    {
+      "file": "training/state_00001250.npz",
+      "sha256": "f23f95c85481412c4b9d246db20e2ca623fd8bcdc7a9ecb72515f09f5576ce6e",
+      "accepted_updates": 1250,
+      "windows": 59976
+    },
+    {
+      "file": "training/state_00001300.npz",
+      "sha256": "a93054695dedf85313e14a937ea8e509b1435f1a28c9d4cdca4fc2963b97659d",
+      "accepted_updates": 1300,
+      "windows": 62376
+    },
+    {
+      "file": "training/state_00001350.npz",
+      "sha256": "9a551ffe79920878b3c951c9a42bc902e42c7097f3dda8e1fa30fad164fdc75c",
+      "accepted_updates": 1350,
+      "windows": 64776
+    },
+    {
+      "file": "training/state_00001400.npz",
+      "sha256": "015bc365652f5e1feede58407e3067738e7864783c69021fd8f125a9248e736d",
+      "accepted_updates": 1400,
+      "windows": 67176
+    },
+    {
+      "file": "training/state_00001450.npz",
+      "sha256": "fb9e2b429ad5829f85f0a9c7e14e5a0f5174c29fbdf00696d798957cb4c1d42c",
+      "accepted_updates": 1450,
+      "windows": 69576
+    },
+    {
+      "file": "training/state_00001500.npz",
+      "sha256": "99579fc73867bce80318e4b708af8f588558cbd789cf12840deafd7d403e017f",
+      "accepted_updates": 1500,
+      "windows": 71976
+    },
+    {
+      "file": "training/state_00001550.npz",
+      "sha256": "a6e2ca4fcce4c5c2da7d4c474f06096527d1692b49230561f3374f7d8be99e67",
+      "accepted_updates": 1550,
+      "windows": 74376
+    },
+    {
+      "file": "training/state_00001600.npz",
+      "sha256": "d547fdac4bd679b512cc2e24f76c69c419af22742171ea000562f122ed1aedf6",
+      "accepted_updates": 1600,
+      "windows": 76776
+    },
+    {
+      "file": "training/state_00001650.npz",
+      "sha256": "81fef8e4bee5c2872ac18f8ff4ef6e17bfa5a9ce609a0cb2b901709f10fb778b",
+      "accepted_updates": 1650,
+      "windows": 79176
+    },
+    {
+      "file": "training/state_00001700.npz",
+      "sha256": "809dc40919b23ec1fa9aaaa04ab9ab73be322a865fba0e32e8dff64c6effdb7d",
+      "accepted_updates": 1700,
+      "windows": 81576
+    },
+    {
+      "file": "training/state_00001750.npz",
+      "sha256": "cfb01a7c6a9f34c085e3665cd1ae23678e56a46d63182cd3c3cd368a000a048b",
+      "accepted_updates": 1750,
+      "windows": 83976
+    },
+    {
+      "file": "training/state_00001776.npz",
+      "sha256": "b5bd7a8a2a6b1fd68ca5bc8bc4861c12675055d761874fa873724641e1fa8f9a",
+      "accepted_updates": 1776,
+      "windows": 85212
+    },
+    {
+      "file": "training/state_00001800.npz",
+      "sha256": "b3c1f51c4fad2d917179c144ea520762106185405e6e41d0b35781225821d9b0",
+      "accepted_updates": 1800,
+      "windows": 86364
+    },
+    {
+      "file": "training/state_00001850.npz",
+      "sha256": "62bd13a9f804f5f936f5c3d7f9de412845a257c15b3ce5c2d5094b1c0009bf85",
+      "accepted_updates": 1850,
+      "windows": 88764
+    },
+    {
+      "file": "training/state_00001900.npz",
+      "sha256": "0e1f7c8c1112d5597bdc2be931bb55461820e8b524557aa61027c156375db795",
+      "accepted_updates": 1900,
+      "windows": 91164
+    },
+    {
+      "file": "training/state_00001950.npz",
+      "sha256": "e9938ad15fdfafc3b77db11ba4daaa3bd7b8c0d140a10026e1db06c510c63d68",
+      "accepted_updates": 1950,
+      "windows": 93564
+    },
+    {
+      "file": "training/state_00002000.npz",
+      "sha256": "019fcc1b481bd1c9fa1470bff70b7e30f5977a71f085bb285f405270a99a2567",
+      "accepted_updates": 2000,
+      "windows": 95964
+    },
+    {
+      "file": "training/state_00002050.npz",
+      "sha256": "01c71f2bdc70a19b524312a7f98daf0d63bdce99fdd85f55dcf8530b59dd84b4",
+      "accepted_updates": 2050,
+      "windows": 98364
+    },
+    {
+      "file": "training/state_00002100.npz",
+      "sha256": "f2f8a465b0d45c9470482f1a7ffa64b798a6ec2655d728b0ccdb65e498aba961",
+      "accepted_updates": 2100,
+      "windows": 100764
+    },
+    {
+      "file": "training/state_00002150.npz",
+      "sha256": "1317f50d057bb7a6430f6700c264c201d4cd8c5fd32fcc630d7008a88f96a394",
+      "accepted_updates": 2150,
+      "windows": 103164
+    },
+    {
+      "file": "training/state_00002200.npz",
+      "sha256": "d20cadce90257a0100f4a7a1af17a0cc3e78fcac370bc1001c147c89be4f8f3c",
+      "accepted_updates": 2200,
+      "windows": 105564
+    },
+    {
+      "file": "training/state_00002250.npz",
+      "sha256": "12320a2e89fb508565b6b9ffd12a022c04117d4d1c3bea4614c6b1b9d764ecb9",
+      "accepted_updates": 2250,
+      "windows": 107964
+    },
+    {
+      "file": "training/state_00002300.npz",
+      "sha256": "5296875319082b0fb5b7d10c376ffb8015cd4ac04711ba1185e6d4ee77bdf444",
+      "accepted_updates": 2300,
+      "windows": 110364
+    },
+    {
+      "file": "training/state_00002350.npz",
+      "sha256": "b81f0be960a854acb1440492018df2703c1090f862b77f8b6d08b87672b417b3",
+      "accepted_updates": 2350,
+      "windows": 112764
+    },
+    {
+      "file": "training/state_00002368.npz",
+      "sha256": "d430e2f09bdeeaee36a42fd3bb41b50b9d8cfa04ba181c032474e53d9dfe01f8",
+      "accepted_updates": 2368,
+      "windows": 113616
+    },
+    {
+      "file": "training/state_00002400.npz",
+      "sha256": "942c8350e0c7aad0ba183265c7f2decb8a08097f83ce887f1a584507c0a28bb0",
+      "accepted_updates": 2400,
+      "windows": 115152
+    },
+    {
+      "file": "training/state_00002450.npz",
+      "sha256": "e8b586c59e5a05af23dc9594e7d5e20382654e1b34596121cf358f70b2fa5049",
+      "accepted_updates": 2450,
+      "windows": 117552
+    },
+    {
+      "file": "training/state_00002500.npz",
+      "sha256": "09cef50009aa5c19d4784cda228173e4d30cb33373ac6856abd39eb22866b5cf",
+      "accepted_updates": 2500,
+      "windows": 119952
+    },
+    {
+      "file": "training/state_00002550.npz",
+      "sha256": "3505ccd3abc51c6f365d738ecda8ef9454831ee8e49ccf2872f2649107a225bb",
+      "accepted_updates": 2550,
+      "windows": 122352
+    },
+    {
+      "file": "training/state_00002600.npz",
+      "sha256": "f9bff27a5e4f13f978edc1f3b9618ea5aa1fdafd451df599ff49a4492782a249",
+      "accepted_updates": 2600,
+      "windows": 124752
+    },
+    {
+      "file": "training/state_00002650.npz",
+      "sha256": "9f0ac2057d6da31b8df5bc7aef65903a2505230f1f326bffb95f849d5884faa7",
+      "accepted_updates": 2650,
+      "windows": 127152
+    },
+    {
+      "file": "training/state_00002700.npz",
+      "sha256": "e9992fbe0a22ff8e5ed53da9225c4a7bd20415cfdbccc5da6f7e84b951845b4b",
+      "accepted_updates": 2700,
+      "windows": 129552
+    },
+    {
+      "file": "training/state_00002750.npz",
+      "sha256": "f61f17f8dc57e66e840874217e569b8ed2d3cae545c908fd51aba00ff5c75b88",
+      "accepted_updates": 2750,
+      "windows": 131952
+    },
+    {
+      "file": "training/state_00002800.npz",
+      "sha256": "588b22d1a18c4ac012023040e1c1bd9d269bb061704dfa66a7f4c321ec948fe5",
+      "accepted_updates": 2800,
+      "windows": 134352
+    },
+    {
+      "file": "training/state_00002850.npz",
+      "sha256": "b1cf0d3926640d6afcbd82629d6fa0fa1ddb0a0c3bb979563ee8664c3516b6a8",
+      "accepted_updates": 2850,
+      "windows": 136752
+    },
+    {
+      "file": "training/state_00002900.npz",
+      "sha256": "687c9020fa5604d6b22b37e9c850fb6ce8b2ac5a52bb5abfa8d668a6bcec3374",
+      "accepted_updates": 2900,
+      "windows": 139152
+    },
+    {
+      "file": "training/state_00002950.npz",
+      "sha256": "eeb88bfdb4d742c59879e69c945e4f42c2bc80d8c5d6c478ebe99c6013d59019",
+      "accepted_updates": 2950,
+      "windows": 141552
+    },
+    {
+      "file": "training/state_00002960.npz",
+      "sha256": "750d0e616ce5cb481386b16b712be8dfb4d0ca1af0409da4139368d3955c0eea",
+      "accepted_updates": 2960,
+      "windows": 142020
+    }
+  ],
+  "artifact_sha256": {
+    "COMPLETE.json": "e878deb22265b75a5b00c854d53f4f639ff58a4aa1e4d7145bda89b0e5aa1b8c",
+    "FINAL_REPORT.md": "e982c008634570b4e36ac8ad7cbd4d6f3ad7338c97c04a5fc67cee91ba17db08",
+    "FINAL_ARTIFACT_VERIFICATION.json": "a995da2f5c34d605bd2ad544c0fd2c9b1f7f92ff5b1fa2abba34c9edbc44b049",
+    "mirror_index.json": "99b126f5871392b42a24277495b15f9fa907bdca3b9cdaf5a8189c83f88962f5",
+    "final_billing_report.json": "acbf3840d1b540c31dde7ba1089c2441e9f9297e1bbe805524251a9a8919a748",
+    "analysis/update_00002960/summary.json": "d17317c884e2c87fa0e19a95d5fbe734816e4b8ec2207bfba2579fd9a477285a",
+    "analysis/update_00002960/complete_epoch_train_validation.png": "c9290404ca55446dd3a18cb3a46d6469c2c7860b47444d37f2b2c6e3ae694bee",
+    "analysis/update_00002960/training_validation_updates.png": "ac185265f136906986bb28c798b982e06f0e0482edbb3b1bb46c8b8964e0989d",
+    "analysis/update_00002960/clean/autonomous_energy_update_00000300.png": "0925101a0454d948629ca4c37c10ac658b445400eb7d7202c093d2e0522f30c3",
+    "analysis/update_00002960/clean/autonomous_energy_update_00001776.png": "59c74870701ecc125a0ce858629fbeb81d6cbd0fdbbe5dafeea1d179d8b0a113",
+    "analysis/update_00002960/clean/autonomous_energy_update_00002960.png": "f0c4c8d1a5f5bf85c0e51ba04e627e5df586e3ad42eee42fd1b66aeb81e2d626"
+  },
+  "preservation": "Scientific sources and controller are byte-identical to the completed run. Large outputs remain outside Git. Earlier datasets and experiments are unchanged.",
+  "limitations": [
+    "All 21 T120 cases are finite at each saved evaluation, but several late damping floors and nonlinear recovery errors remain.",
+    "Lower window loss does not imply a better full energy trajectory.",
+    "Reported billing may lag and is not a final invoice."
+  ],
+  "reported_cost_usd": {
+    "this_run": 34.52742083,
+    "combined_since_2026_09_25": 111.72869474,
+    "authorized_cap": 350
+  },
+  "analysis_scripts_sha256": {
+    "scripts/analyze_full_window_qualification.py": "9e8c7a624abad127d30a4f3a27949d2d0c83aed90ede3fb65ec9d0e12e106ab7",
+    "scripts/summarize_saved_wave_feedback.py": "b112e0cd709c19af8440495d3de0d7eb6667f258ca6b8dd494642058bf75f626"
+  },
+  "implementation_commits": {
+    "finite_derivatives": "3525de2",
+    "loss_and_precision": "d3f91ce",
+    "execution_and_evaluation": "7ae76d9"
+  },
+  "preservation_checks": {
+    "scientific_training_tests_passed": 24,
+    "controller_bookkeeping_tests_passed": 2,
+    "local_checkpoint_hashes_reverified": 68,
+    "committed_source_files_match_frozen": 52,
+    "complete_epoch_losses_recomputed_from_saved_batches": true,
+    "new_training_started": false
+  }
+}
