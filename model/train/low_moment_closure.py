@@ -1534,6 +1534,23 @@ def _adam_step(
     )
 
 
+@jax.custom_jvp
+def _sqrt_with_zero_subgradient(value):
+    """Square root for an L2 objective, with zero subgradient at exact agreement.
+
+    Positive values are unchanged. This adds no amplitude floor or sample weight.
+    """
+    return jnp.sqrt(value)
+
+
+@_sqrt_with_zero_subgradient.defjvp
+def _sqrt_with_zero_subgradient_jvp(primals, tangents):
+    (value,), (tangent,) = primals, tangents
+    root = _sqrt_with_zero_subgradient(value)
+    denominator = 2 * jnp.sqrt(jnp.where(value == 0, 1, value))
+    return root, jnp.where(value == 0, 0, tangent / denominator)
+
+
 def make_loss_function(
     *,
     regimes: Sequence[str] = REGIMES,
@@ -1552,6 +1569,8 @@ def make_loss_function(
     pressure_floor: float,
     relative_trajectory_loss: bool = False,
     global_relative_trajectory_loss: bool = False,
+    global_relative_loss_norm: str = "squared_l2",
+    global_relative_normalization: str = "window_rms",
     closure_history_input: bool = False,
     relative_time_block_steps: int = 0,
     relative_time_block_count: int = 0,
@@ -1567,6 +1586,14 @@ def make_loss_function(
     log_energy_weight: float = 0.0,
     log_growth_weight: float = 0.0,
 ):
+    if global_relative_loss_norm not in ("squared_l2", "l2"):
+        raise ValueError("global_relative_loss_norm must be squared_l2 or l2")
+    if global_relative_loss_norm == "l2" and not global_relative_trajectory_loss:
+        raise ValueError("The l2 option requires global_relative_trajectory_loss")
+    if global_relative_normalization not in ("window_rms", "initial_rms"):
+        raise ValueError("Unknown global_relative_normalization")
+    if global_relative_normalization == "initial_rms" and not global_relative_trajectory_loss:
+        raise ValueError("Initial RMS requires global_relative_trajectory_loss")
     default_k_jax = jnp.asarray(k_arr, dtype=jnp.float32)
     input_scale_jax = jnp.asarray(input_scale, dtype=jnp.float32)
     regime_scales_jax = jnp.asarray(regime_scales, dtype=jnp.float32)
@@ -1749,12 +1776,20 @@ def make_loss_function(
             numerator = jnp.sum(
                 jnp.square(predicted_fields - target_fields), axis=(1, 2, 3)
             )
-            denominator = jnp.sum(jnp.square(target_fields), axis=(1, 2, 3))
+            if global_relative_normalization == "initial_rms":
+                # One scale from the complete IC at t=0, independent of the
+                # anchor or its target window. It is used only in the loss.
+                scale = batch["initial_reference_rms"]
+                denominator = jnp.square(scale) * np.prod(target_fields.shape[1:])
+            else:
+                denominator = jnp.sum(jnp.square(target_fields), axis=(1, 2, 3))
             sample_loss = jnp.where(
                 denominator > 0.0,
                 numerator / denominator,
                 jnp.nan,
             )
+            if global_relative_loss_norm == "l2":
+                sample_loss = _sqrt_with_zero_subgradient(sample_loss)
         else:
             scales = regime_scales_jax[batch["regime_index"]][:, None, :, None]
             normalized_error = (predicted_fields - target_fields) / scales

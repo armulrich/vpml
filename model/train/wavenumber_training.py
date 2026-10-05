@@ -30,16 +30,28 @@ class Configuration:
     preparation_steps: int = 200
     horizon: int = 400
     detach_preparation: bool = False
+    relative_loss_norm: str = "squared_l2"
+    relative_normalization: str = "window_rms"
     planned_epochs: int = 1000
     learning_rate: float = .001
     final_learning_rate: float = .00001
     weight_decay: float = .0001
+    compute_dtype: str = "float32"
+
+    def __post_init__(self):
+        if self.compute_dtype not in ("float32", "float64"):
+            raise ValueError("compute_dtype must be float32 or float64")
 
 
 def initialize(config):
-    return init_burles_latent_fno_params(jax.random.PRNGKey(config.seed),
+    params = init_burles_latent_fno_params(jax.random.PRNGKey(config.seed),
         width=config.width, spectral_modes=config.modes, memory_steps=config.memory_steps,
         depth=config.depth, latent_dim=config.latent_dim)
+    # Preserve the established random draw. Precision changes its storage and
+    # arithmetic, not the seed's initial neural values.
+    if config.compute_dtype == "float64":
+        params = jax.tree_util.tree_map(lambda x: x.astype(jnp.float64), params)
+    return params
 
 
 def loss_factory(config, stats):
@@ -51,6 +63,8 @@ def loss_factory(config, stats):
         amplitude_scale=float(stats['amplitude_scale'][0]), poisson_sign=1.,
         normalized_heat_flux_bound=128., density_floor=1e-4,pressure_floor=1e-4,
         global_relative_trajectory_loss=True, closure_history_input=True,
+        global_relative_loss_norm=config.relative_loss_norm,
+        global_relative_normalization=config.relative_normalization,
         memory_backend='burles_latent_fno', memory_stride=config.memory_stride,
         input_scaling='current_density_rms_arcsinh', dynamic_amplitude_floor=1e-6,
         allow_uniform_heating=True, autonomous_burnin_steps=config.preparation_steps,
@@ -73,6 +87,7 @@ def load_stats(checkpoint):
 
 def batch_from_states(manifest, rows, states, config):
     initials=[]; targets=[]; amplitudes=[]; regimes=[]; wavenumbers=[]
+    initial_scales=[]; scale_cache={}
     for ci, ai in rows:
         case=manifest['cases'][int(ci)]
         history=states[case['case_id']]
@@ -84,12 +99,24 @@ def batch_from_states(manifest, rows, states, config):
         targets.append(history[s+config.preparation_steps+1:stop])
         amplitudes.append(case['epsilon']); regimes.append(REGIMES.index(case['regime']))
         wavenumbers.append(2*np.pi*np.fft.rfftfreq(config.nx,d=case['domain_length']/config.nx))
+        if config.relative_normalization == 'initial_rms':
+            cid=case['case_id']
+            if cid not in scale_cache:
+                fields=base._primitive_numpy(history[:1],case['domain_length']).astype(np.float64)
+                scale_cache[cid]=float(np.sqrt(np.mean(fields*fields)))
+                if not np.isfinite(scale_cache[cid]) or scale_cache[cid] <= 0:
+                    raise ValueError(f'Initial perturbation RMS must be positive: {cid}')
+            initial_scales.append(scale_cache[cid])
     b=len(rows)
-    return dict(initial=np.asarray(initials,np.float32), targets=np.asarray(targets,np.float32),
-        memory=np.zeros((b,config.memory_steps,3,config.nx),np.float32),
-        heat_flux_gradient_history=np.zeros((b,config.memory_steps,config.nx),np.float32),
-        amplitude=np.asarray(amplitudes,np.float32),regime_index=np.asarray(regimes,np.int32),
-        k_arr=np.asarray(wavenumbers,np.float32))
+    dtype=np.dtype(config.compute_dtype)
+    batch=dict(initial=np.asarray(initials,dtype), targets=np.asarray(targets,dtype),
+        memory=np.zeros((b,config.memory_steps,3,config.nx),dtype),
+        heat_flux_gradient_history=np.zeros((b,config.memory_steps,config.nx),dtype),
+        amplitude=np.asarray(amplitudes,dtype),regime_index=np.asarray(regimes,np.int32),
+        k_arr=np.asarray(wavenumbers,dtype))
+    if config.relative_normalization == 'initial_rms':
+        batch['initial_reference_rms']=np.asarray(initial_scales,dtype)
+    return batch
 
 
 def convert_old_case(cache, case, config):
@@ -144,7 +171,7 @@ def update_factory(config,stats):
     @jax.jit
     def update(params,opt,batch,rate):
         value,grad=jax.value_and_grad(loss)(params,batch)
-        p,o,gn,un,_=base._adam_step(params,grad,opt,jnp.asarray(rate,jnp.float32),0.,config.weight_decay,0.)
+        p,o,gn,un,_=base._adam_step(params,grad,opt,jnp.asarray(rate,getattr(jnp,config.compute_dtype)),0.,config.weight_decay,0.)
         p=jax.tree_util.tree_map(lambda new,old:new.astype(old.dtype),p,params)
         for part in ("m","v"):
             o[part]=jax.tree_util.tree_map(lambda new,old:new.astype(old.dtype),o[part],opt[part])

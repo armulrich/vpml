@@ -15,7 +15,7 @@ def rollout_factory(config,stats,chunk_steps=200):
     def run(params,state,history,closure_history,counter,previous,z,amplitude,k):
         return rollout_burles_latent_closure(params,state,history,counter,amplitude,k,
             horizon=chunk_steps,dt=config.dt,memory_stride=config.memory_stride,
-            input_scale=jnp.asarray(stats['input_scale'],jnp.float32),
+            input_scale=jnp.asarray(stats['input_scale'],state.dtype),
             heat_flux_gradient_scale=float(stats['heat_flux_gradient_scale'][0]),
             amplitude_center=float(stats['amplitude_center'][0]),amplitude_scale=float(stats['amplitude_scale'][0]),
             compact_latent=z,previous_heat_flux_gradient=previous,heat_flux_gradient_history=closure_history,
@@ -27,12 +27,13 @@ def rollout_factory(config,stats,chunk_steps=200):
 def autonomous_case(params,case,initial,config,rollout,*,horizon=120.,chunk_steps=200):
     total=int(round(horizon/config.dt))
     if total%chunk_steps:raise ValueError('Evaluation horizon must fit complete chunks')
-    state=jnp.asarray(initial[None],jnp.float32)
-    h=jnp.zeros((1,config.memory_steps,3,config.nx),jnp.float32)
-    ch=jnp.zeros((1,config.memory_steps,config.nx),jnp.float32)
-    count=jnp.asarray(0,jnp.int32);prev=jnp.zeros((1,config.nx),jnp.float32);z=None
-    k=jnp.asarray(2*np.pi*np.fft.rfftfreq(config.nx,d=case['domain_length']/config.nx),jnp.float32)
-    a=jnp.asarray([case['epsilon']],jnp.float32)
+    dtype=getattr(jnp,config.compute_dtype)
+    state=jnp.asarray(initial[None],dtype)
+    h=jnp.zeros((1,config.memory_steps,3,config.nx),dtype)
+    ch=jnp.zeros((1,config.memory_steps,config.nx),dtype)
+    count=jnp.asarray(0,jnp.int32);prev=jnp.zeros((1,config.nx),dtype);z=None
+    k=jnp.asarray(2*np.pi*np.fft.rfftfreq(config.nx,d=case['domain_length']/config.nx),dtype)
+    a=jnp.asarray([case['epsilon']],dtype)
     pieces=[np.asarray(initial)[None]];zn=[]
     for _ in range(total//chunk_steps):
         states,memory=rollout(params,state,h,ch,count,prev,z,a,k)
