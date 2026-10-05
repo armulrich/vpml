@@ -494,6 +494,24 @@ def _causal_temporal_convolution(
     )
 
 
+def _rms_with_floor(values: Array, floor: float) -> Array:
+    """Floor RMS without differentiating sqrt at zero or changing floor rounding."""
+    values = jnp.asarray(values)
+    mean_square = jnp.mean(jnp.square(values), axis=-1)
+    floor_value = jnp.asarray(floor, dtype=values.dtype)
+    # Keep the original rounded comparison: sqrt(max(mean_square, floor**2))
+    # can change the forward value or threshold when floor**2 rounds.
+    # This sqrt only selects a branch; the differentiated sqrt is guarded below.
+    below_floor = jnp.sqrt(jax.lax.stop_gradient(mean_square)) < floor_value
+    zero = mean_square == 0.0
+    safe_mean_square = jnp.where(below_floor | zero, 1.0, mean_square)
+    rms = jnp.sqrt(safe_mean_square)
+    # A zero floor stays zero, with the zero subgradient of RMS at the origin.
+    rms = jnp.where(zero, 0.0, rms)
+    # Retain maximum's original tie convention at an exactly attained floor.
+    return jnp.maximum(jnp.where(below_floor, floor_value, rms), floor_value)
+
+
 def _normalized_closure_fields(
     params: Dict[str, Array],
     state: Array,
@@ -514,11 +532,7 @@ def _normalized_closure_fields(
     if input_scaling not in INPUT_SCALING_KINDS:
         raise ValueError(f"Unsupported low-moment input scaling: {input_scaling}")
     if input_scaling == DYNAMIC_INPUT_SCALING:
-        physical_amplitude = jnp.sqrt(jnp.mean(jnp.square(fields[:, 0]), axis=-1))
-        physical_amplitude = jnp.maximum(
-            physical_amplitude,
-            jnp.asarray(dynamic_amplitude_floor, dtype=real_dtype),
-        )
+        physical_amplitude = _rms_with_floor(fields[:, 0], dynamic_amplitude_floor)
         normalized = jnp.arcsinh(fields / physical_amplitude[:, None, None])
     else:
         physical_amplitude = jnp.asarray(amplitude, dtype=real_dtype)
@@ -583,9 +597,8 @@ def _window_fno_features(
     current_amplitude = jnp.asarray(amplitude, dtype=state.dtype)
     if input_scaling == DYNAMIC_INPUT_SCALING:
         current_fields = primitive_fields(state, k_arr, poisson_sign=poisson_sign)
-        current_amplitude = jnp.maximum(
-            jnp.sqrt(jnp.mean(jnp.square(current_fields[:, 0]), axis=-1)),
-            jnp.asarray(dynamic_amplitude_floor, dtype=state.dtype),
+        current_amplitude = _rms_with_floor(
+            current_fields[:, 0], dynamic_amplitude_floor
         )
     if encoded_history is None:
         encoded_history = encode_explicit_window_history(
@@ -863,13 +876,14 @@ def encode_explicit_window_history(
         raise ValueError(f"Unsupported low-moment input scaling: {input_scaling}")
     if input_scaling == DYNAMIC_INPUT_SCALING:
         if normalization_amplitude is None:
-            normalization_amplitude = jnp.sqrt(
-                jnp.mean(jnp.square(fields[:, -1, 0]), axis=-1)
+            normalization_amplitude = _rms_with_floor(
+                fields[:, -1, 0], dynamic_amplitude_floor
             )
-        normalization_amplitude = jnp.maximum(
-            jnp.asarray(normalization_amplitude, dtype=history.dtype),
-            jnp.asarray(dynamic_amplitude_floor, dtype=history.dtype),
-        )
+        else:
+            normalization_amplitude = jnp.maximum(
+                jnp.asarray(normalization_amplitude, dtype=history.dtype),
+                jnp.asarray(dynamic_amplitude_floor, dtype=history.dtype),
+            )
         fields = jnp.arcsinh(
             fields / normalization_amplitude[:, None, None, None]
         )
@@ -1146,9 +1160,12 @@ def limit_low_moment_state(
     density_excess = jnp.maximum(updated_density - floor, 0.0)
     mean_excess = jnp.mean(density_excess, axis=-1, keepdims=True)
     target_excess = jnp.maximum(density_mean - floor, 0.0)
+    rescale_density = mean_excess > jnp.finfo(updated.dtype).eps
+    # Guard the division itself: an inactive 0/0 can still poison reverse AD.
+    safe_mean_excess = jnp.where(rescale_density, mean_excess, 1.0)
     corrected_density = jnp.where(
-        mean_excess > jnp.finfo(updated.dtype).eps,
-        floor + density_excess * target_excess / mean_excess,
+        rescale_density,
+        floor + density_excess * target_excess / safe_mean_excess,
         jnp.broadcast_to(density_mean, density_excess.shape),
     )
     density_perturbation = jnp.where(
