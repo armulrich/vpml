@@ -66,6 +66,97 @@ def stopping_updates(protocol, stop_epoch, stop_update=0):
     return target,gates
 
 
+def validate_continuation(parent, child):
+    """Allow a longer endpoint, never a changed scientific training prefix."""
+    fixed = ('config', 'source_sha256', 'evaluation_source_sha256',
+        'manifest_sha256', 'normalization_sha256', 'random_float32_init_sha256',
+        'validation_configurations', 'runtime', 'updates_per_epoch',
+        'windows_per_epoch', 'planned_epochs', 'reference_root',
+        'normalization_origin', 'train_count', 'heldout_count',
+        'initial_descent_check_batches', 'stop_on_nonfinite', 'combined_cost_cap')
+    for key in fixed:
+        if child.get(key) != parent.get(key):
+            raise ValueError(f'Continuation changes {key}')
+    resume = child['resume_from']
+    name = resume['run']
+    if not name.replace('_', '').replace('-', '').isalnum():
+        raise ValueError('Unsafe parent namespace')
+    count = parent['updates_per_epoch']
+    start = parent['stop_epoch'] * count
+    if resume['accepted_updates'] != start:
+        raise ValueError('Continuation must restore the completed parent endpoint')
+    if not parent['stop_epoch'] < child['stop_epoch'] <= parent['config']['planned_epochs']:
+        raise ValueError('Invalid continuation endpoint')
+    expected = parent['autonomous_gate_updates'] + [
+        epoch * count for epoch in range(parent['stop_epoch'] + 1, child['stop_epoch'] + 1)]
+    if child['autonomous_gate_updates'] != expected:
+        raise ValueError('Continuation must retain every autonomous epoch gate')
+    return start
+
+
+def prepare_continuation(ctx):
+    """Copy a completed lineage into a new namespace, retaining every state array."""
+    import shutil, numpy as np
+    from model.train.interface_flux_data import sha256_file, sha256_json
+    from model.train.wavenumber_training import load_snapshot
+    resume = ctx['protocol']['resume_from']; parent = REMOTE / resume['run']
+    if parent == OUT:
+        raise ValueError('Continuation cannot overwrite its parent')
+    old = json.loads((parent/'protocol.json').read_text())
+    if sha256_json(old) != resume['protocol_sha256']:
+        raise ValueError('Parent protocol hash mismatch')
+    start = validate_continuation(old, ctx['protocol'])
+    complete = json.loads((parent/'COMPLETE.json').read_text())
+    if (parent/'STOPPED.json').exists() or complete['accepted_updates'] != start:
+        raise ValueError('Parent is not a completed successful qualification')
+    checkpoint = parent/'training'/f'state_{start:08d}.npz'
+    if sha256_file(checkpoint) != resume['checkpoint_sha256']:
+        raise ValueError('Parent checkpoint hash mismatch')
+    p,o,r,rows = load_snapshot(checkpoint, resume['protocol_sha256'])
+    if r['accepted_updates'] != start:
+        raise ValueError('Parent checkpoint is not the requested endpoint')
+    r = dict(r, protocol_sha256=ctx['digest'])
+    validate(r,o,rows)
+    # Hash every reused evaluation and the original initialization qualification.
+    for rel,digest in resume['reused_files'].items():
+        path = Path(rel)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError('Unsafe parent artifact path')
+        if sha256_file(parent/path) != digest:
+            raise ValueError(f'Parent artifact changed: {rel}')
+    for gate in old['autonomous_gate_updates']:
+        rel = f'evaluation/update_{gate:08d}/report.json'
+        if rel not in resume['reused_files']:
+            raise ValueError(f'Missing parent evaluation: {gate}')
+        report = json.loads((parent/rel).read_text())
+        if report['nonfinite_count'] or any(v is None for v in report['validation_losses'].values()):
+            raise ValueError('Failed parent autonomous gate')
+    OUT.mkdir(exist_ok=False)
+    shutil.copytree('/root/setup',OUT/'setup')
+    for rel in resume['reused_files']:
+        target = OUT/rel; target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(parent/rel,target)
+    write(OUT/'protocol.json',ctx['protocol'])
+    snapshot(p,o,r,rows)
+    with np.load(checkpoint,allow_pickle=False) as before, np.load(
+            OUT/'training'/checkpoint.name,allow_pickle=False) as after:
+        if set(before.files) != set(after.files):
+            raise ValueError('Continuation checkpoint fields changed')
+        for key in before.files:
+            if key == 'record': continue
+            a,b = before[key],after[key]
+            if a.dtype != b.dtype or a.shape != b.shape or a.tobytes() != b.tobytes():
+                raise ValueError(f'Continuation changed checkpoint array {key}')
+    result = dict(status='ready',accepted_updates=start,parent_run=resume['run'],
+        parent_checkpoint_sha256=resume['checkpoint_sha256'],
+        exact_array_and_optimizer_parity=True,preserved_loss_rows=len(rows),
+        next_epoch=r['epoch'],next_batch=r['next_batch'],
+        note='Only the provenance protocol hash changes. Scientific config, optimizer, data cursor and loss prefix are unchanged.')
+    write(OUT/'CONTINUATION_PARITY.json',result)
+    write(OUT/'READY.json',result)
+    volume.commit(); return result
+
+
 def context():
     import numpy as np
     import jax
@@ -138,6 +229,8 @@ def prepare():
         if not (OUT/'READY.json').exists(): raise ValueError('Partial setup: preserve and inspect')
         if json.loads((OUT/'protocol.json').read_text()) != ctx['protocol']: raise ValueError('Resume protocol mismatch')
         return dict(status='existing')
+    if 'resume_from' in ctx['protocol']:
+        return prepare_continuation(ctx)
     hashes=json.loads((ORIGIN/'reference_hashes.json').read_text())
     for cid, a in ctx['states'].items():
         if a.shape != (4801,3,128) or not np.isfinite(a).all() or sha256_file(REF/'reference'/cid/'states.npy') != hashes[cid]:
@@ -243,6 +336,20 @@ def train_chunk(stop: int):
                 payload.update({f'optimizer_{part}_{k}':np.asarray(v) for part in ('m','v') for k,v in oo[part].items()})
                 np.savez(f,**payload,loss=np.asarray(loss),gradient_norm=np.asarray(gn))
             write(OUT/'STOPPED.json',fail);volume.commit();return fail
+        resume = ctx['protocol'].get('resume_from')
+        if resume and r['accepted_updates'] == resume['accepted_updates']:
+            rp,ro,_,_ = load_latest()
+            repeated = step(rp,ro,b,lr)
+            equal = all(np.array_equal(np.asarray(a),np.asarray(d)) for a,d in
+                zip(jax.tree_util.tree_leaves(out),jax.tree_util.tree_leaves(repeated)))
+            check = dict(bitwise_repeat_resume=equal,from_update=r['accepted_updates'],
+                attempted_update=r['accepted_updates']+1,learning_rate=float(lr),
+                loss=float(loss),finite=finite,epoch=r['epoch'],batch=bi+1)
+            write(OUT/'continuation_first_update_check.json',check)
+            if not equal:
+                write(OUT/'STOPPED.json',dict(status='continuation_replay_failed',
+                    accepted_updates=r['accepted_updates'],check=check))
+                volume.commit();return dict(status='continuation_replay_failed',**r)
         if start==0 and bi==0:
             # Same random model and update, repeated after exact disk restore.
             rp,ro,rr,_=load_snapshot(OUT/'training/state_00000000.npz',ctx['digest'])
