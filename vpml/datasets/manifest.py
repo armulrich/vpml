@@ -9,17 +9,17 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 import hashlib
-import json
 from numbers import Real
-import os
 from pathlib import Path
-import tempfile
 
 import numpy as np
 
 from .initial_conditions import (
     _finite_real, _integer, draw_coefficients, validate_amplitudes,
 )
+
+from vpml.io.atomic import atomic_write
+from vpml.io.serialization import canonical_json_bytes as _canonical, read_json
 
 SCHEMA_VERSION = 1
 OUTPUT_SCHEMA = "gaussian-fields-v1"
@@ -103,10 +103,6 @@ def _numerics(value: Numerics | Mapping | None) -> Numerics:
         return value
     _require_keys(value, {field.name for field in fields(Numerics)}, "numerics")
     return Numerics(**value)
-
-
-def _canonical(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 def _shape_id(case: Mapping, amplitudes: Mapping) -> str:
@@ -258,40 +254,12 @@ def write_manifest(path: str | Path, manifest: Mapping) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = _canonical(manifest) + b"\n"
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Linking is atomic and exclusive, unlike os.replace, which overwrites.
-        os.link(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        os.unlink(temporary)
+    atomic_write(path, lambda handle: handle.write(payload), replace=False)
     return path
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict:
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"Duplicate JSON key: {key}")
-        value[key] = item
-    return value
-
-
-def _invalid_constant(value: str):
-    raise ValueError(f"Nonfinite JSON value: {value}")
 
 
 def read_manifest(path: str | Path) -> dict:
     """Load strict JSON and validate before any worker can consume it."""
-    manifest = json.loads(Path(path).read_text(), object_pairs_hook=_unique_object,
-                          parse_constant=_invalid_constant)
+    manifest = read_json(path)
     validate_manifest(manifest)
     return manifest

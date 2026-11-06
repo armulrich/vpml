@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import uuid
 
 import numpy as np
 
+
+from vpml.io.atomic import atomic_write as _atomic_write
+from vpml.io.serialization import canonical_json_bytes, file_digest as _file_sha256
 
 _VERSION = 1
 _KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
@@ -27,37 +29,7 @@ _TEMP = re.compile(
 
 
 def _json_bytes(value: object) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":"),
-                       allow_nan=False) + "\n").encode("utf-8")
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _sync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _atomic_write(path: Path, write) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            write(handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _sync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+    return canonical_json_bytes(value, newline=True)
 
 
 def _atomic_json(path: Path, value: dict) -> None:

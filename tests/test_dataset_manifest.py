@@ -93,7 +93,7 @@ class ManifestTests(unittest.TestCase):
                 write_manifest(path, manifest)
             self.assertEqual(path.read_bytes(), before)
             failed_path = Path(directory) / "failed.json"
-            with patch("vpml.datasets.manifest.os.link", side_effect=OSError("injected publication failure")):
+            with patch("vpml.io.atomic.os.link", side_effect=OSError("injected publication failure")):
                 with self.assertRaises(OSError):
                     write_manifest(failed_path, manifest)
             self.assertFalse(failed_path.exists())

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import math
 import os
@@ -41,41 +40,19 @@ def sample_initial_condition(
     return (float(eps) / max(len(modes), 1)) * perturbation
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def sha256_json(value: object) -> str:
-    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
-
-
-def sha256_file(path: Path, *, chunk_bytes: int = 8 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(int(chunk_bytes))
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+from vpml.io.atomic import atomic_write
+from vpml.io.serialization import (
+    canonical_json_bytes as _canonical_json_bytes,
+    file_digest as sha256_file,
+    json_digest as sha256_json,
+)
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write(path, lambda handle: handle.write(encoded))
 
 
 def evaluate_manifest_case(case: Mapping[str, object], x: np.ndarray) -> np.ndarray:

@@ -14,19 +14,9 @@ def read_parameters(path: Path | None) -> dict:
     if path is None:
         return {}
 
-    def unique_keys(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"Duplicate parameter: {key}")
-            result[key] = value
-        return result
+    from vpml.io.serialization import read_json
 
-    def invalid_number(value):
-        raise ValueError(f"Nonfinite JSON parameter: {value}")
-
-    result = json.loads(path.read_text(), object_pairs_hook=unique_keys,
-                        parse_constant=invalid_number)
+    result = read_json(path)
     if not isinstance(result, dict):
         raise ValueError("Parameters must be a JSON object")
     return result
