@@ -193,13 +193,13 @@ class LowMomentClosureTests(unittest.TestCase):
             return jnp.zeros_like(fluid).at[:, 2].set(closure)
 
         with mock.patch(
-            "vpml.low_moment.burles_latent_closure_rhs",
+            "vpml.solvers.moment_rollout.burles_latent_closure_rhs",
             side_effect=fake_closure_rhs,
         ), mock.patch(
-            "vpml.low_moment.low_moment_rhs",
+            "vpml.solvers.moment_rollout.low_moment_rhs",
             side_effect=closure_only_rhs,
         ), mock.patch(
-            "vpml.low_moment.encode_explicit_window_history",
+            "vpml.solvers.moment_rollout.encode_explicit_window_history",
             return_value=jnp.zeros((1, 1, nx), dtype=jnp.float32),
         ):
             states, _ = rollout_burles_latent_closure(
