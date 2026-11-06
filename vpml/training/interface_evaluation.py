@@ -16,7 +16,7 @@ from vpml.datasets.interface_flux import (
     grouped_history_gather,
 )
 from vpml.core import GRID_CUBIC_SPLINE_TEACHER_BACKEND, LearnedInterfaceClosure
-from vpml.physical_grid import extract_interface_supervised_pairs_from_coeff_history
+from vpml.solvers.physical_grid import extract_interface_supervised_pairs_from_coeff_history
 from vpml.training.interface_configuration import (
     CANONICAL_METADATA_SCHEMA_VERSION,
     CANONICAL_NV_TARGETS,

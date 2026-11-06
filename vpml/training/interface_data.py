@@ -13,7 +13,7 @@ from vpml.datasets.interface_flux import (
     StreamingMoments,
     grouped_history_gather,
 )
-from vpml.physical_grid import extract_interface_supervised_pairs_from_coeff_history
+from vpml.solvers.physical_grid import extract_interface_supervised_pairs_from_coeff_history
 from vpml.training.interface_configuration import (
     REGIME_LINEAR,
     interface_flux_rollout_coeff_key,
