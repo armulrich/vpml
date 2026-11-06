@@ -1,6 +1,2 @@
-jax
-jaxlib
-numpy
-matplotlib
-scipy
-
+# Install the package and the dependencies declared in pyproject.toml.
+-e .

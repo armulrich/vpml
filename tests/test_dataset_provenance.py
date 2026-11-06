@@ -36,7 +36,7 @@ class ProvenanceTests(unittest.TestCase):
         for relative in ("scripts/gaussian_dataset.py", "vpml/physical_grid.py",
                          "environments/delta/requirements.lock"):
             self.assertEqual(record["files"][relative],
-                             hashlib.sha256((root / relative).read_bytes()).hexdigest())
+                             hashlib.sha256((root / ("src" if relative.startswith("vpml/") else "") / relative).read_bytes()).hexdigest())
 
     def test_gpu_runtime_records_bounded_driver_query_without_secrets(self):
         jax.config.update("jax_enable_x64", True)

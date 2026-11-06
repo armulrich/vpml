@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
 
+from vpml._jax_precision import enable_x64
+
+enable_x64()
+
 import jax.numpy as jnp
 import numpy as np
 

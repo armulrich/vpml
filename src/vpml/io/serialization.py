@@ -30,6 +30,30 @@ def file_digest(path: str | Path, *, chunk_bytes: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def source_tree_digest(root: str | Path) -> str:
+    """Match historical Modal source identities across src and flat layouts.
+
+    Uploaded packages are flattened to ``vpml/``. Logical paths and byte order
+    remain identical to the older flat-tree algorithm; new code still produces
+    a new identity and cannot silently replace a frozen experiment's sources.
+    """
+    root = Path(root)
+    digest = hashlib.sha256()
+    for name in ("model", "vpml"):
+        directory = root / name
+        if name == "vpml" and (root / "src/vpml").is_dir():
+            directory = root / "src/vpml"
+        if not directory.is_dir():
+            raise ValueError(f"Missing source directory: {directory}")
+        for path in sorted(directory.rglob("*.py")):
+            logical = Path(name) / path.relative_to(directory)
+            digest.update(logical.as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict:
     value = {}
     for key, item in pairs:

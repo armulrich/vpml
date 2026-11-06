@@ -12,6 +12,10 @@ without the equilibrium subtraction used by the older ``states.npy`` format.
 
 from __future__ import annotations
 
+from vpml._jax_precision import enable_x64
+
+enable_x64()
+
 import jax.numpy as jnp
 
 from vpml.fourier import restrict_rfft_jax

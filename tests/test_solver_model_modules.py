@@ -41,6 +41,18 @@ assert 'vpml.models.interface_checkpoint' not in sys.modules
 """
         )
 
+    def test_reference_observations_preserve_float64_without_solver_import(self):
+        self.run_in_fresh_process(
+            """
+from vpml.datasets.observations import raw_to_primitives
+import jax
+import jax.numpy as jnp
+assert jax.config.x64_enabled
+value = raw_to_primitives(jnp.ones((3, 8), dtype=jnp.float64))
+assert value.dtype == jnp.float64
+"""
+        )
+
     def test_moment_equations_do_not_load_closure_architectures(self):
         self.run_in_fresh_process(
             """

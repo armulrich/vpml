@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from functools import lru_cache, partial
 
+from vpml._jax_precision import enable_x64
+
+enable_x64()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
