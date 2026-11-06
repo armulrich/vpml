@@ -10,7 +10,7 @@ from unittest import mock
 
 import jax
 
-from scripts.gaussian_dataset import main, read_parameters
+from vpml.cli.gaussian_dataset import main, read_parameters
 from vpml.datasets.manifest import Numerics, build_manifest, write_manifest
 
 
