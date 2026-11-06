@@ -15,6 +15,7 @@ import uuid
 import numpy as np
 
 from .manifest import Numerics, read_manifest, validate_manifest, write_manifest
+from .schema import validate_completed_progress
 from .provenance import json_digest, runtime_record, source_record
 
 
@@ -112,34 +113,6 @@ def dataset_status(root: Path, manifest_path: Path | None = None) -> dict:
         counts[status] += 1
         cases.append({"case_id": case_id, "status": status, "step": progress.get("step", 0)})
     return {"counts": counts, "cases": cases, "integrity_verified": False}
-
-
-def validate_completed_progress(progress: dict, numerics: Numerics, linearized: bool) -> None:
-    """Tie generic storage completion to this solver's final time and schema."""
-    from .diagnostics import DIAGNOSTIC_NAMES, LINEAR_DIAGNOSTIC_NAMES
-    from .observations import FIELD_NAMES, RAW_MOMENT_NAMES
-
-    if progress["step"] != numerics.nsteps:
-        raise ValueError("Completed case does not reach the final solver step")
-    diagnostics = len(DIAGNOSTIC_NAMES) + (len(LINEAR_DIAGNOSTIC_NAMES) if linearized else 0)
-    expected = {
-        "times": ((numerics.nsamples,), "float64"),
-        "diagnostic_times": ((numerics.nsteps + 1,), "float64"),
-        "diagnostics": ((numerics.nsteps + 1, diagnostics), "float64"),
-        "fields": ((numerics.nsamples, len(FIELD_NAMES), numerics.output_nx), numerics.storage_dtype),
-        "raw_moments": ((numerics.nsamples, len(RAW_MOMENT_NAMES), numerics.output_nx), numerics.storage_dtype),
-        "electric": ((numerics.nsamples, numerics.output_nx), numerics.storage_dtype),
-    }
-    actual = progress["outputs"]["arrays"]
-    if actual.keys() != expected.keys() or any(
-        tuple(actual[key]["shape"]) != shape or np.dtype(actual[key]["dtype"]) != np.dtype(dtype)
-        for key, (shape, dtype) in expected.items()
-    ):
-        raise ValueError("Completed output schema disagrees with the numerical protocol")
-    for name in ("fields", "raw_moments", "electric", "diagnostics"):
-        if sum(block["observations"]["arrays"][name]["shape"][0]
-               for block in progress["blocks"]) != numerics.nsteps + 1:
-            raise ValueError("Completed history length disagrees with the numerical protocol")
 
 
 def run_dataset(

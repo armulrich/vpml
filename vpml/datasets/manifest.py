@@ -22,7 +22,7 @@ from vpml.io.atomic import atomic_write
 from vpml.io.serialization import canonical_json_bytes as _canonical, read_json
 
 SCHEMA_VERSION = 1
-OUTPUT_SCHEMA = "gaussian-fields-v1"
+from .schema import OUTPUT_SCHEMA
 _SPLITS = ("train", "validation", "test")
 _MANIFEST_KEYS = {"schema_version", "output_schema", "numerics", "amplitudes", "cases"}
 _CASE_KEYS = {"case_id", "shape_id", "split", "k0", "mode_count", "decay", "seed", "strength", "coefficients"}

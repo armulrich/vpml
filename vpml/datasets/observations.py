@@ -16,9 +16,7 @@ import jax.numpy as jnp
 
 from vpml.fourier import restrict_rfft_jax
 
-FIELD_NAMES = ("n", "u", "p", "Q", "dQ_dx")
-RAW_MOMENT_NAMES = ("M0", "M1", "M2")
-OUTPUT_SCHEMA = "gaussian-fields-v1"
+from .schema import FIELD_NAMES, RAW_MOMENT_NAMES, OUTPUT_SCHEMA
 
 
 def restrict_fourier(values, output_nx: int):

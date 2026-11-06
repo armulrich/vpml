@@ -8,12 +8,7 @@ import math
 import jax.numpy as jnp
 import numpy as np
 
-DIAGNOSTIC_NAMES = (
-    "mass", "total_energy", "electric_energy", "min_f",
-    "negative_mass_fraction", "boundary_abs_fraction", "min_n", "charge_imbalance",
-)
-LINEAR_DIAGNOSTIC_NAMES = ("linear_electric_energy", "delta_e2")
-
+from .schema import DIAGNOSTIC_NAMES, LINEAR_DIAGNOSTIC_NAMES
 
 @dataclass(frozen=True)
 class DiagnosticTolerances:
