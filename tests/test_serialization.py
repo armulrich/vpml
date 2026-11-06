@@ -5,10 +5,24 @@ import tempfile
 import unittest
 
 from vpml.io.atomic import atomic_write
-from vpml.io.serialization import canonical_json_bytes, file_digest, read_json
+from vpml.io.serialization import canonical_json_bytes, file_digest, read_json, source_tree_digest
 
 
 class SerializationTests(unittest.TestCase):
+    def test_source_digest_matches_flat_upload_and_src_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for layout in ("checkout", "upload"):
+                (root / layout / "model").mkdir(parents=True)
+                (root / layout / "model/driver.py").write_text("value = 1\n")
+            (root / "checkout/src/vpml").mkdir(parents=True)
+            (root / "upload/vpml").mkdir()
+            for path in (root / "checkout/src/vpml/solver.py", root / "upload/vpml/solver.py"):
+                path.write_text("value = 2\n")
+            self.assertEqual(source_tree_digest(root / "checkout"), source_tree_digest(root / "upload"))
+            (root / "checkout/src/vpml/solver.py").write_text("value = 3\n")
+            self.assertNotEqual(source_tree_digest(root / "checkout"), source_tree_digest(root / "upload"))
+
     def test_canonical_bytes_preserve_existing_hash_conventions(self):
         value = {"z": 1.0, "a": "λ"}
         expected = b'{"a":"\\u03bb","z":1.0}'

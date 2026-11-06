@@ -17,7 +17,7 @@ volume=modal.Volume.from_name('vpml-wavenumber-generalization-20260924',create_i
 old=modal.Volume.from_name('vpml-low-moment-burles',create_if_missing=False)
 image=(modal.Image.debian_slim(python_version='3.12')
     .pip_install('jax[cuda13]==0.10.0','numpy==2.4.4','matplotlib==3.10.9','scipy')
-    .add_local_dir('vpml',str(ROOT/'vpml'),copy=True)
+    .add_local_dir('src/vpml',str(ROOT/'vpml'),copy=True)
     .add_local_dir('model',str(ROOT/'model'),copy=True)
     .env({'PYTHONPATH':str(ROOT),'VPML_JAX_BACKEND':'gpu','PYTHONUNBUFFERED':'1'}))
 
