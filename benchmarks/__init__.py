@@ -1,1 +1,1 @@
-"""Runnable benchmark and simulation scripts that use the vpml package."""
+"""Compatibility entry points for :mod:`vpml.benchmarks`."""

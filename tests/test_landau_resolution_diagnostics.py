@@ -17,7 +17,7 @@ from model.diagnostics.physical_velocity_grid_convergence import (
 from model.diagnostics.physical_spatial_grid_convergence import (
     _distribution_successive_x_change,
 )
-from model.diagnostics.physical_grid_2d_convergence import (
+from vpml.diagnostics.physical_grid_2d_convergence import (
     _parse_case_names,
     _projected_change,
     _run_case_segmented,
@@ -116,7 +116,7 @@ class LandauResolutionDiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             cases_dir = Path(temporary_directory)
             with mock.patch(
-                "model.diagnostics.physical_grid_2d_convergence."
+                "vpml.diagnostics.physical_grid_2d_convergence."
                 "run_semilagrangian_vlasov_poisson",
                 side_effect=interrupt_second_segment,
             ):

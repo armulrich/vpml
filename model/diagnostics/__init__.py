@@ -1,2 +1,1 @@
-"""Model-side diagnostics for training data and loss geometry."""
-
+"""Compatibility entry points for :mod:`vpml.diagnostics`."""
