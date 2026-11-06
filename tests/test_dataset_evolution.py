@@ -60,7 +60,7 @@ class EvolutionTests(unittest.TestCase):
         end, history = runner.advance(initial, 1)
         def full_step(f):
             return semilagrangian_vlasov_poisson_step(runner.cfg, f, ops=runner.ops)[0]
-        expected = jax.jvp(full_step, (runner._equilibrium,), (initial["h"],))[1]
+        expected = jax.jvp(full_step, (runner.equilibrium,), (initial["h"],))[1]
         np.testing.assert_allclose(end["h"], expected, atol=1e-13, rtol=1e-13)
         self.assertEqual(history["diagnostics"].shape[-1], len(DIAGNOSTIC_NAMES) + 2)
         self.assertIn("delta_e2", runner.diagnostic_names)
@@ -69,6 +69,21 @@ class EvolutionTests(unittest.TestCase):
         runner = make_evolution()
         with self.assertRaisesRegex(ValueError, "float64"):
             runner.observe({"f": np.asarray(runner.initial_state()["f"], dtype=np.float32)})
+
+    def test_tangent_matches_centered_finite_difference(self):
+        runner = make_evolution(strength=0.7, linearized=True)
+        initial = runner.initial_state()
+        direction = initial["h"]
+        epsilon = 1e-4
+
+        def full_step(f):
+            return semilagrangian_vlasov_poisson_step(runner.cfg, f, ops=runner.ops)[0]
+
+        difference = (full_step(runner.equilibrium + epsilon * direction)
+                      - full_step(runner.equilibrium - epsilon * direction)) / (2 * epsilon)
+        advanced, _ = runner.advance({"f": runner.equilibrium, "h": direction}, 1)
+        relative = np.linalg.norm(advanced["h"] - difference) / np.linalg.norm(difference)
+        self.assertLess(relative, 1e-6)
 
 
 if __name__ == "__main__":

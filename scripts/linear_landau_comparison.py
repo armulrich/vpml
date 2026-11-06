@@ -1,4 +1,4 @@
-"""Single-mode linearized kinetic Landau comparators for the Gaussian pilot.
+"""Single-mode linearized kinetic Landau comparators for Gaussian references.
 
 Each independent periodic domain has one complex positive spatial mode h(v,t).
 The real perturbation is 2 Re[h exp(i k x)]. The linearized equation is
@@ -110,22 +110,39 @@ def spline_jvp_validation():
     """Calibrate against the maintained kinetic map's tangent on a small grid."""
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
-    from scripts.gaussian_dataset_pilot import Runner
+    from vpml.datasets.evolution import ReferenceEvolution
+    from vpml.datasets.initial_conditions import DEFAULT_AMPLITUDES, draw_coefficients
+    from vpml.datasets.manifest import Numerics
+    from vpml.datasets.observations import moment_fields
+    from vpml.physical_grid import compute_electric_field_from_distribution
     import jax.numpy as jnp
-    runner = Runner(nx=64, nv=512, dt=.02, k0=.43)
+    numerical = Numerics(nx=64, nv=512, dt=.02, final_time=2.,
+                         output_nx=64, save_dt=.1, block_steps=5)
+    case = {"k0": .43, "strength": 0., "coefficients": draw_coefficients(0, 5, 1.2)}
+    runner = ReferenceEvolution(case, numerical, DEFAULT_AMPLITUDES, linearized=True)
     f = runner.equilibrium
     h = .001 * f * jnp.cos(.43 * runner.cfg.x)[None, :]
-    reference_times = [0.]
-    reference_fields = [np.asarray(runner.diagnostics(f, h)[2])]
-    reference_moments = [np.asarray(runner.moments(f + h))]
-    for block in range(2):
+    state = {"f": f, "h": h}
+
+    def tangent_field(current):
+        return np.asarray(compute_electric_field_from_distribution(
+            current["h"], runner.cfg, ops=runner.ops,
+        ))
+
+    def total_moments(current):
+        return np.asarray(moment_fields(current["f"] + current["h"],
+                                       runner.cfg.v, runner.cfg.Lx)[0])
+
+    reference_fields = [tangent_field(state)]
+    reference_moments = [total_moments(state)]
+    for sample in range(1, 21):
         # Full f remains the homogeneous Maxwellian. h follows the exact JVP
         # of the spline timestep, with its own discretization of M'(v).
-        (f, h), (_, _, _, ehist) = runner.advance(f, h)
-        reference_fields.extend(np.asarray(ehist))
-        # Retain the final moment sample in each one-unit block for comparison.
-        reference_moments.append(np.asarray(runner.moments(f + h)))
-        reference_times.extend(np.arange(1, 11) * .1 + block)
+        state, _ = runner.advance(state, steps=5)
+        reference_fields.append(tangent_field(state))
+        # Preserve the historical moment samples at times 0, 1 and 2.
+        if sample % 10 == 0:
+            reference_moments.append(total_moments(state))
     spectral = solve_modes([.43], nv=512, dt=.02, final_time=2.)
     actual = fields(spectral, 0, nx=64)
     field_error = relative_error(actual["E"], np.asarray(reference_fields))

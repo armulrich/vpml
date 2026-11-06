@@ -100,6 +100,11 @@ class ReferenceEvolution:
             state["h"] = self._f0 - self._equilibrium
         return state
 
+    @property
+    def equilibrium(self):
+        """Normalized homogeneous Maxwellian used by the optional tangent map."""
+        return self._equilibrium
+
     def _validate_state(self, state):
         expected_keys = {"f", "h"} if self.linearized else {"f"}
         if set(state) != expected_keys:
