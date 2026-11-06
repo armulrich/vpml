@@ -4,3 +4,7 @@ jax[cuda12]==0.10.0
 numpy==2.4.4
 scipy==1.17.1
 matplotlib==3.10.9
+
+# Build the reviewed checkout without an unpinned isolated build environment.
+setuptools==80.9.0
+wheel==0.45.1

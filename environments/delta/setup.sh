@@ -27,6 +27,8 @@ unset LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME
 "$python" -m venv "$destination"
 "$destination/bin/python" -m pip --isolated install --require-hashes --only-binary=:all: \
     --index-url https://pypi.org/simple -r "$directory/requirements.lock"
+code=$(cd -- "$directory/../.." && pwd -P)
+"$destination/bin/python" -m pip --isolated install --no-deps --no-build-isolation --editable "$code"
 "$destination/bin/python" -m pip check
 "$destination/bin/python" --version
 printf 'Environment installed at %s. No GPU verification or job submission was performed.\n' "$destination"
