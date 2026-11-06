@@ -44,5 +44,5 @@ Reading completed data
 Kinetic solver
 --------------
 
-.. automodule:: vpml.physical_grid
+.. automodule:: vpml.solvers.physical_grid
    :members: PhysicalGridVlasovPoissonConfig, semilagrangian_vlasov_poisson_step

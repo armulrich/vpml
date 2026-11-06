@@ -136,6 +136,13 @@ integration step. For example, a state at :math:`t=37` with
 :math:`\Delta t=0.01` resumes at step 3,701. The original initial observation
 remains the conservation baseline.
 
+Resume compatibility includes the numerical code dependencies, manifest and
+runtime. The complete source inventory is stored separately, and each saved
+array bundle records the inventory used to produce it. Changes to unrelated
+plotting code are recorded without invalidating a numerical checkpoint.
+Older protocols with a different compatibility definition are not silently
+upgraded; use their recorded code revision for continuation.
+
 An exclusive case lock prevents two workers from writing the same case.
 Investigate the recorded owner before removing a stale lock; workers never
 steal locks. Uncommitted files are excluded from recovery. Nonfinite blocks do

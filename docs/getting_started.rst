@@ -61,9 +61,12 @@ Run a benchmark
 
 .. code-block:: bash
 
-   python -m benchmarks.fh_benchmarks_2412_07073_jax \
+   python -m vpml.benchmarks.fh_benchmarks_2412_07073_jax \
      linear_landau --outdir out_bench/linear_landau
 
 This command performs a numerical calculation and writes figures and metrics
 under the chosen output directory. Command-specific options are available
 through ``--help``.
+
+The complete initial-field example is ``examples/gaussian_initial_fields.py``.
+It constructs one distribution without evolving it or writing run outputs.

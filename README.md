@@ -34,7 +34,7 @@ For example, run a local linear-Landau benchmark:
 
 ```bash
 VPML_JAX_BACKEND=cpu JAX_PLATFORMS=cpu \
-  python -m benchmarks.fh_benchmarks_2412_07073_jax \
+  python -m vpml.benchmarks.fh_benchmarks_2412_07073_jax \
   linear_landau --outdir out_bench/linear_landau
 ```
 

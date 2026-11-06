@@ -14,7 +14,8 @@ reviewed direct dependencies are in ``environments/delta/requirements.in``;
      /absolute/path/to/python3.12 /absolute/path/to/new-venv
 
 The helper requires Linux x86_64, refuses an existing environment and installs
-hash-verified wheels. It does not submit a job. The CUDA 12 JAX wheels require
+hash-verified wheels and the reviewed checkout as an editable package. The
+launcher checks that its Python imports that checkout. Setup does not submit a job. The CUDA 12 JAX wheels require
 an NVIDIA Linux driver of at least 525; confirm the allocated node's driver and
 actual JAX execution before relying on GPU compatibility. See the
 `JAX installation guide <https://docs.jax.dev/en/latest/installation.html#nvidia-gpu>`_.

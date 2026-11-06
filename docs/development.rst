@@ -4,7 +4,9 @@ Development
 Code and outputs
 ----------------
 
-Numerical algorithms live in the ``vpml`` package. Dataset modules separate
+Numerical algorithms live in ``src/vpml``. The installed package contains
+solvers, models, training, datasets, diagnostics and evaluation. Root-level
+``model`` and ``benchmarks`` modules are compatibility entry points only. Dataset modules separate
 initial conditions, manifests, observations, evolution, diagnostics,
 checkpoints and execution. CLI and scheduler wrappers call these interfaces;
 they do not implement a second numerical solver.
@@ -28,8 +30,9 @@ restart equivalence and failure handling:
    python -m unittest discover -s tests -p 'test_delta_launcher.py'
    shellcheck -x scripts/delta/*.sh environments/delta/setup.sh
 
-Launcher tests use a fake scheduler. They do not reserve GPUs. Broader tests
-are available with ``python -m unittest discover -s tests``. Passing software
+Launcher tests use a fake scheduler. They do not reserve GPUs. For the full suite, including function-based tests, install ``.[test]`` and use
+``python -m pytest``. The test extra includes the Modal SDK only to import
+legacy controller definitions; those tests do not submit remote work. Passing software
 tests does not replace numerical convergence checks for a chosen dataset.
 
 Build documentation
