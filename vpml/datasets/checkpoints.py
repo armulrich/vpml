@@ -92,13 +92,18 @@ class CheckpointStore:
     finishing a trajectory is distinct from qualifying it for training.
     """
 
-    def __init__(self, directory: Path, protocol: dict):
+    def __init__(self, directory: Path, protocol: dict, *, read_only: bool = False):
         if not isinstance(protocol, dict):
             raise ValueError("Protocol must be a dictionary")
         self.directory = Path(directory)
+        self.read_only = read_only
         if self.directory.is_symlink():
             raise ValueError("Checkpoint directory must not be a symlink")
-        self.directory.mkdir(parents=True, exist_ok=True)
+        if read_only:
+            if not self.directory.is_dir():
+                raise ValueError("Checkpoint directory does not exist")
+        else:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self.protocol = json.loads(_json_bytes(protocol))
         self.protocol_sha256 = hashlib.sha256(_json_bytes(self.protocol)).hexdigest()
         self.progress_path = self.directory / "progress.json"
@@ -113,6 +118,8 @@ class CheckpointStore:
             if _json_bytes(json.loads(protocol_path.read_text())) != _json_bytes(self.protocol):
                 raise ValueError("Checkpoint protocol mismatch")
         else:
+            if read_only:
+                raise ValueError("Checkpoint protocol does not exist")
             # A crash during the first protocol write can leave only its temp.
             if any(not p.name.startswith(".protocol.json.")
                    for p in self.directory.iterdir()):
@@ -120,10 +127,26 @@ class CheckpointStore:
             _atomic_json(protocol_path, self.protocol)
 
     def _write_bundle(self, kind: str, arrays: dict) -> dict:
+        self._require_writable()
         path = self.directory / f"{kind}-{uuid.uuid4().hex}.npz"
         _atomic_npz(path, arrays)
         return {"file": path.name, "sha256": _file_sha256(path),
                 "arrays": _schema(arrays)}
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise PermissionError("Checkpoint store is read-only")
+
+    def outputs(self) -> dict[str, np.ndarray]:
+        """Read and checksum final outputs without loading kinetic history.
+
+        This verifies the output bundle, not all intermediate restart states.
+        ``load`` performs the full checkpoint validation needed for continuation.
+        """
+        progress = self.read_progress()
+        if progress["status"] != "complete":
+            raise ValueError("Case is not complete")
+        return self._read_bundle(progress["outputs"])
 
     def _read_bundle(self, record: dict) -> dict[str, np.ndarray]:
         name = record.get("file", "")
@@ -198,6 +221,7 @@ class CheckpointStore:
         return state, progress
 
     def initialize(self, state: dict, observations: dict) -> dict:
+        self._require_writable()
         state = _arrays(state, state=True)
         observations = _arrays(observations, observations=True)
         if self.progress_path.exists():
@@ -215,6 +239,7 @@ class CheckpointStore:
         return progress
 
     def append(self, step: int, state: dict, observations: dict) -> dict:
+        self._require_writable()
         # Resume/finalization perform full verification. During normal execution
         # do not reread all earlier history at every block (quadratic disk I/O).
         progress = self.read_progress()
@@ -251,6 +276,7 @@ class CheckpointStore:
                 for key in chunks[0]}
 
     def finalize(self, outputs: dict, report: dict) -> dict:
+        self._require_writable()
         _, progress = self.load()
         outputs = _arrays(outputs)
         if not isinstance(report, dict):

@@ -1,4 +1,4 @@
-"""Summarize the local Gaussian pilot without changing the research notes.
+"""Summarize Gaussian reference trajectories and their feature histories.
 
 The effective-rank calculation is descriptive. It does not certify independent
 histories, reference accuracy, or improvement of a learned closure.
@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -78,27 +77,17 @@ def common_standardization(a: np.ndarray, b: np.ndarray) -> tuple:
 
 
 def load_cases(root: Path) -> list[dict]:
-    cases = []
-    for meta_path in sorted((root / "cases").glob("*.json")):
-        metadata = json.loads(meta_path.read_text())
-        path = meta_path.with_suffix(".npz")
-        if not path.exists() or metadata.get("family") not in ("gaussian", "linear_landau"):
-            continue
-        expected = metadata.get("result_sha256")
-        if expected and hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise ValueError(f"Result checksum mismatch: {path}")
-        with np.load(path) as saved:
-            names = ("times", "n", "u", "p", "E", "Q", "g", "full_energy",
-                     "linear_energy", "linear_field", "final_f", "x", "v",
-                     "diagnostic_times", "diagnostics")
-            arrays = {name: saved[name] for name in names if name in saved}
-        cases.append({**metadata, **arrays, "id": meta_path.stem})
-    return sorted(cases, key=lambda c: (c["family"], c.get("seed", 0), c.get("strength", 0), c["id"]))
+    """Load either supported reference format through its validated adapter."""
+    from vpml.datasets.reader import iter_cases
+
+    return sorted(iter_cases(root), key=lambda c: (
+        c["family"], c.get("seed", 0), c.get("strength", 0), c["id"]))
 
 
 def primary_cases(cases: list[dict]) -> list[dict]:
     """Only the declared base collection contributes to population summaries."""
-    return [case for case in cases if case["id"].endswith("_base")]
+    return [case for case in cases if case.get("format") == "gaussian-fields-v1"
+            or case["id"].endswith("_base")]
 
 
 def _relative_l2(coarse, fine, times=None, velocity=None):
@@ -151,7 +140,7 @@ def refinement_comparisons(cases: list[dict], tolerances=None) -> list[dict]:
     bases = {(c["family"], c["seed"], c["strength"], c["k0"]): c for c in primary_cases(cases)}
     comparisons = []
     for fine in cases:
-        if fine["id"].endswith("_base"):
+        if fine.get("format") == "gaussian-fields-v1" or fine["id"].endswith("_base"):
             continue
         coarse = bases.get((fine["family"], fine["seed"], fine["strength"], fine["k0"]))
         if coarse is None:
@@ -391,7 +380,8 @@ def figures(cases: list[dict], info: dict, destination: Path) -> list[str]:
     for ax, case in zip(axes[0], first):
         scale = case["strength"] ** 2
         ax.semilogy(case["times"], case["full_energy"] / scale, color="#6f39a8", lw=1.5, label="Kinetic")
-        ax.semilogy(case["times"], case["linear_energy"] / scale, color="#e27b21", lw=1.1, ls="--", label="Linearized")
+        if "linear_energy" in case:
+            ax.semilogy(case["times"], case["linear_energy"] / scale, color="#e27b21", lw=1.1, ls="--", label="Linearized")
         ax.set_title(rf"$\lambda={case['strength']:g}$")
         ax.set_xlabel("Time")
         ax.grid(alpha=.18)
@@ -401,24 +391,25 @@ def figures(cases: list[dict], info: dict, destination: Path) -> list[str]:
     fig.savefig(path); plt.close(fig); paths.append(str(path))
 
     select = [first[0], first[len(first) // 2], first[-1]] if len(first) >= 3 else first
-    fig, axes = plt.subplots(1, len(select), figsize=(4 * len(select), 3.3), squeeze=False,
-                             sharey=True, constrained_layout=True)
-    v_max = max(np.max(c["final_f"]) for c in select)
-    v_min = min(0.0, min(np.min(c["final_f"]) for c in select))
-    for ax, case in zip(axes[0], select):
-        mask = np.abs(case["v"]) <= 4
-        xnorm = case["x"] / (2 * np.pi / case["k0"])
-        mesh = ax.pcolormesh(xnorm, case["v"][mask], case["final_f"][mask],
-                             shading="auto", cmap="viridis", vmin=v_min, vmax=v_max,
-                             rasterized=True)
-        ax.contour(xnorm, case["v"][mask], case["final_f"][mask],
-                   levels=[.1, .3, .5], colors="white", linewidths=.5, alpha=.6)
-        ax.set_xlabel(r"$x/L$")
-        ax.set_title(rf"$\lambda={case['strength']:g}$")
-    axes[0, 0].set_ylabel("Velocity")
-    fig.colorbar(mesh, ax=axes[0].tolist(), label=r"$f(x,v,T)$", shrink=.9)
-    path = destination / "final_phase_space.png"
-    fig.savefig(path); plt.close(fig); paths.append(str(path))
+    if select and all("final_f" in case for case in select):
+        fig, axes = plt.subplots(1, len(select), figsize=(4 * len(select), 3.3), squeeze=False,
+                                 sharey=True, constrained_layout=True)
+        v_max = max(np.max(c["final_f"]) for c in select)
+        v_min = min(0.0, min(np.min(c["final_f"]) for c in select))
+        for ax, case in zip(axes[0], select):
+            mask = np.abs(case["v"]) <= 4
+            xnorm = case["x"] / (2 * np.pi / case["k0"])
+            mesh = ax.pcolormesh(xnorm, case["v"][mask], case["final_f"][mask],
+                                 shading="auto", cmap="viridis", vmin=v_min, vmax=v_max,
+                                 rasterized=True)
+            ax.contour(xnorm, case["v"][mask], case["final_f"][mask],
+                       levels=[.1, .3, .5], colors="white", linewidths=.5, alpha=.6)
+            ax.set_xlabel(r"$x/L$")
+            ax.set_title(rf"$\lambda={case['strength']:g}$")
+        axes[0, 0].set_ylabel("Velocity")
+        fig.colorbar(mesh, ax=axes[0].tolist(), label=r"$f(x,v,T)$", shrink=.9)
+        path = destination / "final_phase_space.png"
+        fig.savefig(path); plt.close(fig); paths.append(str(path))
 
     comparison = info.get("comparisons", {}).get("moment_history_modes_4")
     if comparison:
@@ -466,16 +457,17 @@ def analyze(root: Path) -> dict:
     grouped = {}
     for strength in sorted({c["strength"] for c in base_cases if c["family"] == "gaussian"}):
         group = [c for c in base_cases if c["family"] == "gaussian" and c["strength"] == strength]
-        eta = np.array([c["eta_NL"] for c in group])
-        grouped[str(strength)] = {"count": len(group), "eta_median": float(np.median(eta)),
-                                 "eta_min": float(eta.min()), "eta_max": float(eta.max()),
+        eta = np.array([c["eta_NL"] for c in group if c.get("eta_NL") is not None])
+        grouped[str(strength)] = {"count": len(group), "eta_median": float(np.median(eta)) if eta.size else None,
+                                 "eta_min": float(eta.min()) if eta.size else None,
+                                 "eta_max": float(eta.max()) if eta.size else None,
                                  "qualified_count": sum(bool(c["qualification_pass"]) for c in group)}
     summary = {
         "cases": rows, "amplitude_groups": grouped, "information_content": info,
         "primary_case_ids": [c["id"] for c in base_cases],
-        "sensitivity_case_ids": [c["id"] for c in cases if not c["id"].endswith("_base")],
+        "sensitivity_case_ids": [c["id"] for c in cases if c["id"] not in {b["id"] for b in base_cases}],
         "solver_scope": {
-            "gaussian": "Nonlinear collisionless Vlasov-Poisson with cubic B-spline Strang splitting; comparison is with its linearization about the homogeneous unit Maxwellian from the same initial distribution.",
+            "gaussian": "Nonlinear collisionless Vlasov-Poisson with cubic B-spline Strang splitting; optional tangent-reference diagnostics are present only when explicitly saved.",
             "linear_landau": "Linearized kinetic evolution about the homogeneous unit Maxwellian, initialized with one small density Fourier mode at each physical wavenumber; this is not a nonlinear Gaussian-family trajectory.",
             "case_solver_metadata": {c["id"]: {key: c[key] for key in
                 ("solver", "linearization", "evolution", "initialization") if key in c} for c in cases},
