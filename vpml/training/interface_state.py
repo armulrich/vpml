@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from model.train.interface_flux_data import sha256_json
+from vpml.datasets.interface_flux import sha256_json
 from vpml.core import (
     Array,
     LearnedInterfaceClosure,

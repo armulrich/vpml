@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from model.train.interface_flux_data import IC_SPLIT_HELDOUT, case_shard_paths
+from vpml.datasets.interface_flux import IC_SPLIT_HELDOUT, case_shard_paths
 from vpml.low_moment import (
     DEFAULT_DENSITY_FLOOR,
     DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,

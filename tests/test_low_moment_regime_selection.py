@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from model.train import low_moment_closure as trainer
+from vpml.training import low_moment_train as trainer
 import jax
 import jax.numpy as jnp
 import numpy as np

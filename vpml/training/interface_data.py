@@ -7,7 +7,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from model.train.interface_flux_data import (
+from vpml.datasets.interface_flux import (
     IC_SPLIT_HELDOUT,
     IC_SPLIT_TRAIN,
     StreamingMoments,

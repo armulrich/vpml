@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import model.train.interface_flux_rollout as trainer
+import vpml.training.interface_train as trainer
 from vpml.core import (
     FourierHermiteIMEX,
     LearnedInterfaceClosure,

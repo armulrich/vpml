@@ -11,7 +11,7 @@ from typing import Dict, Mapping, Sequence, Tuple
 
 import numpy as np
 
-from model.train.interface_flux_data import (
+from vpml.datasets.interface_flux import (
     IC_SPLIT_TRAIN,
     load_ic_manifest,
     load_sharded_reference,

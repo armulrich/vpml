@@ -8,7 +8,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import jax.numpy as jnp
 import numpy as np
 
-from model.train.interface_flux_data import grouped_history_gather
+from vpml.datasets.interface_flux import grouped_history_gather
 from vpml.core import Array
 from vpml.training.interface_configuration import (
     exact_rollout_numpy_complex_dtype,

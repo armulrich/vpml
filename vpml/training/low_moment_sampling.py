@@ -7,7 +7,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from model.train.interface_flux_data import IC_SPLIT_HELDOUT, IC_SPLIT_TRAIN
+from vpml.datasets.interface_flux import IC_SPLIT_HELDOUT, IC_SPLIT_TRAIN
 from vpml.training.low_moment_configuration import REGIMES
 from vpml.training.low_moment_data import (
     _case_amplitudes,

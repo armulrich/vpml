@@ -9,7 +9,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import jax.numpy as jnp
 import numpy as np
 
-from model.train.interface_flux_data import (
+from vpml.datasets.interface_flux import (
     IC_SPLIT_TRAIN,
     case_shard_is_complete,
     evaluate_manifest_case,
