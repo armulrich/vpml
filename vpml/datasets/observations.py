@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
+from vpml.fourier import restrict_rfft_jax
+
 FIELD_NAMES = ("n", "u", "p", "Q", "dQ_dx")
 RAW_MOMENT_NAMES = ("M0", "M1", "M2")
 OUTPUT_SCHEMA = "gaussian-fields-v1"
@@ -34,9 +36,9 @@ def restrict_fourier(values, output_nx: int):
         raise ValueError("output_nx must be even and between 2 and the input size")
     if output_nx == source_nx:
         return values
-    coefficients = jnp.fft.rfft(values, axis=-1)[..., :output_nx // 2 + 1]
-    coefficients = coefficients.at[..., -1].set(2 * jnp.real(coefficients[..., -1]))
-    coefficients = coefficients * (output_nx / source_nx)
+    coefficients = restrict_rfft_jax(
+        jnp.fft.rfft(values, axis=-1), source_nx=source_nx, target_nx=output_nx,
+    )
     return jnp.fft.irfft(coefficients, n=output_nx, axis=-1)
 
 
