@@ -5,6 +5,7 @@ import json
 import os
 import hashlib
 from pathlib import Path
+from vpml.io.atomic import atomic_write
 import numpy as np
 from vpml.physical_grid import (PhysicalGridVlasovPoissonConfig,build_physical_grid_ops,
     semilagrangian_vlasov_poisson_step,normalize_density_on_grid,gaussian_pdf)
@@ -24,6 +25,7 @@ def reference_kernel(case,*,nx=1024,nv=8192,dt=.01,steps=10,batched_v_prefilter=
         perturb=f-fv[:,None]
         m=jnp.stack([jnp.trapezoid(perturb*cfg.v[:,None]**j,x=cfg.v,axis=0) for j in range(3)])
         mh=jnp.fft.rfft(m,axis=-1)[:,:65]*(128/nx)
+        # Historical output convention: do not double this Nyquist coefficient.
         mh=mh.at[:,-1].set(jnp.real(mh[:,-1]))
         return jnp.fft.irfft(mh,n=128,axis=-1).astype(jnp.float32)
     @jax.jit
@@ -46,35 +48,14 @@ def benchmark_reference(case,*,nx=1024,nv=8192,steps=10,batched_v_prefilter=Fals
     return dict(nx=nx,nv=nv,steps=steps,compile_seconds=compile_seconds,seconds=seconds,seconds_per_step=seconds/steps,batched_v_prefilter=batched_v_prefilter)
 
 
-def generate_reference(case,destination,*,nx=1024,nv=8192,dt=.01):
-    dest=Path(destination);dest.mkdir(parents=True,exist_ok=False)
-    f,moments,advance=reference_kernel(case,nx=nx,nv=nv,dt=dt,steps=100)
-    raw=np.lib.format.open_memmap(dest/'moments_dt001.npy',mode='w+',dtype=np.float32,shape=(12001,3,128))
-    raw[0]=np.asarray(moments(f))
-    for i in range(120):
-        f,values=advance(f);arr=np.asarray(values)
-        if not np.isfinite(arr).all():raise FloatingPointError(f'Nonfinite reference at block{i}')
-        raw[1+i*100:1+(i+1)*100]=arr;raw.flush()
-    # The same linear temporal interpolation used by the original trainer.
-    idx=np.arange(4801)*.025/.01;lo=np.floor(idx).astype(int);hi=np.minimum(lo+1,12000)
-    frac=(idx-lo).astype(np.float32)[:,None,None]
-    with (dest/'states.npy').open('xb') as handle:np.save(handle,(1-frac)*raw[lo]+frac*raw[hi])
-    with (dest/'kinetic_final.npy').open('xb') as handle:np.save(handle,np.asarray(f))
-    return dest/'states.npy'
-
-
 def _atomic_npy(path, value):
-    path=Path(path);tmp=path.with_suffix(path.suffix+'.tmp')
-    with tmp.open('wb') as f:
-        np.save(f,np.asarray(value));f.flush();os.fsync(f.fileno())
-    os.replace(tmp,path)
+    atomic_write(path, lambda handle: np.save(handle, np.asarray(value)))
 
 
 def _atomic_json(path, value):
-    path=Path(path);tmp=path.with_suffix(path.suffix+'.tmp')
-    with tmp.open('w') as f:
-        json.dump(value,f,sort_keys=True);f.flush();os.fsync(f.fileno())
-    os.replace(tmp,path)
+    # Preserve the legacy protocol's whitespace and absence of a final newline.
+    payload = json.dumps(value, sort_keys=True).encode("utf-8")
+    atomic_write(path, lambda handle: handle.write(payload))
 
 
 def generate_reference_resumable(case,destination,*,nx=1024,nv=8192,dt=.01,

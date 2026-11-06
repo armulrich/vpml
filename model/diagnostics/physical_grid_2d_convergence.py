@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
+from vpml.io.atomic import atomic_write
 from vpml.jax_runtime import bootstrap_jax_runtime, print_jax_runtime_summary
 
 bootstrap_jax_runtime()
@@ -51,21 +52,11 @@ except Exception:
 
 
 def _atomic_savez(path: Path, **payload: np.ndarray) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("wb") as handle:
-        np.savez(handle, **payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    atomic_write(path, lambda handle: np.savez(handle, **payload))
 
 
 def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("wb") as handle:
-        np.save(handle, value)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    atomic_write(path, lambda handle: np.save(handle, value))
 
 
 def _pair_directory(root: Path, nx: int, nv: int) -> Path:
