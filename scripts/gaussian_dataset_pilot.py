@@ -23,6 +23,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from scipy.special import erfc
+from vpml.datasets.initial_conditions import draw_coefficients, fields_from_coefficients
 from vpml.physical_grid import (
     PhysicalGridVlasovPoissonConfig, build_physical_grid_ops,
     compute_electric_field_from_distribution, gaussian_pdf,
@@ -46,16 +47,11 @@ def sha256(path):
 
 
 def realization(seed, nx, strength, k0=.43, J=5, s=1.2):
-    rng = np.random.default_rng(seed)
-    coeff = rng.standard_normal((3, 2, J)) * np.arange(1, J + 1)[None, None, :] ** (-s)
-    coeff /= np.sqrt(.5 * np.sum(coeff ** 2, axis=(1, 2)))[:, None, None]
-    theta = 2 * np.pi * np.arange(nx) / nx
-    phase = np.arange(1, J + 1)[:, None] * theta[None, :]
-    shapes = coeff[:, 0] @ np.cos(phase) + coeff[:, 1] @ np.sin(phase)
-    gn, gu, gt = shapes
-    n = np.exp(strength * BASE_SCALES[0] * gn); n /= n.mean()
-    temp = np.exp(strength * BASE_SCALES[1] * gt); temp /= temp.mean()
-    u = strength * BASE_SCALES[2] * (gu - np.mean(n * gu) / n.mean())
+    # k0 fixes the physical domain length; shapes use the normalized coordinate.
+    coeff = draw_coefficients(seed, J, s)
+    n, u, temp = fields_from_coefficients(coeff, nx, strength, {
+        "density": BASE_SCALES[0], "velocity": BASE_SCALES[2], "temperature": BASE_SCALES[1],
+    })
     return n, u, temp, coeff
 
 
