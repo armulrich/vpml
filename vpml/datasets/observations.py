@@ -16,7 +16,7 @@ import jax.numpy as jnp
 
 from vpml.fourier import restrict_rfft_jax
 
-from .schema import FIELD_NAMES, RAW_MOMENT_NAMES, OUTPUT_SCHEMA
+from .schema import FIELD_NAMES, RAW_MOMENT_NAMES, OUTPUT_SCHEMA, observation_schema
 
 
 def restrict_fourier(values, output_nx: int):
@@ -81,19 +81,3 @@ def moment_fields(distribution, velocity_grid, domain_length: float):
     fields = jnp.stack((density, flow, pressure, heat_flux, derivative))
     raw = jnp.stack((density, momentum, second))
     return fields, raw
-
-
-def observation_schema() -> dict:
-    """JSON-compatible definitions included in dataset provenance."""
-    return {
-        "version": OUTPUT_SCHEMA,
-        "axes": ["time", "field", "position"],
-        "fields": list(FIELD_NAMES),
-        "raw_moments": list(RAW_MOMENT_NAMES),
-        "raw_moment_definition": "M_j = integral v**j f dv; no equilibrium subtraction",
-        "pressure_definition": "p = integral (v-u)**2 f dv",
-        "heat_flux_definition": "Q = integral (v-u)**3 f dv",
-        "spatial_order": "evaluate moments on kinetic grid, then Fourier restrict each field",
-        "temporal_order": "linear interpolation of saved observables from integration-step times",
-        "units": "nondimensional Vlasov-Poisson units",
-    }

@@ -22,6 +22,17 @@ def observations(first, stop):
 
 
 class CheckpointStoreTests(unittest.TestCase):
+    def test_duplicate_progress_keys_and_nonfinite_reports_are_rejected(self):
+        self.initialize()
+        path = self.store.progress_path
+        original = path.read_text()
+        path.write_text(original.rstrip()[:-1] + ',"step":0}')
+        with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
+            self.store.read_progress()
+        path.write_text(original.rstrip()[:-1] + ',"report":{"value":NaN}}')
+        with self.assertRaisesRegex(ValueError, "Nonfinite JSON"):
+            self.store.read_progress()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

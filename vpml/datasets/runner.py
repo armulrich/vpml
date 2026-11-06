@@ -17,6 +17,8 @@ import numpy as np
 from .manifest import Numerics, read_manifest, validate_manifest, write_manifest
 from .schema import validate_completed_progress
 from .provenance import json_digest, runtime_record, source_record
+from vpml.io.atomic import atomic_write
+from vpml.io.serialization import canonical_json_bytes, read_json
 
 
 @contextmanager
@@ -102,7 +104,7 @@ def dataset_status(root: Path, manifest_path: Path | None = None) -> dict:
     for case in manifest["cases"]:
         case_id = case["case_id"]
         progress_path = root / "cases" / case_id / "progress.json"
-        progress = json.loads(progress_path.read_text()) if progress_path.exists() else {}
+        progress = read_json(progress_path) if progress_path.exists() else {}
         status = "pending"
         if (root / "failures" / f"{case_id}.json").exists():
             status = "failed"
@@ -159,6 +161,19 @@ def run_dataset(
             pass  # Another worker may have published the identical manifest.
     if read_manifest(manifest_path) != manifest:
         raise ValueError("Output directory belongs to a different manifest")
+    provenance_directory = root / "provenance"
+    provenance_directory.mkdir(exist_ok=True)
+    provenance = {"source": source, "runtime": runtime}
+    provenance_digest = json_digest(provenance)
+    provenance_path = provenance_directory / f"{provenance_digest}.json"
+    if not provenance_path.exists():
+        try:
+            atomic_write(provenance_path, lambda handle: handle.write(
+                canonical_json_bytes(provenance, newline=True)), replace=False)
+        except FileExistsError:
+            pass
+    if read_json(provenance_path) != provenance:
+        raise ValueError("Source provenance record mismatch")
     (root / "failures").mkdir(exist_ok=True)
     outcomes = []
     for case in cases:
@@ -173,11 +188,11 @@ def run_dataset(
             with case_lock(root / "locks" / f"{case_id}.lock"):
                 protocol = {"manifest_sha256": json_digest(manifest), "case": case,
                             "numerics": manifest["numerics"], "runtime": runtime,
-                            "source": source, "linearized": linearized,
+                            "source": source["compatibility"], "linearized": linearized,
                             "output_schema": manifest["output_schema"],
                             "observations": observation_schema()}
                 directory = root / "cases" / case_id
-                store = CheckpointStore(directory, protocol)
+                store = CheckpointStore(directory, protocol, provenance_sha256=provenance_digest)
                 if (directory / "progress.json").exists():
                     state, progress = store.load()
                     if progress["status"] == "complete":

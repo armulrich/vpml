@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import tempfile
 
 import jax
 
@@ -11,6 +12,23 @@ from vpml.datasets.provenance import json_digest, runtime_record, source_record
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_unrelated_sources_are_recorded_but_only_numerical_dependencies_block_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "vpml"
+            (package / "datasets").mkdir(parents=True)
+            (package / "datasets/runner.py").write_text("from ..solver import step\n")
+            (package / "solver.py").write_text("from .quadrature import integrate\n")
+            (package / "quadrature.py").write_text("def integrate(): return 1\n")
+            plot = package / "plot.py"
+            plot.write_text("color = 'blue'\n")
+            original = source_record(package)
+            plot.write_text("color = 'purple'\n")
+            plotting_change = source_record(package)
+            self.assertNotEqual(original["sha256"], plotting_change["sha256"])
+            self.assertEqual(original["compatibility"], plotting_change["compatibility"])
+            (package / "quadrature.py").write_text("def integrate(): return 2\n")
+            self.assertNotEqual(original["compatibility"], source_record(package)["compatibility"])
+
     def test_source_covers_cli_solver_and_environment_lock(self):
         root = Path(__file__).resolve().parents[1]
         record = source_record()

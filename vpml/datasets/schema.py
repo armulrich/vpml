@@ -39,3 +39,17 @@ def validate_completed_progress(progress: dict, numerics, linearized: bool) -> N
             raise ValueError("Completed history length disagrees with the numerical protocol")
 
 
+def observation_schema() -> dict:
+    """JSON-compatible definitions included in dataset provenance."""
+    return {
+        "version": OUTPUT_SCHEMA,
+        "axes": ["time", "field", "position"],
+        "fields": list(FIELD_NAMES),
+        "raw_moments": list(RAW_MOMENT_NAMES),
+        "raw_moment_definition": "M_j = integral v**j f dv; no equilibrium subtraction",
+        "pressure_definition": "p = integral (v-u)**2 f dv",
+        "heat_flux_definition": "Q = integral (v-u)**3 f dv",
+        "spatial_order": "evaluate moments on kinetic grid, then Fourier restrict each field",
+        "temporal_order": "linear interpolation of saved observables from integration-step times",
+        "units": "nondimensional Vlasov-Poisson units",
+    }

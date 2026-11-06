@@ -47,7 +47,7 @@ class DatasetRunnerTests(unittest.TestCase):
         self.case_id = self.manifest["cases"][0]["case_id"]
         # Other development agents may edit source files during this test run.
         # Provenance enforcement itself has a separate negative test below.
-        source = mock.patch.object(runner, "source_record", return_value={"sha256": "test-source"})
+        source = mock.patch.object(runner, "source_record", return_value={"sha256": "test-source", "compatibility": {"sha256": "test-numerics"}})
         source.start()
         self.addCleanup(source.stop)
 
@@ -115,7 +115,7 @@ class DatasetRunnerTests(unittest.TestCase):
 
     def test_changed_source_or_manifest_cannot_reuse_results(self):
         self.run_worker(self.root)
-        with mock.patch.object(runner, "source_record", return_value={"sha256": "different-source"}):
+        with mock.patch.object(runner, "source_record", return_value={"sha256": "different-source", "compatibility": {"sha256": "changed-numerics"}}):
             with self.assertRaisesRegex(ValueError, "protocol mismatch"):
                 self.run_worker(self.root)
         self.manifest = tiny_manifest(final_time=0.06)
@@ -128,6 +128,30 @@ class DatasetRunnerTests(unittest.TestCase):
         with mock.patch.object(runner, "runtime_record", return_value=changed):
             with self.assertRaisesRegex(ValueError, "protocol mismatch"):
                 self.run_worker(self.root)
+
+    def test_unrelated_source_change_resumes_and_attributes_each_output_block(self):
+        stopped = [False]
+        append = CheckpointStore.append
+
+        def append_and_stop(store, *args, **kwargs):
+            result = append(store, *args, **kwargs)
+            stopped[0] = True
+            return result
+
+        with mock.patch.object(CheckpointStore, "append", append_and_stop):
+            self.assertEqual(self.run_worker(self.root, stop_requested=lambda: stopped[0])
+                             ["outcomes"][0]["status"], "partial")
+        changed_inventory = {"sha256": "changed-plot", "compatibility": {"sha256": "test-numerics"}}
+        with mock.patch.object(runner, "source_record", return_value=changed_inventory):
+            self.assertEqual(self.run_worker(self.root)["outcomes"][0]["status"], "complete")
+        progress = json.loads((self.root / "cases" / self.case_id / "progress.json").read_text())
+        first = progress["blocks"][0]["observations"]["provenance_sha256"]
+        last = progress["blocks"][-1]["observations"]["provenance_sha256"]
+        self.assertNotEqual(first, last)
+        self.assertEqual(progress["outputs"]["provenance_sha256"], last)
+        for digest in (first, last):
+            record = json.loads((self.root / "provenance" / f"{digest}.json").read_text())
+            self.assertEqual(runner.json_digest(record), digest)
 
     def test_deadline_stops_before_next_block_and_can_resume(self):
         readings = iter([0.0, 0.0, 61.0, 61.0])

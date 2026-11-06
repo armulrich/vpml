@@ -17,7 +17,7 @@ import numpy as np
 
 
 from vpml.io.atomic import atomic_write as _atomic_write
-from vpml.io.serialization import canonical_json_bytes, file_digest as _file_sha256
+from vpml.io.serialization import canonical_json_bytes, file_digest as _file_sha256, read_json
 
 _VERSION = 1
 _KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
@@ -92,11 +92,15 @@ class CheckpointStore:
     finishing a trajectory is distinct from qualifying it for training.
     """
 
-    def __init__(self, directory: Path, protocol: dict, *, read_only: bool = False):
+    def __init__(self, directory: Path, protocol: dict, *, read_only: bool = False,
+                 provenance_sha256: str | None = None):
         if not isinstance(protocol, dict):
             raise ValueError("Protocol must be a dictionary")
         self.directory = Path(directory)
         self.read_only = read_only
+        if provenance_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", provenance_sha256):
+            raise ValueError("Invalid provenance digest")
+        self.provenance_sha256 = provenance_sha256
         if self.directory.is_symlink():
             raise ValueError("Checkpoint directory must not be a symlink")
         if read_only:
@@ -115,7 +119,7 @@ class CheckpointStore:
                 raise ValueError(f"Unrecognized checkpoint entry: {path.name}")
         protocol_path = self.directory / "protocol.json"
         if protocol_path.exists():
-            if _json_bytes(json.loads(protocol_path.read_text())) != _json_bytes(self.protocol):
+            if _json_bytes(read_json(protocol_path)) != _json_bytes(self.protocol):
                 raise ValueError("Checkpoint protocol mismatch")
         else:
             if read_only:
@@ -130,8 +134,11 @@ class CheckpointStore:
         self._require_writable()
         path = self.directory / f"{kind}-{uuid.uuid4().hex}.npz"
         _atomic_npz(path, arrays)
-        return {"file": path.name, "sha256": _file_sha256(path),
-                "arrays": _schema(arrays)}
+        record = {"file": path.name, "sha256": _file_sha256(path),
+                  "arrays": _schema(arrays)}
+        if self.provenance_sha256 is not None:
+            record["provenance_sha256"] = self.provenance_sha256
+        return record
 
     def _require_writable(self) -> None:
         if self.read_only:
@@ -167,9 +174,9 @@ class CheckpointStore:
         """Read committed metadata; use ``load`` to verify its data files too."""
         protocol_path = self.directory / "protocol.json"
         if (protocol_path.is_symlink() or self.progress_path.is_symlink()
-                or _json_bytes(json.loads(protocol_path.read_text())) != _json_bytes(self.protocol)):
+                or _json_bytes(read_json(protocol_path)) != _json_bytes(self.protocol)):
             raise ValueError("Checkpoint protocol mismatch or unsafe metadata path")
-        progress = json.loads(self.progress_path.read_text())
+        progress = read_json(self.progress_path)
         if (progress.get("version") != _VERSION
                 or progress.get("protocol_sha256") != self.protocol_sha256):
             raise ValueError("Checkpoint protocol/version mismatch")
