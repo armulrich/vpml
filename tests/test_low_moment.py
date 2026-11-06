@@ -270,7 +270,7 @@ class LowMomentClosureTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "model.train.low_moment_closure._rollout_window_memory",
+            "vpml.training.low_moment_losses._rollout_window_memory",
             return_value=(predicted, ()),
         ) as rollout:
             loss_fn({}, batch)
@@ -331,7 +331,7 @@ class LowMomentClosureTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "model.train.low_moment_closure._rollout_window_memory",
+            "vpml.training.low_moment_losses._rollout_window_memory",
             return_value=(predicted, ()),
         ):
             loss_value, regime_loss = loss_fn({}, batch)
@@ -701,7 +701,7 @@ class LowMomentClosureTests(unittest.TestCase):
                 np.testing.assert_allclose(norms[case_id], expected_norm, rtol=2e-6)
             self.assertTrue((root / "metadata.json").is_file())
             with mock.patch(
-                "model.train.low_moment_closure.low_hermite_coefficients_to_conservative",
+                "vpml.training.low_moment_data.low_hermite_coefficients_to_conservative",
                 side_effect=AssertionError("cache should be reused"),
             ):
                 reused, reused_norms, reused_root = _load_or_build_primitive_target_cache(
@@ -1678,7 +1678,7 @@ class LowMomentClosureTests(unittest.TestCase):
             return {"selection_index": np.asarray([len(captured)])}
 
         with mock.patch(
-            "model.train.low_moment_closure.sample_batch", side_effect=capture_batch
+            "vpml.training.low_moment_sampling.sample_batch", side_effect=capture_batch
         ):
             panel = build_diagnostic_panel(
                 np.random.default_rng(0),

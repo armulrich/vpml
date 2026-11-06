@@ -173,7 +173,7 @@ class RegimeSelectionTests(unittest.TestCase):
                          amplitude=jnp.ones(count), regime_index=jnp.arange(count),
                          heat_flux_gradient_target=jnp.ones((count, 8)) * 2,
                          heat_flux_gradient_case_scale=jnp.ones(count))
-            with mock.patch.object(trainer, "explicit_window_closure_step", return_value=jnp.zeros((count, 8))):
+            with mock.patch("vpml.training.low_moment_losses.explicit_window_closure_step", return_value=jnp.zeros((count, 8))):
                 value, per_regime = trainer.make_supervised_heat_flux_loss(regimes=regimes, **options)({}, batch)
             self.assertEqual(float(value), 4.)
             np.testing.assert_array_equal(per_regime, np.full(count, 4.))
@@ -261,7 +261,7 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                                          {**self.metadata, "regimes": list(regimes)}, self.stats)
                 with mock.patch.object(trainer, "_load_reference_cache", return_value=(
                     self.grouped, self.manifest, cache_metadata, "coefficients"
-                )), mock.patch.object(trainer, "_evaluate_heldout") as evaluate, mock.patch.object(
+                )), mock.patch("vpml.training.low_moment_evaluation._evaluate_heldout") as evaluate, mock.patch.object(
                     trainer, "load_or_compute_training_statistics", side_effect=AssertionError("no recompute")
                 ):
                     trainer.main(["--reference-cache", tmp, "--outdir", str(Path(tmp) / "eval"),
@@ -288,7 +288,7 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                     "--diagnostic-start-times", "0", "--width", "2", "--spectral-modes", "2"]
             with mock.patch.object(trainer, "_load_reference_cache", return_value=(
                 self.grouped, self.manifest, cache_metadata, "coefficients"
-            )), mock.patch.object(trainer, "init_burles_latent_fno_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
+            )), mock.patch("vpml.training.low_moment_state.init_burles_latent_fno_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
                 trainer, "load_or_compute_training_statistics", side_effect=AssertionError("no recompute")
             ), mock.patch.object(trainer, "_load_checkpoint", side_effect=AssertionError("no weights")), mock.patch.object(
                 trainer, "make_loss_function", side_effect=SetupComplete
@@ -337,7 +337,7 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                 trainer, "_load_reference_cache", return_value=(
                     self.grouped, self.manifest, cache_metadata, "coefficients"
                 )
-            ), mock.patch.object(trainer, "init_spectral_memory_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
+            ), mock.patch("vpml.training.low_moment_state.init_spectral_memory_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
                 trainer, "load_or_compute_training_statistics", side_effect=AssertionError("no cache writes")
             ), mock.patch.object(trainer, "make_loss_function", side_effect=toy_loss), mock.patch.object(trainer, "_plot_losses"):
                 trainer.main(args)
