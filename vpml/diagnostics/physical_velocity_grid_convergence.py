@@ -23,7 +23,7 @@ from vpml.datasets.interface_flux import sample_initial_condition
 from vpml.diagnostics.projection_quadrature_convergence import (
     _load_teacher_snapshot_artifact,
 )
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     cubic_bspline_interp_constant,
     cubic_bspline_prefilter_constant,

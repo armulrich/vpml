@@ -23,7 +23,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import jax
 import jax.numpy as jnp
 
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     gaussian_pdf,
     gaussian_vhat,

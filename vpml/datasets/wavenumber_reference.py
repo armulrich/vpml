@@ -7,7 +7,7 @@ import hashlib
 from pathlib import Path
 from vpml.io.atomic import atomic_write
 import numpy as np
-from vpml.physical_grid import (PhysicalGridVlasovPoissonConfig,build_physical_grid_ops,
+from vpml.solvers.physical_grid import (PhysicalGridVlasovPoissonConfig,build_physical_grid_ops,
     semilagrangian_vlasov_poisson_step,normalize_density_on_grid,gaussian_pdf)
 from vpml.datasets.interface_flux import evaluate_manifest_case
 import jax

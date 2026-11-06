@@ -36,7 +36,7 @@ from vpml.metrics import (
     FieldErrorConfig,
     SelfGeneratedFieldErrorMetric,
 )
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     compute_electric_field_from_distribution,
     gaussian_pdf,

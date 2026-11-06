@@ -30,7 +30,7 @@ from vpml.diagnostics.physical_velocity_grid_convergence import (
 from vpml.diagnostics.projection_quadrature_convergence import (
     _load_teacher_snapshot_artifact,
 )
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     gaussian_pdf,
     normalize_density_on_grid,

@@ -21,7 +21,7 @@ from vpml.datasets.interface_flux import (
 )
 from vpml.core import Array, GRID_CUBIC_SPLINE_TEACHER_BACKEND
 from vpml.fourier import restrict_rfft_numpy
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     build_cubic_spline_hermite_projection_matrix,
     gaussian_pdf,

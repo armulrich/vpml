@@ -32,7 +32,7 @@ from vpml.diagnostics.physical_velocity_grid_convergence import (
     _parse_float_tuple,
     _resample_velocity_snapshots,
 )
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     build_cubic_spline_hermite_projection_matrix,
     gaussian_pdf,

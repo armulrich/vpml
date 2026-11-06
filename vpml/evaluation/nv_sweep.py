@@ -29,7 +29,7 @@ from vpml.core import (
     hermite_basis_phi,
     load_learned_interface_closure_npz,
 )
-from vpml.physical_grid import project_distribution_snapshot_to_fourier_hermite
+from vpml.solvers.physical_grid import project_distribution_snapshot_to_fourier_hermite
 from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,
     EarlyGrowthConfig,

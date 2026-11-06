@@ -25,7 +25,7 @@ from vpml.training.interface_train import (
     INTERFACE_FLUX_PROJECTION_SCHEME,
 )
 from vpml.datasets.interface_flux import sample_initial_condition
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     build_cubic_spline_hermite_projection_matrix,
     gaussian_pdf,
