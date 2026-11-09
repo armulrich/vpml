@@ -49,11 +49,16 @@ def main(argv=None) -> int:
     # Process pairs sequentially, retaining at most two full kinetic states.
     comparisons = []
     baseline = read_variant(args.out, config["baseline"])
+    base_protocol = read_json(args.out / "variants" / config["baseline"] / "protocol.json")
     light_variants = [dict(baseline, state={})]
     for base_name, other_name in config["comparisons"]:
         if base_name != config["baseline"]:
             raise ValueError("Each configured comparison must use the declared baseline")
         other = read_variant(args.out, other_name)
+        other_protocol = read_json(args.out / "variants" / other_name / "protocol.json")
+        if any(base_protocol[key] != other_protocol[key] for key in
+               ("source", "diagnostic_runner_sha256", "runtime")):
+            raise ValueError("Refinement variants must share numerical source and runtime")
         comparisons.append(compare_variants(baseline, other))
         light_variants.append(dict(other, state={}))
         del other
