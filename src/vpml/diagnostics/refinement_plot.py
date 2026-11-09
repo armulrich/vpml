@@ -85,6 +85,8 @@ def plot_comparison(variants: list[dict], comparisons: list[dict],
     error_axis.set_ylabel(r"RMS difference in $\partial_xQ$" + "\n/ comparison history RMS")
     if error_axis.lines:
         error_axis.legend(fontsize=9, loc="best")
+        if any(np.any(line.get_ydata() > 0) for line in error_axis.lines):
+            error_axis.set_yscale("log")
     if omitted:
         error_axis.text(.02, .97, "Zero reference norm: " + ", ".join(omitted),
                         transform=error_axis.transAxes, va="top", fontsize=9)
