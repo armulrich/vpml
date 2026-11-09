@@ -162,3 +162,35 @@ Completion and training qualification are separate. A passing report retains
 comparisons establish adequate accuracy for the intended use. The optional
 linearized evolution follows the tangent map about a homogeneous Maxwellian;
 it is disabled in the versioned dataset configuration.
+
+Compare numerical settings
+--------------------------
+
+The CPU refinement command compares explicitly named variants of one recorded
+initial condition. Its configuration contains the actual Fourier coefficients,
+numerical settings and comparison pairs. Use a separate diagnostic output
+directory, with float64 storage and a sampling interval that is an integer
+multiple of every variant's timestep:
+
+.. code-block:: bash
+
+   python -m vpml.cli.gaussian_refinement validate --config /path/to/comparison.json
+   python -m vpml.cli.gaussian_refinement run --config /path/to/comparison.json \
+     --out /path/to/diagnostics --variant baseline --max-seconds 10800
+   # Execute each remaining named variant with the same configuration and output root.
+   python -m vpml.cli.gaussian_refinement compare --out /path/to/diagnostics --plot
+
+The versioned ``scripts/local/run_gaussian_refinement_v1.sh`` wrapper provides
+``validate``, ``run`` and ``compare`` actions. Set ``VPML_PYTHON`` to an absolute
+Python executable and ``VPML_REFINEMENT_ROOT`` to an absolute output directory.
+It runs variants sequentially in separate processes and retains logs under the
+output root. Repeating ``run`` verifies completed variants and resumes partial
+ones; source, runtime and configuration changes invalidate continuation.
+
+Finite failures remain recorded while diagnostic evolution continues to its
+configured endpoint. Nonfinite states stop execution without replacing the
+last valid checkpoint. These outputs are never qualified for training, and
+the production dataset's rejection behavior is unchanged. Comparisons retain
+failure reports and include closure fields as well as density, velocity,
+pressure and electric field. Agreement between two settings establishes a
+sensitivity result, not a convergence order.

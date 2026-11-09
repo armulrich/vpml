@@ -23,6 +23,7 @@ test = ["pytest>=8", "modal>=1.0"]
 vpml-dataset = "vpml.cli.gaussian_dataset:main"
 vpml-low-moment-train = "vpml.training.low_moment_train:main"
 vpml-gaussian-analyze = "vpml.diagnostics.gaussian_dataset:main"
+vpml-gaussian-refine = "vpml.cli.gaussian_refinement:main"
 vpml-linear-landau-compare = "vpml.diagnostics.linear_landau_comparison:main"
 fh-nonlinear-sim = "vpml.benchmarks.fh_nonlinear_sim_jax:main"
 fh-benchmarks-2412-07073 = "vpml.benchmarks.fh_benchmarks_2412_07073_jax:main"
