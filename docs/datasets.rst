@@ -187,6 +187,21 @@ It runs variants sequentially in separate processes and retains logs under the
 output root. Repeating ``run`` verifies completed variants and resumes partial
 ones; source, runtime and configuration changes invalidate continuation.
 
+To add a refinement without repeating a completed baseline, use a new configuration
+and output directory. ``compare --baseline-root /path/to/previous/diagnostics``
+loads the declared baseline variant from that directory and verifies its case,
+numerical settings, source and runtime. Its name and settings must also appear
+in the new configuration. The previous directory stays unchanged.
+
+For the recorded 2048-to-4096 spatial comparison, set
+``VPML_REFINEMENT_PARAMS`` to the absolute path of
+``scripts/local/gaussian_spatial_refinement_v2.params.sh`` and
+``VPML_REFINEMENT_BASELINE_ROOT`` to the existing diagnostic directory containing
+the completed ``finer_x`` variant. The same wrapper then runs only
+``spatial_4096`` and compares it with that verified baseline. It validates the
+external baseline before evolution; a missing or incompatible baseline stops
+the command before any trajectory work.
+
 Finite failures remain recorded while diagnostic evolution continues to its
 configured endpoint. Nonfinite states stop execution without replacing the
 last valid checkpoint. These outputs are never qualified for training, and
