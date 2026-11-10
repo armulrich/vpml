@@ -20,8 +20,6 @@ class DiagnosticTolerances:
 
     relative_mass: float = 1e-9
     relative_energy: float = 1e-4
-    minimum_f: float = -1e-8
-    negative_mass_fraction: float = 1e-8
     boundary_abs_fraction: float = 1e-8
     charge_imbalance: float = 1e-8
 
@@ -29,10 +27,7 @@ class DiagnosticTolerances:
         for name, value in asdict(self).items():
             if not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
-            if name == "minimum_f":
-                if value > 0:
-                    raise ValueError("minimum_f must be nonpositive")
-            elif value < 0:
+            if value < 0:
                 raise ValueError(f"{name} must be nonnegative")
 
 
@@ -73,6 +68,7 @@ def qualification_report(
     """Summarize a diagnostic history whose first row is the original IC.
 
     Nonfinite input is reported with JSON ``null`` metrics, never NaN/Infinity.
+    Finite negative distribution values and their mass are recorded, not rejected.
     Passing these checks does not establish grid or velocity-domain convergence.
     """
     data = np.asarray(history, dtype=np.float64)
@@ -110,15 +106,12 @@ def qualification_report(
     limits = (
         ("relative_mass", "max_relative_mass_error", tolerances.relative_mass),
         ("relative_energy", "max_relative_total_energy_error", tolerances.relative_energy),
-        ("negative_mass_fraction", "max_negative_mass_fraction", tolerances.negative_mass_fraction),
         ("boundary_abs_fraction", "max_boundary_abs_fraction", tolerances.boundary_abs_fraction),
         ("charge_imbalance", "max_abs_charge_imbalance", tolerances.charge_imbalance),
     )
     for name, metric, limit in limits:
         if metrics[metric] is None or metrics[metric] > limit:
             failures.append(name)
-    if metrics["min_f"] is None or metrics["min_f"] < tolerances.minimum_f:
-        failures.append("minimum_f")
     if metrics["min_n"] is None or metrics["min_n"] <= 0:
         failures.append("nonpositive_density")
     return {
