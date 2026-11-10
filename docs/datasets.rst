@@ -35,7 +35,7 @@ the resulting charge imbalance and boundary population.
 Parameters and preparation
 --------------------------
 
-The versioned parameters in ``scripts/delta/gaussian_amplitudes_v1.json``
+The parameters in ``scripts/delta/gaussian_amplitudes.json``
 define the wavenumbers, mode counts, decay exponents, amplitudes, strengths,
 numerical grid and data split. They produce 240 shapes and five strengths per
 shape, giving 1,200 cases. All strengths of one shape remain in the same split.
@@ -47,10 +47,10 @@ Preparation records actual coefficients and validated identities in a manifest:
 .. code-block:: bash
 
    vpml-dataset prepare \
-     --parameters scripts/delta/gaussian_amplitudes_v1.json \
+     --parameters scripts/delta/gaussian_amplitudes.json \
      --manifest out_bench/gaussian/manifest.json
    vpml-dataset validate \
-     --parameters scripts/delta/gaussian_amplitudes_v1.json \
+     --parameters scripts/delta/gaussian_amplitudes.json \
      --manifest out_bench/gaussian/manifest.json
 
 These commands perform no trajectory evolution. Reusing a path with different
@@ -104,7 +104,7 @@ Spatial derivatives use physical coordinates; Fourier restriction handles the
 target Nyquist mode explicitly.
 
 Output times between integration steps use linear interpolation of observed
-fields. In the versioned configuration, :math:`\Delta t=0.01` and the output
+fields. In the supplied configuration, :math:`\Delta t=0.01` and the output
 spacing is :math:`0.025`. Output precision is distinct from float64 integration.
 
 Read completed cases
@@ -159,8 +159,11 @@ replaced by new random draws automatically.
 Numerical checks
 ----------------
 
-Reports assess mass and total energy, negative distribution values, negative
+Reports measure mass and total energy, negative distribution values, negative
 mass, boundary population, density, charge imbalance and saved-field positivity.
+Finite distribution undershoots and their negative mass are recorded without
+automatically rejecting a trajectory. Nonfinite values, nonpositive density or
+saved pressure, and failures of the remaining configured checks still reject it.
 The tolerances are engineering thresholds, not a physical admissibility theorem.
 Failed distributions are not repaired by clipping.
 
@@ -168,4 +171,30 @@ Completion and training qualification are separate. A passing report retains
 ``training_qualified = false`` until grid, timestep and velocity-domain
 comparisons establish adequate accuracy for the intended use. The optional
 linearized evolution follows the tangent map about a homogeneous Maxwellian;
-it is disabled in the versioned dataset configuration.
+it is disabled in the supplied dataset configuration.
+
+Compare retained fields
+-----------------------
+
+Use completed cases from two datasets with identical initial conditions,
+velocity interval and output coordinates. Only ``nx``, ``nv`` and ``dt`` may
+differ between their frozen manifests:
+
+.. code-block:: bash
+
+   python -m vpml.diagnostics.dataset_accuracy \
+     --candidate /path/to/candidate/reference \
+     --reference /path/to/refined/reference \
+     --case-id CASE_ID --tolerance 0.005 --out comparison.json
+
+The comparison verifies checksums and measures :math:`n-1,u,p-1,Q,\partial_xQ,E`
+at the actual saved times, including storage rounding. Relative L2 errors use
+the time integral of spatial mean square, separately over the full horizon and
+each third of it. Absolute errors and the largest per-time relative errors are
+also reported. Zero reference norms receive no artificial denominator floor;
+a nonzero difference against a zero reference is inconclusive.
+
+A passing comparison establishes agreement at the chosen tolerance, not the
+accuracy of either reference. Diagnostic failures are reported separately.
+Reference convergence, velocity-domain adequacy and coverage of the intended
+initial-condition family remain necessary before choosing production settings.

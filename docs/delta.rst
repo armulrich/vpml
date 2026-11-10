@@ -33,16 +33,16 @@ Set the environment executable and a dedicated dataset directory:
 .. code-block:: bash
 
    export VPML_PYTHON=/absolute/path/to/prepared-venv/bin/python
-   export VPML_DATA_ROOT=/absolute/path/to/project-work/gaussian-amplitudes-v2
-   export VPML_RUN_PARAMS=/absolute/path/to/vpml/scripts/delta/gaussian_amplitudes_v2.params.sh
+   export VPML_DATA_ROOT=/absolute/path/to/project-work/gaussian-amplitudes
+   export VPML_RUN_PARAMS=/absolute/path/to/vpml/scripts/delta/gaussian_amplitudes.params.sh
 
 The launcher derives the code root from its location; ``VPML_CODE_ROOT`` can
 select another fixed checkout explicitly. ``VPML_RUN_PARAMS`` selects a
-versioned ``.params.sh`` file containing scheduler resources, a scientific
+fixed ``.params.sh`` file containing scheduler resources, a scientific
 parameter JSON, optional case IDs and the failure policy. Omitting it selects
-v1. Both versions use the same launcher and batch entrypoint.
+the adjacent ``gaussian_amplitudes.params.sh``.
 
-The v2 JSON retains all 1,200 initial conditions with 2,048 spatial points.
+The supplied JSON contains all 1,200 initial conditions with 2,048 spatial points.
 Its parameter file selects the first five cases and enables stopping on the
 first failure. Selected IDs are checked before submission and again in the
 worker. Changing resolution requires a new dataset directory and evolution
@@ -50,10 +50,10 @@ from the original initial conditions; an old-grid checkpoint is not resumed.
 
 .. code-block:: bash
 
-   bash scripts/delta/run_gaussian_amplitudes_v1.sh prepare
-   bash scripts/delta/run_gaussian_amplitudes_v1.sh validate
-   bash scripts/delta/run_gaussian_amplitudes_v1.sh status
-   bash scripts/delta/run_gaussian_amplitudes_v1.sh test-submit
+   bash scripts/delta/run_gaussian_amplitudes.sh prepare
+   bash scripts/delta/run_gaussian_amplitudes.sh validate
+   bash scripts/delta/run_gaussian_amplitudes.sh status
+   bash scripts/delta/run_gaussian_amplitudes.sh test-submit
 
 Preparation writes the manifest, validation compares it with the configured
 parameters, and status reads progress metadata. Status is not a full integrity
@@ -64,7 +64,15 @@ Submission is a separate action:
 
 .. code-block:: bash
 
-   bash scripts/delta/run_gaussian_amplitudes_v1.sh submit
+   bash scripts/delta/run_gaussian_amplitudes.sh submit
+
+Before submission, the launcher freezes a read-only record under
+``$VPML_DATA_ROOT/submissions`` with parameter texts, manifest and source hashes,
+selected cases and resource limits. This records intent, not scheduler acceptance;
+retain the actual job ID returned by Slurm separately. When using a Git archive,
+set ``VPML_SOURCE_COMMIT`` to its full commit SHA. The record distinguishes that
+declaration from a commit observed in a checkout. Stage and preserve the source,
+environment and parameters before submission: ``sbatch`` does not transfer them.
 
 This requests a real allocation: account ``bhvw-delta-gpu``, partition
 ``gpuA100x4``, one GPU, 16 CPUs and 60 GB host RAM for at most one hour.
@@ -78,7 +86,11 @@ early. A one-hour allocation does not guarantee that every selected case
 reaches its prescribed simulation time.
 
 The worker's 3,300-second budget leaves a shutdown margin; Slurm also sends an
-advance USR1 signal. There is no automatic requeue, retry or resubmission.
+advance USR1 signal. Shorter jobs may set ``VPML_SHUTDOWN_MARGIN_SECONDS`` between
+60 and 180 seconds; the worker budget must leave at least this margin before
+the requested wall limit. The default is 180 seconds. There is no automatic
+requeue, retry or resubmission. Each submission has its own budget; the launcher
+does not enforce a shared allowance across separate jobs.
 Compilation or slow I/O can still reach the hard limit, so recovery does not
 depend solely on graceful shutdown.
 
@@ -106,9 +118,10 @@ Storage planning
 
 Checkpoint storage is substantially larger than compact training output.
 Each case retains about 110.6 MB of every-step observations and 22.1 MB of
-sampled outputs. Two kinetic states need 134.2 MB at the v1 spatial resolution
-or 268.4 MB at v2. Retaining all 1,200 cases therefore needs approximately
-321 GB for v1 or 482 GB for v2, plus diagnostics, metadata and interrupted
+sampled outputs at ``dt=0.01``. Two float64 kinetic states need
+:math:`2N_xN_v\times8` bytes: 268.4 MB at ``nx=2048, nv=8192``.
+Retaining all 1,200 cases at those settings therefore needs approximately
+482 GB, plus diagnostics, metadata and interrupted
 writes. Optional tangent states require more space.
 
 Use project work storage for active I/O; do not use node-local temporary
@@ -118,4 +131,6 @@ See `Delta storage documentation <https://docs.ncsa.illinois.edu/systems/delta/e
 
 Measure throughput with the actual observation, diagnostic and checkpoint
 settings. Timing a solver kernel alone does not estimate all data-generation
-costs.
+costs. Worker results separate advancement and observation, host transfer,
+checkpoint writing, diagnostic summaries and finalization times. Advancement
+timing waits for device completion and includes compilation on the first block.
