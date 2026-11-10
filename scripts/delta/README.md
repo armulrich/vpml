@@ -7,9 +7,9 @@ preparation, validation, submission, monitoring and continuation.
 `gaussian_amplitudes.params.sh`. `VPML_RUN_PARAMS` optionally selects another
 absolute parameter-file path. The canonical `gaussian_amplitudes.json` supplies
 scientific parameters for the full 1,200-case dataset with 2,048 spatial points.
-The canonical launcher parameters select its first five cases and stop on the
-first numerical rejection. This configuration still requires numerical
-qualification before a larger run.
+The canonical launcher parameters leave `VPML_CASE_IDS` empty to process the
+full manifest within the time budget and stop on the first numerical rejection.
+Numerical qualification remains separate from this selection and resource limit.
 
 After setting absolute `VPML_DATA_ROOT` and `VPML_PYTHON` paths:
 

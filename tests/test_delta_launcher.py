@@ -20,14 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "scripts/delta/run_gaussian_amplitudes.sh"
 PARAMETERS = ROOT / "scripts/delta/gaussian_amplitudes.json"
 RUN_PARAMETERS = ROOT / "scripts/delta/gaussian_amplitudes.params.sh"
-SELECTED_IDS = [
-    "case_0f256f2e1b1d12274df7d726",
-    "case_85d6c8ae79fcf33b5d4878d4",
-    "case_398a3fbaeed975eec57b46d0",
-    "case_047207d6581b94d72a9bd823",
-    "case_8ef5689ddc47917db7b30b97",
-]
-SELECTION = [item for case_id in SELECTED_IDS for item in ("--case-id", case_id)]
+MANIFEST_IDS = ["case_" + f"{index:024x}" for index in range(5)]
 
 
 class DeltaLauncherTests(unittest.TestCase):
@@ -102,7 +95,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(calls[0]["args"][1:], ["prepare", "--manifest", str(self.data / "manifest.json"),
                                               "--parameters", str(PARAMETERS)])
         self.assertEqual(calls[1]["args"][1:], ["validate", "--manifest", str(self.data / "manifest.json"),
-                                              "--parameters", str(PARAMETERS), *SELECTION])
+                                              "--parameters", str(PARAMETERS)])
         self.assertEqual(calls[2]["args"][1:], ["status", "--out", str(self.data / "reference"),
                                                "--manifest", str(self.data / "manifest.json")])
 
@@ -121,8 +114,9 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
             self.assertIn(argument, arguments)
         self.assertIn(str(self.data), arguments)
         self.assertIn(str(self.python), arguments)
-        self.assertEqual(arguments[-16:], [str(ROOT), str(self.data), str(self.python),
-                                          str(PARAMETERS), "3300", *SELECTION, "--stop-on-failure"])
+        self.assertEqual(arguments[-6:], [str(ROOT), str(self.data), str(self.python),
+                                         str(PARAMETERS), "3300", "--stop-on-failure"])
+        self.assertNotIn("--case-id", arguments)
         self.assertFalse(self.data.exists())
 
     def test_canonical_scientific_parameters_and_explicit_default_match(self):
@@ -200,8 +194,8 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
                 scheduler = self.calls()[-1]
                 self.assertIn(f"--time={wall}", scheduler["args"])
                 self.assertIn("--signal=USR1@60", scheduler["args"])
-                self.assertEqual(scheduler["args"][-12], str(worker))
-                self.assertEqual(scheduler["args"][-11:], [*SELECTION, "--stop-on-failure"])
+                self.assertEqual(scheduler["args"][-2], str(worker))
+                self.assertEqual(scheduler["args"][-1], "--stop-on-failure")
                 wall_seconds += int(wall[3:5]) * 60
         self.assertEqual(wall_seconds, 900)
         self.assertFalse(self.data.exists())
@@ -209,7 +203,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
     def test_explicit_submit_is_the_only_action_without_test_only(self):
         self.data.mkdir(mode=0o700)
         manifest = self.data / "manifest.json"
-        manifest.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in SELECTED_IDS]}))
+        manifest.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in MANIFEST_IDS]}))
         result = self.run_action("submit")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
@@ -228,12 +222,12 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(record["manifest"]["sha256"], hashlib.sha256(manifest.read_bytes()).hexdigest())
         self.assertEqual(record["scientific_parameters"]["text"], PARAMETERS.read_text())
         self.assertEqual(record["launcher_parameters"]["text"], RUN_PARAMETERS.read_text())
-        self.assertEqual(record["selected_case_ids"], SELECTED_IDS)
+        self.assertEqual(record["selected_case_ids"], MANIFEST_IDS)
         self.assertEqual(record["scheduler"]["wall_seconds"], 3600)
         self.assertEqual(record["scheduler"]["shutdown_margin_seconds"], 180)
         self.assertEqual(record["worker"]["max_seconds"], 3300)
         self.assertTrue(record["worker"]["stop_on_failure"])
-        self.assertEqual(record["worker"]["arguments"], [*SELECTION, "--stop-on-failure"])
+        self.assertEqual(record["worker"]["arguments"], ["--stop-on-failure"])
         self.assertIn("--gpus-per-node=1", record["scheduler"]["arguments"])
         self.assertEqual(record["code"]["root"], str(ROOT))
         self.assertIn("vpml/datasets/runner.py", record["code"]["source"]["files"])
@@ -249,7 +243,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
     def test_explicit_parameter_snapshots_survive_later_edits(self):
         self.data.mkdir(mode=0o700)
         manifest = self.data / "manifest.json"
-        manifest.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in SELECTED_IDS]}))
+        manifest.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in MANIFEST_IDS]}))
         scientific = self.directory / "custom science.json"
         scientific.write_bytes(PARAMETERS.read_bytes())
         environment = self.parameter_environment(
@@ -269,7 +263,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(record["scientific_parameters"]["text"], scientific_snapshot)
         self.assertEqual(record["launcher_parameters"]["text"], launcher_snapshot)
-        self.assertEqual(record["selected_case_ids"], SELECTED_IDS)
+        self.assertEqual(record["selected_case_ids"], MANIFEST_IDS)
         self.assertEqual(record["scheduler"]["wall_seconds"], 1800)
         self.assertEqual(record["worker"]["max_seconds"], 1200)
         self.assertFalse(record["worker"]["stop_on_failure"])
@@ -284,14 +278,14 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
     def test_failed_record_write_leaves_no_published_or_temporary_intent(self):
         self.data.mkdir(mode=0o700)
         manifest = self.data / "manifest.json"
-        manifest.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in SELECTED_IDS]}))
+        manifest.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in MANIFEST_IDS]}))
         path = ROOT / "scripts/delta/record_submission.py"
         spec = importlib.util.spec_from_file_location("delta_record_submission", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         arguments = [str(path), str(ROOT), str(self.data), str(self.python),
                      str(PARAMETERS), str(RUN_PARAMETERS), "3300", "3600", "180",
-                     "--gpus-per-node=1", "--", *SELECTION]
+                     "--gpus-per-node=1", "--"]
         # Fail after the payload has been written but before publication. This
         # must not leave a truncated or writable intent under its final name.
         with mock.patch.object(sys, "argv", arguments), \

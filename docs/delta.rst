@@ -43,10 +43,12 @@ parameter JSON, optional case IDs and the failure policy. Omitting it selects
 the adjacent ``gaussian_amplitudes.params.sh``.
 
 The supplied JSON contains all 1,200 initial conditions with 2,048 spatial points.
-Its parameter file selects the first five cases and enables stopping on the
-first failure. Selected IDs are checked before submission and again in the
-worker. Changing resolution requires a new dataset directory and evolution
-from the original initial conditions; an old-grid checkpoint is not resumed.
+Its parameter file leaves ``VPML_CASE_IDS`` empty, so the worker processes the
+full manifest in order within its time budget and stops on the first failure.
+Explicit case IDs can restrict the selection; they are checked before submission
+and again in the worker. This selection does not establish numerical accuracy.
+Changing resolution requires a new dataset directory and evolution from the
+original initial conditions; an old-grid checkpoint is not resumed.
 
 .. code-block:: bash
 
