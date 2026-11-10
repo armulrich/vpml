@@ -19,17 +19,31 @@ if [[ ${VPML_REFINEMENT_ROOT:-} != /* || ${VPML_REFINEMENT_ROOT:-} == / ]]; then
     printf 'VPML_REFINEMENT_ROOT must be an absolute output directory other than /.\n' >&2
     exit 2
 fi
-# shellcheck source=scripts/local/gaussian_refinement_v1.params.sh
-source "$script_directory/gaussian_refinement_v1.params.sh"
+# Select a versioned parameter file; the original four-variant comparison is the default.
+parameters=${VPML_REFINEMENT_PARAMS:-"$script_directory/gaussian_refinement_v1.params.sh"}
+if [[ $parameters != /* || ! -f $parameters ]]; then
+    printf 'VPML_REFINEMENT_PARAMS must name an absolute parameter-file path.\n' >&2
+    exit 2
+fi
+# shellcheck source=/dev/null
+source "$parameters"
+if [[ -n ${VPML_REFINEMENT_BASELINE_ROOT:-} && $VPML_REFINEMENT_BASELINE_ROOT != /* ]]; then
+    printf 'VPML_REFINEMENT_BASELINE_ROOT must be an absolute path.\n' >&2
+    exit 2
+fi
 export PYTHONPATH="$VPML_CODE_ROOT/src"
 export VPML_JAX_BACKEND=cpu JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1
 cli=("$VPML_PYTHON" -m vpml.cli.gaussian_refinement)
+validation=(validate --config "$VPML_REFINEMENT_CONFIG")
+if [[ -n ${VPML_REFINEMENT_BASELINE_ROOT:-} ]]; then
+    validation+=(--baseline-root "$VPML_REFINEMENT_BASELINE_ROOT")
+fi
 if [[ $action == validate ]]; then
-    exec "${cli[@]}" validate --config "$VPML_REFINEMENT_CONFIG"
+    exec "${cli[@]}" "${validation[@]}"
 fi
 if [[ $action == run ]]; then
-    "${cli[@]}" validate --config "$VPML_REFINEMENT_CONFIG"
+    "${cli[@]}" "${validation[@]}"
     mkdir -p -- "$VPML_REFINEMENT_ROOT/logs"
     for variant in "${VPML_REFINEMENT_VARIANTS[@]}"; do
         "${cli[@]}" run --config "$VPML_REFINEMENT_CONFIG" \
@@ -38,4 +52,8 @@ if [[ $action == run ]]; then
             2>&1 | tee -a "$VPML_REFINEMENT_ROOT/logs/$variant.log"
     done
 fi
-exec "${cli[@]}" compare --out "$VPML_REFINEMENT_ROOT" --plot
+comparison=(compare --out "$VPML_REFINEMENT_ROOT" --plot)
+if [[ -n ${VPML_REFINEMENT_BASELINE_ROOT:-} ]]; then
+    comparison+=(--baseline-root "$VPML_REFINEMENT_BASELINE_ROOT")
+fi
+exec "${cli[@]}" "${comparison[@]}"
