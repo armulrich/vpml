@@ -32,7 +32,8 @@ def fields_for(settings, factor=1.0):
     return values
 
 
-def write_fixture(root, settings, values, *, times=None, complete=True, diagnostic_pass=True):
+def write_fixture(root, settings, values, *, times=None, complete=True, diagnostic_pass=True,
+                  observation_values=None):
     """Publish synthetic arrays with the same protocol/provenance as real outputs."""
     write_manifest(root / "manifest.json", settings)
     numerical = Numerics(**settings["numerics"])
@@ -50,10 +51,12 @@ def write_fixture(root, settings, values, *, times=None, complete=True, diagnost
                             provenance_sha256=provenance_hash)
     diagnostics = np.zeros((numerical.nsteps + 1, len(DIAGNOSTIC_NAMES)))
     diagnostics[:, 0] = 1
+    if observation_values is None:
+        observation_values = np.broadcast_to(values[0], (numerical.nsteps + 1, 6, numerical.output_nx)).copy()
     observations = {
-        "fields": np.broadcast_to(values[0, :5], (numerical.nsteps + 1, 5, numerical.output_nx)).copy(),
+        "fields": observation_values[:, :5],
         "raw_moments": np.zeros((numerical.nsteps + 1, 3, numerical.output_nx)),
-        "electric": np.broadcast_to(values[0, 5], (numerical.nsteps + 1, numerical.output_nx)).copy(),
+        "electric": observation_values[:, 5],
         "diagnostics": diagnostics,
     }
     state = {"f": np.ones((numerical.nv, numerical.nx))}
@@ -62,8 +65,9 @@ def write_fixture(root, settings, values, *, times=None, complete=True, diagnost
     if complete:
         outputs = {"times": np.arange(numerical.nsamples) * numerical.save_dt if times is None else times,
                    "diagnostic_times": np.arange(numerical.nsteps + 1) * numerical.dt,
-                   "fields": values[:, :5], "raw_moments": np.zeros((numerical.nsamples, 3, numerical.output_nx)),
-                   "electric": values[:, 5], "diagnostics": diagnostics}
+                   "fields": values[:, :5].astype(numerical.storage_dtype),
+                   "raw_moments": np.zeros((numerical.nsamples, 3, numerical.output_nx), dtype=numerical.storage_dtype),
+                   "electric": values[:, 5].astype(numerical.storage_dtype), "diagnostics": diagnostics}
         report = {"diagnostic_names": list(DIAGNOSTIC_NAMES), "checks_passed": diagnostic_pass,
                   "training_qualified": False, "failures": [] if diagnostic_pass else ["minimum_f"],
                   "qualification_scope": "synthetic fixture only",
@@ -81,8 +85,8 @@ class DatasetAccuracyTests(unittest.TestCase):
         self.settings = manifest()
         self.case_id = self.settings["cases"][0]["case_id"]
 
-    def compare(self):
-        return compare_dataset_cases(self.candidate, self.reference, [self.case_id])
+    def compare(self, **options):
+        return compare_dataset_cases(self.candidate, self.reference, [self.case_id], **options)
 
     def test_known_relative_error_uses_perturbations_and_allows_resolution_changes(self):
         candidate_settings = manifest(nx=32, nv=32, dt=.5)
@@ -195,8 +199,98 @@ class DatasetAccuracyTests(unittest.TestCase):
                 root = self.root / f"changed-{next(iter(change))}"
                 settings = manifest(**change)
                 write_fixture(root, settings, fields_for(settings))
-                with self.assertRaisesRegex(ValueError, "only in nx, nv and dt"):
+                with self.assertRaisesRegex(ValueError, "only in nx, nv, dt"):
                     compare_dataset_cases(root, self.reference, [self.case_id])
+
+    def test_output_precision_and_checkpoint_cadence_are_explicit_comparison_differences(self):
+        candidate_settings = manifest(storage_dtype="float32", block_steps=400)
+        reference = fields_for(self.settings)
+        candidate = fields_for(candidate_settings, 1.004)
+        for index in (0, 2):
+            reference[:, index] = 1 + 1e-8 * np.cos(2 * np.pi * np.arange(8) / 8)
+            candidate[:, index] = 1 + 1.004e-8 * np.cos(2 * np.pi * np.arange(8) / 8)
+        write_fixture(self.reference, self.settings, reference)
+        write_fixture(self.candidate, candidate_settings, candidate)
+        before = {str(path): path.stat().st_mtime_ns for path in self.root.rglob("*") if path.is_file()}
+        stored = self.compare()
+        self.assertEqual(stored["representation"], "saved")
+        self.assertTrue(stored["storage_rounding_included"])
+        self.assertFalse(stored["observation_history_integrity_verified"])
+        self.assertFalse(stored["all_tolerances_passed"])
+        self.assertEqual(stored["cases"][0]["windows"][0]["fields"]["n-1"]["relative_L2"], 1.)
+        observed = self.compare(representation="observations-float64")
+        self.assertTrue(observed["all_tolerances_passed"])
+        self.assertFalse(observed["storage_rounding_included"])
+        self.assertTrue(observed["observation_history_integrity_verified"])
+        self.assertEqual(observed["protocol_differences"], {
+            "storage_dtype": {"candidate": "float32", "reference": "float64"},
+            "block_steps": {"candidate": 400, "reference": 100}})
+        for key in ("n-1", "p-1"):
+            metric = observed["cases"][0]["windows"][0]["fields"][key]
+            self.assertAlmostEqual(metric["relative_L2"], .004, delta=1e-8)
+            self.assertAlmostEqual(metric["reference_RMS"], 1e-8 / np.sqrt(2), delta=1e-16)
+        self.assertTrue(observed["cases"][0]["candidate_observation_provenance_sha256"])
+        after = {str(path): path.stat().st_mtime_ns for path in self.root.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+        directory = self.candidate / "cases" / self.case_id
+        changed = json.loads((directory / "protocol.json").read_text())
+        changed["numerics"]["storage_dtype"] = "float64"
+        with self.assertRaisesRegex(ValueError, "protocol mismatch"):
+            CheckpointStore(directory, changed, read_only=True)
+
+    def test_float64_observations_use_actual_saved_times_with_interpolation(self):
+        candidate_settings = manifest(dt=2., save_dt=3.)
+        reference_settings = manifest(dt=1., save_dt=3.)
+
+        def evolving_values(times):
+            wave = (1 + times[:, None] / 120) * .1 * np.cos(2 * np.pi * np.arange(8) / 8)
+            values = np.broadcast_to(wave[:, None], (len(times), 6, 8)).copy()
+            values[:, 0] += 1
+            values[:, 2] += 1
+            return values
+
+        for root, settings in ((self.candidate, candidate_settings), (self.reference, reference_settings)):
+            numerical = Numerics(**settings["numerics"])
+            write_fixture(root, settings, evolving_values(np.arange(numerical.nsamples) * numerical.save_dt),
+                          observation_values=evolving_values(np.arange(numerical.nsteps + 1) * numerical.dt))
+        path = self.root / "observations.json"
+        status = main(["--candidate", str(self.candidate), "--reference", str(self.reference),
+                       "--case-id", self.case_id, "--representation", "observations-float64",
+                       "--out", str(path)])
+        self.assertEqual(status, 0)
+        result = json.loads(path.read_text())
+        self.assertEqual(result["saved_times"], {"start": 0., "end": 120., "spacing": 3., "count": 41})
+        self.assertFalse(result["storage_rounding_included"])
+        for window in result["cases"][0]["windows"]:
+            self.assertTrue(window["all_tolerances_passed"])
+            self.assertLess(window["fields"]["n-1"]["absolute_max"], 3e-16)
+
+    def test_observation_corruption_and_incompatible_provenance_are_rejected(self):
+        write_fixture(self.reference, self.settings, fields_for(self.settings))
+        write_fixture(self.candidate, self.settings, fields_for(self.settings))
+        directory = self.candidate / "cases" / self.case_id
+        progress = json.loads((directory / "progress.json").read_text())
+        record = progress["blocks"][0]["observations"]
+        path = directory / record["file"]
+        original = path.read_bytes()
+        path.write_bytes(original + b"changed")
+        self.assertTrue(self.compare()["all_tolerances_passed"])
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            self.compare(representation="observations-float64")
+        path.write_bytes(original)
+        provenance_path = self.candidate / "provenance" / f"{record['provenance_sha256']}.json"
+        changed = json.loads(provenance_path.read_text())
+        changed["runtime"]["backend"] = "incompatible"
+        digest = json_digest(changed)
+        (provenance_path.parent / f"{digest}.json").write_text(json.dumps(changed))
+        record["provenance_sha256"] = digest
+        (directory / "progress.json").write_text(json.dumps(progress))
+        with self.assertRaisesRegex(ValueError, "Observation provenance"):
+            self.compare(representation="observations-float64")
+
+    def test_unknown_representation_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "representation"):
+            self.compare(representation="unverified")
 
     def test_time_coordinates_and_partial_completion_are_rejected(self):
         write_fixture(self.reference, self.settings, fields_for(self.settings))
