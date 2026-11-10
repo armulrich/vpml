@@ -104,8 +104,13 @@ Spatial derivatives use physical coordinates; Fourier restriction handles the
 target Nyquist mode explicitly.
 
 Output times between integration steps use linear interpolation of observed
-fields. In the supplied configuration, :math:`\Delta t=0.01` and the output
-spacing is :math:`0.025`. Output precision is distinct from float64 integration.
+fields. Integration and retained observations use float64; ``storage_dtype``
+controls the precision of the final fields, raw moments and electric field.
+Float32 rounding near a unit background can erase small :math:`n-1` and
+:math:`p-1` perturbations. Use float64 output when these perturbations must be
+retained, and subtract the background before any lower-precision conversion
+for analysis or training. Float64 storage does not establish grid or timestep
+convergence.
 
 Read completed cases
 --------------------
@@ -149,6 +154,9 @@ array bundle records the inventory used to produce it. Changes to unrelated
 plotting code are recorded without invalidating a numerical checkpoint.
 Older protocols with a different compatibility definition are not silently
 upgraded; use their recorded code revision for continuation.
+Output precision and checkpoint cadence are also part of the frozen protocol.
+Changing ``storage_dtype`` or ``block_steps`` requires a separate dataset;
+comparison between such datasets does not permit resuming with changed settings.
 
 An exclusive case lock prevents two workers from writing the same case.
 Investigate the recorded owner before removing a stale lock; workers never
@@ -177,8 +185,9 @@ Compare retained fields
 -----------------------
 
 Use completed cases from two datasets with identical initial conditions,
-velocity interval and output coordinates. Only ``nx``, ``nv`` and ``dt`` may
-differ between their frozen manifests:
+velocity interval and output coordinates. Only ``nx``, ``nv``, ``dt``,
+``block_steps`` and ``storage_dtype`` may differ between their frozen manifests.
+The report lists these differences:
 
 .. code-block:: bash
 
@@ -193,6 +202,15 @@ the time integral of spatial mean square, separately over the full horizon and
 each third of it. Absolute errors and the largest per-time relative errors are
 also reported. Zero reference norms receive no artificial denominator floor;
 a nonzero difference against a zero reference is inconclusive.
+
+To compare the evolution before output rounding, add
+``--representation observations-float64`` to the same command. This mode
+verifies the retained float64 observation bundles and their provenance, then
+samples them at the same output times using the original interpolation rule.
+It uses existing observations without rerunning a trajectory or modifying its
+files. A pass in this mode does not establish that lower-precision saved
+outputs retain the same accuracy; the default ``saved`` mode includes their
+rounding error.
 
 A passing comparison establishes agreement at the chosen tolerance, not the
 accuracy of either reference. Diagnostic failures are reported separately.
