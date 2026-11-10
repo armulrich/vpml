@@ -42,6 +42,16 @@ def plot_comparison(variants: list[dict], comparisons: list[dict],
     lookup = {case["variant"]: case for case in variants}
     if not variants or len(lookup) != len(variants):
         raise ValueError("Plot requires unique, nonempty variant names")
+    spatial_only = (len({case["numerics"]["nx"] for case in variants}) > 1
+                    and all(len({case["numerics"][key] for case in variants}) == 1
+                            for key in ("nv", "dt")))
+    labels = {case["variant"]: (rf"$N_x={case['numerics']['nx']}$" if spatial_only
+                               else _LABELS.get(case["variant"], case["variant"]))
+              for case in variants}
+    palette = ("#555555", "#2166ac", "#d87520", "#8050a6")
+    colors = ({case["variant"]: palette[i % len(palette)] for i, case in enumerate(
+        sorted(variants, key=lambda item: item["numerics"]["nx"]))}
+        if spatial_only else _COLORS)
     columns = {name: i for i, name in enumerate(DIAGNOSTIC_NAMES)}
     fig, axes = plt.subplots(2, 2, figsize=(12.5, 8), constrained_layout=True)
     min_axis, negative_axis, energy_axis, error_axis = axes.flat
@@ -49,7 +59,7 @@ def plot_comparison(variants: list[dict], comparisons: list[dict],
         name, arrays = case["variant"], case["arrays"]
         times = np.asarray(arrays["diagnostic_times"])
         diagnostics = np.asarray(arrays["diagnostics"])
-        style = dict(color=_COLORS.get(name), label=_LABELS.get(name, name),
+        style = dict(color=colors.get(name), label=labels[name],
                      linewidth=1.8, alpha=.95)
         min_axis.plot(times, diagnostics[:, columns["min_f"]], **style)
         negative_axis.plot(times, np.maximum(
@@ -77,11 +87,13 @@ def plot_comparison(variants: list[dict], comparisons: list[dict],
         reference_rms = np.sqrt(np.trapezoid(np.mean(b ** 2, axis=-1), times)
                                 / (times[-1] - times[0]))
         name = other["variant"]
+        pair_label = (rf"$N_x={base['numerics']['nx']}\,\to\,N_x={other['numerics']['nx']}$"
+                      if spatial_only else labels[name])
         if reference_rms == 0:
-            omitted.append(_LABELS.get(name, name))
+            omitted.append(pair_label)
             continue
         error_axis.plot(times, np.sqrt(np.mean((a - b) ** 2, axis=-1)) / reference_rms,
-                        color=_COLORS.get(name), label=_LABELS.get(name, name), linewidth=1.8)
+                        color=colors.get(name), label=pair_label, linewidth=1.8)
     error_axis.set_ylabel(r"RMS difference in $\partial_xQ$" + "\n/ comparison history RMS")
     if error_axis.lines:
         error_axis.legend(fontsize=9, loc="best")
