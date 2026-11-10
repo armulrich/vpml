@@ -93,6 +93,67 @@ class DatasetRunnerTests(unittest.TestCase):
                 np.testing.assert_allclose(actual_outputs["times"], [0, .02, .04], rtol=0, atol=1e-16)
                 self.assertEqual(actual_outputs["diagnostics"].shape[0], 5)
 
+    def test_checkpoint_cadence_preserves_trajectory_and_resume(self):
+        expected_state = expected_outputs = expected_report = None
+        for block_steps in (100, 400):
+            self.manifest = tiny_manifest(nv=129, final_time=4.02,
+                                          block_steps=block_steps)
+            self.case_id = self.manifest["cases"][0]["case_id"]
+            for interrupted in (False, True):
+                with self.subTest(block_steps=block_steps, interrupted=interrupted):
+                    directory = self.root / f"cadence-{block_steps}-{interrupted}"
+                    if interrupted:
+                        stopped = [False]
+                        append = CheckpointStore.append
+
+                        def append_and_stop(store, *args, **kwargs):
+                            progress = append(store, *args, **kwargs)
+                            stopped[0] = True
+                            return progress
+
+                        with mock.patch.object(CheckpointStore, "append", append_and_stop):
+                            paused = self.run_worker(directory,
+                                                     stop_requested=lambda: stopped[0])
+                        self.assertEqual(paused["outcomes"][0]["status"], "partial")
+                        progress_path = directory / "cases" / self.case_id / "progress.json"
+                        self.assertEqual(json.loads(progress_path.read_text())["step"], block_steps)
+                    report = self.run_worker(directory)
+                    self.assertEqual(report["outcomes"][0]["status"], "complete")
+                    state, outputs, progress = read_case(directory, self.case_id)
+                    self.assertEqual(progress["step"], 402)
+                    self.assertEqual(outputs["diagnostics"].shape[0], 403)
+                    np.testing.assert_array_equal(outputs["times"], np.arange(202) * .02)
+                    if expected_state is None:
+                        expected_state, expected_outputs = state, outputs
+                        expected_report = progress["report"]
+                    for key in expected_state:
+                        np.testing.assert_array_equal(state[key], expected_state[key])
+                    for key in expected_outputs:
+                        np.testing.assert_array_equal(outputs[key], expected_outputs[key])
+                    self.assertEqual(progress["report"], expected_report)
+
+    def test_float64_output_reader_preserves_small_density_perturbations(self):
+        from vpml.datasets.reader import read_case as read_verified_case
+
+        self.manifest = tiny_manifest(strengths=(1e-8,), storage_dtype="float64")
+        self.case_id = self.manifest["cases"][0]["case_id"]
+        self.assertEqual(self.run_worker(self.root)["outcomes"][0]["status"], "complete")
+        case = read_verified_case(self.root, self.case_id)
+        self.assertTrue(case["output_integrity_verified"])
+        for field in ("n", "p"):
+            self.assertEqual(case[field].dtype, np.float64)
+            perturbation = case[field] - 1.0
+            self.assertGreater(float(np.max(np.abs(perturbation))), 1e-10)
+            self.assertLess(float(np.max(np.abs(perturbation))), 2e-8)
+            # These values would disappear if unit-background fields were
+            # rounded to float32 before the background was removed.
+            np.testing.assert_array_equal(case[field].astype(np.float32),
+                                          np.ones_like(case[field], dtype=np.float32))
+        directory = self.root / "cases" / self.case_id
+        protocol = json.loads((directory / "protocol.json").read_text())
+        history = CheckpointStore(directory, protocol, read_only=True).histories()
+        np.testing.assert_array_equal(case["fields"], history["fields"][::2])
+
     def test_completed_case_is_verified_and_skipped_without_evolving_again(self):
         self.run_worker(self.root)
         with mock.patch("vpml.datasets.evolution.ReferenceEvolution", side_effect=AssertionError("unexpected evolution")):
