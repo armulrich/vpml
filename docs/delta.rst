@@ -117,12 +117,16 @@ Storage planning
 ----------------
 
 Checkpoint storage is substantially larger than compact training output.
-Each case retains about 110.6 MB of every-step observations and 22.1 MB of
-sampled outputs at ``dt=0.01``. Two float64 kinetic states need
+At ``dt=0.01``, ``final_time=120``, ``output_nx=128`` and float64 output,
+each case has 44.2 MB of sampled fields, raw moments and electric field:
+53.1 GB across 1,200 cases, or 54.2 GB including saved diagnostics and time
+arrays. Every-step observations take another 111.4 MB per case, including
+eight diagnostic values per step. Two float64 kinetic states need
 :math:`2N_xN_v\times8` bytes: 268.4 MB at ``nx=2048, nv=8192``.
-Retaining all 1,200 cases at those settings therefore needs approximately
-482 GB, plus diagnostics, metadata and interrupted
-writes. Optional tangent states require more space.
+Retaining all observations, sampled outputs and restart states for 1,200 cases
+therefore needs approximately 510 GB, plus file headers, metadata and
+interrupted writes. These sizes use decimal MB and GB. Optional tangent states
+require more space.
 
 Use project work storage for active I/O; do not use node-local temporary
 storage as the only checkpoint copy. Check project quota rather than inferring

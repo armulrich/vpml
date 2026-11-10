@@ -40,7 +40,7 @@
     "vmax": 8.0,
     "output_nx": 128,
     "save_dt": 0.025,
-    "block_steps": 100,
-    "storage_dtype": "float32"
+    "block_steps": 400,
+    "storage_dtype": "float64"
   }
 }

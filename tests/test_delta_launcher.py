@@ -130,7 +130,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(parameters["numerics"], {
             "nx": 2048, "nv": 8192, "dt": 0.01, "final_time": 120.0,
             "vmin": -8.0, "vmax": 8.0, "output_nx": 128, "save_dt": 0.025,
-            "block_steps": 100, "storage_dtype": "float32",
+            "block_steps": 400, "storage_dtype": "float64",
         })
         result = self.run_action("test-submit")
         self.assertEqual(result.returncode, 0, result.stderr)
