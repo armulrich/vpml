@@ -15,6 +15,7 @@ import uuid
 import numpy as np
 
 from .manifest import Numerics, read_manifest, validate_manifest, write_manifest
+from .selection import select_cases
 from .schema import validate_completed_progress
 from .provenance import json_digest, runtime_record, source_record
 from vpml.io.atomic import atomic_write
@@ -125,6 +126,7 @@ def run_dataset(
     max_seconds: float,
     case_ids: list[str] | None = None,
     linearized: bool = False,
+    stop_on_failure: bool = False,
     stop_requested: Callable[[], bool] = lambda: False,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict:
@@ -132,6 +134,8 @@ def run_dataset(
 
     This function does not submit jobs, acquire GPUs, retry failed cases, or
     start training. The caller owns resource allocation and the time limit.
+    With ``stop_on_failure``, the first recorded or newly detected failed case
+    ends this invocation before the next case's evolution is constructed.
     """
     from .checkpoints import CheckpointStore, atomic_json
     from .diagnostics import qualification_report
@@ -139,16 +143,13 @@ def run_dataset(
     from .observations import observation_schema
 
     validate_manifest(manifest)
+    if type(stop_on_failure) is not bool:
+        raise ValueError("stop_on_failure must be a boolean")
     if not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("max_seconds must be finite and positive")
     deadline = clock() + max_seconds
     numerics = Numerics(**manifest["numerics"])
-    cases = manifest["cases"]
-    if case_ids is not None:
-        known = {case["case_id"] for case in cases}
-        if not case_ids or len(set(case_ids)) != len(case_ids) or not set(case_ids) <= known:
-            raise ValueError("Case selection must contain unique known IDs")
-        cases = [case for case in cases if case["case_id"] in set(case_ids)]
+    cases = select_cases(manifest, case_ids)
     runtime = runtime_record(backend)
     source = source_record()
     root = Path(output_root).resolve()
@@ -177,6 +178,8 @@ def run_dataset(
     (root / "failures").mkdir(exist_ok=True)
     outcomes = []
     for case in cases:
+        if stop_on_failure and outcomes and outcomes[-1]["status"] == "failed":
+            break
         if stop_requested() or clock() >= deadline:
             break
         case_id = case["case_id"]
@@ -274,5 +277,8 @@ def run_dataset(
             if exc.filename != str(root / "locks" / f"{case_id}.lock"):
                 raise
             outcomes.append({"case_id": case_id, "status": "busy"})
-    return {"outcomes": outcomes, "stopped": stop_requested() or clock() >= deadline,
+    stopped_on_failure = stop_on_failure and any(case["status"] == "failed" for case in outcomes)
+    return {"outcomes": outcomes,
+            "stopped": stopped_on_failure or stop_requested() or clock() >= deadline,
+            "stopped_on_failure": stopped_on_failure,
             "training_started": False}

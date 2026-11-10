@@ -17,13 +17,13 @@ from vpml.datasets.provenance import runtime_record
 from vpml.datasets import runner
 
 
-def tiny_manifest(**changes):
+def tiny_manifest(*, strengths=(0.1,), **changes):
     numerical = dict(nx=32, nv=257, dt=0.01, final_time=0.04,
                      save_dt=0.02, output_nx=16, block_steps=2,
                      storage_dtype="float64")
     numerical.update(changes)
     return build_manifest(k0_values=(0.5,), mode_counts=(3,), decays=(2.0,),
-                          strengths=(0.1,), draws_per_combination=1,
+                          strengths=strengths, draws_per_combination=1,
                           numerics=Numerics(**numerical))
 
 
@@ -211,6 +211,7 @@ class DatasetRunnerTests(unittest.TestCase):
         self.assertEqual(runner.dataset_status(self.root)["counts"]["failed"], 1)
 
     def test_nonpositive_saved_fields_are_failed_even_when_fine_diagnostics_pass(self):
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3))
         original = runner.sampled_outputs
 
         def negative_saved_pressure(*args, **kwargs):
@@ -220,8 +221,11 @@ class DatasetRunnerTests(unittest.TestCase):
             return outputs
 
         with mock.patch.object(runner, "sampled_outputs", side_effect=negative_saved_pressure):
-            report = self.run_worker(self.root)
+            report = self.run_worker(self.root, stop_on_failure=True)
         self.assertEqual(report["outcomes"][0]["status"], "failed")
+        self.assertTrue(report["stopped_on_failure"])
+        self.assertEqual(len(report["outcomes"]), 1)
+        self.assertFalse((self.root / "cases" / self.manifest["cases"][1]["case_id"]).exists())
         _, _, progress = read_case(self.root, self.case_id)
         self.assertEqual(progress["status"], "complete")
         self.assertFalse(progress["report"]["checks_passed"])
@@ -229,6 +233,7 @@ class DatasetRunnerTests(unittest.TestCase):
         self.assertFalse(progress["report"]["training_qualified"])
 
     def test_completed_failed_report_recovers_missing_failure_marker(self):
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3))
         original_outputs = runner.sampled_outputs
         original_json = atomic_json
 
@@ -246,16 +251,98 @@ class DatasetRunnerTests(unittest.TestCase):
         with mock.patch.object(runner, "sampled_outputs", side_effect=negative_saved_density), \
              mock.patch("vpml.datasets.checkpoints.atomic_json", side_effect=interrupt_failure_marker):
             with self.assertRaisesRegex(RuntimeError, "failure marker"):
-                self.run_worker(self.root)
+                self.run_worker(self.root, stop_on_failure=True)
         failure_path = self.root / "failures" / f"{self.case_id}.json"
         self.assertFalse(failure_path.exists())
         self.assertEqual(runner.dataset_status(self.root)["counts"]["failed"], 1)
         with mock.patch("vpml.datasets.evolution.ReferenceEvolution",
                         side_effect=AssertionError("recomputed completed trajectory")):
-            report = self.run_worker(self.root)
+            report = self.run_worker(self.root, stop_on_failure=True)
         self.assertEqual(report["outcomes"][0]["status"], "failed")
         self.assertTrue(report["outcomes"][0]["reused"])
+        self.assertTrue(report["stopped_on_failure"])
+        self.assertEqual(len(report["outcomes"]), 1)
         self.assertEqual(json.loads(failure_path.read_text())["reason"], "saved_field_checks_failed")
+        self.assertFalse((self.root / "cases" / self.manifest["cases"][1]["case_id"]).exists())
+
+    def test_stop_on_recorded_failure_is_optional_and_preserves_evidence(self):
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3))
+        second_id = self.manifest["cases"][1]["case_id"]
+        for stop_on_failure in (False, True):
+            with self.subTest(stop_on_failure=stop_on_failure):
+                root = self.root / str(stop_on_failure)
+                failure_path = root / "failures" / f"{self.case_id}.json"
+                failure_path.parent.mkdir(parents=True)
+                atomic_json(failure_path, {"case_id": self.case_id,
+                                          "reason": "numerical_checks_failed", "last_committed_step": 2})
+                original = failure_path.read_bytes()
+                report = self.run_worker(root, stop_on_failure=stop_on_failure)
+                self.assertEqual(failure_path.read_bytes(), original)
+                self.assertEqual(report["stopped_on_failure"], stop_on_failure)
+                self.assertEqual(report["stopped"], stop_on_failure)
+                expected = ["failed"] if stop_on_failure else ["failed", "complete"]
+                self.assertEqual([case["status"] for case in report["outcomes"]], expected)
+                self.assertEqual((root / "cases" / second_id).exists(), not stop_on_failure)
+
+    def test_numerical_failure_stops_before_constructing_the_next_case(self):
+        from vpml.datasets.diagnostics import qualification_report
+        from vpml.datasets.evolution import ReferenceEvolution
+
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3))
+
+        def fail_after_first_block(history, **kwargs):
+            report = qualification_report(history, **kwargs)
+            if len(history) > 1:
+                report["checks_passed"] = False
+                report["failures"] = ["relative_energy"]
+            return report
+
+        with mock.patch("vpml.datasets.diagnostics.qualification_report", side_effect=fail_after_first_block), \
+             mock.patch("vpml.datasets.evolution.ReferenceEvolution", wraps=ReferenceEvolution) as evolution:
+            report = self.run_worker(self.root, stop_on_failure=True)
+        self.assertEqual(evolution.call_count, 1)
+        self.assertEqual(report["outcomes"], [{"case_id": self.case_id, "status": "failed"}])
+        self.assertTrue(report["stopped_on_failure"])
+        failure = json.loads((self.root / "failures" / f"{self.case_id}.json").read_text())
+        self.assertEqual(failure["reason"], "numerical_checks_failed")
+        self.assertEqual(failure["last_committed_step"], 2)
+        self.assertFalse((self.root / "locks" / f"{self.case_id}.lock").exists())
+
+    def test_nonfinite_block_stops_and_retains_last_finite_checkpoint(self):
+        from vpml.datasets.evolution import ReferenceEvolution
+
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3))
+
+        def nonfinite_block(evolution, state, steps):
+            observations = {name: np.repeat(np.asarray(value)[None], steps, axis=0)
+                            for name, value in evolution.observe(state).items()}
+            return {"f": np.full_like(state["f"], np.nan)}, observations
+
+        with mock.patch.object(ReferenceEvolution, "advance", nonfinite_block), \
+             mock.patch("vpml.datasets.evolution.ReferenceEvolution", wraps=ReferenceEvolution) as evolution:
+            report = self.run_worker(self.root, stop_on_failure=True)
+        self.assertEqual(evolution.call_count, 1)
+        self.assertEqual(report["outcomes"], [{"case_id": self.case_id, "status": "failed"}])
+        self.assertTrue(report["stopped_on_failure"])
+        failure = json.loads((self.root / "failures" / f"{self.case_id}.json").read_text())
+        self.assertEqual(failure["reason"], "nonfinite_evolution")
+        self.assertEqual(failure["last_committed_step"], 0)
+        directory = self.root / "cases" / self.case_id
+        protocol = json.loads((directory / "protocol.json").read_text())
+        state, progress = CheckpointStore(directory, protocol).load()
+        self.assertEqual(progress["step"], 0)
+        self.assertTrue(np.isfinite(state["f"]).all())
+        self.assertFalse((self.root / "locks" / f"{self.case_id}.lock").exists())
+
+    def test_selected_cases_finish_without_starting_others_or_truncating_manifest(self):
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3, 0.5))
+        ids = [case["case_id"] for case in self.manifest["cases"]]
+        report = self.run_worker(self.root, case_ids=[ids[2], ids[0]], stop_on_failure=True)
+        self.assertEqual([case["case_id"] for case in report["outcomes"]], [ids[0], ids[2]])
+        self.assertTrue(all(case["status"] == "complete" for case in report["outcomes"]))
+        self.assertFalse(report["stopped_on_failure"])
+        self.assertFalse((self.root / "cases" / ids[1]).exists())
+        self.assertEqual(json.loads((self.root / "manifest.json").read_text()), self.manifest)
 
     def test_another_owner_keeps_its_lock_and_case_is_reported_busy(self):
         lock_path = self.root / "locks" / f"{self.case_id}.lock"
@@ -285,8 +372,13 @@ class DatasetRunnerTests(unittest.TestCase):
             with self.subTest(seconds=seconds), self.assertRaisesRegex(ValueError, "max_seconds"):
                 runner.run_dataset(self.manifest, self.root / "absent", backend="cpu", max_seconds=seconds)
         for selected in ([], ["unknown"], [self.case_id, self.case_id]):
-            with self.subTest(selected=selected), self.assertRaisesRegex(ValueError, "unique known"):
+            with self.subTest(selected=selected), \
+                 mock.patch.object(runner, "runtime_record", side_effect=AssertionError("queried backend")), \
+                 self.assertRaisesRegex(ValueError, "unique known"):
                 self.run_worker(self.root / "absent", case_ids=selected)
+        for policy in (1, "true", None):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "stop_on_failure"):
+                self.run_worker(self.root / "absent", stop_on_failure=policy)
         self.assertFalse((self.root / "absent").exists())
 
     def test_gpu_requirement_cannot_silently_fall_back_to_cpu(self):

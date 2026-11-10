@@ -70,6 +70,42 @@ class DatasetCliTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identity"):
             self.invoke(["validate", "--manifest", str(path)])
 
+    def test_validate_selected_cases_preserves_full_manifest_without_querying_devices(self):
+        path = self.root / "manifest.json"
+        manifest = build_manifest()
+        write_manifest(path, manifest)
+        original = path.read_bytes()
+        ids = [case["case_id"] for case in manifest["cases"][:5]]
+        arguments = ["validate", "--manifest", str(path)]
+        for case_id in reversed(ids):
+            arguments += ["--case-id", case_id]
+        with mock.patch.object(jax, "devices", side_effect=AssertionError("device initialization")), \
+             mock.patch.object(jax, "default_backend", side_effect=AssertionError("backend initialization")), \
+             mock.patch("vpml.datasets.runner.run_dataset", side_effect=AssertionError("evolution")):
+            status, report = self.invoke(arguments)
+        self.assertEqual(status, 0)
+        self.assertEqual(report["cases"], 1200)
+        self.assertEqual(report["selected_cases"], 5)
+        self.assertEqual(report["case_ids"], ids)
+        self.assertFalse(report["evolution_started"])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_validate_rejects_duplicate_or_unknown_selected_ids_before_execution(self):
+        path = self.root / "manifest.json"
+        manifest = build_manifest(k0_values=(.5,), mode_counts=(3,), decays=(2,),
+                                  strengths=(.1,), draws_per_combination=1)
+        write_manifest(path, manifest)
+        case_id = manifest["cases"][0]["case_id"]
+        for selected in ([case_id, case_id], ["case_000000000000000000000000"]):
+            arguments = ["validate", "--manifest", str(path)]
+            for selected_id in selected:
+                arguments += ["--case-id", selected_id]
+            with self.subTest(selected=selected), \
+                 mock.patch.object(jax, "default_backend", side_effect=AssertionError("backend initialization")), \
+                 self.assertRaisesRegex(ValueError, "unique known IDs"):
+                self.invoke(arguments)
+        self.assertEqual(list(self.root.iterdir()), [path])
+
     def test_parameter_file_drives_preparation_and_validation(self):
         path = self.root / "manifest.json"
         parameters = self.root / "parameters.json"
@@ -121,6 +157,7 @@ class DatasetCliTests(unittest.TestCase):
             self.assertEqual(kwargs["max_seconds"], 60)
             self.assertEqual(kwargs["case_ids"], [case_id])
             self.assertTrue(kwargs["linearized"])
+            self.assertEqual(kwargs["stop_on_failure"], stop_on_failure)
             self.assertFalse(kwargs["stop_requested"]())
             self.assertEqual(os.environ["JAX_PLATFORMS"], "cuda")
             self.assertEqual(os.environ["VPML_JAX_BACKEND"], "gpu")
@@ -128,16 +165,21 @@ class DatasetCliTests(unittest.TestCase):
             return {"outcomes": [{"case_id": case_id, "status": "failed"}],
                     "training_started": False}
 
-        with mock.patch.dict(os.environ), \
-             mock.patch("vpml.datasets.runner.run_dataset", side_effect=fake_run):
-            status, report = self.invoke([
-                "run", "--manifest", str(path), "--out", str(self.root / "data"),
-                "--backend", "gpu", "--max-seconds", "60", "--case-id", case_id,
-                "--linearized",
-            ])
-        self.assertEqual(status, 2)
-        self.assertFalse(report["training_started"])
-        self.assertFalse((self.root / "data").exists())
+        for stop_on_failure in (False, True):
+            with self.subTest(stop_on_failure=stop_on_failure), \
+                 mock.patch.dict(os.environ), \
+                 mock.patch("vpml.datasets.runner.run_dataset", side_effect=fake_run):
+                arguments = [
+                    "run", "--manifest", str(path), "--out", str(self.root / "data"),
+                    "--backend", "gpu", "--max-seconds", "60", "--case-id", case_id,
+                    "--linearized",
+                ]
+                if stop_on_failure:
+                    arguments.append("--stop-on-failure")
+                status, report = self.invoke(arguments)
+            self.assertEqual(status, 2)
+            self.assertFalse(report["training_started"])
+            self.assertFalse((self.root / "data").exists())
 
 
 if __name__ == "__main__":

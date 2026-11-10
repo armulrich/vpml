@@ -30,6 +30,7 @@ def main(argv=None) -> int:
     validate = commands.add_parser("validate", help="Validate manifest without allocating compute")
     validate.add_argument("--manifest", type=Path, required=True)
     validate.add_argument("--parameters", type=Path)
+    validate.add_argument("--case-id", action="append", dest="case_ids")
     status = commands.add_parser("status", help="Summarize existing progress without loading JAX devices")
     status.add_argument("--out", type=Path, required=True)
     status.add_argument("--manifest", type=Path)
@@ -40,6 +41,8 @@ def main(argv=None) -> int:
     run.add_argument("--max-seconds", type=float, required=True)
     run.add_argument("--case-id", action="append", dest="case_ids")
     run.add_argument("--linearized", action="store_true")
+    run.add_argument("--stop-on-failure", action="store_true",
+                     help="Stop after the first recorded or newly detected failed case")
     args = parser.parse_args(argv)
 
     # Backend selection precedes importing vpml, before any numerical module loads JAX.
@@ -60,10 +63,15 @@ def main(argv=None) -> int:
         print(json.dumps({"manifest": str(args.manifest), "cases": len(manifest["cases"]),
                           "evolution_started": False}))
     elif args.command == "validate":
+        from vpml.datasets.selection import select_cases
+
         manifest = read_manifest(args.manifest)
         if args.parameters is not None and manifest != build_manifest(**read_parameters(args.parameters)):
             raise ValueError("Manifest differs from configured parameters")
+        selected = select_cases(manifest, args.case_ids)
         print(json.dumps({"valid": True, "cases": len(manifest["cases"]),
+                          "selected_cases": len(selected),
+                          "case_ids": [case["case_id"] for case in selected] if args.case_ids is not None else None,
                           "numerics": manifest["numerics"], "evolution_started": False}))
     elif args.command == "status":
         from vpml.datasets.runner import dataset_status
@@ -73,7 +81,8 @@ def main(argv=None) -> int:
         with stop_signals() as stopped:
             report = run_dataset(read_manifest(args.manifest), args.out, backend=args.backend,
                                  max_seconds=args.max_seconds, case_ids=args.case_ids,
-                                 linearized=args.linearized, stop_requested=stopped)
+                                 linearized=args.linearized, stop_on_failure=args.stop_on_failure,
+                                 stop_requested=stopped)
         print(json.dumps(report, indent=2))
         return 2 if any(case["status"] == "failed" for case in report["outcomes"]) else 0
     return 0

@@ -59,6 +59,13 @@ that contribute to a dataset. :doc:`delta` describes execution on allocated
 compute resources; the underlying Python runner also supports CPU execution.
 ``python -m vpml.cli.gaussian_dataset`` provides the same command interface.
 
+Pass ``--case-id`` repeatedly to ``validate`` and ``run`` to select cases from
+the full manifest without changing its contents. Validation rejects duplicate
+or unknown IDs before a worker starts. ``run --stop-on-failure`` ends the
+invocation after the first recorded or newly detected numerical rejection,
+retaining its checkpoint and failure report. Without this option, the runner
+continues to other selected cases.
+
 Saved quantities
 ----------------
 
