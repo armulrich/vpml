@@ -6,7 +6,7 @@ umask 077
 usage() {
     printf 'Usage: bash %s {prepare|validate|status|test-submit|submit}\n' "$0" >&2
     printf 'Required: VPML_DATA_ROOT and VPML_PYTHON, both absolute paths.\n' >&2
-    printf 'Optional: VPML_RUN_PARAMS selects an absolute versioned parameter file.\n' >&2
+    printf 'Optional: VPML_RUN_PARAMS selects an absolute parameter file; the adjacent gaussian_amplitudes.params.sh is the default.\n' >&2
 }
 if [[ $# -ne 1 ]]; then
     usage
@@ -34,14 +34,15 @@ if [[ ${VPML_PYTHON:-} != /* || ! -x ${VPML_PYTHON:-} ]]; then
     printf 'VPML_PYTHON must name the absolute executable in the prepared environment.\n' >&2
     exit 2
 fi
-run_parameters=${VPML_RUN_PARAMS:-"$script_directory/gaussian_amplitudes_v1.params.sh"}
+run_parameters=${VPML_RUN_PARAMS:-"$script_directory/gaussian_amplitudes.params.sh"}
 if [[ $run_parameters != /* || ! -f $run_parameters || ! -r $run_parameters ]]; then
     printf 'VPML_RUN_PARAMS must name an absolute readable parameter file.\n' >&2
     exit 2
 fi
 VPML_CASE_IDS=()
 VPML_STOP_ON_FAILURE=0
-VPML_SLURM_JOB_NAME=vpml-gaussian-v1
+VPML_SLURM_JOB_NAME=vpml-gaussian
+VPML_SHUTDOWN_MARGIN_SECONDS=180
 # shellcheck source=/dev/null
 source "$run_parameters"
 if [[ ${VPML_PARAMETERS_FILE:-} != /* || ! -r $VPML_PARAMETERS_FILE ]]; then
@@ -58,15 +59,18 @@ if [[ ${VPML_SLURM_PARTITION:-} != gpuA100x4 || ${VPML_SLURM_MEMORY:-} != 60G \
 fi
 wall_seconds=$((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
 if [[ ! ${VPML_MAX_SECONDS:-} =~ ^[0-9]{1,4}$ \
+        || ! $VPML_SHUTDOWN_MARGIN_SECONDS =~ ^[0-9]{2,3}$ \
         || ! $VPML_STOP_ON_FAILURE =~ ^[01]$ \
         || ! $VPML_SLURM_JOB_NAME =~ ^[a-zA-Z0-9_-]+$ ]]; then
     printf 'Invalid worker budget, failure policy or job name.\n' >&2
     exit 2
 fi
 worker_seconds=$((10#$VPML_MAX_SECONDS))
-if (( wall_seconds <= 180 || wall_seconds > 3600 || worker_seconds <= 0 \
-        || worker_seconds > 3300 || worker_seconds > wall_seconds - 180 )); then
-    printf 'Require wall time <=3600s and worker time <=3300s with at least 180s shutdown margin.\n' >&2
+shutdown_margin=$((10#$VPML_SHUTDOWN_MARGIN_SECONDS))
+if (( shutdown_margin < 60 || shutdown_margin > 180 || wall_seconds <= shutdown_margin \
+        || wall_seconds > 3600 || worker_seconds <= 0 || worker_seconds > 3300 \
+        || worker_seconds > wall_seconds - shutdown_margin )); then
+    printf 'Require wall time <=3600s, worker time <=3300s and a shutdown margin between 60s and 180s.\n' >&2
     exit 2
 fi
 selection=()
@@ -113,7 +117,7 @@ arguments=(
     "--partition=$VPML_SLURM_PARTITION"
     --nodes=1 --ntasks=1 "--cpus-per-task=$VPML_SLURM_CPUS" --gpus-per-node=1
     "--mem=$VPML_SLURM_MEMORY" "--time=$VPML_SLURM_TIME"
-    --signal=USR1@180 --no-requeue --constraint=work
+    "--signal=USR1@$shutdown_margin" --no-requeue --constraint=work
     --export=NIL
     "--job-name=$VPML_SLURM_JOB_NAME"
     "--chdir=$VPML_CODE_ROOT"
@@ -124,7 +128,12 @@ if [[ $action == test-submit ]]; then
     arguments+=(--test-only)
 else
     mkdir -p -- "$VPML_DATA_ROOT/logs"
+    intent=$("$VPML_PYTHON" "$script_directory/record_submission.py" \
+        "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" \
+        "$run_parameters" "$worker_seconds" "$wall_seconds" "$shutdown_margin" "${arguments[@]}" -- \
+        ${run_options[@]+"${run_options[@]}"})
+    printf 'Submission intent (not scheduler acceptance): %s\n' "$intent" >&2
 fi
-exec sbatch "${arguments[@]}" "$script_directory/gaussian_amplitudes_v1.batch.sh" \
+exec sbatch "${arguments[@]}" "$script_directory/gaussian_amplitudes.batch.sh" \
     "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" "$worker_seconds" \
     ${run_options[@]+"${run_options[@]}"}
