@@ -33,11 +33,20 @@ Set the environment executable and a dedicated dataset directory:
 .. code-block:: bash
 
    export VPML_PYTHON=/absolute/path/to/prepared-venv/bin/python
-   export VPML_DATA_ROOT=/absolute/path/to/project-work/gaussian-amplitudes-v1
+   export VPML_DATA_ROOT=/absolute/path/to/project-work/gaussian-amplitudes-v2
+   export VPML_RUN_PARAMS=/absolute/path/to/vpml/scripts/delta/gaussian_amplitudes_v2.params.sh
 
 The launcher derives the code root from its location; ``VPML_CODE_ROOT`` can
-select another fixed checkout explicitly. The adjacent ``.params.sh`` file
-sets scheduler resources and points to the scientific parameter JSON.
+select another fixed checkout explicitly. ``VPML_RUN_PARAMS`` selects a
+versioned ``.params.sh`` file containing scheduler resources, a scientific
+parameter JSON, optional case IDs and the failure policy. Omitting it selects
+v1. Both versions use the same launcher and batch entrypoint.
+
+The v2 JSON retains all 1,200 initial conditions with 2,048 spatial points.
+Its parameter file selects the first five cases and enables stopping on the
+first failure. Selected IDs are checked before submission and again in the
+worker. Changing resolution requires a new dataset directory and evolution
+from the original initial conditions; an old-grid checkpoint is not resumed.
 
 .. code-block:: bash
 
@@ -62,6 +71,11 @@ This requests a real allocation: account ``bhvw-delta-gpu``, partition
 Allocation time is charged even while the GPU is idle. These settings are
 specific to Delta; another account or cluster needs its own reviewed launcher.
 See `Delta job accounting <https://docs.ncsa.illinois.edu/systems/delta/en/latest/user_guide/job_accounting.html>`_.
+
+The launcher rejects larger CPU, memory or wall-time requests. Completion of
+the selected cases or a configured stop on failure releases the allocation
+early. A one-hour allocation does not guarantee that every selected case
+reaches its prescribed simulation time.
 
 The worker's 3,300-second budget leaves a shutdown margin; Slurm also sends an
 advance USR1 signal. There is no automatic requeue, retry or resubmission.
@@ -91,10 +105,11 @@ Storage planning
 ----------------
 
 Checkpoint storage is substantially larger than compact training output.
-For the versioned parameters, each case retains about 110.6 MB of every-step
-observations, 134.2 MB for two kinetic states and 22.1 MB of sampled outputs.
-The 1,200-case dataset therefore needs approximately 321 GB plus diagnostics,
-metadata and interrupted writes. Optional tangent states require more space.
+Each case retains about 110.6 MB of every-step observations and 22.1 MB of
+sampled outputs. Two kinetic states need 134.2 MB at the v1 spatial resolution
+or 268.4 MB at v2. Retaining all 1,200 cases therefore needs approximately
+321 GB for v1 or 482 GB for v2, plus diagnostics, metadata and interrupted
+writes. Optional tangent states require more space.
 
 Use project work storage for active I/O; do not use node-local temporary
 storage as the only checkpoint copy. Check project quota rather than inferring

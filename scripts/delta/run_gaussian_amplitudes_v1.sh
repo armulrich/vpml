@@ -6,6 +6,7 @@ umask 077
 usage() {
     printf 'Usage: bash %s {prepare|validate|status|test-submit|submit}\n' "$0" >&2
     printf 'Required: VPML_DATA_ROOT and VPML_PYTHON, both absolute paths.\n' >&2
+    printf 'Optional: VPML_RUN_PARAMS selects an absolute versioned parameter file.\n' >&2
 }
 if [[ $# -ne 1 ]]; then
     usage
@@ -33,11 +34,49 @@ if [[ ${VPML_PYTHON:-} != /* || ! -x ${VPML_PYTHON:-} ]]; then
     printf 'VPML_PYTHON must name the absolute executable in the prepared environment.\n' >&2
     exit 2
 fi
-# shellcheck source=scripts/delta/gaussian_amplitudes_v1.params.sh
-source "$script_directory/gaussian_amplitudes_v1.params.sh"
-if [[ ! -r $VPML_PARAMETERS_FILE ]]; then
-    printf 'Cannot read run parameters: %s\n' "$VPML_PARAMETERS_FILE" >&2
+run_parameters=${VPML_RUN_PARAMS:-"$script_directory/gaussian_amplitudes_v1.params.sh"}
+if [[ $run_parameters != /* || ! -f $run_parameters || ! -r $run_parameters ]]; then
+    printf 'VPML_RUN_PARAMS must name an absolute readable parameter file.\n' >&2
     exit 2
+fi
+VPML_CASE_IDS=()
+VPML_STOP_ON_FAILURE=0
+VPML_SLURM_JOB_NAME=vpml-gaussian-v1
+# shellcheck source=/dev/null
+source "$run_parameters"
+if [[ ${VPML_PARAMETERS_FILE:-} != /* || ! -r $VPML_PARAMETERS_FILE ]]; then
+    printf 'Cannot read run parameters: %s\n' "${VPML_PARAMETERS_FILE:-<unset>}" >&2
+    exit 2
+fi
+# This launcher bounds a single A100 allocation even when selecting another
+# parameter file. Reject larger requests before contacting the scheduler.
+if [[ ${VPML_SLURM_PARTITION:-} != gpuA100x4 || ${VPML_SLURM_MEMORY:-} != 60G \
+        || ! ${VPML_SLURM_CPUS:-} =~ ^([1-9]|1[0-6])$ \
+        || ! ${VPML_SLURM_TIME:-} =~ ^([0-9]{2}):([0-5][0-9]):([0-5][0-9])$ ]]; then
+    printf 'Require gpuA100x4, at most 16 CPUs, 60G memory and HH:MM:SS wall time.\n' >&2
+    exit 2
+fi
+wall_seconds=$((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
+if [[ ! ${VPML_MAX_SECONDS:-} =~ ^[0-9]{1,4}$ \
+        || ! $VPML_STOP_ON_FAILURE =~ ^[01]$ \
+        || ! $VPML_SLURM_JOB_NAME =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    printf 'Invalid worker budget, failure policy or job name.\n' >&2
+    exit 2
+fi
+worker_seconds=$((10#$VPML_MAX_SECONDS))
+if (( wall_seconds <= 180 || wall_seconds > 3600 || worker_seconds <= 0 \
+        || worker_seconds > 3300 || worker_seconds > wall_seconds - 180 )); then
+    printf 'Require wall time <=3600s and worker time <=3300s with at least 180s shutdown margin.\n' >&2
+    exit 2
+fi
+selection=()
+run_options=()
+for case_id in ${VPML_CASE_IDS[@]+"${VPML_CASE_IDS[@]}"}; do
+    selection+=(--case-id "$case_id")
+    run_options+=(--case-id "$case_id")
+done
+if [[ $VPML_STOP_ON_FAILURE == 1 ]]; then
+    run_options+=(--stop-on-failure)
 fi
 manifest="$VPML_DATA_ROOT/manifest.json"
 output="$VPML_DATA_ROOT/reference"
@@ -48,15 +87,20 @@ cli="$VPML_CODE_ROOT/scripts/gaussian_dataset.py"
 unset LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME
 export VPML_JAX_BACKEND=cpu JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 PYTHONUNBUFFERED=1
 case $action in
-    prepare|validate)
+    prepare)
         exec "$VPML_PYTHON" "$cli" "$action" --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE"
+        ;;
+    validate)
+        exec "$VPML_PYTHON" "$cli" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
+            ${selection[@]+"${selection[@]}"}
         ;;
     status)
         exec "$VPML_PYTHON" "$cli" status --out "$output" --manifest "$manifest"
         ;;
 esac
 
-"$VPML_PYTHON" "$cli" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE"
+"$VPML_PYTHON" "$cli" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
+    ${selection[@]+"${selection[@]}"}
 command -v sbatch >/dev/null
 # Do not inherit an unrelated array, exclusive allocation or other sbatch
 # option from the caller's environment; this run's request is explicit below.
@@ -71,7 +115,7 @@ arguments=(
     "--mem=$VPML_SLURM_MEMORY" "--time=$VPML_SLURM_TIME"
     --signal=USR1@180 --no-requeue --constraint=work
     --export=NIL
-    --job-name=vpml-gaussian-v1
+    "--job-name=$VPML_SLURM_JOB_NAME"
     "--chdir=$VPML_CODE_ROOT"
     "--output=$VPML_DATA_ROOT/logs/slurm-%j.out"
     "--error=$VPML_DATA_ROOT/logs/slurm-%j.err"
@@ -82,4 +126,5 @@ else
     mkdir -p -- "$VPML_DATA_ROOT/logs"
 fi
 exec sbatch "${arguments[@]}" "$script_directory/gaussian_amplitudes_v1.batch.sh" \
-    "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" "$VPML_MAX_SECONDS"
+    "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" "$worker_seconds" \
+    ${run_options[@]+"${run_options[@]}"}
