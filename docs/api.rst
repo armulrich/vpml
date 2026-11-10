@@ -41,15 +41,6 @@ Reading completed data
 .. automodule:: vpml.datasets.reader
    :members: iter_cases, read_case
 
-Diagnostic refinement comparisons
----------------------------------
-
-.. automodule:: vpml.diagnostics.gaussian_refinement
-   :members: validate_config, run_variant, read_variant
-
-.. automodule:: vpml.diagnostics.refinement_metrics
-   :members: compare_variants
-
 Kinetic solver
 --------------
 
