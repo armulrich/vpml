@@ -103,6 +103,32 @@ class DatasetRunnerTests(unittest.TestCase):
         self.assertEqual(status["counts"], {"complete": 1, "partial": 0, "failed": 0, "pending": 0})
         self.assertFalse(status["integrity_verified"])
 
+    def test_checkpointing_keeps_the_live_device_state_between_blocks(self):
+        from vpml.datasets.evolution import ReferenceEvolution
+
+        advance = ReferenceEvolution.advance
+        previous = [None]
+        calls = []
+
+        def checked_advance(evolution, state, steps):
+            if previous[0] is not None:
+                self.assertIs(state["f"], previous[0]["f"])
+                self.assertIsInstance(state["f"], jax.Array)
+            result = advance(evolution, state, steps)
+            previous[0] = result[0]
+            calls.append(steps)
+            return result
+
+        with mock.patch.object(ReferenceEvolution, "advance", checked_advance):
+            report = self.run_worker(self.root)
+        self.assertEqual(calls, [2, 2])
+        self.assertEqual(report["advanced_blocks"], 2)
+        self.assertEqual(report["outcomes"][0]["status"], "complete")
+        timings = report["timings"]
+        self.assertTrue(all(np.isfinite(value) and value >= 0 for value in timings.values()))
+        self.assertGreater(timings["total_seconds"], sum(value for name, value in timings.items()
+                                                       if name != "total_seconds"))
+
     def test_corrupted_history_prevents_reusing_completed_case(self):
         self.run_worker(self.root)
         directory = self.root / "cases" / self.case_id
@@ -231,6 +257,35 @@ class DatasetRunnerTests(unittest.TestCase):
         self.assertFalse(progress["report"]["checks_passed"])
         self.assertIn("nonpositive_saved_pressure", progress["report"]["failures"])
         self.assertFalse(progress["report"]["training_qualified"])
+
+    def test_finite_distribution_negativity_does_not_stop_completion(self):
+        from vpml.datasets.evolution import ReferenceEvolution
+
+        self.manifest = tiny_manifest(strengths=(0.1, 0.3))
+        advance = ReferenceEvolution.advance
+
+        def negative_distribution_diagnostics(evolution, state, steps):
+            next_state, observations = advance(evolution, state, steps)
+            observations = dict(observations)
+            diagnostics = np.array(observations["diagnostics"], copy=True)
+            diagnostics[:, evolution.diagnostic_names.index("min_f")] = -0.01
+            diagnostics[:, evolution.diagnostic_names.index("negative_mass_fraction")] = 0.02
+            observations["diagnostics"] = diagnostics
+            return next_state, observations
+
+        with mock.patch.object(ReferenceEvolution, "advance", negative_distribution_diagnostics):
+            report = self.run_worker(self.root, stop_on_failure=True)
+        self.assertEqual([case["status"] for case in report["outcomes"]], ["complete", "complete"])
+        self.assertFalse(report["stopped_on_failure"])
+        self.assertEqual(list((self.root / "failures").iterdir()), [])
+        for case in self.manifest["cases"]:
+            _, outputs, progress = read_case(self.root, case["case_id"])
+            self.assertEqual(progress["step"], 4)
+            self.assertTrue(progress["report"]["checks_passed"])
+            self.assertEqual(progress["report"]["metrics"]["min_f"], -0.01)
+            self.assertEqual(progress["report"]["metrics"]["max_negative_mass_fraction"], 0.02)
+            self.assertFalse(progress["report"]["training_qualified"])
+            self.assertEqual(outputs["diagnostics"].shape[0], 5)
 
     def test_completed_failed_report_recovers_missing_failure_marker(self):
         self.manifest = tiny_manifest(strengths=(0.1, 0.3))

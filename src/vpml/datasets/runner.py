@@ -142,6 +142,12 @@ def run_dataset(
     from .evolution import ReferenceEvolution
     from .observations import observation_schema
 
+    measured_start = time.perf_counter()
+    timings = {name: 0.0 for name in (
+        "advance_and_observe_seconds", "host_transfer_seconds",
+        "checkpoint_seconds", "diagnostic_summary_seconds", "finalize_seconds",
+    )}
+    measured_blocks = 0
     validate_manifest(manifest)
     if type(stop_on_failure) is not bool:
         raise ValueError("stop_on_failure must be a boolean")
@@ -230,24 +236,41 @@ def run_dataset(
                         break
                     steps = min(numerics.block_steps, numerics.nsteps - progress["step"])
                     started = clock()
+                    measured = time.perf_counter()
                     next_state, values = evolution.advance(state, steps)
+                    # JAX dispatch is asynchronous. Synchronize before measuring
+                    # transfers so kernel time is not mislabeled as checkpoint I/O.
+                    for value in (*next_state.values(), *values.values()):
+                        if hasattr(value, "block_until_ready"):
+                            value.block_until_ready()
+                    timings["advance_and_observe_seconds"] += time.perf_counter() - measured
+                    measured = time.perf_counter()
                     arrays = {key: np.asarray(value) for key, value in values.items()}
-                    next_state = {key: np.asarray(value) for key, value in next_state.items()}
-                    if not all(np.isfinite(value).all() for value in [*arrays.values(), *next_state.values()]):
+                    checkpoint_state = {key: np.asarray(value) for key, value in next_state.items()}
+                    timings["host_transfer_seconds"] += time.perf_counter() - measured
+                    if not all(np.isfinite(value).all() for value in [*arrays.values(), *checkpoint_state.values()]):
                         atomic_json(failure_path, {"case_id": case_id, "reason": "nonfinite_evolution",
                                                   "last_committed_step": progress["step"]})
                         outcomes.append({"case_id": case_id, "status": "failed"})
                         break
-                    progress = store.append(progress["step"] + steps, next_state, arrays)
+                    measured = time.perf_counter()
+                    progress = store.append(progress["step"] + steps, checkpoint_state, arrays)
+                    timings["checkpoint_seconds"] += time.perf_counter() - measured
+                    # Retain the device arrays for the next block. The NumPy
+                    # checkpoint copy must not cause an unnecessary host re-upload.
                     state = next_state
                     diagnostics.append(arrays["diagnostics"])
+                    measured = time.perf_counter()
                     report = qualification_report(np.concatenate(diagnostics),
                                                   names=evolution.diagnostic_names)
+                    timings["diagnostic_summary_seconds"] += time.perf_counter() - measured
+                    measured_blocks += 1
                     last_block_seconds = clock() - started
                     print(json.dumps({"case_id": case_id, "step": progress["step"],
                                       "time": progress["step"] * numerics.dt,
                                       "final_time": numerics.final_time,
-                                      "checks_passed": report["checks_passed"]}), flush=True)
+                                      "checks_passed": report["checks_passed"],
+                                      "block_seconds": last_block_seconds}), flush=True)
                 if failure_path.exists():
                     continue
                 if not report["checks_passed"]:
@@ -255,6 +278,7 @@ def run_dataset(
                                               "reason": "numerical_checks_failed", "report": report})
                     outcomes.append({"case_id": case_id, "status": "failed"})
                 elif progress["step"] == numerics.nsteps:
+                    measured = time.perf_counter()
                     outputs = sampled_outputs(store.histories(), numerics)
                     report["diagnostic_names"] = list(evolution.diagnostic_names)
                     report["metrics"]["min_saved_density"] = float(outputs["fields"][:, 0].min())
@@ -264,6 +288,7 @@ def run_dataset(
                             report["failures"].append(f"nonpositive_saved_{field}")
                     report["checks_passed"] = not report["failures"]
                     progress = store.finalize(outputs, report)
+                    timings["finalize_seconds"] += time.perf_counter() - measured
                     if not report["checks_passed"]:
                         atomic_json(failure_path, {"case_id": case_id, "reason": "saved_field_checks_failed",
                                                   "last_committed_step": progress["step"], "report": report})
@@ -278,7 +303,9 @@ def run_dataset(
                 raise
             outcomes.append({"case_id": case_id, "status": "busy"})
     stopped_on_failure = stop_on_failure and any(case["status"] == "failed" for case in outcomes)
+    timings["total_seconds"] = time.perf_counter() - measured_start
     return {"outcomes": outcomes,
             "stopped": stopped_on_failure or stop_requested() or clock() >= deadline,
             "stopped_on_failure": stopped_on_failure,
+            "timings": timings, "advanced_blocks": measured_blocks,
             "training_started": False}
