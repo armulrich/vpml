@@ -122,7 +122,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
     def test_canonical_scientific_parameters_and_explicit_default_match(self):
         parameters = json.loads(PARAMETERS.read_text())
         self.assertEqual(parameters["numerics"], {
-            "nx": 2048, "nv": 8192, "dt": 0.01, "final_time": 120.0,
+            "nx": 512, "nv": 4096, "dt": 0.0125, "final_time": 120.0,
             "vmin": -8.0, "vmax": 8.0, "output_nx": 128, "save_dt": 0.025,
             "block_steps": 400, "storage_dtype": "float64",
         })
