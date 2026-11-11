@@ -29,8 +29,7 @@ Independent sine and cosine coefficients define three smooth shapes
 
 Density and temperature are positive with mean one, and
 :math:`\langle n_0u_0\rangle=0`. The Gaussian is evaluated on the finite velocity
-interval without renormalizing away its truncated tails. Diagnostics measure
-the resulting charge imbalance and boundary population.
+interval without renormalizing away its truncated tails.
 
 Parameters and preparation
 --------------------------
@@ -62,14 +61,14 @@ compute resources; the underlying Python runner also supports CPU execution.
 Pass ``--case-id`` repeatedly to ``validate`` and ``run`` to select cases from
 the full manifest without changing its contents. Validation rejects duplicate
 or unknown IDs before a worker starts. ``run --stop-on-failure`` ends the
-invocation after the first recorded or newly detected numerical rejection,
+invocation after the first recorded or newly detected invalid output or integrity failure,
 retaining its checkpoint and failure report. Without this option, the runner
 continues to other selected cases.
 
 Saved quantities
 ----------------
 
-The ``gaussian-fields-v1`` schema uses the solver's nondimensional units.
+The ``gaussian-moments`` schema uses the solver's nondimensional units.
 Velocity integrals use trapezoid quadrature:
 
 .. math::
@@ -94,8 +93,8 @@ no equilibrium subtraction.
      - ``(time, position)``: electric field
    * - ``times``
      - Saved output times, including the initial and final time
-   * - ``diagnostics``, ``diagnostic_times``
-     - Float64 diagnostic values at every integration step
+   * - ``linear_electric`` (optional)
+     - ``(time, position)``: electric field of the tangent evolution
 
 Primitive and central moments are evaluated on the kinetic grid before Fourier
 restriction. Raw moments are restricted independently. Filtering raw moments
@@ -129,9 +128,10 @@ Read one case at a time when inspecting a large dataset:
 The reader verifies completed output checksums and schema without loading
 kinetic restart states. It skips pending and partial cases; corrupted completed
 outputs raise an error. A completed case may still have failed numerical
-checks, so inspect its report before using it for training. ``read_case`` loads
-a single named case. The separate adapter for historical flat NPZ files keeps
-their original metadata; it does not supply missing qualification evidence.
+checks in a historical dataset; the reader preserves that report. ``read_case``
+loads a single named case. The historical ``gaussian-fields-v1`` and flat NPZ
+adapters preserve their original metadata. Reading either format does not
+establish numerical accuracy.
 
 Avoid collecting all cases into a list merely to compute a running statistic.
 The older analysis script materializes trajectories and is intended for small
@@ -145,8 +145,8 @@ and progress. Progress is published only after the referenced data are durable.
 Recovery verifies hashes, shapes, dtypes and the protocol before using a state.
 Complete cases are verified and skipped; partial cases resume at the next
 integration step. For example, a state at :math:`t=37` with
-:math:`\Delta t=0.01` resumes at step 3,701. The original initial observation
-remains the conservation baseline.
+:math:`\Delta t=0.0125` resumes at step 2,961. The original initial observation
+is retained.
 
 Resume compatibility includes the numerical code dependencies, manifest and
 runtime. The complete source inventory is stored separately, and each saved
@@ -164,22 +164,32 @@ steal locks. Uncommitted files are excluded from recovery. Nonfinite blocks do
 not replace the last valid checkpoint, and failed cases are not retried or
 replaced by new random draws automatically.
 
-Numerical checks
-----------------
+Output validity and analysis
+----------------------------
 
-Reports measure mass and total energy, negative distribution values, negative
-mass, boundary population, density, charge imbalance and saved-field positivity.
-Finite distribution undershoots and their negative mass are recorded without
-automatically rejecting a trajectory. Nonfinite values, nonpositive density or
-saved pressure, and failures of the remaining configured checks still reject it.
-The tolerances are engineering thresholds, not a physical admissibility theorem.
-Failed distributions are not repaired by clipping.
+Generation checks finite state and output values, positive density and
+pressure, and storage integrity. It stops on invalid output and records the
+failure. It neither clips the distribution nor applies conservation,
+boundary-population or refinement tolerances. Extra diagnostic reductions and
+numerical-quality warnings are absent from the integration loop.
 
-Completion and training qualification are separate. A passing report retains
-``training_qualified = false`` until grid, timestep and velocity-domain
-comparisons establish adequate accuracy for the intended use. The optional
-linearized evolution follows the tangent map about a homogeneous Maxwellian;
-it is disabled in the supplied dataset configuration.
+The completion report records these validity checks and its scope. Accuracy
+assessment is separate from completion. Saved raw moments and electric fields
+support conservation analysis without rerunning the kinetic evolution:
+
+.. math::
+
+   M(t)=\Delta x\sum_x M_0(x,t),\qquad
+   H(t)=\frac{\Delta x}{2}\sum_x\left[M_2(x,t)+E(x,t)^2\right].
+
+Here :math:`\Delta x` is the spacing of the saved spatial grid. This energy
+uses retained electric-field modes; discarded-mode energy is unavailable,
+so it is not the full kinetic-grid energy diagnostic. Full-distribution
+minima and velocity-boundary populations are not reconstructed from moments;
+they require a retained kinetic state. Historical output keeps its original
+diagnostic arrays and reports. The optional linearized evolution follows the
+tangent map about a homogeneous Maxwellian and saves its electric field; it
+is disabled in the supplied dataset configuration.
 
 Compare retained fields
 -----------------------
@@ -213,6 +223,6 @@ outputs retain the same accuracy; the default ``saved`` mode includes their
 rounding error.
 
 A passing comparison establishes agreement at the chosen tolerance, not the
-accuracy of either reference. Diagnostic failures are reported separately.
-Reference convergence, velocity-domain adequacy and coverage of the intended
-initial-condition family remain necessary before choosing production settings.
+accuracy of either reference. Historical diagnostic failures are reported
+separately. The comparison is an analysis tool, not a dataset-generation gate;
+its tolerance should reflect the quantities and use being assessed.

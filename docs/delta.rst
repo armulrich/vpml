@@ -42,13 +42,22 @@ fixed ``.params.sh`` file containing scheduler resources, a scientific
 parameter JSON, optional case IDs and the failure policy. Omitting it selects
 the adjacent ``gaussian_amplitudes.params.sh``.
 
-The supplied JSON contains all 1,200 initial conditions with 2,048 spatial points.
+The supplied JSON contains all 1,200 initial conditions with 512 spatial points,
+4,096 velocity points and a timestep of 0.0125.
 Its parameter file leaves ``VPML_CASE_IDS`` empty, so the worker processes the
 full manifest in order within its time budget and stops on the first failure.
 Explicit case IDs can restrict the selection; they are checked before submission
 and again in the worker. This selection does not establish numerical accuracy.
 Changing resolution requires a new dataset directory and evolution from the
 original initial conditions; an old-grid checkpoint is not resumed.
+
+The ``gaussian-moments`` output format stores the required fields, raw moments
+and electric field. Generation checks finite values, positive density and
+pressure, and checkpoint integrity. It does not compute extra per-step
+diagnostics, issue numerical-quality warnings or impose conservation and
+refinement tolerances. Conservation summaries can be computed afterward from
+saved moments and electric fields. Completion records output validity;
+numerical accuracy is assessed separately.
 
 .. code-block:: bash
 
@@ -119,24 +128,23 @@ Storage planning
 ----------------
 
 Checkpoint storage is substantially larger than compact training output.
-At ``dt=0.01``, ``final_time=120``, ``output_nx=128`` and float64 output,
-each case has 44.2 MB of sampled fields, raw moments and electric field:
-53.1 GB across 1,200 cases, or 54.2 GB including saved diagnostics and time
-arrays. Every-step observations take another 111.4 MB per case, including
-eight diagnostic values per step. Two float64 kinetic states need
-:math:`2N_xN_v\times8` bytes: 268.4 MB at ``nx=2048, nv=8192``.
+At ``dt=0.0125``, ``final_time=120``, ``output_nx=128``, ``save_dt=0.025``
+and float64 output, each case has 44.3 MB of sampled fields, raw moments,
+electric field and time coordinates: 53.1 GB across 1,200 cases.
+Every-step observations take another 88.5 MB per case. Two float64 kinetic
+states need :math:`2N_xN_v\times8` bytes: 33.6 MB at ``nx=512, nv=4096``.
 Retaining all observations, sampled outputs and restart states for 1,200 cases
-therefore needs approximately 510 GB, plus file headers, metadata and
+therefore needs approximately 200 GB, plus file headers, metadata and
 interrupted writes. These sizes use decimal MB and GB. Optional tangent states
-require more space.
+and their electric fields require more space.
 
 Use project work storage for active I/O; do not use node-local temporary
 storage as the only checkpoint copy. Check project quota rather than inferring
 it from filesystem free space. Preserve complete results before any cleanup.
 See `Delta storage documentation <https://docs.ncsa.illinois.edu/systems/delta/en/latest/user_guide/data_mgmt.html>`_.
 
-Measure throughput with the actual observation, diagnostic and checkpoint
+Measure throughput with the actual observation and checkpoint
 settings. Timing a solver kernel alone does not estimate all data-generation
 costs. Worker results separate advancement and observation, host transfer,
-checkpoint writing, diagnostic summaries and finalization times. Advancement
+checkpoint writing and finalization times. Advancement
 timing waits for device completion and includes compilation on the first block.
