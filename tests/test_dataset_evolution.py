@@ -5,7 +5,6 @@ import unittest
 import jax
 import numpy as np
 
-from vpml.datasets.diagnostics import DIAGNOSTIC_NAMES
 from vpml.datasets.evolution import ReferenceEvolution
 from vpml.datasets.initial_conditions import draw_coefficients
 from vpml.datasets.manifest import Numerics
@@ -37,7 +36,7 @@ class EvolutionTests(unittest.TestCase):
                 np.testing.assert_allclose(history[key][index], expected[key], atol=1e-12, rtol=1e-12)
         self.assertEqual(history["fields"].shape, (2, 5, 8))
         self.assertEqual(history["raw_moments"].shape, (2, 3, 8))
-        self.assertEqual(history["diagnostics"].shape, (2, len(DIAGNOSTIC_NAMES)))
+        self.assertEqual(set(history), {"fields", "raw_moments", "electric"})
         self.assertEqual(end["f"].dtype, np.dtype("float64"))
 
     def test_zero_strength_is_stationary(self):
@@ -62,8 +61,8 @@ class EvolutionTests(unittest.TestCase):
             return semilagrangian_vlasov_poisson_step(runner.cfg, f, ops=runner.ops)[0]
         expected = jax.jvp(full_step, (runner.equilibrium,), (initial["h"],))[1]
         np.testing.assert_allclose(end["h"], expected, atol=1e-13, rtol=1e-13)
-        self.assertEqual(history["diagnostics"].shape[-1], len(DIAGNOSTIC_NAMES) + 2)
-        self.assertIn("delta_e2", runner.diagnostic_names)
+        self.assertEqual(history["linear_electric"].shape, (1, 8))
+        self.assertNotIn("diagnostics", history)
 
     def test_invalid_state_precision_rejected(self):
         runner = make_evolution()

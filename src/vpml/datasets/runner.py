@@ -16,7 +16,7 @@ import numpy as np
 
 from .manifest import Numerics, read_manifest, validate_manifest, write_manifest
 from .selection import select_cases
-from .schema import validate_completed_progress
+from .schema import OUTPUT_SCHEMA, validate_completed_progress
 from .provenance import json_digest, runtime_record, source_record
 from vpml.io.atomic import atomic_write
 from vpml.io.serialization import canonical_json_bytes, read_json
@@ -67,7 +67,7 @@ def sampled_outputs(history: dict, numerics: Numerics) -> dict:
 
     Spatial projection has already been applied to each defined observable.
     For save_dt=.025 and dt=.01, odd saved samples interpolate neighboring
-    numerical steps. Diagnostics remain at the original numerical timestep.
+    numerical steps.
     """
     expected = numerics.nsteps + 1
     if any(value.shape[0] != expected for value in history.values()):
@@ -81,10 +81,13 @@ def sampled_outputs(history: dict, numerics: Numerics) -> dict:
     lower = np.floor(indices).astype(int)
     upper = np.minimum(lower + 1, numerics.nsteps)
     fraction = indices - lower
-    output = {"times": times,
-              "diagnostic_times": np.arange(expected, dtype=np.float64) * numerics.dt,
-              "diagnostics": history["diagnostics"]}
-    for name in ("fields", "raw_moments", "electric"):
+    names = ("fields", "raw_moments", "electric")
+    if "linear_electric" in history:
+        names += ("linear_electric",)
+    if set(history) != set(names):
+        raise ValueError("Unexpected observation arrays")
+    output = {"times": times}
+    for name in names:
         values = history[name]
         weight = fraction.reshape((-1,) + (1,) * (values.ndim - 1))
         result = (1 - weight) * values[lower] + weight * values[upper]
@@ -92,6 +95,22 @@ def sampled_outputs(history: dict, numerics: Numerics) -> dict:
     if not all(np.isfinite(value).all() for value in output.values()):
         raise FloatingPointError("Nonfinite values in final output")
     return output
+
+
+def _invalid_fields(fields: np.ndarray) -> list[str]:
+    """Reject unusable moments already computed for the saved observations."""
+    return [f"nonpositive_{name}" for name, index in (("density", 0), ("pressure", 2))
+            if np.any(fields[:, index] <= 0)]
+
+
+def _completion_report(outputs: dict) -> dict:
+    """Describe output validity without claiming numerical convergence."""
+    metrics = {f"min_saved_{name}": float(outputs["fields"][:, index].min())
+               for name, index in (("density", 0), ("pressure", 2))}
+    failures = [f"nonpositive_saved_{name}" for name in ("density", "pressure")
+                if metrics[f"min_saved_{name}"] <= 0]
+    return {"checks_passed": not failures, "failures": failures, "metrics": metrics,
+            "validation_scope": "finite output and positive density/pressure"}
 
 
 def dataset_status(root: Path, manifest_path: Path | None = None) -> dict:
@@ -138,17 +157,18 @@ def run_dataset(
     ends this invocation before the next case's evolution is constructed.
     """
     from .checkpoints import CheckpointStore, atomic_json
-    from .diagnostics import qualification_report
     from .evolution import ReferenceEvolution
     from .observations import observation_schema
 
     measured_start = time.perf_counter()
     timings = {name: 0.0 for name in (
         "advance_and_observe_seconds", "host_transfer_seconds",
-        "checkpoint_seconds", "diagnostic_summary_seconds", "finalize_seconds",
+        "checkpoint_seconds", "finalize_seconds",
     )}
     measured_blocks = 0
     validate_manifest(manifest)
+    if manifest["output_schema"] != OUTPUT_SCHEMA:
+        raise ValueError("Legacy output schemas are read-only; start a new dataset to evolve")
     if type(stop_on_failure) is not bool:
         raise ValueError("stop_on_failure must be a boolean")
     if not math.isfinite(max_seconds) or max_seconds <= 0:
@@ -222,15 +242,15 @@ def run_dataset(
                     first = {key: np.asarray(value)[None] for key, value in evolution.observe(state).items()}
                     if not all(np.isfinite(value).all() for value in first.values()):
                         raise FloatingPointError(f"Nonfinite initial observations: {case_id}")
+                    if _invalid_fields(first["fields"]):
+                        raise FloatingPointError(f"Nonpositive initial density or pressure: {case_id}")
                     progress = store.initialize({k: np.asarray(v) for k, v in state.items()}, first)
                 history = store.histories()
                 if (progress["step"] > numerics.nsteps
                         or any(value.shape[0] != progress["step"] + 1 for value in history.values())):
                     raise ValueError("Committed histories disagree with the numerical step")
-                diagnostics = [history["diagnostics"]]
-                report = qualification_report(diagnostics[0], names=evolution.diagnostic_names)
                 last_block_seconds = 0.0
-                while progress["step"] < numerics.nsteps and report["checks_passed"]:
+                while progress["step"] < numerics.nsteps:
                     remaining = deadline - clock()
                     if stop_requested() or remaining <= max(1.0, 1.5 * last_block_seconds):
                         break
@@ -253,40 +273,31 @@ def run_dataset(
                                                   "last_committed_step": progress["step"]})
                         outcomes.append({"case_id": case_id, "status": "failed"})
                         break
+                    invalid_fields = _invalid_fields(arrays["fields"])
+                    if invalid_fields:
+                        atomic_json(failure_path, {"case_id": case_id, "reason": "invalid_moments",
+                                                  "failures": invalid_fields,
+                                                  "last_committed_step": progress["step"]})
+                        outcomes.append({"case_id": case_id, "status": "failed"})
+                        break
                     measured = time.perf_counter()
                     progress = store.append(progress["step"] + steps, checkpoint_state, arrays)
                     timings["checkpoint_seconds"] += time.perf_counter() - measured
                     # Retain the device arrays for the next block. The NumPy
                     # checkpoint copy must not cause an unnecessary host re-upload.
                     state = next_state
-                    diagnostics.append(arrays["diagnostics"])
-                    measured = time.perf_counter()
-                    report = qualification_report(np.concatenate(diagnostics),
-                                                  names=evolution.diagnostic_names)
-                    timings["diagnostic_summary_seconds"] += time.perf_counter() - measured
                     measured_blocks += 1
                     last_block_seconds = clock() - started
                     print(json.dumps({"case_id": case_id, "step": progress["step"],
                                       "time": progress["step"] * numerics.dt,
                                       "final_time": numerics.final_time,
-                                      "checks_passed": report["checks_passed"],
                                       "block_seconds": last_block_seconds}), flush=True)
                 if failure_path.exists():
                     continue
-                if not report["checks_passed"]:
-                    atomic_json(failure_path, {"case_id": case_id, "last_committed_step": progress["step"],
-                                              "reason": "numerical_checks_failed", "report": report})
-                    outcomes.append({"case_id": case_id, "status": "failed"})
-                elif progress["step"] == numerics.nsteps:
+                if progress["step"] == numerics.nsteps:
                     measured = time.perf_counter()
                     outputs = sampled_outputs(store.histories(), numerics)
-                    report["diagnostic_names"] = list(evolution.diagnostic_names)
-                    report["metrics"]["min_saved_density"] = float(outputs["fields"][:, 0].min())
-                    report["metrics"]["min_saved_pressure"] = float(outputs["fields"][:, 2].min())
-                    for field in ("density", "pressure"):
-                        if report["metrics"][f"min_saved_{field}"] <= 0:
-                            report["failures"].append(f"nonpositive_saved_{field}")
-                    report["checks_passed"] = not report["failures"]
+                    report = _completion_report(outputs)
                     progress = store.finalize(outputs, report)
                     timings["finalize_seconds"] += time.perf_counter() - measured
                     if not report["checks_passed"]:

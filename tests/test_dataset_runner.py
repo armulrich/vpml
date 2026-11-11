@@ -89,9 +89,9 @@ class DatasetRunnerTests(unittest.TestCase):
                 for key in expected_outputs:
                     np.testing.assert_array_equal(actual_outputs[key], expected_outputs[key])
                 self.assertEqual(actual_progress["report"], expected_progress["report"])
-                self.assertFalse(actual_progress["report"]["training_qualified"])
+                self.assertNotIn("training_qualified", actual_progress["report"])
                 np.testing.assert_allclose(actual_outputs["times"], [0, .02, .04], rtol=0, atol=1e-16)
-                self.assertEqual(actual_outputs["diagnostics"].shape[0], 5)
+                self.assertNotIn("diagnostics", actual_outputs)
 
     def test_checkpoint_cadence_preserves_trajectory_and_resume(self):
         expected_state = expected_outputs = expected_report = None
@@ -121,7 +121,7 @@ class DatasetRunnerTests(unittest.TestCase):
                     self.assertEqual(report["outcomes"][0]["status"], "complete")
                     state, outputs, progress = read_case(directory, self.case_id)
                     self.assertEqual(progress["step"], 402)
-                    self.assertEqual(outputs["diagnostics"].shape[0], 403)
+                    self.assertNotIn("diagnostics", outputs)
                     np.testing.assert_array_equal(outputs["times"], np.arange(202) * .02)
                     if expected_state is None:
                         expected_state, expected_outputs = state, outputs
@@ -273,31 +273,34 @@ class DatasetRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "histories disagree"):
             self.run_worker(self.root)
 
-    def test_finite_quality_failure_is_flagged_and_not_automatically_retried(self):
-        from vpml.datasets.diagnostics import qualification_report
+    def test_generation_does_not_compute_or_apply_optional_diagnostics(self):
+        from vpml.datasets.evolution import _build_kernels
 
-        def failed_report(*args, **kwargs):
-            report = qualification_report(*args, **kwargs)
-            report["checks_passed"] = False
-            report["failures"] = ["relative_energy"]
-            report["metrics"]["max_relative_total_energy_error"] = 0.2
-            return report
-
-        with mock.patch("vpml.datasets.diagnostics.qualification_report", side_effect=failed_report), \
-             mock.patch("vpml.datasets.evolution.ReferenceEvolution.advance",
-                        side_effect=AssertionError("advanced after numerical failure")):
+        _build_kernels.cache_clear()
+        with mock.patch("vpml.datasets.evolution.diagnostic_vector", create=True,
+                        side_effect=AssertionError("full-grid diagnostics executed")), \
+             mock.patch("vpml.datasets.diagnostics.qualification_report",
+                        side_effect=AssertionError("numerical tolerance gate executed")):
             report = self.run_worker(self.root)
-        self.assertEqual(report["outcomes"][0]["status"], "failed")
-        failure_path = self.root / "failures" / f"{self.case_id}.json"
-        failure = json.loads(failure_path.read_text())
-        self.assertEqual(failure["reason"], "numerical_checks_failed")
-        with mock.patch("vpml.datasets.evolution.ReferenceEvolution",
-                        side_effect=AssertionError("retried failed case")):
-            repeated = self.run_worker(self.root)
-        self.assertEqual(repeated["outcomes"][0]["status"], "failed")
-        self.assertEqual(runner.dataset_status(self.root)["counts"]["failed"], 1)
+        self.assertEqual(report["outcomes"][0]["status"], "complete")
+        _, outputs, progress = read_case(self.root, self.case_id)
+        self.assertEqual(set(outputs), {"times", "fields", "raw_moments", "electric"})
+        self.assertEqual(set(progress["report"]),
+                         {"checks_passed", "failures", "metrics", "validation_scope"})
+        self.assertNotIn("diagnostic_summary_seconds", report["timings"])
 
-    def test_nonpositive_saved_fields_are_failed_even_when_fine_diagnostics_pass(self):
+    def test_legacy_manifest_is_readable_but_cannot_resume_under_new_generator(self):
+        from vpml.datasets.manifest import validate_manifest
+        from vpml.datasets.schema import LEGACY_OUTPUT_SCHEMA
+
+        self.manifest["output_schema"] = LEGACY_OUTPUT_SCHEMA
+        validate_manifest(self.manifest)
+        with self.assertRaisesRegex(ValueError, "read-only"), \
+             mock.patch.object(runner, "runtime_record", side_effect=AssertionError("runtime initialized")):
+            self.run_worker(self.root / "absent")
+        self.assertFalse((self.root / "absent").exists())
+
+    def test_nonpositive_saved_fields_are_failed_at_completion(self):
         self.manifest = tiny_manifest(strengths=(0.1, 0.3))
         original = runner.sampled_outputs
 
@@ -317,7 +320,7 @@ class DatasetRunnerTests(unittest.TestCase):
         self.assertEqual(progress["status"], "complete")
         self.assertFalse(progress["report"]["checks_passed"])
         self.assertIn("nonpositive_saved_pressure", progress["report"]["failures"])
-        self.assertFalse(progress["report"]["training_qualified"])
+        self.assertNotIn("training_qualified", progress["report"])
 
     def test_finite_distribution_negativity_does_not_stop_completion(self):
         from vpml.datasets.evolution import ReferenceEvolution
@@ -325,28 +328,24 @@ class DatasetRunnerTests(unittest.TestCase):
         self.manifest = tiny_manifest(strengths=(0.1, 0.3))
         advance = ReferenceEvolution.advance
 
-        def negative_distribution_diagnostics(evolution, state, steps):
+        def negative_tail(evolution, state, steps):
             next_state, observations = advance(evolution, state, steps)
-            observations = dict(observations)
-            diagnostics = np.array(observations["diagnostics"], copy=True)
-            diagnostics[:, evolution.diagnostic_names.index("min_f")] = -0.01
-            diagnostics[:, evolution.diagnostic_names.index("negative_mass_fraction")] = 0.02
-            observations["diagnostics"] = diagnostics
+            next_state = dict(next_state)
+            next_state["f"] = next_state["f"].at[0, 0].set(-1e-9)
             return next_state, observations
 
-        with mock.patch.object(ReferenceEvolution, "advance", negative_distribution_diagnostics):
+        with mock.patch.object(ReferenceEvolution, "advance", negative_tail):
             report = self.run_worker(self.root, stop_on_failure=True)
         self.assertEqual([case["status"] for case in report["outcomes"]], ["complete", "complete"])
         self.assertFalse(report["stopped_on_failure"])
         self.assertEqual(list((self.root / "failures").iterdir()), [])
         for case in self.manifest["cases"]:
-            _, outputs, progress = read_case(self.root, case["case_id"])
+            state, outputs, progress = read_case(self.root, case["case_id"])
             self.assertEqual(progress["step"], 4)
             self.assertTrue(progress["report"]["checks_passed"])
-            self.assertEqual(progress["report"]["metrics"]["min_f"], -0.01)
-            self.assertEqual(progress["report"]["metrics"]["max_negative_mass_fraction"], 0.02)
-            self.assertFalse(progress["report"]["training_qualified"])
-            self.assertEqual(outputs["diagnostics"].shape[0], 5)
+            self.assertLess(state["f"].min(), 0)
+            self.assertNotIn("min_f", progress["report"]["metrics"])
+            self.assertNotIn("diagnostics", outputs)
 
     def test_completed_failed_report_recovers_missing_failure_marker(self):
         self.manifest = tiny_manifest(strengths=(0.1, 0.3))
@@ -400,28 +399,28 @@ class DatasetRunnerTests(unittest.TestCase):
                 self.assertEqual([case["status"] for case in report["outcomes"]], expected)
                 self.assertEqual((root / "cases" / second_id).exists(), not stop_on_failure)
 
-    def test_numerical_failure_stops_before_constructing_the_next_case(self):
-        from vpml.datasets.diagnostics import qualification_report
+    def test_invalid_moments_stop_before_constructing_the_next_case(self):
         from vpml.datasets.evolution import ReferenceEvolution
 
         self.manifest = tiny_manifest(strengths=(0.1, 0.3))
+        advance = ReferenceEvolution.advance
 
-        def fail_after_first_block(history, **kwargs):
-            report = qualification_report(history, **kwargs)
-            if len(history) > 1:
-                report["checks_passed"] = False
-                report["failures"] = ["relative_energy"]
-            return report
+        def invalid_pressure(evolution, state, steps):
+            next_state, observations = advance(evolution, state, steps)
+            observations = dict(observations)
+            observations["fields"] = observations["fields"].at[:, 2, 0].set(-1)
+            return next_state, observations
 
-        with mock.patch("vpml.datasets.diagnostics.qualification_report", side_effect=fail_after_first_block), \
+        with mock.patch.object(ReferenceEvolution, "advance", invalid_pressure), \
              mock.patch("vpml.datasets.evolution.ReferenceEvolution", wraps=ReferenceEvolution) as evolution:
             report = self.run_worker(self.root, stop_on_failure=True)
         self.assertEqual(evolution.call_count, 1)
         self.assertEqual(report["outcomes"], [{"case_id": self.case_id, "status": "failed"}])
         self.assertTrue(report["stopped_on_failure"])
         failure = json.loads((self.root / "failures" / f"{self.case_id}.json").read_text())
-        self.assertEqual(failure["reason"], "numerical_checks_failed")
-        self.assertEqual(failure["last_committed_step"], 2)
+        self.assertEqual(failure["reason"], "invalid_moments")
+        self.assertEqual(failure["failures"], ["nonpositive_pressure"])
+        self.assertEqual(failure["last_committed_step"], 0)
         self.assertFalse((self.root / "locks" / f"{self.case_id}.lock").exists())
 
     def test_nonfinite_block_stops_and_retains_last_finite_checkpoint(self):
@@ -513,15 +512,15 @@ class DatasetRunnerTests(unittest.TestCase):
         histories = {"fields": np.broadcast_to((2 + 3 * times)[:, None, None], (11, 5, 8)),
                      "raw_moments": np.broadcast_to((1 + 2 * times)[:, None, None], (11, 3, 8)),
                      "electric": np.broadcast_to((4 * times)[:, None], (11, 8)),
-                     "diagnostics": times[:, None]}
+                     "linear_electric": np.broadcast_to((2 * times)[:, None], (11, 8))}
         output = runner.sampled_outputs(histories, numerical)
         np.testing.assert_array_equal(output["times"], np.arange(5) * .025)
         np.testing.assert_allclose(output["fields"][:, 0, 0], 2 + 3 * output["times"], rtol=1e-7)
         np.testing.assert_allclose(output["raw_moments"][:, 0, 0], 1 + 2 * output["times"], rtol=1e-7)
         np.testing.assert_allclose(output["electric"][:, 0], 4 * output["times"], rtol=1e-7)
-        np.testing.assert_array_equal(output["diagnostics"], histories["diagnostics"])
+        np.testing.assert_allclose(output["linear_electric"][:, 0], 2 * output["times"], rtol=1e-7)
         self.assertEqual(output["fields"].dtype, np.float32)
-        self.assertEqual(output["diagnostics"].dtype, np.float64)
+        self.assertEqual(output["linear_electric"].dtype, np.float32)
         histories["fields"] = histories["fields"][:-1]
         with self.assertRaisesRegex(ValueError, "History length"):
             runner.sampled_outputs(histories, numerical)

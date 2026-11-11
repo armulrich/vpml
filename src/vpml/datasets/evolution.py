@@ -20,7 +20,6 @@ from vpml.solvers.physical_grid import (
     normalize_density_on_grid,
     semilagrangian_vlasov_poisson_step,
 )
-from .diagnostics import DIAGNOSTIC_NAMES, LINEAR_DIAGNOSTIC_NAMES, diagnostic_vector
 from .initial_conditions import fields_from_coefficients, gaussian_distribution
 from .manifest import Numerics
 from .observations import moment_fields, restrict_fourier
@@ -48,16 +47,15 @@ def _build_kernels(numerics: Numerics, k0: float, linearized: bool):
         f = state["f"]
         fields, raw = moment_fields(f, cfg.v, cfg.Lx)
         electric = compute_electric_field_from_distribution(f, cfg, ops=ops)
-        linear_electric = (
-            compute_electric_field_from_distribution(state["h"], cfg, ops=ops)
-            if linearized else None
-        )
-        return {
+        observations = {
             "fields": restrict_fourier(fields, numerics.output_nx),
             "raw_moments": restrict_fourier(raw, numerics.output_nx),
             "electric": restrict_fourier(electric, numerics.output_nx),
-            "diagnostics": diagnostic_vector(f, cfg.v, cfg.dx, electric, linear_electric=linear_electric),
         }
+        if linearized:
+            linear_electric = compute_electric_field_from_distribution(state["h"], cfg, ops=ops)
+            observations["linear_electric"] = restrict_fourier(linear_electric, numerics.output_nx)
+        return observations
 
     @partial(jax.jit, static_argnames=("steps",))
     def advance(state, steps):
@@ -89,7 +87,6 @@ class ReferenceEvolution:
             raise ValueError("k0 must be finite and positive")
         self.numerics = numerics
         self.linearized = bool(linearized)
-        self.diagnostic_names = DIAGNOSTIC_NAMES + (LINEAR_DIAGNOSTIC_NAMES if linearized else ())
         self.cfg, self.ops, self._equilibrium, self._observe, self._advance = _build_kernels(
             numerics, float(case["k0"]), self.linearized,
         )

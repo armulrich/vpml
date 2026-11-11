@@ -22,7 +22,7 @@ from vpml.io.atomic import atomic_write
 from vpml.io.serialization import canonical_json_bytes as _canonical, read_json
 
 SCHEMA_VERSION = 1
-from .schema import OUTPUT_SCHEMA
+from .schema import OUTPUT_SCHEMA, SUPPORTED_OUTPUT_SCHEMAS
 _SPLITS = ("train", "validation", "test")
 _MANIFEST_KEYS = {"schema_version", "output_schema", "numerics", "amplitudes", "cases"}
 _CASE_KEYS = {"case_id", "shape_id", "split", "k0", "mode_count", "decay", "seed", "strength", "coefficients"}
@@ -188,7 +188,7 @@ def validate_manifest(manifest: Mapping) -> None:
     _require_keys(manifest, _MANIFEST_KEYS, "manifest")
     if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
         raise ValueError("Unsupported manifest schema_version")
-    if manifest["output_schema"] != OUTPUT_SCHEMA:
+    if manifest["output_schema"] not in SUPPORTED_OUTPUT_SCHEMAS:
         raise ValueError("Unsupported output_schema")
     numerical = _numerics(manifest["numerics"])
     amplitudes = validate_amplitudes(manifest["amplitudes"])
