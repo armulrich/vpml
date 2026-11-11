@@ -9,7 +9,7 @@ import numpy as np
 
 from vpml.datasets.checkpoints import CheckpointStore
 from vpml.datasets.manifest import Numerics, build_manifest, write_manifest
-from vpml.datasets.schema import DIAGNOSTIC_NAMES, OUTPUT_SCHEMA, observation_schema
+from vpml.datasets.schema import DIAGNOSTIC_NAMES, OUTPUT_SCHEMA, LEGACY_OUTPUT_SCHEMA, observation_schema
 from vpml.diagnostics.dataset_accuracy import compare_dataset_cases, main
 from vpml.io.serialization import json_digest
 
@@ -44,8 +44,8 @@ def write_fixture(root, settings, values, *, times=None, complete=True, diagnost
     (root / "provenance").mkdir()
     (root / "provenance" / f"{provenance_hash}.json").write_text(json.dumps(provenance))
     protocol = {"manifest_sha256": json_digest(settings), "case": case,
-                "numerics": settings["numerics"], "output_schema": OUTPUT_SCHEMA,
-                "linearized": False, "observations": observation_schema(),
+                "numerics": settings["numerics"], "output_schema": settings["output_schema"],
+                "linearized": False, "observations": observation_schema(settings["output_schema"]),
                 "source": provenance["source"]["compatibility"], "runtime": provenance["runtime"]}
     store = CheckpointStore(root / "cases" / case["case_id"], protocol,
                             provenance_sha256=provenance_hash)
@@ -57,21 +57,28 @@ def write_fixture(root, settings, values, *, times=None, complete=True, diagnost
         "fields": observation_values[:, :5],
         "raw_moments": np.zeros((numerical.nsteps + 1, 3, numerical.output_nx)),
         "electric": observation_values[:, 5],
-        "diagnostics": diagnostics,
     }
+    if settings["output_schema"] == LEGACY_OUTPUT_SCHEMA:
+        observations["diagnostics"] = diagnostics
     state = {"f": np.ones((numerical.nv, numerical.nx))}
     store.initialize(state, {key: array[:1] for key, array in observations.items()})
     store.append(numerical.nsteps, state, {key: array[1:] for key, array in observations.items()})
     if complete:
         outputs = {"times": np.arange(numerical.nsamples) * numerical.save_dt if times is None else times,
-                   "diagnostic_times": np.arange(numerical.nsteps + 1) * numerical.dt,
                    "fields": values[:, :5].astype(numerical.storage_dtype),
                    "raw_moments": np.zeros((numerical.nsamples, 3, numerical.output_nx), dtype=numerical.storage_dtype),
-                   "electric": values[:, 5].astype(numerical.storage_dtype), "diagnostics": diagnostics}
-        report = {"diagnostic_names": list(DIAGNOSTIC_NAMES), "checks_passed": diagnostic_pass,
-                  "training_qualified": False, "failures": [] if diagnostic_pass else ["minimum_f"],
-                  "qualification_scope": "synthetic fixture only",
-                  "metrics": {"min_f": 0., "max_boundary_abs_fraction": 0.}}
+                   "electric": values[:, 5].astype(numerical.storage_dtype)}
+        report = {"checks_passed": diagnostic_pass,
+                  "failures": [] if diagnostic_pass else ["nonpositive_saved_pressure"],
+                  "validation_scope": "synthetic fixture only",
+                  "metrics": {"min_saved_density": float(values[:, 0].min()),
+                              "min_saved_pressure": float(values[:, 2].min())}}
+        if settings["output_schema"] == LEGACY_OUTPUT_SCHEMA:
+            outputs.update(diagnostic_times=np.arange(numerical.nsteps + 1) * numerical.dt,
+                           diagnostics=diagnostics)
+            report.update(diagnostic_names=list(DIAGNOSTIC_NAMES), training_qualified=False,
+                          qualification_scope="synthetic fixture only",
+                          metrics={"min_f": 0., "max_boundary_abs_fraction": 0.})
         store.finalize(outputs, report)
     return case["case_id"]
 
@@ -87,6 +94,14 @@ class DatasetAccuracyTests(unittest.TestCase):
 
     def compare(self, **options):
         return compare_dataset_cases(self.candidate, self.reference, [self.case_id], **options)
+
+    def test_historical_diagnostic_format_remains_comparable(self):
+        self.settings["output_schema"] = LEGACY_OUTPUT_SCHEMA
+        write_fixture(self.candidate, self.settings, fields_for(self.settings, 1.004))
+        write_fixture(self.reference, self.settings, fields_for(self.settings))
+        result = self.compare(representation="observations-float64")
+        self.assertTrue(result["all_tolerances_passed"])
+        self.assertAlmostEqual(result["cases"][0]["windows"][0]["fields"]["n-1"]["relative_L2"], .004)
 
     def test_known_relative_error_uses_perturbations_and_allows_resolution_changes(self):
         candidate_settings = manifest(nx=32, nv=32, dt=.5)
@@ -320,7 +335,7 @@ class DatasetAccuracyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum"):
             self.compare()
 
-    def test_diagnostic_failure_is_retained_and_cli_writes_json(self):
+    def test_output_validity_failure_is_retained_and_cli_writes_json(self):
         write_fixture(self.reference, self.settings, fields_for(self.settings), diagnostic_pass=False)
         write_fixture(self.candidate, self.settings, fields_for(self.settings))
         path = self.root / "comparison.json"
@@ -328,7 +343,7 @@ class DatasetAccuracyTests(unittest.TestCase):
                        "--case-id", self.case_id, "--out-report", str(path)])
         self.assertEqual(status, 0)
         result = json.loads(path.read_text())
-        self.assertFalse(result["cases"][0]["reference_diagnostic_checks_passed"])
+        self.assertFalse(result["cases"][0]["reference_checks_passed"])
         self.assertFalse(result["training_qualified"])
 
 

@@ -18,6 +18,7 @@ from vpml.datasets.checkpoints import CheckpointStore
 from vpml.datasets.manifest import Numerics, read_manifest
 from vpml.datasets.reader import read_case
 from vpml.datasets.runner import sampled_outputs
+from vpml.datasets.schema import LEGACY_OUTPUT_SCHEMA
 from vpml.io.serialization import file_digest, json_digest, read_json
 
 
@@ -40,8 +41,11 @@ def _comparison_fields(root, case, numerics, representation):
     history = store.histories()  # Checks every observation, restart and output bundle.
     expected = {"fields": (numerics.nsteps + 1, 5, numerics.output_nx),
                 "raw_moments": (numerics.nsteps + 1, 3, numerics.output_nx),
-                "electric": (numerics.nsteps + 1, numerics.output_nx),
-                "diagnostics": (numerics.nsteps + 1, len(case["diagnostic_names"]))}
+                "electric": (numerics.nsteps + 1, numerics.output_nx)}
+    if case["format"] == LEGACY_OUTPUT_SCHEMA:
+        expected["diagnostics"] = (numerics.nsteps + 1, len(case["diagnostic_names"]))
+    elif protocol["linearized"]:
+        expected["linear_electric"] = (numerics.nsteps + 1, numerics.output_nx)
     if set(history) != set(expected) or any(
             history[key].shape != shape or history[key].dtype != np.dtype("float64")
             for key, shape in expected.items()):
@@ -65,7 +69,8 @@ def _comparison_fields(root, case, numerics, representation):
                 or provenance["source"]["compatibility"] != protocol["source"]
                 or provenance["runtime"] != protocol["runtime"]):
             raise ValueError("Observation provenance disagrees with its case protocol")
-    arrays = sampled_outputs(history, replace(numerics, storage_dtype="float64"))
+    arrays = sampled_outputs({key: value for key, value in history.items() if key != "diagnostics"},
+                             replace(numerics, storage_dtype="float64"))
     if (not np.array_equal(arrays["times"], case["times"])
             or file_digest(directory / "progress.json") != progress_digest):
         raise ValueError("Observation sampling or progress changed during comparison")
@@ -193,7 +198,7 @@ def compare_dataset_cases(candidate_root, reference_root, case_ids, tolerance=0.
         candidate, reference = [read_case(root, case_id) for root in roots]
         if (not candidate["output_integrity_verified"] or not reference["output_integrity_verified"]
                 or candidate["format"] != reference["format"]
-                or candidate["diagnostic_names"] != reference["diagnostic_names"]
+                or candidate.get("diagnostic_names") != reference.get("diagnostic_names")
                 or not np.array_equal(candidate["times"], reference["times"])
                 or not np.array_equal(candidate["x"], reference["x"])):
             raise ValueError("Verified output schemas or coordinates disagree")
@@ -224,10 +229,12 @@ def compare_dataset_cases(candidate_root, reference_root, case_ids, tolerance=0.
         results.append({
             "case_id": case_id, "windows": comparisons,
             "all_tolerances_passed": all(window["all_tolerances_passed"] for window in comparisons),
-            "candidate_diagnostic_checks_passed": bool(candidate["report"]["checks_passed"]),
-            "reference_diagnostic_checks_passed": bool(reference["report"]["checks_passed"]),
-            "candidate_diagnostic_failures": list(candidate["report"]["failures"]),
-            "reference_diagnostic_failures": list(reference["report"]["failures"]),
+            "candidate_checks_passed": bool(candidate["report"]["checks_passed"]),
+            "reference_checks_passed": bool(reference["report"]["checks_passed"]),
+            "candidate_check_failures": list(candidate["report"]["failures"]),
+            "reference_check_failures": list(reference["report"]["failures"]),
+            "candidate_check_scope": candidate["report"].get("validation_scope", candidate.get("qualification_scope")),
+            "reference_check_scope": reference["report"].get("validation_scope", reference.get("qualification_scope")),
             "candidate_provenance_sha256": candidate["provenance_sha256"],
             "reference_provenance_sha256": reference["provenance_sha256"],
             "candidate_observation_provenance_sha256": left_provenance,

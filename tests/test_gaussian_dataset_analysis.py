@@ -1,4 +1,8 @@
 """Checks for the measured-field to history-matrix construction."""
+from pathlib import Path
+import tempfile
+import unittest
+
 import numpy as np
 
 from scripts.analyze_gaussian_dataset import (
@@ -6,6 +10,22 @@ from scripts.analyze_gaussian_dataset import (
     primary_cases, refinement_comparisons,
     common_spectral_band_errors,
 )
+
+
+class MomentOnlyAnalysisTests(unittest.TestCase):
+    def test_figures_do_not_require_unsaved_kinetic_diagnostics(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        from vpml.diagnostics.gaussian_dataset import figures
+        case = {"id": "case_current", "format": "gaussian-moments", "family": "gaussian",
+                "seed": 1, "strength": .1, "k0": .5, "eta_NL": None,
+                "times": np.array([0., 1.]), "full_energy": np.array([.01, .005])}
+        self.assertEqual(primary_cases([case]), [case])
+        self.assertEqual(refinement_comparisons([case]), [])
+        with tempfile.TemporaryDirectory() as directory:
+            paths = figures([case], {}, Path(directory))
+            self.assertEqual([Path(path).name for path in paths], ["energy_histories.png"])
+            self.assertTrue(all(Path(path).is_file() for path in paths))
 
 
 def test_effective_rank_uses_singular_values_not_squares():

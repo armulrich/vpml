@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 from scipy.interpolate import interp1d
 
+from vpml.datasets.schema import SUPPORTED_OUTPUT_SCHEMAS
+
 
 def effective_rank(matrix: np.ndarray) -> dict:
     """Roy--Vetterli entropy of singular values (not squared values)."""
@@ -79,7 +81,7 @@ def load_cases(root: Path) -> list[dict]:
 
 def primary_cases(cases: list[dict]) -> list[dict]:
     """Only the declared base collection contributes to population summaries."""
-    return [case for case in cases if case.get("format") == "gaussian-fields-v1"
+    return [case for case in cases if case.get("format") in SUPPORTED_OUTPUT_SCHEMAS
             or case["id"].endswith("_base")]
 
 
@@ -133,7 +135,7 @@ def refinement_comparisons(cases: list[dict], tolerances=None) -> list[dict]:
     bases = {(c["family"], c["seed"], c["strength"], c["k0"]): c for c in primary_cases(cases)}
     comparisons = []
     for fine in cases:
-        if fine.get("format") == "gaussian-fields-v1" or fine["id"].endswith("_base"):
+        if fine.get("format") in SUPPORTED_OUTPUT_SCHEMAS or fine["id"].endswith("_base"):
             continue
         coarse = bases.get((fine["family"], fine["seed"], fine["strength"], fine["k0"]))
         if coarse is None:
@@ -350,28 +352,32 @@ def figures(cases: list[dict], info: dict, destination: Path) -> list[str]:
     paths = []
     seeds = sorted({c["seed"] for c in gauss})
     colors = plt.cm.viridis(np.linspace(.15, .85, len(seeds)))
-    fig, axes = plt.subplots(1, 3, figsize=(12.2, 3.5), constrained_layout=True)
-    for seed, color in zip(seeds, colors):
-        selected = sorted([c for c in gauss if c["seed"] == seed], key=lambda c: c["strength"])
-        x = [c["strength"] for c in selected]
-        axes[0].plot(x, [c["eta_NL"] for c in selected], "o-", color=color, label=str(seed))
-        axes[1].plot(x, [max(-c["min_full_distribution"], 1e-18) for c in selected], "o-", color=color)
-        axes[2].plot(x, [max(c["max_negative_mass_fraction"], 1e-20) for c in selected], "o-", color=color)
-    axes[0].set_ylabel(r"Field departure $\eta_{\rm NL}$")
-    axes[0].legend(title="Spatial seed", frameon=False, fontsize=8)
-    axes[1].set_ylabel(r"Largest negative depth $\max(-\min f,0)$")
-    axes[1].set_yscale("log")
-    axes[2].set_ylabel("Maximum negative population fraction")
-    axes[2].set_yscale("log")
-    for ax in axes[1:]:
-        ax.axhline(1e-8, color="0.35", lw=.9, ls="--", label="Screening tolerance")
-        ax.legend(frameon=False, fontsize=8, loc="upper left")
-        ax.yaxis.set_major_locator(LogLocator(numticks=6))
-    for ax in axes:
-        ax.set_xlabel(r"Amplitude $\lambda$")
-        ax.grid(alpha=.2)
-    path = destination / "amplitude_and_reference_checks.png"
-    fig.savefig(path); plt.close(fig); paths.append(str(path))
+    diagnostic_cases = [case for case in gauss if case.get("eta_NL") is not None
+                        and case.get("min_full_distribution") is not None
+                        and case.get("max_negative_mass_fraction") is not None]
+    if diagnostic_cases:
+        fig, axes = plt.subplots(1, 3, figsize=(12.2, 3.5), constrained_layout=True)
+        for seed, color in zip(seeds, colors):
+            selected = sorted([c for c in diagnostic_cases if c["seed"] == seed], key=lambda c: c["strength"])
+            x = [c["strength"] for c in selected]
+            axes[0].plot(x, [c["eta_NL"] for c in selected], "o-", color=color, label=str(seed))
+            axes[1].plot(x, [max(-c["min_full_distribution"], 1e-18) for c in selected], "o-", color=color)
+            axes[2].plot(x, [max(c["max_negative_mass_fraction"], 1e-20) for c in selected], "o-", color=color)
+        axes[0].set_ylabel(r"Field departure $\eta_{\rm NL}$")
+        axes[0].legend(title="Spatial seed", frameon=False, fontsize=8)
+        axes[1].set_ylabel(r"Largest negative depth $\max(-\min f,0)$")
+        axes[1].set_yscale("log")
+        axes[2].set_ylabel("Maximum negative population fraction")
+        axes[2].set_yscale("log")
+        for ax in axes[1:]:
+            ax.axhline(1e-8, color="0.35", lw=.9, ls="--", label="Screening tolerance")
+            ax.legend(frameon=False, fontsize=8, loc="upper left")
+            ax.yaxis.set_major_locator(LogLocator(numticks=6))
+        for ax in axes:
+            ax.set_xlabel(r"Amplitude $\lambda$")
+            ax.grid(alpha=.2)
+        path = destination / "amplitude_and_reference_checks.png"
+        fig.savefig(path); plt.close(fig); paths.append(str(path))
 
     first = sorted([c for c in gauss if c["seed"] == seeds[0]], key=lambda c: c["strength"])
     fig, axes = plt.subplots(1, len(first), figsize=(3.05 * len(first), 3.25), squeeze=False,
