@@ -28,14 +28,32 @@ def pilot(source_sha: str):
     from dataclasses import asdict,replace
     import numpy as np
     import jax
-    from model.train.interface_flux_data import sha256_file,sha256_json
-    from model.train.wavenumber_data import build_manifest,write_new_json,REGIMES
-    from model.train.wavenumber_training import (Configuration,initialize,load_stats,convert_old_case,
-        batch_from_states,loss_factory,update_factory,tree_hash,base,save_snapshot,load_snapshot)
-    from model.train.wavenumber_reference import benchmark_reference
-    from model.train.modal_burles_latent_fno import _source_tree_sha256
-    if _source_tree_sha256(ROOT)!=source_sha:raise ValueError('Uploaded source hash mismatch')
-    if sha256_file(NORMALIZATION)!=NORMALIZATION_SHA:raise ValueError('Normalization mismatch')
+    from vpml.io.serialization import (
+        file_digest,
+        json_digest,
+    )
+    from vpml.datasets.wavenumber import (
+        build_manifest,
+        write_new_json,
+        REGIMES,
+    )
+    from vpml.training.wavenumber_training import (
+        Configuration,
+        initialize,
+        load_stats,
+        convert_old_case,
+        batch_from_states,
+        loss_factory,
+        update_factory,
+        tree_hash,
+        save_snapshot,
+        load_snapshot,
+    )
+    from vpml.training.optimization import adam_init
+    from vpml.datasets.wavenumber_reference import benchmark_reference
+    from vpml.io.serialization import source_tree_digest
+    if source_tree_digest(ROOT)!=source_sha:raise ValueError('Uploaded source hash mismatch')
+    if file_digest(NORMALIZATION)!=NORMALIZATION_SHA:raise ValueError('Normalization mismatch')
     if jax.default_backend()!='gpu':raise RuntimeError('Pilot requires GPU')
     pilot_dir=OUT/'pilot';pilot_dir.mkdir(parents=True,exist_ok=False)
     started=time.monotonic()
@@ -50,7 +68,7 @@ def pilot(source_sha: str):
     states={manifest['cases'][i]['case_id']:convert_old_case(CACHE,manifest['cases'][i],config) for i in selected}
     rows=np.array([(i,j*20) for i in selected for j in range(16)],np.int32)
     batch=batch_from_states(manifest,rows,states,config)
-    opt=base._adam_init(params); update=update_factory(config,stats)
+    opt=adam_init(params); update=update_factory(config,stats)
     t=time.monotonic();p1,o1,l,gn,un,ig,finite=update(params,opt,batch,.001);jax.block_until_ready(l)
     report['compile_and_first_update_seconds']=time.monotonic()-t
     if not bool(finite) or float(ig)<=0:raise RuntimeError('Finite update/initializer-gradient gate failed')

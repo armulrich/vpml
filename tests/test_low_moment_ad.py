@@ -7,7 +7,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vpml import low_moment as lm
+from vpml.models import moment_features
+from vpml.models.moment_features import (
+    DYNAMIC_INPUT_SCALING,
+    _normalized_closure_fields,
+    _window_fno_features,
+    encode_explicit_window_history,
+)
+from vpml.models.spectral_layers import _rms_with_floor
+from vpml.models.moment_parameters import init_window_fno_params
+from vpml.solvers.moments import limit_low_moment_state
 
 
 def legacy_rms(values, floor):
@@ -32,7 +41,7 @@ class LowMomentADEdgeTests(unittest.TestCase):
     def test_rms_forward_bits_at_floor_and_neighbors(self):
         for dtype in (np.float32, np.float64):
             for evaluate in (lambda f: f, jax.jit):
-                old, new = evaluate(legacy_rms), evaluate(lm._rms_with_floor)
+                old, new = evaluate(legacy_rms), evaluate(_rms_with_floor)
                 for floor in (0.0, 1e-6, 0.1, 0.125, 1e-30, 1e30):
                     floor = dtype(floor)
                     amplitudes = np.asarray([
@@ -50,7 +59,7 @@ class LowMomentADEdgeTests(unittest.TestCase):
     def test_rms_gradients_below_at_above_and_zero_floor(self):
         for dtype in (jnp.float32, jnp.float64):
             for evaluate in (lambda f: f, jax.jit):
-                gradient = evaluate(jax.grad(lambda x, f: jnp.sum(lm._rms_with_floor(x, f))))
+                gradient = evaluate(jax.grad(lambda x, f: jnp.sum(_rms_with_floor(x, f))))
                 for value, floor, expected in (
                     (0.0, 0.125, 0.0), (0.0625, 0.125, 0.0),
                     (0.125, 0.125, 0.125), (0.25, 0.125, 0.25),
@@ -66,23 +75,23 @@ class LowMomentADEdgeTests(unittest.TestCase):
             state = jnp.zeros((1, 3, nx), dtype=dtype)
             history = jnp.zeros((1, 2, 3, nx), dtype=dtype)
             k = jnp.arange(nx // 2 + 1, dtype=dtype)
-            params = lm.init_window_fno_params(
+            params = init_window_fno_params(
                 jax.random.PRNGKey(5), width=2, spectral_modes=2,
                 memory_steps=2, depth=1, input_channels=4, dtype=dtype,
             )
             common = dict(input_scale=jnp.ones(4, dtype=dtype),
-                          heat_flux_gradient_scale=1.0, input_scaling=lm.DYNAMIC_INPUT_SCALING,
+                          heat_flux_gradient_scale=1.0, input_scaling=DYNAMIC_INPUT_SCALING,
                           dynamic_amplitude_floor=1e-3)
-            fields = lambda x: lm._normalized_closure_fields(
+            fields = lambda x: _normalized_closure_fields(
                 {"amplitude_gain": jnp.zeros(4, dtype=dtype)}, x, jnp.ones(1, dtype=dtype), k,
                 amplitude_center=0.0, amplitude_scale=1.0,
                 previous_heat_flux_gradient=None, poisson_sign=1.0, **common,
             )
-            features = lambda x: lm._window_fno_features(
+            features = lambda x: _window_fno_features(
                 params, x, history, jnp.ones(1, dtype=dtype), k,
                 amplitude_center=0.0, amplitude_scale=1.0, **common,
             )[0]
-            encoded = lambda x: lm.encode_explicit_window_history(params, x, k, **common)
+            encoded = lambda x: encode_explicit_window_history(params, x, k, **common)
             for function, value in ((fields, state), (features, state), (encoded, history)):
                 gradient = jax.jit(jax.grad(lambda x: jnp.sum(function(x))))(value)
                 self.assertTrue(np.isfinite(np.asarray(gradient)).all())
@@ -96,7 +105,7 @@ class LowMomentADEdgeTests(unittest.TestCase):
                 probe_history = jnp.repeat(probe[:, None], 2, axis=1)
                 for function, value in ((fields, probe), (features, probe), (encoded, probe_history)):
                     actual = jax.jit(function)(value)
-                    with mock.patch.object(lm, "_rms_with_floor", legacy_rms):
+                    with mock.patch.object(moment_features, "_rms_with_floor", legacy_rms):
                         expected = jax.jit(lambda x: function(x))(value)
                     self.assertSameBits(actual, expected)
 
@@ -105,7 +114,7 @@ class LowMomentADEdgeTests(unittest.TestCase):
             eps = np.finfo(np.dtype(dtype)).eps
             reference = jnp.zeros((1, 3, 4), dtype=dtype)
             for evaluate in (lambda f: f, jax.jit):
-                limit = evaluate(lambda x: lm.limit_low_moment_state(
+                limit = evaluate(lambda x: limit_low_moment_state(
                     x, reference_state=reference, density_floor=0.25,
                 ))
                 for ratio in (0.0, 0.5, 1.0, 2.0):
@@ -125,7 +134,7 @@ class LowMomentADEdgeTests(unittest.TestCase):
             reference = jnp.zeros((1, 3, 4), dtype=dtype)
             for floor in (0.0, 1e-4):
                 state = reference.at[:, 0].set(-2.0)
-                limit = lambda x: lm.limit_low_moment_state(
+                limit = lambda x: limit_low_moment_state(
                     x, reference_state=reference, density_floor=floor,
                 )
                 expected_gradient = jnp.ones_like(state).at[:, 0].set(0.0)
@@ -143,7 +152,7 @@ class LowMomentADEdgeTests(unittest.TestCase):
             state = reference.at[:, 0].set(jnp.asarray([-1.2, -0.4, 0.2, 1.4], dtype=dtype))
             direction = jnp.asarray(np.random.default_rng(9).normal(size=state.shape), dtype=dtype)
             weights = jnp.arange(1, 13, dtype=dtype).reshape(state.shape)
-            function = jax.jit(lambda x: jnp.sum(weights * lm.limit_low_moment_state(
+            function = jax.jit(lambda x: jnp.sum(weights * limit_low_moment_state(
                 x, reference_state=reference, density_floor=0.25,
             )))
             ad = jnp.vdot(jax.grad(function)(state), direction)

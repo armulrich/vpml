@@ -2,6 +2,8 @@
 
 VPML_RUN_NAME selects an isolated, already prepared setup directory. Historical
 defaults remain usable, while each new setup freezes its own scientific source.
+The model.train imports intentionally use that frozen tree, whose original
+module paths and source identity are part of the recorded protocol.
 """
 from pathlib import Path
 import hashlib

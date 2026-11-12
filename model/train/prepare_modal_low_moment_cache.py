@@ -19,7 +19,11 @@ from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
-from model.train.interface_flux_data import load_ic_manifest, sha256_file, sha256_json
+from vpml.datasets.interface_flux import load_ic_manifest
+from vpml.io.serialization import (
+    file_digest,
+    json_digest,
+)
 
 
 SCHEMA_VERSION = 1
@@ -62,7 +66,7 @@ def _copy_low_hermite_rows(source: Path, destination: Path) -> Mapping[str, obje
     return {
         "shape": list(expected_shape),
         "dtype": "complex64",
-        "sha256": sha256_file(destination),
+        "sha256": file_digest(destination),
     }
 
 
@@ -94,7 +98,7 @@ def _copy_evaluation_snapshot(
     temporary.replace(destination)
     return {
         "E_hat_hist_shape": list(field_hat.shape),
-        "sha256": sha256_file(destination),
+        "sha256": file_digest(destination),
     }
 
 
@@ -144,13 +148,13 @@ def prepare_cache(source: Path, destination: Path, *, target_nx: int = 128) -> P
     compact_metadata = {
         "format": source_metadata["format"],
         "configuration": configuration,
-        "configuration_sha256": sha256_json(configuration),
+        "configuration_sha256": json_digest(configuration),
         "manifest_sha256": source_metadata["manifest_sha256"],
         "compact_low_moment_cache": {
             "schema_version": SCHEMA_VERSION,
             "parent_configuration_sha256": source_metadata["configuration_sha256"],
-            "parent_metadata_sha256": sha256_file(source_metadata_path),
-            "parent_manifest_sha256": sha256_file(source_manifest_path),
+            "parent_metadata_sha256": file_digest(source_metadata_path),
+            "parent_manifest_sha256": file_digest(source_manifest_path),
             "source_projection_order": source_projection_order,
             "retained_hermite_rows": [0, 1, 2, 3],
             "evaluation_target_nx": int(target_nx),
@@ -201,7 +205,7 @@ def prepare_cache(source: Path, destination: Path, *, target_nx: int = 128) -> P
         "source": str(source),
         "destination": str(destination),
         "manifest_sha256": str(manifest["sha256"]),
-        "metadata_sha256": sha256_file(destination / "metadata.json"),
+        "metadata_sha256": file_digest(destination / "metadata.json"),
         "target_nx": int(target_nx),
         "retained_hermite_rows": [0, 1, 2, 3],
         "case_count": len(records),

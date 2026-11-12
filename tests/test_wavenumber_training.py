@@ -4,9 +4,26 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 import numpy as np
-from model.train.wavenumber_data import build_manifest,build_five_epoch_manifest,epoch_batches,REGIMES,write_new_json
-from model.train.wavenumber_training import (Configuration,initialize,loss_factory,tree_hash,
-    save_snapshot,load_snapshot,update_factory,batch_from_states,base)
+from vpml.datasets.wavenumber import (
+    build_manifest,
+    build_five_epoch_manifest,
+    epoch_batches,
+    REGIMES,
+    write_new_json,
+)
+from vpml.training.wavenumber_training import (
+    Configuration,
+    initialize,
+    loss_factory,
+    tree_hash,
+    save_snapshot,
+    load_snapshot,
+    update_factory,
+    batch_from_states,
+)
+from vpml.training.low_moment_losses import _sqrt_with_zero_subgradient
+from vpml.training.optimization import adam_init
+from vpml.solvers.moments import primitive_fields
 import jax
 import jax.numpy as jnp
 
@@ -38,7 +55,7 @@ class WavenumberTests(unittest.TestCase):
         expected=[]
         for i in range(2):
             sample={k:v[i:i+1] for k,v in b.items()}
-            target=base.primitive_fields(jnp.asarray(sample['targets'][0]),jnp.asarray(sample['k_arr'][0]))
+            target=primitive_fields(jnp.asarray(sample['targets'][0]),jnp.asarray(sample['k_arr'][0]))
             factor=float(jnp.sqrt(jnp.mean(target*target)))/float(b['initial_reference_rms'][i])
             value,g=jax.jit(jax.value_and_grad(old))(p,sample)
             actual,ng=jax.jit(jax.value_and_grad(new))(p,sample)
@@ -70,7 +87,7 @@ class WavenumberTests(unittest.TestCase):
     def test_initial_rms_exact_resume(self):
         c,b,s=tiny();c=replace(c,detach_preparation=True,relative_loss_norm='l2',relative_normalization='initial_rms')
         b={**b,'initial_reference_rms':np.array([.02,.03],np.float32)}
-        p=initialize(c);opt=base._adam_init(p);step=update_factory(c,s)
+        p=initialize(c);opt=adam_init(p);step=update_factory(c,s)
         p,opt,*rest=step(p,opt,b,.001);self.assertTrue(bool(rest[-1]))
         with tempfile.TemporaryDirectory() as d:
             f=Path(d)/'state.npz';save_snapshot(f,p,opt,dict(protocol_sha256='initial'),[])
@@ -100,7 +117,7 @@ class WavenumberTests(unittest.TestCase):
         np.testing.assert_allclose(loss_factory(candidate,s2)(p,changed),new(p,b),rtol=0,atol=0)
 
     def test_l2_zero_error_and_invalid_denominator(self):
-        root=base._sqrt_with_zero_subgradient
+        root=_sqrt_with_zero_subgradient
         f=lambda x:root(jnp.sum(x*x)/jnp.asarray(2.))
         value,g=jax.jit(jax.value_and_grad(f))(jnp.zeros(4))
         self.assertEqual(float(value),0.)
@@ -115,7 +132,7 @@ class WavenumberTests(unittest.TestCase):
 
     def test_relative_l2_exact_resume(self):
         c,b,s=tiny();c=replace(c,detach_preparation=True,relative_loss_norm='l2')
-        p=initialize(c);opt=base._adam_init(p);step=update_factory(c,s)
+        p=initialize(c);opt=adam_init(p);step=update_factory(c,s)
         p,opt,*rest=step(p,opt,b,.001)
         self.assertTrue(bool(rest[-1]))
         with tempfile.TemporaryDirectory() as d:
@@ -163,7 +180,10 @@ class WavenumberTests(unittest.TestCase):
         self.assertAlmostEqual(float(lv),np.mean(singles),places=7)
 
     def test_continuous_evaluation_chunk_parity(self):
-        from model.train.wavenumber_evaluation import rollout_factory,autonomous_case
+        from vpml.training.wavenumber_evaluation import (
+            rollout_factory,
+            autonomous_case,
+        )
         c,b,s=tiny();p=initialize(c)
         case=dict(case_id='small',domain_length=2*np.pi/.3,epsilon=.01)
         a,z=autonomous_case(p,case,b['initial'][0],c,rollout_factory(c,s,2),horizon=.1,chunk_steps=2)
@@ -172,7 +192,7 @@ class WavenumberTests(unittest.TestCase):
         self.assertEqual(a.shape,(5,3,16))
 
     def test_exact_resume_and_overwrite_refusal(self):
-        c,b,s=tiny();p=initialize(c);o=base._adam_init(p);step=update_factory(c,s)
+        c,b,s=tiny();p=initialize(c);o=adam_init(p);step=update_factory(c,s)
         p,o,*rest=step(p,o,b,.001);self.assertTrue(bool(rest[-1]))
         with tempfile.TemporaryDirectory() as d:
             f=Path(d)/'state.npz';record=dict(protocol_sha256='test',epoch=1,next_batch=1)

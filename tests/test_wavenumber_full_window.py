@@ -6,11 +6,18 @@ import unittest
 import numpy as np
 import jax
 import jax.numpy as jnp
-from model.train.wavenumber_training import (
-    Configuration, initialize, batch_from_states, loss_factory, update_factory,
-    save_snapshot, load_snapshot, base,
+from vpml.training.wavenumber_training import (
+    Configuration,
+    initialize,
+    batch_from_states,
+    loss_factory,
+    update_factory,
+    save_snapshot,
+    load_snapshot,
 )
-from vpml.low_moment import rollout_burles_latent_closure, primitive_fields
+from vpml.training.optimization import adam_init
+from vpml.solvers.moment_rollout import rollout_burles_latent_closure
+from vpml.solvers.moments import primitive_fields
 
 
 class FullWindowTests(unittest.TestCase):
@@ -79,7 +86,7 @@ class FullWindowTests(unittest.TestCase):
         np.testing.assert_allclose(fd,gn,rtol=2e-4,atol=1e-8)
 
     def test_two_update_resume_parity(self):
-        step=update_factory(self.new,self.stats);o=base._adam_init(self.params)
+        step=update_factory(self.new,self.stats);o=adam_init(self.params)
         first=step(self.params,o,self.batch,.0001)
         self.assertTrue(bool(first[-1]));self.assertGreater(float(first[-2]),0)
         direct=step(first[0],first[1],self.batch,.0001)

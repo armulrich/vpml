@@ -6,8 +6,16 @@ from dataclasses import replace
 import numpy as np
 import jax
 import jax.numpy as jnp
-from model.train.wavenumber_training import Configuration,initialize,batch_from_states,update_factory,base,save_snapshot,load_snapshot
-from model.train.wavenumber_evaluation import rollout_factory
+from vpml.training.wavenumber_training import (
+    Configuration,
+    initialize,
+    batch_from_states,
+    update_factory,
+    save_snapshot,
+    load_snapshot,
+)
+from vpml.training.optimization import adam_init
+from vpml.training.wavenumber_evaluation import rollout_factory
 
 
 class PrecisionTests(unittest.TestCase):
@@ -36,7 +44,7 @@ class PrecisionTests(unittest.TestCase):
             b=batch_from_states(self.manifest,np.array([[0,0]]),self.states,c)
             for k,v in b.items():
                 if k!='regime_index':self.assertEqual(v.dtype,np.dtype(dtype))
-            p=initialize(c);o=base._adam_init(p)
+            p=initialize(c);o=adam_init(p)
             updated=update_factory(c,self.stats)(p,o,b,.0001)
             self.assertTrue(bool(updated[-1]))
             for x in jax.tree_util.tree_leaves(updated[:2]):
@@ -51,7 +59,7 @@ class PrecisionTests(unittest.TestCase):
     def test_float64_resume_with_nonzero_adam_state(self):
         c=replace(self.config,compute_dtype='float64')
         b=batch_from_states(self.manifest,np.array([[0,0]]),self.states,c)
-        step=update_factory(c,self.stats);p=initialize(c);o=base._adam_init(p)
+        step=update_factory(c,self.stats);p=initialize(c);o=adam_init(p)
         first=step(p,o,b,.0001)
         uninterrupted=step(first[0],first[1],b,.0001)
         with tempfile.TemporaryDirectory() as directory:

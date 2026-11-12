@@ -28,17 +28,20 @@ image=(modal.Image.debian_slim(python_version='3.12')
 
 
 def _verify_source(source_sha):
-    from model.train.modal_burles_latent_fno import _source_tree_sha256
-    if _source_tree_sha256(ROOT)!=source_sha:raise ValueError('Uploaded source hash mismatch')
+    from vpml.io.serialization import source_tree_digest
+    if source_tree_digest(ROOT)!=source_sha:raise ValueError('Uploaded source hash mismatch')
 
 
 @app.function(image=image,cpu=2,memory=4096,timeout=600,
     volumes={'/mnt/new':volume,'/mnt/old':old},max_containers=1)
 def prepare(source_sha):
-    from model.train.wavenumber_data import build_five_epoch_manifest,write_new_json
-    from model.train.interface_flux_data import sha256_file
+    from vpml.datasets.wavenumber import (
+        build_five_epoch_manifest,
+        write_new_json,
+    )
+    from vpml.io.serialization import file_digest
     _verify_source(source_sha)
-    if sha256_file(NORMALIZATION)!=NORMALIZATION_SHA:raise ValueError('Normalization mismatch')
+    if file_digest(NORMALIZATION)!=NORMALIZATION_SHA:raise ValueError('Normalization mismatch')
     original=json.loads((CACHE/'ic_manifest.json').read_text())
     manifest=build_five_epoch_manifest(original)
     OUT.mkdir(parents=True,exist_ok=True)
@@ -59,8 +62,8 @@ def prepare(source_sha):
     volumes={'/mnt/new':volume},max_containers=1)
 def profile(source_sha):
     import jax,numpy as np
-    from model.train.wavenumber_reference import reference_kernel
-    from model.train.wavenumber_data import write_new_json
+    from vpml.datasets.wavenumber_reference import reference_kernel
+    from vpml.datasets.wavenumber import write_new_json
     _verify_source(source_sha)
     manifest=json.loads((OUT/'manifest.json').read_text())
     case=next(c for c in manifest['cases'] if c['split']=='train' and c['regime']=='nonlinear_landau_strong')
@@ -85,7 +88,7 @@ def profile(source_sha):
     volumes={'/mnt/new':volume},max_containers=2,retries=0)
 def reference_case(source_sha,case_id,fast):
     import jax
-    from model.train.wavenumber_reference import generate_reference_resumable
+    from vpml.datasets.wavenumber_reference import generate_reference_resumable
     _verify_source(source_sha)
     if jax.default_backend()!='gpu':raise RuntimeError('GPU reference required')
     manifest=json.loads((OUT/'manifest.json').read_text())
@@ -106,9 +109,15 @@ def reference_case(source_sha,case_id,fast):
 def train_chunk(source_sha,stop_epoch,max_updates=50):
     import numpy as np,jax
     from dataclasses import asdict
-    from model.train.wavenumber_training import (Configuration,load_stats,
-        train_segment,tree_hash,initialize,load_snapshot)
-    from model.train.interface_flux_data import sha256_json
+    from vpml.training.wavenumber_training import (
+        Configuration,
+        load_stats,
+        train_segment,
+        tree_hash,
+        initialize,
+        load_snapshot,
+    )
+    from vpml.io.serialization import json_digest
     _verify_source(source_sha)
     if jax.default_backend()!='gpu':raise RuntimeError('GPU training required')
     manifest=json.loads((OUT/'manifest.json').read_text())
@@ -135,10 +144,17 @@ def train_chunk(source_sha,stop_epoch,max_updates=50):
 def evaluate_epoch(source_sha,epoch):
     import numpy as np,jax
     from dataclasses import asdict
-    from model.train.wavenumber_training import (Configuration,load_stats,initialize,
-        tree_hash,load_snapshot,loss_factory,batch_from_states)
-    from model.train.wavenumber_evaluation import evaluate
-    from model.train.interface_flux_data import sha256_json
+    from vpml.training.wavenumber_training import (
+        Configuration,
+        load_stats,
+        initialize,
+        tree_hash,
+        load_snapshot,
+        loss_factory,
+        batch_from_states,
+    )
+    from vpml.training.wavenumber_evaluation import evaluate
+    from vpml.io.serialization import json_digest
     _verify_source(source_sha)
     manifest=json.loads((OUT/'manifest.json').read_text())
     config=Configuration();stats=load_stats(NORMALIZATION)
@@ -153,7 +169,7 @@ def evaluate_epoch(source_sha,epoch):
         wanted=epoch*592
         match=next((p for p in candidates if p.stem==f'state_{wanted:08d}'),None)
         if match is None:raise FileNotFoundError(f'No snapshot for epoch {epoch}, update {wanted}')
-        params,_,_,_=load_snapshot(match,sha256_json(protocol))
+        params,_,_,_=load_snapshot(match,json_digest(protocol))
     destination=OUT/'evaluation'/f'epoch_{epoch:04d}'
     report=evaluate(params,manifest,states,stats,config,destination)
     loss=jax.jit(loss_factory(config,stats))

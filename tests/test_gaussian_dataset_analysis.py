@@ -5,9 +5,13 @@ import unittest
 
 import numpy as np
 
-from scripts.analyze_gaussian_dataset import (
-    common_standardization, effective_rank, history_features, spatial_features,
-    primary_cases, refinement_comparisons,
+from vpml.diagnostics.gaussian_dataset import (
+    common_standardization,
+    effective_rank,
+    history_features,
+    spatial_features,
+    primary_cases,
+    refinement_comparisons,
     common_spectral_band_errors,
 )
 

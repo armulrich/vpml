@@ -1,6 +1,12 @@
-"""Classify nonfinite autonomous cases at saved epochs without changing training."""
+"""Evaluate saved E5 epochs with their exact preserved training source.
+
+VPML_FROZEN_SOURCE can select the original run's frozen_source directory. The
+archive-specific model.train imports below belong to that snapshot, not the
+maintained package; its pinned source identity must match before any upload.
+"""
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 import modal
 
@@ -10,13 +16,23 @@ OUT=Path('/mnt/new')/NAME
 OLD=Path('/mnt/old')
 NORMALIZATION=OLD/'runs/history_fno_random1729_full_anchor_E1000/training/epoch000_low_moment_closure.npz'
 SOURCE='ad8cabb58635341993b24385b550f950f6d7398c69c7193b50ea820c4b19e88e'
+FROZEN=Path(os.environ.get('VPML_FROZEN_SOURCE', str(
+    Path('/Users/armin/Documents/NYU/vpml/out_bench')/NAME/'frozen_source'))).resolve()
+if modal.is_local():
+    from vpml.io.serialization import source_tree_digest
+    if not all((FROZEN/package).is_dir() for package in ('model', 'vpml')):
+        raise FileNotFoundError(
+            f'Missing preserved model/ and vpml/ source at {FROZEN}; '
+            'set VPML_FROZEN_SOURCE to the original E5 frozen_source directory')
+    if source_tree_digest(FROZEN) != SOURCE:
+        raise ValueError('Preserved E5 source does not match its pinned training identity')
 app=modal.App('vpml-wavenumber-e5-robust-evaluation')
 volume=modal.Volume.from_name('vpml-wavenumber-generalization-v2-20260925',create_if_missing=False,version=2)
 old=modal.Volume.from_name('vpml-low-moment-burles',create_if_missing=False)
 image=(modal.Image.debian_slim(python_version='3.12')
     .pip_install('jax[cuda13]==0.10.0','numpy==2.4.4','matplotlib==3.10.9','scipy')
-    .add_local_dir('src/vpml',str(ROOT/'vpml'),copy=True)
-    .add_local_dir('model',str(ROOT/'model'),copy=True)
+    .add_local_dir(str(FROZEN/'vpml'),str(ROOT/'vpml'),copy=True)
+    .add_local_dir(str(FROZEN/'model'),str(ROOT/'model'),copy=True)
     .env({'PYTHONPATH':str(ROOT),'VPML_JAX_BACKEND':'gpu','PYTHONUNBUFFERED':'1'}))
 
 

@@ -80,6 +80,7 @@ def main():
         fig.savefig(out/'training_validation_updates.png', dpi=180); plt.close(fig)
     # Each batch mean is weighted by its number of windows, including the final short batch.
     manifest = json.loads((root/'manifest.json').read_text())
+    # Batch ordering belongs to this run's preserved source, including its old module paths.
     sys.path.insert(0, str(root/'frozen_source'))
     from model.train.wavenumber_data import epoch_batches
     batch_sizes = np.asarray([len(b) for b in epoch_batches(manifest, 1, protocol['config']['seed'])])

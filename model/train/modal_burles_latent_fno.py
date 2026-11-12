@@ -61,7 +61,7 @@ def latent_train_arguments(
     arguments = [
         sys.executable,
         "-m",
-        "model.train.low_moment_closure",
+        "vpml.training.low_moment_train",
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",
@@ -144,7 +144,7 @@ def evaluation_arguments(
     return [
         sys.executable,
         "-m",
-        "model.train.low_moment_closure",
+        "vpml.training.low_moment_train",
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",

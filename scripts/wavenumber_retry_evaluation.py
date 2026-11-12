@@ -1,6 +1,8 @@
 """Shared robust autonomous evaluation for the detached-preparation control.
 
 Numerical evaluation body preserved from evaluate_wavenumber_e5.py.
+This file is frozen into a run's setup and imports that run's original
+model.train modules. Keep those archive-specific paths and numerical behavior.
 """
 from pathlib import Path
 import json

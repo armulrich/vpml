@@ -8,50 +8,66 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from model.diagnostics.low_moment_resonance_identifiability import (
-    mode_bounce_exposure,
-)
-from model.train.low_moment_closure import (
-    _adam_init,
+from vpml.diagnostics.low_moment_resonance_identifiability import mode_bounce_exposure
+from vpml.training.optimization import (
+    adam_init,
     _adam_step,
-    _block_relative_sample_loss,
     _cosine_learning_rate,
+)
+from vpml.training.low_moment_losses import (
+    _block_relative_sample_loss,
+    make_loss_function,
+    make_continuous_chunk_loss_function,
+)
+from vpml.training.low_moment_evaluation import (
     _electric_field_energy,
-    _gather_coefficients,
     _interpolate_time_series,
-    _load_training_state,
+)
+from vpml.training.low_moment_data import (
+    _gather_coefficients,
     _load_or_build_primitive_target_cache,
     _primitive_numpy,
+    low_hermite_coefficients_to_conservative,
+)
+from vpml.training.low_moment_state import (
+    _load_training_state,
     _save_training_state,
+)
+from vpml.training.low_moment_sampling import (
     build_balanced_random_window_epoch,
     build_balanced_full_anchor_epoch,
     build_complete_trajectory_case_batches,
     build_diagnostic_panel,
     limit_training_anchors,
-    low_hermite_coefficients_to_conservative,
-    make_loss_function,
-    make_continuous_chunk_loss_function,
-    parse_horizon_curriculum,
-    parse_train_case_limits,
     sample_complete_trajectory_batch,
     sample_batch,
 )
-from vpml.low_moment import (
-    DYNAMIC_INPUT_SCALING,
+from vpml.training.low_moment_configuration import (
+    parse_horizon_curriculum,
+    parse_train_case_limits,
+)
+from vpml.models.moment_features import DYNAMIC_INPUT_SCALING
+from vpml.solvers.moments import (
     _dealias,
-    _causal_temporal_convolution,
     electric_field_from_density,
+    low_moment_rhs,
+    low_moment_rk4_step,
+    primitive_fields,
+    spectral_derivative,
+)
+from vpml.models.spectral_layers import _causal_temporal_convolution
+from vpml.models.moment_closures import (
     explicit_window_closure_step,
+    spectral_memory_closure_step,
+)
+from vpml.models.moment_parameters import (
     init_burles_latent_fno_params,
     init_causal_spacetime_operator_params,
     init_explicit_window_params,
     init_spectral_memory_params,
     init_window_fno_params,
-    low_moment_rhs,
-    low_moment_rk4_step,
-    primitive_fields,
-    spectral_derivative,
-    spectral_memory_closure_step,
+)
+from vpml.solvers.moment_rollout import (
     rollout_explicit_window_closure,
     rollout_burles_latent_closure,
 )
@@ -354,7 +370,7 @@ class LowMomentClosureTests(unittest.TestCase):
         updated, _, grad_norm, raw_update_norm, update_scale = _adam_step(
             params,
             grads,
-            _adam_init(params),
+            adam_init(params),
             learning_rate=0.1,
             grad_clip=10.0,
             update_norm_cap=0.01,

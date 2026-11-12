@@ -56,7 +56,7 @@ def history_train_arguments(stop_epoch: int) -> list[str]:
     arguments = [
         sys.executable,
         "-m",
-        "model.train.low_moment_closure",
+        "vpml.training.low_moment_train",
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",
@@ -135,7 +135,7 @@ def evaluation_arguments(epoch: int) -> list[str]:
     return [
         sys.executable,
         "-m",
-        "model.train.low_moment_closure",
+        "vpml.training.low_moment_train",
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",

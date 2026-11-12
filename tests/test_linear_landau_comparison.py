@@ -2,7 +2,10 @@ import unittest
 
 import numpy as np
 
-from scripts.linear_landau_comparison import fields, solve_modes
+from vpml.diagnostics.linear_landau_comparison import (
+    fields,
+    solve_modes,
+)
 
 
 class LinearLandauComparisonTests(unittest.TestCase):

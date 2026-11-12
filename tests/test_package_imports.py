@@ -25,7 +25,7 @@ assert len(json_digest({'test': 1})) == 64
 
     def test_public_solver_names_keep_their_implementations(self):
         import vpml
-        from vpml.physical_grid import PhysicalGridVlasovPoissonConfig
+        from vpml.solvers.physical_grid import PhysicalGridVlasovPoissonConfig
         self.assertIs(vpml.PhysicalGridVlasovPoissonConfig, PhysicalGridVlasovPoissonConfig)
         self.assertIn("FourierHermiteIMEX", dir(vpml))
         with self.assertRaises(AttributeError):

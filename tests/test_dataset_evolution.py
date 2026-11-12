@@ -8,7 +8,7 @@ import numpy as np
 from vpml.datasets.evolution import ReferenceEvolution
 from vpml.datasets.initial_conditions import draw_coefficients
 from vpml.datasets.manifest import Numerics
-from vpml.physical_grid import semilagrangian_vlasov_poisson_step
+from vpml.solvers.physical_grid import semilagrangian_vlasov_poisson_step
 
 
 AMPLITUDES = {"density": 0.18, "velocity": 0.25, "temperature": 0.10}

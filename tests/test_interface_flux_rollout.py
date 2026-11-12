@@ -7,11 +7,42 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import vpml.training.interface_train as trainer
-from vpml.core import (
-    FourierHermiteIMEX,
-    LearnedInterfaceClosure,
-    learned_interface_q_hat,
+from vpml.models.interface_closure import init_interface_closure_params
+from vpml.training.interface_configuration import (
+    CANONICAL_REGIMES,
+    INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
+    INTERFACE_FLUX_ROLLOUT_OBJECTIVE,
+    INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
+    build_arg_parser,
+    interface_flux_rollout_coeff_key,
+    REGIME_LINEAR,
+    CANONICAL_NV_TARGETS,
+)
+from vpml.training.interface_reference import restrict_rfft_coefficients_to_grid
+from vpml.training.interface_data import (
+    build_interface_flux_rollout_qpair_dataset,
+    interface_flux_rollout_regime_loss_stds,
+)
+from vpml.training.interface_losses import (
+    interface_flux_rollout_loss_for_anchor_batch,
+    make_interface_flux_rollout_batch_loss,
+)
+from vpml.training.interface_sampling import (
+    translate_interface_flux_rollout_anchor_batch,
+    prepare_interface_flux_rollout_sampling_state,
+    sample_interface_flux_rollout_regime_batch,
+    interface_flux_cutoff_for_step,
+)
+from vpml.training.interface_state import (
+    _derived_statistics_path,
+    _save_derived_statistics,
+    _load_derived_statistics,
+    _load_init_checkpoint_for_interface_closure,
+)
+from vpml.solvers.hermite import FourierHermiteIMEX
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.models.interface_inference import learned_interface_q_hat
+from vpml.models.interface_checkpoint import (
     load_learned_interface_closure_npz,
     save_learned_interface_closure_npz,
 )
@@ -21,7 +52,7 @@ jax.config.update("jax_enable_x64", True)
 
 
 def _zero_params(input_dim: int, hidden_width: int = 8):
-    params = trainer.init_interface_closure_params(
+    params = init_interface_closure_params(
         jax.random.PRNGKey(0),
         input_dim=input_dim,
         hidden_width=hidden_width,
@@ -48,7 +79,7 @@ def _closure(*, params=None, centered: bool = True) -> LearnedInterfaceClosure:
         complex_normalization_mode="phase_isotropic",
         translation_augmented=True,
         Nv_targets=(4,),
-        train_regimes=trainer.CANONICAL_REGIMES,
+        train_regimes=CANONICAL_REGIMES,
         teacher_backend="grid_cubic_spline",
         teacher_Lx=4.0 * math.pi,
         teacher_Nx=4,
@@ -59,16 +90,16 @@ def _closure(*, params=None, centered: bool = True) -> LearnedInterfaceClosure:
         teacher_dt=0.05,
         teacher_proj_Nv=5,
         projection_quadrature_Nv=64,
-        training_mode=trainer.INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
-        train_objective=trainer.INTERFACE_FLUX_ROLLOUT_OBJECTIVE,
+        training_mode=INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
+        train_objective=INTERFACE_FLUX_ROLLOUT_OBJECTIVE,
         rollout_horizon=1,
-        loss_backend=trainer.INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
+        loss_backend=INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
     )
 
 
 class InterfaceFluxRolloutTests(unittest.TestCase):
     def test_canonical_parser_does_not_expose_trainer_switches(self) -> None:
-        parser = trainer.build_arg_parser()
+        parser = build_arg_parser()
         option_names = {flag for action in parser._actions for flag in action.option_strings}
         self.assertNotIn("--training-mode", option_names)
         self.assertNotIn("--train-objective", option_names)
@@ -93,7 +124,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             - 0.3 * np.sin(2.0 * target_x)
             + 0.1 * np.cos(4.0 * target_x)
         )
-        restricted = trainer.restrict_rfft_coefficients_to_grid(
+        restricted = restrict_rfft_coefficients_to_grid(
             np.fft.rfft(source_signal),
             source_Nx=source_nx,
             target_Nx=target_nx,
@@ -107,8 +138,8 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
 
     def test_cutoff_cycle_is_per_optimizer_step(self) -> None:
         observed = [
-            trainer.interface_flux_cutoff_for_step(
-                trainer.CANONICAL_NV_TARGETS,
+            interface_flux_cutoff_for_step(
+                CANONICAL_NV_TARGETS,
                 step,
             )
             for step in range(8)
@@ -117,12 +148,12 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
 
     def test_whole_trajectory_split_never_mixes_time_windows(self) -> None:
         max_projection_order = 4
-        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
         coeff_history = np.zeros((2, 5, max_projection_order + 1, 3), dtype=np.complex128)
         coeff_history[:, :, 3:, 1:] = 0.25 + 0.1j
-        dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
+        dataset, _ = build_interface_flux_rollout_qpair_dataset(
             {
-                trainer.REGIME_LINEAR: {
+                REGIME_LINEAR: {
                     coeff_key: coeff_history,
                     "case_splits": np.array(["train", "heldout"]),
                 }
@@ -137,7 +168,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             n_low=2,
             context_mode="none",
         )
-        linear = dataset[trainer.REGIME_LINEAR]
+        linear = dataset[REGIME_LINEAR]
         np.testing.assert_array_equal(
             linear["train_anchor_time_indices"],
             np.array([0, 2, 4], dtype=np.int32),
@@ -175,7 +206,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             learned,
             a_hat_prev=anchors[0, 1],
         )
-        loss = trainer.interface_flux_rollout_loss_for_anchor_batch(
+        loss = interface_flux_rollout_loss_for_anchor_batch(
             anchors,
             direct[None, None, :],
             jnp.zeros((1,), dtype=jnp.int32),
@@ -193,8 +224,8 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             "target_mean": np.zeros((2,), dtype=np.float64),
             "target_std": np.ones((2,), dtype=np.float64),
         }
-        loss_fn, _ = trainer.make_interface_flux_rollout_batch_loss(
-            regime_weights={regime: 1.0 for regime in trainer.CANONICAL_REGIMES},
+        loss_fn, _ = make_interface_flux_rollout_batch_loss(
+            regime_weights={regime: 1.0 for regime in CANONICAL_REGIMES},
             Nm=1,
             k_scale=1.0,
             nv_scale=4.0,
@@ -202,7 +233,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             hidden_width=8,
             res_blocks=0,
             Nv_targets=(4,),
-            train_regimes=trainer.CANONICAL_REGIMES,
+            train_regimes=CANONICAL_REGIMES,
             teacher_backend="grid_cubic_spline",
             teacher_Lx=4.0 * math.pi,
             teacher_Nx=4,
@@ -218,14 +249,14 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             poisson_sign=1.0,
             rollout_dealias_23=False,
             regime_q_loss_stds={
-                regime: 1.0 for regime in trainer.CANONICAL_REGIMES
+                regime: 1.0 for regime in CANONICAL_REGIMES
             },
             equilibrium_centered=True,
             complex_normalization_mode="phase_isotropic",
             translation_augmented=True,
         )
         batches = {}
-        for amplitude, regime in zip((1.0, 2.0, 3.0), trainer.CANONICAL_REGIMES):
+        for amplitude, regime in zip((1.0, 2.0, 3.0), CANONICAL_REGIMES):
             reference = np.full((1, 1, 3), amplitude + 0.0j, dtype=np.complex128)
             reference[..., 0] = 1e6
             batches[regime] = {
@@ -264,7 +295,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         k_arr = np.arange(5, dtype=np.float64) * 0.5
         shifts = np.array([0.3, 1.1], dtype=np.float64)
         translated_stencils, translated_targets = (
-            trainer.translate_interface_flux_rollout_anchor_batch(
+            translate_interface_flux_rollout_anchor_batch(
                 stencils,
                 targets,
                 k_arr=k_arr,
@@ -284,18 +315,18 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
     def test_sharded_and_stacked_sampling_are_identical(self) -> None:
         rng = np.random.default_rng(31)
         max_projection_order = 4
-        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
         histories = (
             rng.normal(size=(2, 8, max_projection_order + 1, 5))
             + 1j * rng.normal(size=(2, 8, max_projection_order + 1, 5))
         ).astype(np.complex64)
         reference_stacked = {
-            trainer.REGIME_LINEAR: {
+            REGIME_LINEAR: {
                 coeff_key: histories,
                 "case_splits": np.array(["train", "train"]),
             }
         }
-        dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
+        dataset, _ = build_interface_flux_rollout_qpair_dataset(
             reference_stacked,
             max_projection_order=max_projection_order,
             Nv_targets=(4,),
@@ -308,19 +339,19 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             context_mode="none",
         )
         reference_sharded = {
-            trainer.REGIME_LINEAR: {
+            REGIME_LINEAR: {
                 coeff_key: tuple(histories[index] for index in range(2)),
                 "case_splits": np.array(["train", "train"]),
             }
         }
-        stacked_state = trainer.prepare_interface_flux_rollout_sampling_state(
+        stacked_state = prepare_interface_flux_rollout_sampling_state(
             reference_stacked,
             dataset,
             max_projection_order=max_projection_order,
             target_nvs=(4,),
             history_dtype=np.complex64,
         )
-        sharded_state = trainer.prepare_interface_flux_rollout_sampling_state(
+        sharded_state = prepare_interface_flux_rollout_sampling_state(
             reference_sharded,
             dataset,
             max_projection_order=max_projection_order,
@@ -329,7 +360,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         )
         selected = np.array([0, 3, 7, 10], dtype=np.int32)
         kwargs = {
-            "regime": trainer.REGIME_LINEAR,
+            "regime": REGIME_LINEAR,
             "target_nv": 4,
             "rollout_horizon": 2,
             "batch_size": 4,
@@ -338,12 +369,12 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             "all_k_loss": True,
             "selected_indices": selected,
         }
-        stacked_batch = trainer.sample_interface_flux_rollout_regime_batch(
+        stacked_batch = sample_interface_flux_rollout_regime_batch(
             stacked_state,
             rng=np.random.default_rng(37),
             **kwargs,
         )
-        sharded_batch = trainer.sample_interface_flux_rollout_regime_batch(
+        sharded_batch = sample_interface_flux_rollout_regime_batch(
             sharded_state,
             rng=np.random.default_rng(37),
             **kwargs,
@@ -356,7 +387,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
 
     def test_sampling_restricts_cached_teacher_to_rollout_grid(self) -> None:
         max_projection_order = 4
-        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
         source_nx = 8
         rollout_nx = 4
         history = np.zeros(
@@ -365,13 +396,13 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         )
         history[0, :, :, 1] = 4.0 + 2.0j
         reference = {
-            trainer.REGIME_LINEAR: {
+            REGIME_LINEAR: {
                 coeff_key: history,
                 "case_splits": np.array(["train"]),
             }
         }
         k_arr = np.array([0.0, 0.5, 1.0], dtype=np.float64)
-        dataset, _ = trainer.build_interface_flux_rollout_qpair_dataset(
+        dataset, _ = build_interface_flux_rollout_qpair_dataset(
             reference,
             max_projection_order=max_projection_order,
             Nv_targets=(4,),
@@ -385,7 +416,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             source_Nx=source_nx,
             rollout_Nx=rollout_nx,
         )
-        state = trainer.prepare_interface_flux_rollout_sampling_state(
+        state = prepare_interface_flux_rollout_sampling_state(
             reference,
             dataset,
             max_projection_order=max_projection_order,
@@ -395,9 +426,9 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             source_Nx=source_nx,
             rollout_Nx=rollout_nx,
         )
-        batch = trainer.sample_interface_flux_rollout_regime_batch(
+        batch = sample_interface_flux_rollout_regime_batch(
             state,
-            regime=trainer.REGIME_LINEAR,
+            regime=REGIME_LINEAR,
             target_nv=4,
             rollout_horizon=2,
             batch_size=1,
@@ -417,7 +448,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
     def test_training_statistics_ignore_unretained_teacher_modes(self) -> None:
         rng = np.random.default_rng(17)
         max_projection_order = 4
-        coeff_key = trainer.interface_flux_rollout_coeff_key(max_projection_order)
+        coeff_key = interface_flux_rollout_coeff_key(max_projection_order)
         source_nx = 8
         rollout_nx = 4
         base = (
@@ -447,9 +478,9 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         }
 
         def build(history):
-            return trainer.build_interface_flux_rollout_qpair_dataset(
+            return build_interface_flux_rollout_qpair_dataset(
                 {
-                    trainer.REGIME_LINEAR: {
+                    REGIME_LINEAR: {
                         coeff_key: history,
                         "case_splits": np.array(["train"]),
                     }
@@ -463,9 +494,9 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         self.assertIsNotNone(stats_changed)
         for key in stats_base:
             np.testing.assert_allclose(stats_changed[key], stats_base[key])
-        scales_base = trainer.interface_flux_rollout_regime_loss_stds(
+        scales_base = interface_flux_rollout_regime_loss_stds(
             {
-                trainer.REGIME_LINEAR: {
+                REGIME_LINEAR: {
                     coeff_key: base,
                     "case_splits": np.array(["train"]),
                 }
@@ -478,9 +509,9 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             source_Nx=source_nx,
             rollout_Nx=rollout_nx,
         )
-        scales_changed = trainer.interface_flux_rollout_regime_loss_stds(
+        scales_changed = interface_flux_rollout_regime_loss_stds(
             {
-                trainer.REGIME_LINEAR: {
+                REGIME_LINEAR: {
                     coeff_key: changed,
                     "case_splits": np.array(["train"]),
                 }
@@ -516,7 +547,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             loaded = load_learned_interface_closure_npz(canonical_path)
             self.assertEqual(
                 loaded.loss_backend,
-                trainer.INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
+                INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
             )
             self.assertEqual(loaded.projection_quadrature_Nv, 64)
             self.assertEqual(loaded.rollout_Nx, 4)
@@ -540,7 +571,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             adapted = load_learned_interface_closure_npz(legacy_path)
             self.assertEqual(
                 adapted.training_mode,
-                trainer.INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
+                INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
             )
             np.testing.assert_allclose(
                 np.asarray(learned_interface_q_hat(state, k_arr, 4, adapted)),
@@ -556,16 +587,16 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
         }
         scales = {
             regime: float(index + 1)
-            for index, regime in enumerate(trainer.CANONICAL_REGIMES)
+            for index, regime in enumerate(CANONICAL_REGIMES)
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "derived" / "stats.npz"
-            trainer._save_derived_statistics(
+            _save_derived_statistics(
                 path,
                 stats=stats,
                 regime_loss_stds=scales,
             )
-            loaded = trainer._load_derived_statistics(path)
+            loaded = _load_derived_statistics(path)
             self.assertIsNotNone(loaded)
             loaded_stats, loaded_scales = loaded
             for key in stats:
@@ -582,10 +613,10 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             "k_scale": 64.0,
             "nv_scale": 64.0,
         }
-        first = trainer._derived_statistics_path(
+        first = _derived_statistics_path(
             Path("cache"), rollout_Nx=256, **common
         )
-        second = trainer._derived_statistics_path(
+        second = _derived_statistics_path(
             Path("cache"), rollout_Nx=1024, **common
         )
         self.assertNotEqual(first, second)
@@ -601,7 +632,7 @@ class InterfaceFluxRolloutTests(unittest.TestCase):
             path = Path(tmp) / "checkpoint.npz"
             save_learned_interface_closure_npz(path, learned)
             with self.assertRaisesRegex(ValueError, "IC manifest"):
-                trainer._load_init_checkpoint_for_interface_closure(
+                _load_init_checkpoint_for_interface_closure(
                     path,
                     Nm=1,
                     hidden_width=8,
