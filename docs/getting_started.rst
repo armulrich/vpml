@@ -14,8 +14,9 @@ root, create an environment and install the package:
    python -m pip install -e .
 
 The package depends on JAX, NumPy, SciPy and Matplotlib. The editable install
-uses the source in the checkout. Keep that source fixed while producing a
-dataset or continuing a saved computation.
+uses the source in the checkout. Keep that source fixed for each dataset
+worker. Continuing an existing dataset after a reviewed source
+refactor requires the explicit transition described in :doc:`datasets`.
 
 For Delta, use the pinned Linux CUDA environment described in :doc:`delta`
 instead of assuming that a local CPU environment will work on the cluster.
@@ -67,6 +68,18 @@ Run a benchmark
 This command performs a numerical calculation and writes figures and metrics
 under the chosen output directory. Command-specific options are available
 through ``--help``.
+
+Import numerical interfaces directly from their owning modules:
+
+.. code-block:: python
+
+   from vpml.solvers.hermite import FourierHermiteIMEX
+   from vpml.solvers.physical_grid import PhysicalGridVlasovPoissonConfig
+   from vpml.models.interface_checkpoint import load_learned_interface_closure_npz
+
+Use installed ``python -m vpml...`` commands for package workflows. The
+retained shell scripts and experiment controllers described in :doc:`workflows`
+configure or coordinate those workflows.
 
 The complete initial-field example is ``examples/gaussian_initial_fields.py``.
 It constructs one distribution without evolving it or writing run outputs.

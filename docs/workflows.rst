@@ -41,7 +41,7 @@ entry point before preparing training inputs:
    * - History or persistent-memory low-moment FNO
      - ``python -m vpml.training.low_moment_train --help``
 
-For the interface closure, the maintained shell wrapper configures the solver,
+For the interface closure, the maintained workflow script configures the solver,
 reference cache, training and evaluation:
 
 .. code-block:: bash
@@ -51,8 +51,8 @@ reference cache, training and evaluation:
 The low-moment option ``--memory-backend burles_latent_fno`` supports a history-only
 model with ``--latent-memory-dim 0`` or persistent memory with
 ``--latent-memory-dim 6``. Its expected inputs are defined by the trainer;
-the Gaussian ``gaussian-fields-v1`` outputs are not interchangeable with an
-older ``states.npy`` array.
+the Gaussian ``gaussian-moments`` and historical ``gaussian-fields-v1`` outputs
+are not interchangeable with an older ``states.npy`` array.
 
 The retained Modal launchers reproduce their own fixed configurations. They
 require the referenced cache and Modal authentication before use. Staging
@@ -69,7 +69,14 @@ These are distinct operations:
 The latent-model counterpart is
 ``model/train/run_modal_burles_latent_fno_E20.sh``. These launchers resume their
 recorded lineage; changing a scientific setting requires a new configuration
-and output location. Delta reference generation does not start training.
+and output location. Keep their archived source snapshots available: a
+maintained package refactor does not replace a frozen experiment's code.
+Delta reference generation does not start training.
+
+For Python integrations, import model implementations from ``vpml.models``,
+rollouts from ``vpml.solvers`` and reusable training functions from their
+owning ``vpml.training`` modules. The trainer entry points expose their command
+interfaces; they are not aggregate import locations for shared helpers.
 
 Resolution diagnostics
 ----------------------

@@ -5,11 +5,21 @@ Code and outputs
 ----------------
 
 Numerical algorithms live in ``src/vpml``. The installed package contains
-solvers, models, training, datasets, diagnostics and evaluation. Root-level
-``model`` and ``benchmarks`` modules are compatibility entry points only. Dataset modules separate
-initial conditions, manifests, observations, evolution, diagnostics,
-checkpoints and execution. CLI and scheduler wrappers call these interfaces;
-they do not implement a second numerical solver.
+solvers, models, training, datasets, diagnostics and evaluation. Import reusable
+functions from their owning modules, such as ``vpml.solvers.hermite``,
+``vpml.models.interface_checkpoint`` and ``vpml.training.low_moment_data``.
+Training entry points contain workflow orchestration; shared helpers belong in
+the corresponding configuration, data, loss, state or optimization module.
+The package root retains its lazy public API without loading a numerical
+backend for metadata-only commands.
+
+The retained files under ``model/train``, ``model/diagnostics``, ``benchmarks``
+and ``scripts`` implement experiment controllers, launch procedures and saved-run
+analysis. Their shell commands call installed ``vpml`` modules. Preserve a
+frozen experiment's recorded source and configuration when continuing it.
+Dataset modules separate initial conditions, manifests, observations,
+evolution, diagnostics, checkpoints and execution. CLI and scheduler code call
+these interfaces without implementing a second numerical solver.
 
 Keep source code, tests, input parameter files and dependency locks in version
 control. Generated manifests, provenance, progress, logs, metrics, checkpoints

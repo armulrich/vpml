@@ -54,7 +54,8 @@ Preparation records actual coefficients and validated identities in a manifest:
 
 These commands perform no trajectory evolution. Reusing a path with different
 parameters is rejected. Keep the manifest and source fixed for all workers
-that contribute to a dataset. :doc:`delta` describes execution on allocated
+that contribute to a dataset, except for the explicitly reviewed source
+transitions described below. :doc:`delta` describes execution on allocated
 compute resources; the underlying Python runner also supports CPU execution.
 ``python -m vpml.cli.gaussian_dataset`` provides the same command interface.
 
@@ -157,6 +158,70 @@ upgraded; use their recorded code revision for continuation.
 Output precision and checkpoint cadence are also part of the frozen protocol.
 Changing ``storage_dtype`` or ``block_steps`` requires a separate dataset;
 comparison between such datasets does not permit resuming with changed settings.
+
+Continuing after a source refactor
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An explicit source-transition record supports reviewed changes to package
+entry points, provenance and execution code while keeping the numerical
+dependencies unchanged. It binds the exact previous and current source hashes,
+every changed dependency file and the manifest hash. The supported review
+boundary is ``vpml/__init__.py``, ``vpml/datasets/runner.py``,
+``vpml/datasets/provenance.py`` and ``vpml/datasets/continuation.py``. Numerical
+kernel, schema and storage files remain byte-for-byte unchanged. Review of
+the listed control files must confirm that numerical behavior and runtime
+initialization are preserved. The record documents that review; it does not
+establish numerical equivalence.
+
+Use the new fixed checkout to prepare a record against the existing reference
+directory. For a refactor that changes all four reviewable files:
+
+.. code-block:: bash
+
+   python -m vpml.cli.gaussian_dataset prepare-continuation \
+     --out /dataset/reference \
+     --transition /dataset/source-transition.json \
+     --allow-source-change vpml/__init__.py \
+     --allow-source-change vpml/datasets/runner.py \
+     --allow-source-change vpml/datasets/provenance.py \
+     --allow-source-change vpml/datasets/continuation.py \
+     --reason "Reviewed import and execution refactor; numerical dependencies unchanged"
+
+The repeated ``--allow-source-change`` options must name exactly the observed
+changes. A changed protected file is rejected. If more than one previous source
+identity occurs in the dataset, select the intended original identity with
+``--from-source-sha256``. Preparation writes the immutable transition record
+without evolving trajectories or rewriting existing dataset records.
+The command prints the record's canonical digest in its ``sha256`` field.
+Retain it with the record; an ordinary checksum
+of the JSON file is not this canonical digest.
+
+Validate the record, then supply the same file when continuing on resources
+already allocated for the chosen backend:
+
+.. code-block:: bash
+
+   python -m vpml.cli.gaussian_dataset validate \
+     --manifest /dataset/manifest.json --out /dataset/reference \
+     --source-transition /dataset/source-transition.json \
+     --source-transition-sha256 "$SOURCE_TRANSITION_SHA256"
+   python -m vpml.cli.gaussian_dataset run \
+     --manifest /dataset/manifest.json --out /dataset/reference \
+     --source-transition /dataset/source-transition.json \
+     --source-transition-sha256 "$SOURCE_TRANSITION_SHA256" \
+     --backend gpu --max-seconds 3300 --stop-on-failure
+
+Set ``SOURCE_TRANSITION_SHA256`` to the digest printed during preparation.
+Passing it pins the reviewed record's contents as well as its path.
+
+The source transition leaves scientific settings and runtime checks in force.
+Original case protocols, observation blocks and provenance remain immutable;
+newly written arrays identify their actual source and the transition. Completed
+cases are verified and skipped, and partial cases resume from their last
+committed state in the same data directory. Keep the original staged checkout
+available alongside the new one. There is no temporary source exception or
+rewriting of old hashes to make a checkpoint acceptable. :doc:`delta` describes
+passing this record through the scheduler launcher.
 
 An exclusive case lock prevents two workers from writing the same case.
 Investigate the recorded owner before removing a stale lock; workers never

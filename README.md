@@ -42,6 +42,16 @@ The benchmark performs a calculation and writes its outputs under `out_bench`.
 Dataset preparation, validation, reference generation and model training are
 separate commands. See the corresponding guide before launching a workload.
 
+Python integrations import the owning package modules, for example
+`vpml.solvers.physical_grid`, `vpml.models.interface_checkpoint` or
+`vpml.training.low_moment_data`. Retained scripts under `model`, `benchmarks`
+and `scripts` coordinate experiments, scheduling and saved-run analysis.
+
+Existing Gaussian datasets resume from their verified checkpoints. A reviewed
+source refactor requires an explicit source transition while preserving the
+original manifest, protocols and provenance; see
+[continuation](docs/datasets.rst) and the [Delta guide](docs/delta.rst).
+
 ## Read the documentation
 
 The Sphinx site contains usage, numerical conventions and API documentation:
