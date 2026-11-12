@@ -13,16 +13,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from vpml.datasets.interface_flux import IC_SPLIT_HELDOUT, case_shard_paths
-from vpml.low_moment import (
+from vpml.solvers.moments import (
     DEFAULT_DENSITY_FLOOR,
-    DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
     DEFAULT_PRESSURE_FLOOR,
-    FIXED_INPUT_SCALING,
     electric_field_from_density,
-    encode_explicit_window_history,
-    rollout_low_moment_closure,
-    warm_spectral_memory,
 )
+from vpml.models.moment_features import (
+    DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
+    FIXED_INPUT_SCALING,
+    encode_explicit_window_history,
+)
+from vpml.solvers.moment_rollout import rollout_low_moment_closure, warm_spectral_memory
 from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,
     EarlyGrowthConfig,

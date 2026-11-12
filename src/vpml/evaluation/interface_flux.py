@@ -21,11 +21,9 @@ from vpml.nonlinear_landau import (
     NonlinearLandauParams,
     run_nonlinear_landau_rollout_raw,
 )
-from vpml.core import (
-    LearnedInterfaceClosure,
-    e_hat_history_from_a_hat_history,
-    load_learned_interface_closure_npz,
-)
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.solvers.hermite import e_hat_history_from_a_hat_history
+from vpml.models.interface_checkpoint import load_learned_interface_closure_npz
 from vpml.linear_landau import (
     LinearLandauConfig,
     run_linear_landau_rollout,

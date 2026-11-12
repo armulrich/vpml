@@ -12,12 +12,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from vpml.datasets.interface_flux import sha256_json
-from vpml.core import (
-    Array,
-    LearnedInterfaceClosure,
-    load_learned_interface_closure_npz,
-    normalize_teacher_backend_name,
-)
+from vpml.solvers.implicit import Array
+from vpml.models.interface_closure import LearnedInterfaceClosure, normalize_teacher_backend_name
+from vpml.models.interface_checkpoint import load_learned_interface_closure_npz
 from vpml.training.interface_configuration import (
     CANONICAL_NV_TARGETS,
     CANONICAL_REGIMES,

@@ -9,10 +9,9 @@ from typing import Dict, Mapping, Tuple
 
 import jax
 
-from vpml.low_moment import (
-    DEFAULT_DENSITY_FLOOR,
+from vpml.solvers.moments import DEFAULT_DENSITY_FLOOR, DEFAULT_PRESSURE_FLOOR
+from vpml.models.moment_features import (
     DEFAULT_NORMALIZED_HEAT_FLUX_BOUND,
-    DEFAULT_PRESSURE_FLOOR,
     DYNAMIC_INPUT_SCALING,
     FIXED_INPUT_SCALING,
     INPUT_SCALING_KINDS,

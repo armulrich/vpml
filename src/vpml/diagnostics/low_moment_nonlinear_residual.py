@@ -17,13 +17,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from vpml.datasets.interface_flux import load_ic_manifest
-from vpml.training.low_moment_train import (
-    REGIMES,
+from vpml.training.low_moment_configuration import REGIMES
+from vpml.training.low_moment_data import (
     _central_heat_flux_numpy,
-    _load_checkpoint,
     low_hermite_coefficients_to_conservative,
 )
-from vpml.low_moment import explicit_window_closure_step, low_moment_rhs, primitive_fields
+from vpml.training.low_moment_state import _load_checkpoint
+from vpml.models.moment_closures import explicit_window_closure_step
+from vpml.solvers.moments import low_moment_rhs, primitive_fields
 
 
 def _case_map(cache_dir: Path) -> tuple[dict[str, dict], dict]:

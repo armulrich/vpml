@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import os
-from pathlib import Path
 from typing import (
     Dict,
     Optional,
@@ -23,13 +21,13 @@ from vpml.datasets.interface_flux import (
     IC_SPLIT_TRAIN,
 )
 
-from vpml.core import (
-    Array,
-    FourierHermiteIMEX,
+from vpml.solvers.implicit import Array
+from vpml.solvers.hermite import FourierHermiteIMEX
+from vpml.models.interface_closure import (
     GRID_CUBIC_SPLINE_TEACHER_BACKEND,
     init_interface_closure_params,
-    save_learned_interface_closure_npz,
 )
+from vpml.models.interface_checkpoint import save_learned_interface_closure_npz
 from vpml.visualization.training import save_training_loss_plot
 
 try:
@@ -38,64 +36,26 @@ except Exception:
     pass
 
 
-# Compatibility exports; reusable implementations live in vpml.training.
 from vpml.training.interface_configuration import (
     build_arg_parser,
     validate_training_options,
-    REGIME_LINEAR,
-    REGIME_WEAK,
-    REGIME_STRONG,
-    ALL_REGIMES,
-    INTERFACE_FLUX_ROLLOUT_TRAINING_MODE,
-    INTERFACE_FLUX_ROLLOUT_OBJECTIVE,
-    INTERFACE_FLUX_ROLLOUT_LOSS_BACKEND,
-    INTERFACE_FLUX_PROJECTION_SCHEME,
-    EXACT_ROLLOUT_PRECISION_FLOAT64,
-    EXACT_ROLLOUT_PRECISION_FLOAT32,
-    ALL_EXACT_ROLLOUT_PRECISIONS,
-    EXACT_TARGET_SAMPLING_CYCLE,
     CANONICAL_NV_TARGETS,
     CANONICAL_REGIMES,
-    CANONICAL_METADATA_SCHEMA_VERSION,
     parse_float_tuple,
     interface_flux_rollout_coeff_key,
-    exact_rollout_precision_dtypes,
-    exact_rollout_numpy_complex_dtype,
-    exact_rollout_numpy_real_dtype,
 )
 from vpml.training.interface_reference import (
-    restrict_rfft_coefficients_to_grid,
-    maxwellian_equilibrium,
-    _projected_history_projector,
-    _run_landau_teacher_projected_history,
     build_interface_flux_rollout_reference_dataset,
     _reference_case_histories,
     _reference_case_splits,
 )
 from vpml.training.interface_data import (
-    append_pairs,
     build_interface_flux_rollout_qpair_dataset,
     interface_flux_rollout_regime_loss_stds,
-    build_model_inputs,
-    safe_feature_std,
     phase_isotropic_complex_training_stats,
 )
-from vpml.training.interface_sampling import (
-    prepare_interface_flux_rollout_sampling_state,
-    select_interface_flux_rollout_regime_indices,
-    translate_interface_flux_rollout_anchor_batch,
-    sample_interface_flux_rollout_regime_batch,
-    interface_flux_cutoff_for_step,
-)
-from vpml.training.interface_losses import (
-    _linear_explicit_n_hat_for_state,
-    _nonlinear_explicit_n_hat_for_state,
-    rollout_anchor_closure_flux_from_anchor_stencil,
-    interface_flux_rollout_loss_for_anchor_batch,
-    make_interface_flux_rollout_batch_loss,
-)
+from vpml.training.interface_losses import make_interface_flux_rollout_batch_loss
 from vpml.training.interface_state import (
-    cast_learned_closure_for_rollout,
     default_exact_k_scale,
     build_learned_interface_closure,
     _load_init_checkpoint_for_interface_closure,
@@ -103,15 +63,7 @@ from vpml.training.interface_state import (
     _load_derived_statistics,
     _save_derived_statistics,
 )
-from vpml.training.optimization import (
-    adam_init,
-    adam_step,
-    _tree_all_finite,
-)
-from vpml.training.interface_optimization import (
-    _format_train_loss_log,
-    train_with_interface_flux_rollout_minibatch_loss,
-)
+from vpml.training.interface_optimization import train_with_interface_flux_rollout_minibatch_loss
 from vpml.training.interface_evaluation import (
     evaluate_heldout_interface_flux_metrics,
     _canonical_metrics_payload,

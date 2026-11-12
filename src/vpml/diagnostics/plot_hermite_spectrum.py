@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 import numpy as np
 
-from vpml.core import hermite_basis_phi_scaled
+from vpml.solvers.hermite import hermite_basis_phi_scaled
 
 
 _COEFF_KEY_RE = re.compile(r"^(?P<regime>.+)_(?P<split>train|val)_a_hat_ref_nv(?P<nv>\d+)$")

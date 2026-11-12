@@ -8,13 +8,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vpml.core import (
-    Array,
-    FourierHermiteIMEX,
-    LearnedInterfaceClosure,
-    learned_boundary_flux_hat,
-    learned_interface_q_hat,
-)
+from vpml.solvers.implicit import Array
+from vpml.solvers.hermite import FourierHermiteIMEX
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.models.interface_inference import learned_boundary_flux_hat, learned_interface_q_hat
 from vpml.training.interface_configuration import (
     EXACT_ROLLOUT_PRECISION_FLOAT64,
     REGIME_LINEAR,

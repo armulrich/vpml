@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-from vpml.training.interface_train import (
+from vpml.training.interface_configuration import (
     CANONICAL_NV_TARGETS,
     INTERFACE_FLUX_PROJECTION_SCHEME,
 )

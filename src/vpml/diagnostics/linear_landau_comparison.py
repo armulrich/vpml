@@ -106,7 +106,7 @@ def spline_jvp_validation():
     from vpml.datasets.initial_conditions import DEFAULT_AMPLITUDES, draw_coefficients
     from vpml.datasets.manifest import Numerics
     from vpml.datasets.observations import moment_fields
-    from vpml.physical_grid import compute_electric_field_from_distribution
+    from vpml.solvers.physical_grid import compute_electric_field_from_distribution
     import jax.numpy as jnp
     numerical = Numerics(nx=64, nv=512, dt=.02, final_time=2.,
                          output_nx=64, save_dt=.1, block_steps=5)

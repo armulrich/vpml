@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
-from vpml.core import Array
+from vpml.solvers.implicit import Array
 
 
 def _cosine_learning_rate(
@@ -91,10 +91,6 @@ def _adam_step(
 def adam_init(params: Dict[str, Array]) -> Dict[str, object]:
     zeros = jax.tree_util.tree_map(jnp.zeros_like, params)
     return {"step": jnp.array(0, dtype=jnp.int32), "m": zeros, "v": zeros}
-
-
-# Both trainers used the same initialization; retain the old private spelling.
-_adam_init = adam_init
 
 
 def adam_step(

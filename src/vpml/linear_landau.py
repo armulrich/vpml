@@ -15,19 +15,20 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
 
-from .core import (
-    Array,
+from vpml.solvers.implicit import Array, implicit_midpoint_jfnk_step
+from vpml.solvers.hermite import (
     FourierHermiteIMEX,
-    HouLiFilter,
-    HyperCollisions,
-    LearnedInterfaceClosure,
-    NonlocalClosure,
     e_hat_history_from_a_hat_history,
-    implicit_midpoint_jfnk_step,
     irfft_x,
-    learned_boundary_flux_hat,
     rfft_x,
 )
+from vpml.models.hermite_closures import (
+    HouLiFilter,
+    HyperCollisions,
+    NonlocalClosure,
+)
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.models.interface_inference import learned_boundary_flux_hat
 
 try:
     jax.config.update("jax_enable_x64", True)

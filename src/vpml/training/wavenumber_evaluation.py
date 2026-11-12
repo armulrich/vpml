@@ -4,11 +4,10 @@ from pathlib import Path
 import numpy as np
 import jax
 import jax.numpy as jnp
-from vpml.training import low_moment_train as base  # Legacy module attribute.
 from vpml.training.low_moment_data import _primitive_numpy
 from vpml.training.low_moment_evaluation import _json_float
 from vpml.datasets.wavenumber import write_new_json
-from vpml.low_moment import rollout_burles_latent_closure
+from vpml.solvers.moment_rollout import rollout_burles_latent_closure
 from vpml.metrics import (SelfGeneratedFieldErrorMetric,FieldErrorConfig,
                          EarlyElectricFieldGrowthMetric,EarlyGrowthConfig)
 

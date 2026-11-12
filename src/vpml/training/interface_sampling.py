@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from vpml.datasets.interface_flux import grouped_history_gather
-from vpml.core import Array
+from vpml.solvers.implicit import Array
 from vpml.training.interface_configuration import (
     exact_rollout_numpy_complex_dtype,
     exact_rollout_numpy_real_dtype,

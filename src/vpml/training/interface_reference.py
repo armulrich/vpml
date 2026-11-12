@@ -19,7 +19,8 @@ from vpml.datasets.interface_flux import (
     reference_cache_directory,
     write_case_shard,
 )
-from vpml.core import Array, GRID_CUBIC_SPLINE_TEACHER_BACKEND
+from vpml.solvers.implicit import Array
+from vpml.models.interface_closure import GRID_CUBIC_SPLINE_TEACHER_BACKEND
 from vpml.fourier import restrict_rfft_numpy
 from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,

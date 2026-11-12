@@ -6,17 +6,18 @@ per-example physical geometry, complete exposure, and immutable resume snapshots
 from __future__ import annotations
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-# Compatibility attribute for older experiment scripts.
-from vpml.training import low_moment_train as base
-from vpml.training.low_moment_data import _primitive_numpy, low_hermite_coefficients_to_conservative
+from vpml.training.low_moment_data import (
+    _primitive_numpy,
+    low_hermite_coefficients_to_conservative,
+)
 from vpml.training.low_moment_losses import make_loss_function
-from vpml.training.optimization import _adam_init, _adam_step, _cosine_learning_rate
+from vpml.training.optimization import adam_init, _adam_step, _cosine_learning_rate
 from vpml.datasets.interface_flux import sha256_json, sha256_file
-from vpml.datasets.wavenumber import REGIMES, epoch_batches, write_new_json
-from vpml.low_moment import init_burles_latent_fno_params, rollout_burles_latent_closure
+from vpml.datasets.wavenumber import REGIMES, epoch_batches
+from vpml.models.moment_parameters import init_burles_latent_fno_params
 import jax
 import jax.numpy as jnp
 
@@ -189,7 +190,7 @@ def update_factory(config,stats):
 def train_segment(manifest,states,stats,config,outdir,protocol,*,resume=None,max_updates=50,stop_epoch=20):
     out=Path(outdir);out.mkdir(parents=True,exist_ok=True)
     digest=sha256_json(protocol)
-    params=initialize(config);opt=_adam_init(params)
+    params=initialize(config);opt=adam_init(params)
     record=dict(protocol_sha256=digest,epoch=1,next_batch=0,accepted_updates=0,windows=0)
     rows=[]
     if resume: params,opt,record,rows=load_snapshot(resume,digest)

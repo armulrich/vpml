@@ -24,7 +24,7 @@ import numpy as np
 
 from vpml.diagnostics.phase_space import phase_space_from_hermite_phys
 from vpml.evaluation.interface_flux import run_physical_landau_reference
-from vpml.core import load_learned_interface_closure_npz
+from vpml.models.interface_checkpoint import load_learned_interface_closure_npz
 from vpml.nonlinear_landau import NonlinearLandauParams, run_nonlinear_landau_rollout_raw
 
 

@@ -5,7 +5,7 @@ Benchmark suite in **JAX** to reproduce the *key linear tests* from:
   on Hermite-based Vlasov-Poisson Simulations", arXiv:2412.07073 (v3).
 
 This script is designed to run side-by-side with the nonlinear solver script
-``vpml.benchmarks.fh_nonlinear_sim_jax``, sharing the same core numerics via ``vpml.core``.
+``vpml.benchmarks.fh_nonlinear_sim_jax``, sharing the Fourier-Hermite operators in ``vpml.solvers.hermite``.
 
 What this benchmark script covers
 ---------------------------------
@@ -56,16 +56,16 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import jax
 import jax.numpy as jnp
 
-from vpml.core import (
-    Array,
+from vpml.solvers.implicit import Array
+from vpml.models.hermite_closures import (
     HermiteExponentialFilter,
     HouLiFilter,
     HyperCollisions,
-    LearnedInterfaceClosure,
     NonlocalClosure,
-    hermite_basis_phi,
-    load_learned_interface_closure_npz,
 )
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.solvers.hermite import hermite_basis_phi
+from vpml.models.interface_checkpoint import load_learned_interface_closure_npz
 from vpml.linear_landau import (
     LinearLandauConfig,
     landau_gamma_mag,

@@ -74,10 +74,6 @@ def irfft_x(u_hat: Array, Nx: int) -> Array:
     return jnp.fft.irfft(u_hat, n=Nx, axis=1).astype(jnp.float64)
 
 
-_rfft_x = rfft_x
-_irfft_x = irfft_x
-
-
 def hermite_basis_phi_scaled(N: int, v: np.ndarray, vth: float = 1.0) -> np.ndarray:
     """
     Build the scaled AW Hermite basis φ_n^{(vth)}(v) on a velocity grid.

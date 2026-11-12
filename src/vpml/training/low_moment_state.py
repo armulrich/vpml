@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vpml.low_moment import (
+from vpml.models.moment_parameters import (
     init_burles_latent_fno_params,
     init_causal_spacetime_operator_params,
     init_explicit_window_params,

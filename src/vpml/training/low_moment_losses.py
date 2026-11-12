@@ -8,14 +8,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vpml.low_moment import (
-    FIXED_INPUT_SCALING,
-    explicit_window_closure_step,
-    primitive_fields,
+from vpml.models.moment_features import FIXED_INPUT_SCALING
+from vpml.models.moment_closures import explicit_window_closure_step, spectral_memory_closure_step
+from vpml.solvers.moments import primitive_fields
+from vpml.solvers.moment_rollout import (
     rollout_burles_latent_closure,
     rollout_explicit_window_closure,
     rollout_low_moment_closure,
-    spectral_memory_closure_step,
     warm_spectral_memory,
 )
 from vpml.training.low_moment_configuration import (

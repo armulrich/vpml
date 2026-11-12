@@ -9,7 +9,7 @@ from zipfile import ZipFile
 
 import numpy as np
 
-from vpml.core import hermite_basis_phi_scaled
+from vpml.solvers.hermite import hermite_basis_phi_scaled
 
 
 def _read_npy_header_from_npz(zf: ZipFile, member: str):

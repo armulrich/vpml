@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vpml.core import Array
+from vpml.solvers.implicit import Array
 from vpml.training.interface_configuration import (
     EXACT_ROLLOUT_PRECISION_FLOAT64,
     exact_rollout_numpy_complex_dtype,

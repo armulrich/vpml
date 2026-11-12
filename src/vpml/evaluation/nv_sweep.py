@@ -23,12 +23,9 @@ from vpml.nonlinear_landau import (
     _time_key,
     run_nonlinear_landau_rollout_raw,
 )
-from vpml.core import (
-    LearnedInterfaceClosure,
-    e_hat_history_from_a_hat_history,
-    hermite_basis_phi,
-    load_learned_interface_closure_npz,
-)
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.solvers.hermite import e_hat_history_from_a_hat_history, hermite_basis_phi
+from vpml.models.interface_checkpoint import load_learned_interface_closure_npz
 from vpml.solvers.physical_grid import project_distribution_snapshot_to_fourier_hermite
 from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,

@@ -23,10 +23,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from vpml.datasets.interface_flux import sha256_json
-from vpml.low_moment import primitive_fields
+from vpml.solvers.moments import primitive_fields
 
 
-# Compatibility exports; reusable implementations live in vpml.training.
 from vpml.training.low_moment_configuration import (
     build_arg_parser,
     validate_training_options,
@@ -35,28 +34,12 @@ from vpml.training.low_moment_configuration import (
     OBJECTIVE,
     MODEL_BACKEND,
     CHECKPOINT_SCHEMA,
-    WINDOW_MEMORY_BACKENDS,
-    parse_training_regimes,
-    _checkpoint_regimes,
     _validate_regime_resume_configuration,
-    _uses_window_memory,
-    _uses_compact_latent,
-    parse_train_case_limits,
-    parse_horizon_curriculum,
 )
 from vpml.training.low_moment_data import (
     _load_convergence_floor,
-    _restrict_rfft,
-    low_hermite_coefficients_to_conservative,
-    _primitive_numpy,
-    _central_heat_flux_numpy,
     _load_reference_cache,
-    _case_amplitudes,
-    _gather_coefficients,
-    _statistics_path,
-    _primitive_target_cache_root,
     _load_or_build_primitive_target_cache,
-    _compute_training_statistics,
     load_or_compute_training_statistics,
     _load_normalization_statistics,
 )
@@ -72,16 +55,11 @@ from vpml.training.low_moment_sampling import (
     build_diagnostic_panel,
 )
 from vpml.training.optimization import (
-    _adam_init,
+    adam_init,
     _cosine_learning_rate,
     _adam_step,
 )
 from vpml.training.low_moment_losses import (
-    _rollout_window_memory,
-    _unpack_window_memory,
-    _block_relative_sample_loss,
-    _sqrt_with_zero_subgradient,
-    _sqrt_with_zero_subgradient_jvp,
     make_loss_function,
     make_continuous_chunk_loss_function,
     make_supervised_heat_flux_loss,
@@ -96,10 +74,6 @@ from vpml.training.low_moment_state import (
 from vpml.training.low_moment_evaluation import (
     evaluate_saved_checkpoint,
     _plot_losses,
-    _electric_field_energy,
-    _json_float,
-    _interpolate_time_series,
-    _energy_peak_angular_frequency,
     _evaluate_heldout,
 )
 
@@ -348,7 +322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             raise ValueError(f"Incompatible initialization checkpoint: {mismatches}")
         params = initialized_params
         print(f"[train] initialized closure from {args.init_checkpoint}")
-    optimizer = _adam_init(params)
+    optimizer = adam_init(params)
     rng = np.random.default_rng(args.seed)
     validation_rng = np.random.default_rng(args.seed + 1)
     train_history = []

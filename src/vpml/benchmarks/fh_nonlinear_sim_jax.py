@@ -2,7 +2,7 @@
 Nonlinear 1D1V Vlasov-Poisson simulations on a physical (x, v) grid.
 
 Both the two-stream and bump-on-tail paths use the shared JAX semi-Lagrangian cubic-spline
-solver from ``vpml.physical_grid``.
+solver from ``vpml.solvers.physical_grid``.
 """
 
 from __future__ import annotations
