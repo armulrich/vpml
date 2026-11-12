@@ -15,8 +15,8 @@ root, create an environment and install the package:
 
 The package depends on JAX, NumPy, SciPy and Matplotlib. The editable install
 uses the source in the checkout. Keep that source fixed for each dataset
-worker. Continuing an existing dataset after a reviewed source
-refactor requires the explicit transition described in :doc:`datasets`.
+worker. Compatible code revisions continue an existing dataset through the
+same commands and paths; :doc:`datasets` describes the restart contract.
 
 For Delta, use the pinned Linux CUDA environment described in :doc:`delta`
 instead of assuming that a local CPU environment will work on the cluster.

@@ -134,31 +134,25 @@ not stage the new code, and ``sbatch`` does not copy source to a worker.
 Keep ``VPML_DATA_ROOT`` set to the existing dataset directory and retain its
 manifest and scientific parameters.
 
-When the only numerical-dependency changes are within the explicit review
-boundary, prepare the source-transition record described in :doc:`datasets`
-using the new checkout and ``$VPML_DATA_ROOT/reference``. Then configure the
-launcher with the new fixed paths, the absolute record path and the canonical
-digest printed in the preparation command's ``sha256`` field:
+Compatible code revisions use the ordinary validation and submission commands
+with the same dataset directory. Configure the launcher with the new fixed
+checkout and environment paths:
 
 .. code-block:: bash
 
    export VPML_CODE_ROOT=/absolute/path/to/new-reviewed-checkout
    export VPML_PYTHON=/absolute/path/to/new-prepared-venv/bin/python
    export VPML_RUN_PARAMS="$VPML_CODE_ROOT/scripts/delta/gaussian_amplitudes.params.sh"
-   export VPML_SOURCE_TRANSITION=/absolute/path/to/source-transition.json
-   export VPML_SOURCE_TRANSITION_SHA256=CANONICAL_DIGEST_PRINTED_DURING_PREPARATION
    bash "$VPML_CODE_ROOT/scripts/delta/run_gaussian_amplitudes.sh" validate
-
-``VPML_SOURCE_TRANSITION`` and ``VPML_SOURCE_TRANSITION_SHA256`` are required
-together. The digest binds the record contents; computing a checksum of the
-formatted JSON file does not produce the canonical digest.
 
 For a staged Git archive, also set ``VPML_SOURCE_COMMIT`` to the new full commit
 SHA. Review the scientific parameters in the selected parameter file against
-the existing manifest. The launcher validates the transition on the login node
-before submission and forwards the record path and digest to the worker. Its
-exact source and manifest bindings are checked again during continuation; a stale record or
-a protected numerical change is rejected.
+the existing manifest. Login-node validation checks the saved protocol and
+maintained restart contract before submission. The worker also checks its
+actual runtime against the saved runtime. Source hashes record the code used
+for each part of the run; source-byte equality is not the restart gate.
+Supported existing protocols without an explicit numerical contract identifier
+are handled by the ordinary reader, without rewriting their records.
 
 After the previous worker has ended, a separate ``submit`` command requests
 the next allocation. Completed cases are verified and skipped; partial cases

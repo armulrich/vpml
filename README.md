@@ -47,9 +47,10 @@ Python integrations import the owning package modules, for example
 `vpml.training.low_moment_data`. Retained scripts under `model`, `benchmarks`
 and `scripts` coordinate experiments, scheduling and saved-run analysis.
 
-Existing Gaussian datasets resume from their verified checkpoints. A reviewed
-source refactor requires an explicit source transition while preserving the
-original manifest, protocols and provenance; see
+Existing Gaussian datasets resume from their verified checkpoints using the
+same manifest and dataset directory. A stable restart contract checks stored
+state and numerical semantics; source hashes record provenance. Original
+protocols and provenance remain preserved. See
 [continuation](docs/datasets.rst) and the [Delta guide](docs/delta.rst).
 
 ## Read the documentation

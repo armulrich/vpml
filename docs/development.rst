@@ -27,6 +27,30 @@ and figures belong with the corresponding run output, such as the ignored
 ``out_bench`` directory or an external project data directory. Documentation
 explains how to use and interpret the code; it does not accumulate run diaries.
 
+Maintaining restart compatibility
+---------------------------------
+
+The dataset restart contract describes the saved-state format and numerical
+semantics supported by the implementation. Source revisions and full file
+hashes are recorded as provenance; an import refactor or documentation change
+does not by itself change that contract. The ordinary reader recognizes the
+supported existing protocol format without rewriting its saved metadata.
+
+Change ``solver_revision`` when an implementation change alters the evolution,
+observation definitions or interpretation of saved state. Change
+``protocol_version`` or ``checkpoint_version`` when the corresponding stored
+representation changes. Review compatibility
+explicitly and provide a reader for a supported older format, or reject it.
+Keeping an identifier unchanged is a developer assertion of compatibility,
+not something a source hash or version label can prove.
+
+Restart tests must cover uninterrupted versus interrupted evolution, continued
+loading of supported older checkpoints, preservation of original records and
+rejection of incompatible scientific parameters, runtime or state. Use an
+archived implementation when verifying continuation across a refactor. A tiny
+CPU comparison checks that continuation path; it does not establish grid
+convergence or bitwise agreement across GPU environments.
+
 Checks
 ------
 
