@@ -21,7 +21,7 @@ esac
 
 script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 VPML_CODE_ROOT=${VPML_CODE_ROOT:-$(cd -- "$script_directory/../.." && pwd -P)}
-if [[ $VPML_CODE_ROOT != /* || ! -f $VPML_CODE_ROOT/scripts/gaussian_dataset.py ]]; then
+if [[ $VPML_CODE_ROOT != /* || ! -f $VPML_CODE_ROOT/src/vpml/cli/gaussian_dataset.py ]]; then
     printf 'VPML_CODE_ROOT must be an absolute path to the reviewed VPML checkout.\n' >&2
     exit 2
 fi
@@ -75,6 +75,17 @@ if (( shutdown_margin < 60 || shutdown_margin > 180 || wall_seconds <= shutdown_
 fi
 selection=()
 run_options=()
+transition_options=()
+if [[ -n ${VPML_SOURCE_TRANSITION:-} || -n ${VPML_SOURCE_TRANSITION_SHA256:-} ]]; then
+    if [[ ${VPML_SOURCE_TRANSITION:-} != /* || ! -r ${VPML_SOURCE_TRANSITION:-} \
+            || ! ${VPML_SOURCE_TRANSITION_SHA256:-} =~ ^[0-9a-f]{64}$ ]]; then
+        printf 'Require an absolute readable VPML_SOURCE_TRANSITION and its VPML_SOURCE_TRANSITION_SHA256.\n' >&2
+        exit 2
+    fi
+    transition_options=(--source-transition "$VPML_SOURCE_TRANSITION" \
+        --source-transition-sha256 "$VPML_SOURCE_TRANSITION_SHA256")
+    run_options+=("${transition_options[@]}")
+fi
 for case_id in ${VPML_CASE_IDS[@]+"${VPML_CASE_IDS[@]}"}; do
     selection+=(--case-id "$case_id")
     run_options+=(--case-id "$case_id")
@@ -84,7 +95,11 @@ if [[ $VPML_STOP_ON_FAILURE == 1 ]]; then
 fi
 manifest="$VPML_DATA_ROOT/manifest.json"
 output="$VPML_DATA_ROOT/reference"
-cli="$VPML_CODE_ROOT/scripts/gaussian_dataset.py"
+cli=(-m vpml.cli.gaussian_dataset --code-root "$VPML_CODE_ROOT")
+validation_options=(--out "$output" ${selection[@]+"${selection[@]}"})
+if (( ${#transition_options[@]} )); then
+    validation_options+=("${transition_options[@]}")
+fi
 
 # Login-node actions only inspect or prepare metadata. Avoid inherited CUDA
 # library paths; the pinned environment supplies its own CUDA wheel libraries.
@@ -92,19 +107,19 @@ unset LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME
 export VPML_JAX_BACKEND=cpu JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 PYTHONUNBUFFERED=1
 case $action in
     prepare)
-        exec "$VPML_PYTHON" "$cli" "$action" --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE"
+        exec "$VPML_PYTHON" "${cli[@]}" "$action" --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE"
         ;;
     validate)
-        exec "$VPML_PYTHON" "$cli" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
-            ${selection[@]+"${selection[@]}"}
+        exec "$VPML_PYTHON" "${cli[@]}" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
+            ${validation_options[@]+"${validation_options[@]}"}
         ;;
     status)
-        exec "$VPML_PYTHON" "$cli" status --out "$output" --manifest "$manifest"
+        exec "$VPML_PYTHON" "${cli[@]}" status --out "$output" --manifest "$manifest"
         ;;
 esac
 
-"$VPML_PYTHON" "$cli" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
-    ${selection[@]+"${selection[@]}"}
+"$VPML_PYTHON" "${cli[@]}" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
+    ${validation_options[@]+"${validation_options[@]}"}
 command -v sbatch >/dev/null
 # Do not inherit an unrelated array, exclusive allocation or other sbatch
 # option from the caller's environment; this run's request is explicit below.

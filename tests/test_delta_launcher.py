@@ -63,6 +63,8 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
                                 SBATCH_EXCLUSIVE="1")
         self.environment.pop("VPML_RUN_PARAMS", None)
         self.environment.pop("VPML_SOURCE_COMMIT", None)
+        self.environment.pop("VPML_SOURCE_TRANSITION", None)
+        self.environment.pop("VPML_SOURCE_TRANSITION_SHA256", None)
 
     def run_action(self, *args, environment=None):
         return subprocess.run(["/bin/bash", str(LAUNCHER), *args],
@@ -92,11 +94,13 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         calls = self.calls()
         self.assertEqual([call["program"] for call in calls], ["python"] * 3)
         self.assertTrue(all(call["backend"] == "cpu" and call["ld_path"] is None for call in calls))
-        self.assertEqual(calls[0]["args"][1:], ["prepare", "--manifest", str(self.data / "manifest.json"),
+        self.assertTrue(all(call["args"][:4] == ["-m", "vpml.cli.gaussian_dataset", "--code-root", str(ROOT)]
+                            for call in calls))
+        self.assertEqual(calls[0]["args"][4:], ["prepare", "--manifest", str(self.data / "manifest.json"),
                                               "--parameters", str(PARAMETERS)])
-        self.assertEqual(calls[1]["args"][1:], ["validate", "--manifest", str(self.data / "manifest.json"),
-                                              "--parameters", str(PARAMETERS)])
-        self.assertEqual(calls[2]["args"][1:], ["status", "--out", str(self.data / "reference"),
+        self.assertEqual(calls[1]["args"][4:], ["validate", "--manifest", str(self.data / "manifest.json"),
+                                              "--parameters", str(PARAMETERS), "--out", str(self.data / "reference")])
+        self.assertEqual(calls[2]["args"][4:], ["status", "--out", str(self.data / "reference"),
                                                "--manifest", str(self.data / "manifest.json")])
 
     def test_test_submit_is_only_scheduler_test_and_quoted_paths_survive(self):
@@ -104,7 +108,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         self.assertEqual([call["program"] for call in calls], ["python", "sbatch"])
-        self.assertEqual(calls[0]["args"][1], "validate")
+        self.assertEqual(calls[0]["args"][4], "validate")
         arguments = calls[1]["args"]
         self.assertEqual(calls[1]["sbatch_env"], [])
         for argument in ("--test-only", "--account=bhvw-delta-gpu", "--partition=gpuA100x4",
@@ -274,6 +278,53 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual([call["program"] for call in self.calls()], ["python"])
         self.assertFalse((self.data / "submissions").exists())
+
+    def test_reviewed_source_transition_is_bound_to_submission_and_worker(self):
+        from vpml.datasets.continuation import changed_sources, write_transition
+        from vpml.datasets.provenance import source_record
+        from vpml.io.serialization import json_digest
+
+        self.data.mkdir()
+        manifest = {"cases": [{"case_id": case_id} for case_id in MANIFEST_IDS]}
+        (self.data / "manifest.json").write_text(json.dumps(manifest))
+        current = source_record()["compatibility"]
+        previous = json.loads(json.dumps(current))
+        previous["files"]["vpml/__init__.py"] = "0" * 64
+        previous["sha256"] = json_digest(previous["files"])
+        transition = {"format": 1, "kind": "reviewed-source-transition",
+                      "manifest_sha256": json_digest(manifest), "from_source": previous,
+                      "to_source": current, "changes": changed_sources(previous, current),
+                      "reason": "Reviewed import relocation"}
+        path = self.directory / "source transition.json"
+        digest = write_transition(path, transition)
+        environment = dict(self.environment, VPML_SOURCE_TRANSITION=str(path),
+                           VPML_SOURCE_TRANSITION_SHA256=digest)
+        result = self.run_action("submit", environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        expected = ["--source-transition", str(path), "--source-transition-sha256", digest]
+        for arguments in (calls[0]["args"], calls[1]["args"]):
+            start = arguments.index("--source-transition")
+            self.assertEqual(arguments[start:start + 4], expected)
+        record = json.loads(next((self.data / "submissions").glob("*.json")).read_text())
+        self.assertEqual(record["source_transition"]["record_sha256"], digest)
+        self.assertEqual(json.loads(record["source_transition"]["text"]), transition)
+        transition["reason"] = "Changed after review"
+        path.write_text(json.dumps(transition))
+        result = self.run_action("submit", environment=environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sum(call["program"] == "sbatch" for call in self.calls()), 1)
+
+    def test_transition_path_and_digest_must_be_supplied_together(self):
+        path = self.directory / "transition.json"
+        path.write_text("{}")
+        for changes in ({"VPML_SOURCE_TRANSITION": str(path)},
+                        {"VPML_SOURCE_TRANSITION_SHA256": "a" * 64},
+                        {"VPML_SOURCE_TRANSITION": str(path), "VPML_SOURCE_TRANSITION_SHA256": "invalid"}):
+            with self.subTest(changes=changes):
+                result = self.run_action("submit", environment=dict(self.environment, **changes))
+                self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_failed_record_write_leaves_no_published_or_temporary_intent(self):
         self.data.mkdir(mode=0o700)

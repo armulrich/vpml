@@ -63,6 +63,7 @@ def main() -> int:
     scheduler_arguments, worker_arguments = args.arguments[:split], args.arguments[split + 1:]
     selected = []
     stop_on_failure = False
+    transition_path = transition_digest = None
     index = 0
     while index < len(worker_arguments):
         option = worker_arguments[index]
@@ -72,6 +73,16 @@ def main() -> int:
         elif option == "--stop-on-failure":
             stop_on_failure = True
             index += 1
+        elif option in {"--source-transition", "--source-transition-sha256"}:
+            if option == "--source-transition":
+                if transition_path is not None:
+                    raise ValueError("Duplicate source transition path")
+                transition_path = Path(worker_arguments[index + 1])
+            else:
+                if transition_digest is not None:
+                    raise ValueError("Duplicate source transition digest")
+                transition_digest = worker_arguments[index + 1]
+            index += 2
         else:
             raise ValueError(f"Unsupported worker option: {option}")
 
@@ -79,11 +90,24 @@ def main() -> int:
     sys.path.insert(0, str(args.code_root / "src"))
     from vpml.datasets.provenance import source_record
     from vpml.io.atomic import atomic_write
-    from vpml.io.serialization import canonical_json_bytes
+    from vpml.io.serialization import canonical_json_bytes, json_digest
 
     manifest_path = args.data_root / "manifest.json"
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
+    transition = None
+    if transition_path is not None or transition_digest is not None:
+        from vpml.datasets.continuation import validate_transition
+
+        if transition_path is None or not transition_path.is_absolute():
+            raise ValueError("An absolute source transition path is required")
+        transition = snapshot(transition_path)
+        value = json.loads(transition["text"])
+        validate_transition(value, current_source=source_record()["compatibility"],
+                            manifest_sha256=json_digest(manifest))
+        if json_digest(value) != transition_digest:
+            raise ValueError("Source transition checksum mismatch")
+        transition["record_sha256"] = transition_digest
     if not selected:
         selected = [case["case_id"] for case in manifest["cases"]]
     launcher_directory = Path(__file__).resolve().parent
@@ -104,6 +128,7 @@ def main() -> int:
                  "source": source_record(args.code_root / "src/vpml"),
                  "launcher_sha256": launcher_sources},
         "selected_case_ids": selected,
+        "source_transition": transition,
         "scheduler": {"arguments": scheduler_arguments, "wall_seconds": args.wall_seconds,
                       "shutdown_margin_seconds": args.shutdown_margin_seconds},
         "worker": {"python": str(args.python), "arguments": worker_arguments,
