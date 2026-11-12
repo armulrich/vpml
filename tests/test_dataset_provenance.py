@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 import tempfile
+import subprocess
+import sys
 
 import jax
 
@@ -12,6 +14,16 @@ from vpml.datasets.provenance import json_digest, runtime_record, source_record
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_cli_rejects_the_wrong_staged_checkout_before_reading_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([
+                sys.executable, "-m", "vpml.cli.gaussian_dataset", "--code-root", directory,
+                "validate", "--manifest", str(Path(directory) / "missing.json"),
+            ], capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("different checkout", result.stderr)
+        self.assertNotIn("FileNotFoundError", result.stderr)
+
     def test_unrelated_sources_are_recorded_but_only_numerical_dependencies_block_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "vpml"
@@ -33,7 +45,7 @@ class ProvenanceTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         record = source_record()
         self.assertEqual(record["sha256"], json_digest(record["files"]))
-        for relative in ("scripts/gaussian_dataset.py", "vpml/physical_grid.py",
+        for relative in ("vpml/cli/gaussian_dataset.py", "vpml/solvers/physical_grid.py",
                          "environments/delta/requirements.lock"):
             self.assertEqual(record["files"][relative],
                              hashlib.sha256((root / ("src" if relative.startswith("vpml/") else "") / relative).read_bytes()).hexdigest())

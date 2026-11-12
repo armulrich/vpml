@@ -146,6 +146,8 @@ def run_dataset(
     case_ids: list[str] | None = None,
     linearized: bool = False,
     stop_on_failure: bool = False,
+    source_transition: Path | None = None,
+    source_transition_sha256: str | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict:
@@ -159,6 +161,9 @@ def run_dataset(
     from .checkpoints import CheckpointStore, atomic_json
     from .evolution import ReferenceEvolution
     from .observations import observation_schema
+    from .continuation import (
+        continuation_protocol, validate_provenance, validate_transition, write_transition,
+    )
 
     measured_start = time.perf_counter()
     timings = {name: 0.0 for name in (
@@ -176,8 +181,15 @@ def run_dataset(
     deadline = clock() + max_seconds
     numerics = Numerics(**manifest["numerics"])
     cases = select_cases(manifest, case_ids)
-    runtime = runtime_record(backend)
     source = source_record()
+    transition = read_json(Path(source_transition)) if source_transition is not None else None
+    if source_transition_sha256 is not None and (
+            transition is None or json_digest(transition) != source_transition_sha256):
+        raise ValueError("Source transition checksum mismatch")
+    if transition is not None:
+        validate_transition(transition, current_source=source["compatibility"],
+                            manifest_sha256=json_digest(manifest))
+    runtime = runtime_record(backend)
     root = Path(output_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "manifest.json"
@@ -191,6 +203,10 @@ def run_dataset(
     provenance_directory = root / "provenance"
     provenance_directory.mkdir(exist_ok=True)
     provenance = {"source": source, "runtime": runtime}
+    if transition is not None:
+        transition_digest = json_digest(transition)
+        write_transition(root / "source-transitions" / f"{transition_digest}.json", transition)
+        provenance["source_transition_sha256"] = transition_digest
     provenance_digest = json_digest(provenance)
     provenance_path = provenance_directory / f"{provenance_digest}.json"
     if not provenance_path.exists():
@@ -221,9 +237,18 @@ def run_dataset(
                             "output_schema": manifest["output_schema"],
                             "observations": observation_schema()}
                 directory = root / "cases" / case_id
+                if (directory / "protocol.json").exists():
+                    protocol = continuation_protocol(
+                        protocol, read_json(directory / "protocol.json"), transition)
                 store = CheckpointStore(directory, protocol, provenance_sha256=provenance_digest)
                 if (directory / "progress.json").exists():
                     state, progress = store.load()
+                    bundles = [block["observations"] for block in progress["blocks"]]
+                    bundles.extend(entry["state"] for entry in progress["states"])
+                    if progress["status"] == "complete":
+                        bundles.append(progress["outputs"])
+                    for digest in {bundle.get("provenance_sha256") for bundle in bundles} - {None}:
+                        validate_provenance(root, digest, protocol)
                     if progress["status"] == "complete":
                         validate_completed_progress(progress, numerics, linearized)
                         status = "complete" if progress["report"]["checks_passed"] else "failed"

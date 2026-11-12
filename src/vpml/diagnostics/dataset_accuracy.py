@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from vpml.datasets.checkpoints import CheckpointStore
+from vpml.datasets.continuation import validate_provenance
 from vpml.datasets.manifest import Numerics, read_manifest
 from vpml.datasets.reader import read_case
 from vpml.datasets.runner import sampled_outputs
@@ -64,11 +65,7 @@ def _comparison_fields(root, case, numerics, representation):
             raise ValueError("Observation bundle has no valid provenance digest")
         provenance_digests.add(digest)
     for digest in provenance_digests:
-        provenance = read_json(root / "provenance" / f"{digest}.json")
-        if (json_digest(provenance) != digest
-                or provenance["source"]["compatibility"] != protocol["source"]
-                or provenance["runtime"] != protocol["runtime"]):
-            raise ValueError("Observation provenance disagrees with its case protocol")
+        validate_provenance(root, digest, protocol)
     arrays = sampled_outputs({key: value for key, value in history.items() if key != "diagnostics"},
                              replace(numerics, storage_dtype="float64"))
     if (not np.array_equal(arrays["times"], case["times"])

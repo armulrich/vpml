@@ -300,7 +300,7 @@ class DatasetAccuracyTests(unittest.TestCase):
         (provenance_path.parent / f"{digest}.json").write_text(json.dumps(changed))
         record["provenance_sha256"] = digest
         (directory / "progress.json").write_text(json.dumps(progress))
-        with self.assertRaisesRegex(ValueError, "Observation provenance"):
+        with self.assertRaisesRegex(ValueError, "Array provenance"):
             self.compare(representation="observations-float64")
 
     def test_unknown_representation_is_rejected(self):

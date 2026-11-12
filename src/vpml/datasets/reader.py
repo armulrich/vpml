@@ -13,6 +13,7 @@ import numpy as np
 
 from vpml.io.serialization import file_digest, json_digest, read_json
 from .checkpoints import CheckpointStore
+from .continuation import validate_provenance
 from .manifest import Numerics, read_manifest
 from .schema import (
     DIAGNOSTIC_NAMES, LINEAR_DIAGNOSTIC_NAMES, OUTPUT_SCHEMA, LEGACY_OUTPUT_SCHEMA,
@@ -50,14 +51,7 @@ def _read_current_case(root: Path, manifest: dict, case: dict) -> dict:
     arrays = store.outputs()
     provenance_digest = progress["outputs"].get("provenance_sha256")
     if provenance_digest is not None:
-        if (not isinstance(provenance_digest, str) or len(provenance_digest) != 64
-                or any(c not in "0123456789abcdef" for c in provenance_digest)):
-            raise ValueError("Invalid output provenance digest")
-        provenance = read_json(root / "provenance" / f"{provenance_digest}.json")
-        if (json_digest(provenance) != provenance_digest
-                or provenance["source"]["compatibility"] != protocol["source"]
-                or provenance["runtime"] != protocol["runtime"]):
-            raise ValueError("Output provenance disagrees with its case protocol")
+        validate_provenance(root, provenance_digest, protocol)
     expected_times = np.arange(numerics.nsamples) * numerics.save_dt
     if not np.array_equal(arrays["times"], expected_times):
         raise ValueError("Saved time coordinates disagree with the numerical protocol")

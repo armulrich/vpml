@@ -76,7 +76,7 @@ def source_record(package: Path | None = None) -> dict:
     # Checkout inputs are useful provenance but not numerical compatibility.
     repository = next((parent for parent in package.parents if (parent / "pyproject.toml").is_file()), None)
     if repository is not None:
-        for relative in ("scripts/gaussian_dataset.py", "environments/delta/requirements.lock"):
+        for relative in ("environments/delta/requirements.lock",):
             path = repository / relative
             if path.is_file():
                 files[relative] = file_digest(path)

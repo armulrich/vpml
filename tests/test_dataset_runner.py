@@ -203,7 +203,7 @@ class DatasetRunnerTests(unittest.TestCase):
     def test_changed_source_or_manifest_cannot_reuse_results(self):
         self.run_worker(self.root)
         with mock.patch.object(runner, "source_record", return_value={"sha256": "different-source", "compatibility": {"sha256": "changed-numerics"}}):
-            with self.assertRaisesRegex(ValueError, "protocol mismatch"):
+            with self.assertRaisesRegex(ValueError, "Checkpoint source changed"):
                 self.run_worker(self.root)
         self.manifest = tiny_manifest(final_time=0.06)
         with self.assertRaisesRegex(ValueError, "different manifest"):
