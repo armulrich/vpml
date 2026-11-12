@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from vpml.datasets.checkpoints import CheckpointStore
-from vpml.datasets.continuation import validate_provenance
+from vpml.datasets.compatibility import validate_provenance
 from vpml.datasets.manifest import Numerics, read_manifest
 from vpml.datasets.reader import read_case
 from vpml.datasets.runner import sampled_outputs

@@ -4,8 +4,10 @@ No test contacts Slurm, starts JAX, installs packages or reserves hardware.
 """
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -63,8 +65,6 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
                                 SBATCH_EXCLUSIVE="1")
         self.environment.pop("VPML_RUN_PARAMS", None)
         self.environment.pop("VPML_SOURCE_COMMIT", None)
-        self.environment.pop("VPML_SOURCE_TRANSITION", None)
-        self.environment.pop("VPML_SOURCE_TRANSITION_SHA256", None)
 
     def run_action(self, *args, environment=None):
         return subprocess.run(["/bin/bash", str(LAUNCHER), *args],
@@ -236,6 +236,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(record["code"]["root"], str(ROOT))
         self.assertIn("vpml/datasets/runner.py", record["code"]["source"]["files"])
         self.assertRegex(record["code"]["source"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("source_transition", record)
         self.assertEqual(record["code"]["launcher_sha256"][LAUNCHER.name],
                          hashlib.sha256(LAUNCHER.read_bytes()).hexdigest())
         # A later submit records its own intent without overwriting earlier evidence.
@@ -279,52 +280,40 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual([call["program"] for call in self.calls()], ["python"])
         self.assertFalse((self.data / "submissions").exists())
 
-    def test_reviewed_source_transition_is_bound_to_submission_and_worker(self):
-        from vpml.datasets.continuation import changed_sources, write_transition
-        from vpml.datasets.provenance import source_record
-        from vpml.io.serialization import json_digest
+    def test_cli_preflight_forwards_case_selection_and_requested_mode(self):
+        from vpml.cli.gaussian_dataset import main
+        from vpml.datasets.manifest import build_manifest, write_manifest
 
-        self.data.mkdir()
-        manifest = {"cases": [{"case_id": case_id} for case_id in MANIFEST_IDS]}
-        (self.data / "manifest.json").write_text(json.dumps(manifest))
-        current = source_record()["compatibility"]
-        previous = json.loads(json.dumps(current))
-        previous["files"]["vpml/__init__.py"] = "0" * 64
-        previous["sha256"] = json_digest(previous["files"])
-        transition = {"format": 1, "kind": "reviewed-source-transition",
-                      "manifest_sha256": json_digest(manifest), "from_source": previous,
-                      "to_source": current, "changes": changed_sources(previous, current),
-                      "reason": "Reviewed import relocation"}
-        path = self.directory / "source transition.json"
-        digest = write_transition(path, transition)
-        environment = dict(self.environment, VPML_SOURCE_TRANSITION=str(path),
-                           VPML_SOURCE_TRANSITION_SHA256=digest)
-        result = self.run_action("submit", environment=environment)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls()
-        expected = ["--source-transition", str(path), "--source-transition-sha256", digest]
-        for arguments in (calls[0]["args"], calls[1]["args"]):
-            start = arguments.index("--source-transition")
-            self.assertEqual(arguments[start:start + 4], expected)
-        record = json.loads(next((self.data / "submissions").glob("*.json")).read_text())
-        self.assertEqual(record["source_transition"]["record_sha256"], digest)
-        self.assertEqual(json.loads(record["source_transition"]["text"]), transition)
-        transition["reason"] = "Changed after review"
-        path.write_text(json.dumps(transition))
-        result = self.run_action("submit", environment=environment)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(sum(call["program"] == "sbatch" for call in self.calls()), 1)
+        manifest = build_manifest(k0_values=(.5,), mode_counts=(3,), decays=(2.,),
+                                  strengths=(.1,), draws_per_combination=1)
+        path = self.directory / "valid-manifest.json"
+        write_manifest(path, manifest)
+        output = self.data / "reference"
+        selected = manifest["cases"][0]["case_id"]
+        base = ["validate", "--manifest", str(path), "--out", str(output),
+                "--case-id", selected]
+        for options, linearized in (([], False), (["--linearized"], True)):
+            with self.subTest(linearized=linearized), redirect_stdout(io.StringIO()) as stdout, \
+                    mock.patch("vpml.datasets.compatibility.validate_existing_protocols", return_value=1) as preflight:
+                self.assertEqual(main([*base, *options]), 0)
+                preflight.assert_called_once_with(output, manifest, case_ids=[selected], linearized=linearized)
+                self.assertEqual(json.loads(stdout.getvalue())["existing_case_protocols_checked"], 1)
 
-    def test_transition_path_and_digest_must_be_supplied_together(self):
-        path = self.directory / "transition.json"
-        path.write_text("{}")
-        for changes in ({"VPML_SOURCE_TRANSITION": str(path)},
-                        {"VPML_SOURCE_TRANSITION_SHA256": "a" * 64},
-                        {"VPML_SOURCE_TRANSITION": str(path), "VPML_SOURCE_TRANSITION_SHA256": "invalid"}):
-            with self.subTest(changes=changes):
-                result = self.run_action("submit", environment=dict(self.environment, **changes))
-                self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(self.calls(), [])
+    def test_cli_rejects_removed_source_transition_commands(self):
+        from vpml.cli.gaussian_dataset import main
+
+        commands = [["prepare-continuation"]]
+        for command in ("validate", "run"):
+            base = [command, "--manifest", "unused.json"]
+            if command == "run":
+                base += ["--out", "unused", "--backend", "cpu", "--max-seconds", "1"]
+            for flag in ("--source-transition", "--source-transition-sha256"):
+                commands.append([*base, flag, "unused"])
+        for arguments in commands:
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                main(arguments)
+            self.assertEqual(raised.exception.code, 2)
 
     def test_failed_record_write_leaves_no_published_or_temporary_intent(self):
         self.data.mkdir(mode=0o700)
@@ -409,6 +398,12 @@ with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         self.assertEqual([call["program"] for call in calls], ["python", "srun"])
+        self.assertEqual(calls[0]["args"][:5],
+                         ["-m", "vpml.cli.gaussian_dataset", "--code-root", str(ROOT), "validate"])
+        worker = calls[1]["args"]
+        start = worker.index(str(self.python))
+        self.assertEqual(worker[start + 1:start + 6],
+                         ["-m", "vpml.cli.gaussian_dataset", "--code-root", str(ROOT), "run"])
         self.assertEqual(calls[0]["args"][-4:], options[:-1])
         self.assertEqual(calls[1]["args"][-len(options)-2:], ["--max-seconds", "3300", *options])
         self.assertIn("--gpus-per-task=1", calls[1]["args"])
@@ -418,6 +413,8 @@ with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
     def test_batch_rejects_unsupported_options_and_oversized_budget(self):
         command, environment = self.batch_command()
         for options in (["--backend", "cpu"], ["--case-id"],
+                        ["--source-transition", "unused"],
+                        ["--source-transition-sha256", "unused"],
                         ["--stop-on-failure", "--stop-on-failure"]):
             with self.subTest(options=options):
                 result = subprocess.run([*command, *options], env=environment, text=True,

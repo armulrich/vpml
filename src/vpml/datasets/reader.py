@@ -13,7 +13,7 @@ import numpy as np
 
 from vpml.io.serialization import file_digest, json_digest, read_json
 from .checkpoints import CheckpointStore
-from .continuation import validate_provenance
+from .compatibility import build_protocol, resume_protocol, validate_provenance
 from .manifest import Numerics, read_manifest
 from .schema import (
     DIAGNOSTIC_NAMES, LINEAR_DIAGNOSTIC_NAMES, OUTPUT_SCHEMA, LEGACY_OUTPUT_SCHEMA,
@@ -42,6 +42,9 @@ def _read_current_case(root: Path, manifest: dict, case: dict) -> dict:
             or type(protocol.get("linearized")) is not bool
             or protocol.get("observations") != observation_schema(output_schema)):
         raise ValueError("Case protocol disagrees with the dataset manifest")
+    if output_schema == OUTPUT_SCHEMA:
+        expected = build_protocol(manifest, case, protocol.get("runtime"), protocol["linearized"])
+        resume_protocol(expected, protocol)
     store = CheckpointStore(directory, protocol, read_only=True)
     progress = store.read_progress()
     if progress["status"] != "complete":

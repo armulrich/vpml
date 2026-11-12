@@ -1,6 +1,7 @@
 """Tiny CPU trajectory and failure tests for the dataset worker."""
 from contextlib import redirect_stdout
 import io
+import hashlib
 import json
 import copy
 from pathlib import Path
@@ -12,7 +13,7 @@ import jax
 import numpy as np
 
 from vpml.datasets.checkpoints import CheckpointStore, atomic_json
-from vpml.datasets.manifest import Numerics, build_manifest
+from vpml.datasets.manifest import Numerics, build_manifest, write_manifest
 from vpml.datasets.provenance import runtime_record
 from vpml.datasets import runner
 
@@ -37,6 +38,12 @@ def read_case(root, case_id):
     return state, outputs, progress
 
 
+def changed_source_inventory():
+    files = dict(runner.source_record()["files"])
+    files["vpml/__init__.py"] = hashlib.sha256(b"reorganized imports").hexdigest()
+    return {"sha256": runner.json_digest(files), "files": files}
+
+
 class DatasetRunnerTests(unittest.TestCase):
     def setUp(self):
         jax.config.update("jax_enable_x64", True)
@@ -45,11 +52,6 @@ class DatasetRunnerTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.manifest = tiny_manifest()
         self.case_id = self.manifest["cases"][0]["case_id"]
-        # Other development agents may edit source files during this test run.
-        # Provenance enforcement itself has a separate negative test below.
-        source = mock.patch.object(runner, "source_record", return_value={"sha256": "test-source", "compatibility": {"sha256": "test-numerics"}})
-        source.start()
-        self.addCleanup(source.stop)
 
     def run_worker(self, directory, **kwargs):
         with redirect_stdout(io.StringIO()):
@@ -200,11 +202,14 @@ class DatasetRunnerTests(unittest.TestCase):
             self.run_worker(self.root)
         self.assertFalse((self.root / "locks" / f"{self.case_id}.lock").exists())
 
-    def test_changed_source_or_manifest_cannot_reuse_results(self):
+    def test_source_changes_reuse_completed_results_but_manifest_changes_do_not(self):
         self.run_worker(self.root)
-        with mock.patch.object(runner, "source_record", return_value={"sha256": "different-source", "compatibility": {"sha256": "changed-numerics"}}):
-            with self.assertRaisesRegex(ValueError, "Checkpoint source changed"):
-                self.run_worker(self.root)
+        directory = self.root / "cases" / self.case_id
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        with mock.patch.object(runner, "source_record", return_value=changed_source_inventory()):
+            result = self.run_worker(self.root)
+        self.assertTrue(result["outcomes"][0]["reused"])
+        self.assertEqual(before, {path.name: path.read_bytes() for path in directory.iterdir()})
         self.manifest = tiny_manifest(final_time=0.06)
         with self.assertRaisesRegex(ValueError, "different manifest"):
             self.run_worker(self.root)
@@ -216,7 +221,7 @@ class DatasetRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "protocol mismatch"):
                 self.run_worker(self.root)
 
-    def test_unrelated_source_change_resumes_and_attributes_each_output_block(self):
+    def test_source_change_resumes_and_attributes_each_output_block(self):
         stopped = [False]
         append = CheckpointStore.append
 
@@ -228,7 +233,7 @@ class DatasetRunnerTests(unittest.TestCase):
         with mock.patch.object(CheckpointStore, "append", append_and_stop):
             self.assertEqual(self.run_worker(self.root, stop_requested=lambda: stopped[0])
                              ["outcomes"][0]["status"], "partial")
-        changed_inventory = {"sha256": "changed-plot", "compatibility": {"sha256": "test-numerics"}}
+        changed_inventory = changed_source_inventory()
         with mock.patch.object(runner, "source_record", return_value=changed_inventory):
             self.assertEqual(self.run_worker(self.root)["outcomes"][0]["status"], "complete")
         progress = json.loads((self.root / "cases" / self.case_id / "progress.json").read_text())
@@ -239,6 +244,7 @@ class DatasetRunnerTests(unittest.TestCase):
         for digest in (first, last):
             record = json.loads((self.root / "provenance" / f"{digest}.json").read_text())
             self.assertEqual(runner.json_digest(record), digest)
+        self.assertEqual(record["source"], changed_inventory)
 
     def test_deadline_stops_before_next_block_and_can_resume(self):
         readings = iter([0.0, 0.0, 61.0, 61.0])
@@ -386,6 +392,7 @@ class DatasetRunnerTests(unittest.TestCase):
         for stop_on_failure in (False, True):
             with self.subTest(stop_on_failure=stop_on_failure):
                 root = self.root / str(stop_on_failure)
+                write_manifest(root / "manifest.json", self.manifest)
                 failure_path = root / "failures" / f"{self.case_id}.json"
                 failure_path.parent.mkdir(parents=True)
                 atomic_json(failure_path, {"case_id": self.case_id,
@@ -460,6 +467,7 @@ class DatasetRunnerTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "manifest.json").read_text()), self.manifest)
 
     def test_another_owner_keeps_its_lock_and_case_is_reported_busy(self):
+        write_manifest(self.root / "manifest.json", self.manifest)
         lock_path = self.root / "locks" / f"{self.case_id}.lock"
         with runner.case_lock(lock_path):
             owner = lock_path.read_bytes()

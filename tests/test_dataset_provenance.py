@@ -24,7 +24,7 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIn("different checkout", result.stderr)
         self.assertNotIn("FileNotFoundError", result.stderr)
 
-    def test_unrelated_sources_are_recorded_but_only_numerical_dependencies_block_resume(self):
+    def test_source_inventory_records_all_edits_without_defining_restart_compatibility(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "vpml"
             (package / "datasets").mkdir(parents=True)
@@ -37,9 +37,13 @@ class ProvenanceTests(unittest.TestCase):
             plot.write_text("color = 'purple'\n")
             plotting_change = source_record(package)
             self.assertNotEqual(original["sha256"], plotting_change["sha256"])
-            self.assertEqual(original["compatibility"], plotting_change["compatibility"])
+            self.assertEqual(set(original), {"sha256", "files"})
+            self.assertEqual(original["files"]["vpml/quadrature.py"],
+                             plotting_change["files"]["vpml/quadrature.py"])
             (package / "quadrature.py").write_text("def integrate(): return 2\n")
-            self.assertNotEqual(original["compatibility"], source_record(package)["compatibility"])
+            numerical_change = source_record(package)
+            self.assertNotEqual(plotting_change["sha256"], numerical_change["sha256"])
+            self.assertEqual(numerical_change["sha256"], json_digest(numerical_change["files"]))
 
     def test_source_covers_cli_solver_and_environment_lock(self):
         root = Path(__file__).resolve().parents[1]

@@ -16,8 +16,6 @@ shift 5
 selection=()
 run_options=()
 stop_on_failure=0
-transition_path=
-transition_sha256=
 while (( $# )); do
     case $1 in
         --case-id)
@@ -38,21 +36,6 @@ while (( $# )); do
             run_options+=(--stop-on-failure)
             shift
             ;;
-        --source-transition|--source-transition-sha256)
-            if [[ $# -lt 2 || -z $2 ]]; then
-                printf 'Each source transition option requires a value.\n' >&2
-                exit 2
-            fi
-            if [[ $1 == --source-transition ]]; then
-                [[ -z $transition_path ]] || exit 2
-                transition_path=$2
-            else
-                [[ -z $transition_sha256 ]] || exit 2
-                transition_sha256=$2
-            fi
-            run_options+=("$1" "$2")
-            shift 2
-            ;;
         *)
             printf 'Unsupported worker option: %s\n' "$1" >&2
             exit 2
@@ -66,14 +49,6 @@ if [[ $code != /* || $data != /* || $data == / || $python != /* || $parameters !
     || ! $cpus =~ ^([1-9]|1[0-6])$ ]]; then
     printf 'Invalid batch paths or runtime limit.\n' >&2
     exit 2
-fi
-if [[ -n $transition_path || -n $transition_sha256 ]]; then
-    if [[ $transition_path != /* || ! -r $transition_path || ! $transition_sha256 =~ ^[0-9a-f]{64}$ ]]; then
-        printf 'Invalid source transition path or digest.\n' >&2
-        exit 2
-    fi
-    selection+=(--source-transition "$transition_path" \
-        --source-transition-sha256 "$transition_sha256")
 fi
 max_seconds=$((10#$max_seconds))
 if (( max_seconds <= 0 || max_seconds > 3300 )); then

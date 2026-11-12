@@ -1,12 +1,11 @@
 """Explicit source and runtime identities for reproducible reference data.
 
 No credentials, environment-variable dumps, or remote service calls are needed.
-The compatibility fingerprint follows numerical dependencies; the broader
-inventory also records unrelated package files without constraining restart.
+Source inventories identify the code that produced each array bundle.
+Restart compatibility is defined separately by the solver and storage contract.
 """
 from __future__ import annotations
 
-import ast
 import importlib.metadata
 from pathlib import Path
 import platform
@@ -16,73 +15,19 @@ import subprocess
 from vpml.io.serialization import file_digest, json_digest
 
 
-def _imported_package_modules(module: str, path: Path, modules: dict[str, Path]) -> set[str]:
-    """Resolve static local imports without importing the numerical modules."""
-    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
-    result = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-        if isinstance(node, ast.Import):
-            candidates = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                components = package.split(".")
-                base = ".".join(components[:len(components) - node.level + 1])
-                base += ("." + node.module) if node.module else ""
-            else:
-                base = node.module or ""
-            candidates = [base, *(base + "." + alias.name for alias in node.names)]
-        else:
-            continue
-        for candidate in candidates:
-            if candidate in modules:
-                result.add(candidate)
-    return result
-
-
 def source_record(package: Path | None = None) -> dict:
-    """Record all package sources and a separate reference-compatibility digest.
-
-    Compatibility follows the static VPML import dependencies of the dataset
-    runner, including package initializers. Runtime-selected numerical modules
-    must be made explicit imports so their code participates in this identity.
-    An unrelated plotting edit is recorded but does not prevent continuation.
-    """
+    """Record package sources and the environment lock without importing them."""
     package = Path(package) if package is not None else Path(__file__).resolve().parents[1]
-    modules = {}
-    paths = sorted(package.rglob("*.py"))
-    for path in paths:
-        parts = list(path.relative_to(package).with_suffix("").parts)
-        if parts[-1] == "__init__":
-            parts.pop()
-        modules[".".join(["vpml", *parts])] = path
-    files = {str(Path("vpml") / path.relative_to(package)): file_digest(path) for path in paths}
-    pending = ["vpml.datasets.runner"]
-    dependencies = set()
-    while pending:
-        module = pending.pop()
-        if module in dependencies:
-            continue
-        if module not in modules:
-            raise ValueError(f"Missing numerical source module: {module}")
-        dependencies.add(module)
-        pending.extend(_imported_package_modules(module, modules[module], modules) - dependencies)
-        # Importing a child executes each package initializer too.
-        parts = module.split(".")
-        pending.extend(".".join(parts[:i]) for i in range(1, len(parts))
-                       if ".".join(parts[:i]) in modules)
-    numerical_files = {str(Path("vpml") / modules[name].relative_to(package)):
-                       files[str(Path("vpml") / modules[name].relative_to(package))]
-                       for name in sorted(dependencies)}
-    # Checkout inputs are useful provenance but not numerical compatibility.
-    repository = next((parent for parent in package.parents if (parent / "pyproject.toml").is_file()), None)
+    files = {str(Path("vpml") / path.relative_to(package)): file_digest(path)
+             for path in sorted(package.rglob("*.py"))}
+    repository = next((parent for parent in package.parents
+                       if (parent / "pyproject.toml").is_file()), None)
     if repository is not None:
-        for relative in ("environments/delta/requirements.lock",):
-            path = repository / relative
-            if path.is_file():
-                files[relative] = file_digest(path)
-    return {"sha256": json_digest(files), "files": files,
-            "compatibility": {"format": 2, "sha256": json_digest(numerical_files),
-                              "files": numerical_files}}
+        relative = "environments/delta/requirements.lock"
+        path = repository / relative
+        if path.is_file():
+            files[relative] = file_digest(path)
+    return {"sha256": json_digest(files), "files": files}
 
 
 def runtime_record(required_backend: str) -> dict:

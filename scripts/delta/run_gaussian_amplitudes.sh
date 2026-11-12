@@ -75,17 +75,6 @@ if (( shutdown_margin < 60 || shutdown_margin > 180 || wall_seconds <= shutdown_
 fi
 selection=()
 run_options=()
-transition_options=()
-if [[ -n ${VPML_SOURCE_TRANSITION:-} || -n ${VPML_SOURCE_TRANSITION_SHA256:-} ]]; then
-    if [[ ${VPML_SOURCE_TRANSITION:-} != /* || ! -r ${VPML_SOURCE_TRANSITION:-} \
-            || ! ${VPML_SOURCE_TRANSITION_SHA256:-} =~ ^[0-9a-f]{64}$ ]]; then
-        printf 'Require an absolute readable VPML_SOURCE_TRANSITION and its VPML_SOURCE_TRANSITION_SHA256.\n' >&2
-        exit 2
-    fi
-    transition_options=(--source-transition "$VPML_SOURCE_TRANSITION" \
-        --source-transition-sha256 "$VPML_SOURCE_TRANSITION_SHA256")
-    run_options+=("${transition_options[@]}")
-fi
 for case_id in ${VPML_CASE_IDS[@]+"${VPML_CASE_IDS[@]}"}; do
     selection+=(--case-id "$case_id")
     run_options+=(--case-id "$case_id")
@@ -97,9 +86,6 @@ manifest="$VPML_DATA_ROOT/manifest.json"
 output="$VPML_DATA_ROOT/reference"
 cli=(-m vpml.cli.gaussian_dataset --code-root "$VPML_CODE_ROOT")
 validation_options=(--out "$output" ${selection[@]+"${selection[@]}"})
-if (( ${#transition_options[@]} )); then
-    validation_options+=("${transition_options[@]}")
-fi
 
 # Login-node actions only inspect or prepare metadata. Avoid inherited CUDA
 # library paths; the pinned environment supplies its own CUDA wheel libraries.

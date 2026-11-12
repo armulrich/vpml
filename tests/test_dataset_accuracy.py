@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 
 from vpml.datasets.checkpoints import CheckpointStore
+from vpml.datasets.compatibility import build_protocol, PROTOCOL_VERSION, CHECKPOINT_VERSION, SOLVER_REVISION
 from vpml.datasets.manifest import Numerics, build_manifest, write_manifest
 from vpml.datasets.schema import DIAGNOSTIC_NAMES, OUTPUT_SCHEMA, LEGACY_OUTPUT_SCHEMA, observation_schema
 from vpml.diagnostics.dataset_accuracy import compare_dataset_cases, main
@@ -38,15 +39,27 @@ def write_fixture(root, settings, values, *, times=None, complete=True, diagnost
     write_manifest(root / "manifest.json", settings)
     numerical = Numerics(**settings["numerics"])
     case = settings["cases"][0]
-    provenance = {"source": {"compatibility": {"sha256": "a" * 64}},
-                  "runtime": {"backend": "synthetic-test"}}
+    files = {"vpml/synthetic_fixture.py": "a" * 64}
+    source = {"sha256": json_digest(files), "files": files}
+    runtime = {"backend": "cpu", "python": "synthetic-test", "compute_dtype": "float64",
+               "devices": ["synthetic-test"], "driver_versions": [],
+               "packages": {name: "synthetic-test" for name in ("jax", "jaxlib", "numpy", "scipy")}}
+    provenance = {"source": source, "runtime": runtime,
+                  "protocol_version": PROTOCOL_VERSION, "checkpoint_version": CHECKPOINT_VERSION,
+                  "solver_revision": SOLVER_REVISION}
+    if settings["output_schema"] == LEGACY_OUTPUT_SCHEMA:
+        source = dict(source, compatibility=dict(source, format=2))
+        provenance = {"source": source, "runtime": runtime}
     provenance_hash = json_digest(provenance)
     (root / "provenance").mkdir()
     (root / "provenance" / f"{provenance_hash}.json").write_text(json.dumps(provenance))
-    protocol = {"manifest_sha256": json_digest(settings), "case": case,
-                "numerics": settings["numerics"], "output_schema": settings["output_schema"],
-                "linearized": False, "observations": observation_schema(settings["output_schema"]),
-                "source": provenance["source"]["compatibility"], "runtime": provenance["runtime"]}
+    if settings["output_schema"] == LEGACY_OUTPUT_SCHEMA:
+        protocol = {"manifest_sha256": json_digest(settings), "case": case,
+                    "numerics": settings["numerics"], "output_schema": settings["output_schema"],
+                    "linearized": False, "observations": observation_schema(settings["output_schema"]),
+                    "source": source["compatibility"], "runtime": runtime}
+    else:
+        protocol = build_protocol(settings, case, runtime)
     store = CheckpointStore(root / "cases" / case["case_id"], protocol,
                             provenance_sha256=provenance_hash)
     diagnostics = np.zeros((numerical.nsteps + 1, len(DIAGNOSTIC_NAMES)))
