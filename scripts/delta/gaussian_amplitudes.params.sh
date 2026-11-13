@@ -1,0 +1,13 @@
+# shellcheck shell=bash disable=SC2034
+# Iterate the full 1200-IC manifest within the bounded allocation.
+VPML_PARAMETERS_FILE="$VPML_CODE_ROOT/scripts/delta/gaussian_amplitudes.json"
+VPML_SLURM_ACCOUNT=bhvw-delta-gpu
+VPML_SLURM_PARTITION=gpuA100x4
+VPML_SLURM_CPUS=16
+VPML_SLURM_MEMORY=60G
+VPML_SLURM_TIME=01:00:00
+VPML_MAX_SECONDS=3300
+VPML_SHUTDOWN_MARGIN_SECONDS=180
+VPML_SLURM_JOB_NAME=vpml-gaussian
+VPML_STOP_ON_FAILURE=1
+VPML_CASE_IDS=()

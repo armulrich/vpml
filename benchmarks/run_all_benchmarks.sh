@@ -15,8 +15,8 @@ export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
 
 cd "${REPO_ROOT}"
 
-"${PYTHON_BIN}" -m benchmarks.fh_benchmarks_2412_07073_jax fig2 --outdir "${OUTDIR}"
-"${PYTHON_BIN}" -m benchmarks.fh_benchmarks_2412_07073_jax fig3 --outdir "${OUTDIR}"
-"${PYTHON_BIN}" -m benchmarks.fh_benchmarks_2412_07073_jax fig4 --outdir "${OUTDIR}" --Nv "${NV}"
+"${PYTHON_BIN}" -m vpml.benchmarks.fh_benchmarks_2412_07073_jax fig2 --outdir "${OUTDIR}"
+"${PYTHON_BIN}" -m vpml.benchmarks.fh_benchmarks_2412_07073_jax fig3 --outdir "${OUTDIR}"
+"${PYTHON_BIN}" -m vpml.benchmarks.fh_benchmarks_2412_07073_jax fig4 --outdir "${OUTDIR}" --Nv "${NV}"
 
 "${SCRIPT_DIR}/run_linear_landau_suite.sh" "${OUTDIR}"

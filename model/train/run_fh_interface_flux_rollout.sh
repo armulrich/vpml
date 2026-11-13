@@ -106,7 +106,7 @@ if [[ "${RUN_TRAIN}" != "0" ]]; then
     TRAIN_ARGS+=(--init-checkpoint "${TRAIN_INIT_CHECKPOINT}")
   fi
   echo "[interface-flux] [1/2] Training canonical Nv=64 closure with cutoff cycle 6,7,12,20,36,64"
-  "${PYTHON_BIN}" -m model.train.interface_flux_rollout "${TRAIN_ARGS[@]}"
+  "${PYTHON_BIN}" -m vpml.training.interface_train "${TRAIN_ARGS[@]}"
 else
   if [[ ! -f "${CHECKPOINT}" ]]; then
     echo "RUN_TRAIN=0 requires ${CHECKPOINT}" >&2
@@ -150,7 +150,7 @@ if [[ "${RUN_EVAL}" != "0" ]]; then
       exit 1
     fi
     echo "[interface-flux] [2/2] Evaluating every ${EVAL_IC_SPLIT} IC"
-    "${PYTHON_BIN}" -m model.eval_training_cases \
+    "${PYTHON_BIN}" -m vpml.evaluation.training_cases \
       "${COMMON_EVAL_ARGS[@]}" \
       --outdir "${OUTDIR}/evaluation_cases" \
       --ic-manifest "${TRAIN_IC_MANIFEST}" \
@@ -158,7 +158,7 @@ if [[ "${RUN_EVAL}" != "0" ]]; then
       --teacher-reference-dir "${RESOLVED_REFERENCE_CACHE}/snapshots"
   else
     echo "[interface-flux] [2/2] Running Metric 1/2 and raw-HR Fig. 10 evaluation"
-    "${PYTHON_BIN}" -m model.eval_nv_sweep \
+    "${PYTHON_BIN}" -m vpml.evaluation.nv_sweep \
       "${COMMON_EVAL_ARGS[@]}" \
       --outdir "${OUTDIR}" \
       --eps "${EVAL_EPS}"

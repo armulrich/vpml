@@ -7,8 +7,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
-from model.eval_nv_sweep import main as nv_sweep_main
-from vpml.core import LearnedInterfaceClosure, save_learned_interface_closure_npz
+from vpml.evaluation.nv_sweep import main as nv_sweep_main
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.models.interface_checkpoint import save_learned_interface_closure_npz
 
 try:
     jax.config.update("jax_enable_x64", True)

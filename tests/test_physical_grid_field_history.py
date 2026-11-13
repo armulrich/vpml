@@ -3,7 +3,7 @@ import unittest
 import jax.numpy as jnp
 import numpy as np
 
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     compute_electric_field_from_distribution,
     cubic_bspline_prefilter_periodic,

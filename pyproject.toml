@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vpml"
 version = "0.1.0"
-description = "JAX Fourier–Hermite Vlasov–Poisson"
+description = "Vlasov–Poisson solvers, reference datasets and learned closures"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,11 +16,27 @@ dependencies = [
   "scipy",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=8", "modal>=1.0"]
+
 [project.scripts]
-fh-nonlinear-sim = "benchmarks.fh_nonlinear_sim_jax:main"
-fh-benchmarks-2412-07073 = "benchmarks.fh_benchmarks_2412_07073_jax:main"
-fh-interface-flux-train = "model.train.interface_flux_rollout:main"
-fh-learned-closure-eval = "model.eval:main"
+vpml-dataset = "vpml.cli.gaussian_dataset:main"
+vpml-low-moment-train = "vpml.training.low_moment_train:main"
+vpml-gaussian-analyze = "vpml.diagnostics.gaussian_dataset:main"
+vpml-linear-landau-compare = "vpml.diagnostics.linear_landau_comparison:main"
+fh-nonlinear-sim = "vpml.benchmarks.fh_nonlinear_sim_jax:main"
+fh-benchmarks-2412-07073 = "vpml.benchmarks.fh_benchmarks_2412_07073_jax:main"
+fh-interface-flux-train = "vpml.training.interface_train:main"
+fh-learned-closure-eval = "vpml.evaluation.interface_flux:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
-include = ["vpml", "vpml.*", "benchmarks", "benchmarks.*", "model", "model.*"]
+where = ["src"]
+include = ["vpml", "vpml.*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]

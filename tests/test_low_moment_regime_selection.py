@@ -9,7 +9,33 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from model.train import low_moment_closure as trainer
+from vpml.training import low_moment_train as trainer
+from vpml.training.low_moment_configuration import (
+    REGIMES,
+    CHECKPOINT_SCHEMA,
+    build_arg_parser,
+    _validate_regime_resume_configuration,
+    parse_training_regimes,
+    _checkpoint_regimes,
+)
+from vpml.training.low_moment_sampling import (
+    _build_anchor_index,
+    build_balanced_full_anchor_epoch,
+    limit_training_anchors,
+    build_complete_trajectory_case_batches,
+    sample_complete_trajectory_batch,
+    build_diagnostic_panel,
+    sample_batch,
+    _full_anchor_steps_per_epoch,
+    build_balanced_random_window_epoch,
+)
+from vpml.training.low_moment_data import _load_normalization_statistics
+from vpml.training.low_moment_state import (
+    _save_checkpoint,
+    _load_training_state,
+    _load_checkpoint,
+)
+from vpml.training.low_moment_losses import make_supervised_heat_flux_loss
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,7 +46,7 @@ LINEAR = ("linear_landau",)
 
 def reference_fixture(steps=9):
     grouped, cases = {}, []
-    for index, regime in enumerate(trainer.REGIMES):
+    for index, regime in enumerate(REGIMES):
         ids = [f"{regime}_{row}" for row in range(3)]
         histories = []
         for row in range(3):
@@ -53,10 +79,10 @@ def fixed_stats(manifest):
 
 def checkpoint_metadata(manifest):
     return {
-        "schema_version": trainer.CHECKPOINT_SCHEMA,
+        "schema_version": CHECKPOINT_SCHEMA,
         "manifest_sha256": manifest["sha256"],
         "source_Nx": 8, "rollout_Nx": 8,
-        "regimes": list(trainer.REGIMES),
+        "regimes": list(REGIMES),
         "width": 2, "memory_steps": 2, "memory_stride": 1,
     }
 
@@ -70,68 +96,68 @@ class RegimeSelectionTests(unittest.TestCase):
         )
 
     def anchors(self, **kwargs):
-        return trainer._build_anchor_index(
+        return _build_anchor_index(
             self.grouped, "coefficients", horizon=3, history_stride=2, **kwargs
         )
 
     def test_default_and_selected_exposure_and_canonical_indices(self):
-        parser = trainer.build_arg_parser()
+        parser = build_arg_parser()
         args = parser.parse_args(["--reference-cache", "/tmp/cache", "--outdir", "/tmp/run"])
         self.assertEqual(args.training_regimes, "all3")
         self.assertIsNone(args.normalization_checkpoint)
-        self.assertEqual(trainer.parse_training_regimes("all3"), trainer.REGIMES)
-        self.assertEqual(trainer.parse_training_regimes("linear_landau"), LINEAR)
+        self.assertEqual(parse_training_regimes("all3"), REGIMES)
+        self.assertEqual(parse_training_regimes("linear_landau"), LINEAR)
         with self.assertRaises(ValueError):
-            trainer.parse_training_regimes("all")
-        for selection in (None, LINEAR, (trainer.REGIMES[2],)):
+            parse_training_regimes("all")
+        for selection in (None, LINEAR, (REGIMES[2],)):
             kwargs = {} if selection is None else {"regimes": selection}
             anchors = self.anchors(**kwargs)
-            selected = trainer.REGIMES if selection is None else selection
+            selected = REGIMES if selection is None else selection
             self.assertEqual(tuple(anchors), selected)
             # A selected-only grouped mapping catches accidental access to other regimes.
             grouped = {r: self.grouped[r] for r in selected}
-            batch = trainer.sample_batch(
+            batch = sample_batch(
                 np.random.default_rng(7), grouped, anchors, self.manifest, "coefficients",
                 split="train", batch_size_per_regime=2, **self.batch_options, **kwargs,
             )
             self.assertEqual(batch["initial"].shape, (2 * len(selected), 3, 8))
             np.testing.assert_array_equal(
-                batch["regime_index"], np.repeat([trainer.REGIMES.index(r) for r in selected], 2)
+                batch["regime_index"], np.repeat([REGIMES.index(r) for r in selected], 2)
             )
-        self.assertEqual(len(trainer.REGIMES), 3)
+        self.assertEqual(len(REGIMES), 3)
 
     def test_full_sweep_8416_anchors_gives_526_batches_without_omissions(self):
         anchors = {LINEAR[0]: {"train_cases": np.repeat(np.arange(16), 526),
                                "train_times": np.tile(np.arange(526), 16)}}
-        batches = trainer.build_balanced_full_anchor_epoch(
+        batches = build_balanced_full_anchor_epoch(
             np.random.default_rng(3), anchors, regimes=LINEAR,
             split="train", batch_size_per_regime=16,
         )
         self.assertEqual(len(batches), 526)
-        self.assertEqual(trainer._full_anchor_steps_per_epoch(anchors, LINEAR, 16, 1), 526)
-        self.assertEqual(trainer._full_anchor_steps_per_epoch(anchors, LINEAR, 16, 2), 263)
+        self.assertEqual(_full_anchor_steps_per_epoch(anchors, LINEAR, 16, 1), 526)
+        self.assertEqual(_full_anchor_steps_per_epoch(anchors, LINEAR, 16, 2), 263)
         with self.assertRaises(ValueError):
-            trainer._full_anchor_steps_per_epoch(anchors, LINEAR, 16, 3)
+            _full_anchor_steps_per_epoch(anchors, LINEAR, 16, 3)
         observed = [tuple(pair) for batch in batches for pair in zip(*batch[LINEAR[0]])]
         self.assertEqual(len(set(observed)), 8416)
         self.assertEqual(set(observed), {(c, t) for c in range(16) for t in range(526)})
 
     def test_random_cycle_limits_and_complete_batches_use_selected_only(self):
-        anchors, cases = trainer.limit_training_anchors(
+        anchors, cases = limit_training_anchors(
             self.anchors(regimes=LINEAR), {LINEAR[0]: 1}, seed=7, regimes=LINEAR
         )
         self.assertEqual(len(cases[LINEAR[0]]), 1)
-        batches = [trainer.build_balanced_random_window_epoch(
+        batches = [build_balanced_random_window_epoch(
             np.random.default_rng(3), anchors, regimes=LINEAR, split="train",
             batch_size_per_regime=1, deterministic_epoch=epoch,
         ) for epoch in (1, 2)]
         self.assertNotEqual(batches[0][0][LINEAR[0]][1][0], batches[1][0][LINEAR[0]][1][0])
         grouped = {LINEAR[0]: self.grouped[LINEAR[0]]}
-        complete = trainer.build_complete_trajectory_case_batches(
+        complete = build_complete_trajectory_case_batches(
             np.random.default_rng(3), grouped, regimes=LINEAR, split="train",
             batch_size_per_regime=2, shuffle=False,
         )
-        batch = trainer.sample_complete_trajectory_batch(
+        batch = sample_complete_trajectory_batch(
             np.random.default_rng(3), grouped, self.manifest, "coefficients", complete[0],
             regimes=LINEAR, memory_steps=2, memory_stride=1, source_nx=8,
             rollout_nx=8, translation_augmentation=False,
@@ -142,7 +168,7 @@ class RegimeSelectionTests(unittest.TestCase):
     def test_diagnostic_selection_bounds_and_burnin_targets(self):
         kwargs = dict(self.batch_options)
         kwargs.pop("translation_augmentation")
-        panel = trainer.build_diagnostic_panel(
+        panel = build_diagnostic_panel(
             np.random.default_rng(4), {LINEAR[0]: self.grouped[LINEAR[0]]},
             self.anchors(regimes=LINEAR), self.manifest, "coefficients",
             regimes=LINEAR, split="val", start_times=(0, 2), cases_per_regime=None,
@@ -156,7 +182,7 @@ class RegimeSelectionTests(unittest.TestCase):
             self.assertFalse(np.any(batch["memory"]))
             self.assertFalse(np.any(batch["heat_flux_gradient_history"]))
         with self.assertRaisesRegex(ValueError, "exceeds"):
-            trainer.build_diagnostic_panel(
+            build_diagnostic_panel(
                 np.random.default_rng(4), self.grouped, self.anchors(regimes=LINEAR),
                 self.manifest, "coefficients", regimes=LINEAR, split="val",
                 start_times=(5,), cases_per_regime=None, dt=1,
@@ -167,14 +193,14 @@ class RegimeSelectionTests(unittest.TestCase):
         options = dict(k_arr=np.arange(5), width=2, input_scale=np.ones(4),
                        heat_flux_gradient_scale=1., amplitude_center=0., amplitude_scale=1.,
                        poisson_sign=-1., normalized_heat_flux_bound=128., memory_backend="explicit_window")
-        for regimes in (LINEAR, trainer.REGIMES):
+        for regimes in (LINEAR, REGIMES):
             count = len(regimes)
             batch = dict(initial=jnp.zeros((count, 3, 8)), memory=jnp.zeros((count, 2, 3, 8)),
                          amplitude=jnp.ones(count), regime_index=jnp.arange(count),
                          heat_flux_gradient_target=jnp.ones((count, 8)) * 2,
                          heat_flux_gradient_case_scale=jnp.ones(count))
-            with mock.patch.object(trainer, "explicit_window_closure_step", return_value=jnp.zeros((count, 8))):
-                value, per_regime = trainer.make_supervised_heat_flux_loss(regimes=regimes, **options)({}, batch)
+            with mock.patch("vpml.training.low_moment_losses.explicit_window_closure_step", return_value=jnp.zeros((count, 8))):
+                value, per_regime = make_supervised_heat_flux_loss(regimes=regimes, **options)({}, batch)
             self.assertEqual(float(value), 4.)
             np.testing.assert_array_equal(per_regime, np.full(count, 4.))
 
@@ -192,7 +218,7 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                  **{f"stat_{k}": v for k, v in (self.stats if stats is None else stats).items()})
 
     def load_stats(self, path):
-        return trainer._load_normalization_statistics(path, manifest=self.manifest, source_nx=8, rollout_nx=8)
+        return _load_normalization_statistics(path, manifest=self.manifest, source_nx=8, rollout_nx=8)
 
     def test_stats_only_load_preserves_full_family_values_and_file_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,41 +253,41 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "Normalization"):
                         self.load_stats(path)
             self.write_checkpoint(path, metadata={**self.metadata, "regimes": list(LINEAR),
-                                                  "normalization_regimes": list(trainer.REGIMES)})
+                                                  "normalization_regimes": list(REGIMES)})
             self.load_stats(path)
 
     def test_legacy_and_selected_checkpoint_metadata_and_resume_guards(self):
-        self.assertEqual(trainer._checkpoint_regimes({}), trainer.REGIMES)
+        self.assertEqual(_checkpoint_regimes({}), REGIMES)
         selected = dict(regimes=list(LINEAR), training_regimes="linear_landau",
                         normalization_policy="fixed_all3_training_statistics",
-                        normalization_regimes=list(trainer.REGIMES),
+                        normalization_regimes=list(REGIMES),
                         normalization_checkpoint="/old/epoch000.npz",
                         normalization_checkpoint_sha256="source-hash",
                         normalization_statistics_sha256="stats-hash", stats_stride=20)
-        self.assertEqual(trainer._checkpoint_regimes(selected), LINEAR)
-        trainer._validate_regime_resume_configuration(selected, selected)
-        trainer._validate_regime_resume_configuration({}, {"regimes": list(trainer.REGIMES)})
-        for key, value in (("regimes", list(trainer.REGIMES)), ("stats_stride", 40),
+        self.assertEqual(_checkpoint_regimes(selected), LINEAR)
+        _validate_regime_resume_configuration(selected, selected)
+        _validate_regime_resume_configuration({}, {"regimes": list(REGIMES)})
+        for key, value in (("regimes", list(REGIMES)), ("stats_stride", 40),
                            ("normalization_policy", "selected"),
                            ("normalization_checkpoint", "/other.npz"),
                            ("normalization_checkpoint_sha256", "changed"),
                            ("normalization_statistics_sha256", "changed")):
             with self.subTest(key=key), self.assertRaises(ValueError):
-                trainer._validate_regime_resume_configuration(selected, {**selected, key: value})
+                _validate_regime_resume_configuration(selected, {**selected, key: value})
         with self.assertRaises(ValueError):
-            trainer._validate_regime_resume_configuration({}, selected)
+            _validate_regime_resume_configuration({}, selected)
 
     def test_evaluate_checkpoint_uses_saved_selection_and_saved_stats(self):
         cache_metadata = {"configuration": dict(teacher_Nx=8, teacher_L=4 * np.pi,
                           teacher_dt=.01, teacher_poisson_sign=-1.)}
-        for regimes in (LINEAR, trainer.REGIMES):
+        for regimes in (LINEAR, REGIMES):
             with self.subTest(regimes=regimes), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "checkpoint.npz"
-                trainer._save_checkpoint(path, {"test": np.ones(1)},
+                _save_checkpoint(path, {"test": np.ones(1)},
                                          {**self.metadata, "regimes": list(regimes)}, self.stats)
                 with mock.patch.object(trainer, "_load_reference_cache", return_value=(
                     self.grouped, self.manifest, cache_metadata, "coefficients"
-                )), mock.patch.object(trainer, "_evaluate_heldout") as evaluate, mock.patch.object(
+                )), mock.patch("vpml.training.low_moment_evaluation._evaluate_heldout") as evaluate, mock.patch.object(
                     trainer, "load_or_compute_training_statistics", side_effect=AssertionError("no recompute")
                 ):
                     trainer.main(["--reference-cache", tmp, "--outdir", str(Path(tmp) / "eval"),
@@ -288,7 +314,7 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                     "--diagnostic-start-times", "0", "--width", "2", "--spectral-modes", "2"]
             with mock.patch.object(trainer, "_load_reference_cache", return_value=(
                 self.grouped, self.manifest, cache_metadata, "coefficients"
-            )), mock.patch.object(trainer, "init_burles_latent_fno_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
+            )), mock.patch("vpml.training.low_moment_state.init_burles_latent_fno_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
                 trainer, "load_or_compute_training_statistics", side_effect=AssertionError("no recompute")
             ), mock.patch.object(trainer, "_load_checkpoint", side_effect=AssertionError("no weights")), mock.patch.object(
                 trainer, "make_loss_function", side_effect=SetupComplete
@@ -337,21 +363,21 @@ class NormalizationAndCheckpointTests(unittest.TestCase):
                 trainer, "_load_reference_cache", return_value=(
                     self.grouped, self.manifest, cache_metadata, "coefficients"
                 )
-            ), mock.patch.object(trainer, "init_spectral_memory_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
+            ), mock.patch("vpml.training.low_moment_state.init_spectral_memory_params", return_value={"fresh": jnp.ones(1)}), mock.patch.object(
                 trainer, "load_or_compute_training_statistics", side_effect=AssertionError("no cache writes")
             ), mock.patch.object(trainer, "make_loss_function", side_effect=toy_loss), mock.patch.object(trainer, "_plot_losses"):
                 trainer.main(args)
-                _, _, _, state = trainer._load_training_state(outdir / "training_state.npz")
+                _, _, _, state = _load_training_state(outdir / "training_state.npz")
                 self.assertEqual(state["global_epoch"], 1)
                 args[args.index("--epochs") + 1] = "20"
                 trainer.main(args + ["--resume-run", str(outdir)])
-                _, optimizer, histories, state = trainer._load_training_state(outdir / "training_state.npz")
+                _, optimizer, histories, state = _load_training_state(outdir / "training_state.npz")
                 self.assertEqual(state["global_epoch"], 20)
                 self.assertEqual(int(optimizer["step"]), 20)
                 self.assertEqual(len(histories["train_loss"]), 20)
                 self.assertEqual(histories["val_regime_loss"].shape[1], 1)
                 for name in ("epoch000_low_moment_closure.npz", "epoch020_low_moment_closure.npz"):
-                    _, metadata, stats = trainer._load_checkpoint(outdir / name)
+                    _, metadata, stats = _load_checkpoint(outdir / name)
                     self.assertEqual(metadata["planned_epochs"], 1000)
                     self.assertEqual(metadata["steps_per_epoch"], 1)
                     self.assertEqual(metadata["steps_per_epoch_source"], "selected_full_anchor_count")
