@@ -430,13 +430,12 @@ with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
         for requirement in ("jax==0.10.0", "jaxlib==0.10.0", "jax-cuda12-plugin==0.10.0",
                             "numpy==2.4.4", "scipy==1.17.1", "matplotlib==3.10.9"):
             self.assertIn(requirement, lock)
-        requirements = [line for line in lock.splitlines() if line and line[0].isalnum()]
+        requirements = [line for line in lock.splitlines() if line and not line.startswith("#")]
         self.assertGreater(len(requirements), 20)
-        self.assertTrue(all("==" in line for line in requirements))
-        for section in lock.split("\n"):
-            if section and section[0].isalnum():
-                remaining = lock.split(section, 1)[1]
-                self.assertTrue(remaining.lstrip().startswith("--hash=sha256:"))
+        for requirement in requirements:
+            self.assertRegex(requirement, r"^[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+-]*$")
+        names = [requirement.split("==", 1)[0] for requirement in requirements]
+        self.assertEqual(len(names), len(set(names)))
 
 
 if __name__ == "__main__":

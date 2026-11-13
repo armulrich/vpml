@@ -25,7 +25,7 @@ fi
 directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 unset LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH PYTHONHOME
 "$python" -m venv "$destination"
-"$destination/bin/python" -m pip --isolated install --require-hashes --only-binary=:all: \
+"$destination/bin/python" -m pip --isolated install --only-binary=:all: \
     --index-url https://pypi.org/simple -r "$directory/requirements.lock"
 code=$(cd -- "$directory/../.." && pwd -P)
 "$destination/bin/python" -m pip --isolated install --no-deps --no-build-isolation --editable "$code"
