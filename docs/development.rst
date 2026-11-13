@@ -93,7 +93,7 @@ Update the Delta lock
 ---------------------
 
 After reviewing changes to ``environments/delta/requirements.in``, resolve the
-Linux Python 3.12 dependency set with hashes:
+Linux Python 3.12 dependency set into one exact version pin per package:
 
 .. code-block:: bash
 
@@ -101,10 +101,12 @@ Linux Python 3.12 dependency set with hashes:
      --cache-dir /tmp/vpml-delta-uv-cache pip compile \
      environments/delta/requirements.in \
      --python-version 3.12 --python-platform x86_64-unknown-linux-gnu \
-     --generate-hashes --only-binary :all: \
-     --default-index https://pypi.org/simple --no-header \
+     --only-binary :all: \
+     --default-index https://pypi.org/simple --no-header --no-annotate \
      --output-file environments/delta/requirements.lock
 
-Review the resolved versions and install into a new environment. A successful
-resolution establishes neither GPU execution nor numerical equivalence; check
-both before using changed dependencies for reference data.
+The lock includes direct and transitive dependencies without distribution
+hashes. Regenerate it only for a deliberate dependency update. Review the
+resolved versions and install into a new environment. A successful resolution
+establishes neither GPU execution nor numerical equivalence; check both before
+using changed dependencies for reference data.

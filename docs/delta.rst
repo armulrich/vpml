@@ -6,7 +6,9 @@ Environment
 
 Use a fixed checkout on Delta and a separate Python 3.12 environment. The
 reviewed direct dependencies are in ``environments/delta/requirements.in``;
-``requirements.lock`` pins the complete resolved environment with hashes.
+``requirements.lock`` pins exact versions of all direct and transitive
+dependencies. It changes only when dependencies are deliberately updated,
+not for each dataset run.
 
 .. code-block:: bash
 
@@ -14,8 +16,9 @@ reviewed direct dependencies are in ``environments/delta/requirements.in``;
      /absolute/path/to/python3.12 /absolute/path/to/new-venv
 
 The helper requires Linux x86_64, refuses an existing environment and installs
-hash-verified wheels and the reviewed checkout as an editable package. The
-launcher checks that its Python imports that checkout. Setup does not submit a job. The CUDA 12 JAX wheels require
+wheels at the pinned versions and the reviewed checkout as an editable package.
+The launcher checks that its Python imports that checkout. Setup does not submit
+a job. The CUDA 12 JAX wheels require
 an NVIDIA Linux driver of at least 525; confirm the allocated node's driver and
 actual JAX execution before relying on GPU compatibility. See the
 `JAX installation guide <https://docs.jax.dev/en/latest/installation.html#nvidia-gpu>`_.
