@@ -20,15 +20,17 @@ After setting absolute `VPML_DATA_ROOT` and `VPML_PYTHON` paths:
 bash scripts/delta/run_gaussian_amplitudes.sh prepare
 bash scripts/delta/run_gaussian_amplitudes.sh validate
 bash scripts/delta/run_gaussian_amplitudes.sh status
+bash scripts/delta/run_gaussian_amplitudes.sh budget
 bash scripts/delta/run_gaussian_amplitudes.sh test-submit
 ```
 
 Only the explicit `submit` action requests a real allocation. The launcher
-bounds every parameter-file choice to one A100, at most 16 CPUs, 60G memory,
-one hour of allocation time and a 3,300-second worker budget. The default
-shutdown margin is 180 seconds. An explicit parameter file can set
-`VPML_SHUTDOWN_MARGIN_SECONDS` between 60 and 180; the worker budget must still
-fit inside the allocation time minus that margin. Array definitions and output
+bounds every parameter-file choice to one A100, at most 16 CPUs and 60G memory.
+The default is a cumulative allowance of 26 additional SU, a maximum allocation
+of 25 hours 55 minutes and a 93,000-second worker budget. The allocation limit
+also applies when SSH disconnects. Later submissions use the unused allowance
+after reconciling recorded jobs; they do not reset it. The default worker
+shutdown margin is 300 seconds. Array definitions and output
 validation are documented in the [dataset guide](../../docs/datasets.rst).
 
 Before a real submission, the launcher writes a read-only, content-addressed
@@ -38,4 +40,6 @@ worker budgets, and source hashes. Git identity is recorded when available;
 for an archived checkout, optional `VPML_SOURCE_COMMIT` supplies a validated
 40-digit hexadecimal commit declaration alongside the actual source hashes.
 The record is a submission intent, not evidence of scheduler acceptance or job
-completion. Keep the staged code and manifest unchanged while a job can use them.
+completion. Accepted job IDs and the cumulative allowance are recorded separately
+in `$VPML_DATA_ROOT/budget.json`. Keep this file and the saved checkpoints when
+continuing. Keep the staged code and manifest unchanged while a job can use them.

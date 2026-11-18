@@ -67,12 +67,15 @@ numerical accuracy is assessed separately.
    bash scripts/delta/run_gaussian_amplitudes.sh prepare
    bash scripts/delta/run_gaussian_amplitudes.sh validate
    bash scripts/delta/run_gaussian_amplitudes.sh status
+   bash scripts/delta/run_gaussian_amplitudes.sh budget
    bash scripts/delta/run_gaussian_amplitudes.sh test-submit
 
 Preparation writes the manifest, validation compares it with the configured
 parameters, and status reads progress metadata. Status is not a full integrity
-audit. ``test-submit`` uses ``sbatch --test-only``: a hypothetical job ID does
-not indicate that a job was submitted or a GPU tested.
+audit. ``budget`` reads the allocation allowance and Slurm accounting without
+submitting work. ``test-submit`` checks the billing configuration and uses
+``sbatch --test-only``: a hypothetical job ID does not indicate that a job was
+submitted or a GPU tested.
 
 Submission is a separate action:
 
@@ -82,31 +85,47 @@ Submission is a separate action:
 
 Before submission, the launcher freezes a read-only record under
 ``$VPML_DATA_ROOT/submissions`` with parameter texts, manifest and source hashes,
-selected cases and resource limits. This records intent, not scheduler acceptance;
-retain the actual job ID returned by Slurm separately. When using a Git archive,
+selected cases and resource limits. It separately records the accepted Slurm job
+ID in the dataset's budget record. An intent alone does not prove acceptance or
+completion. When using a Git archive,
 set ``VPML_SOURCE_COMMIT`` to its full commit SHA. The record distinguishes that
 declaration from a commit observed in a checkout. Stage and preserve the source,
 environment and parameters before submission: ``sbatch`` does not transfer them.
 
 This requests a real allocation: account ``bhvw-delta-gpu``, partition
-``gpuA100x4``, one GPU, 16 CPUs and 60 GB host RAM for at most one hour.
+``gpuA100x4``, one GPU, 16 CPUs and 60 GB host RAM. The default requests at most
+25 hours 55 minutes within a cumulative allowance of 26 additional SU.
 Allocation time is charged even while the GPU is idle. These settings are
 specific to Delta; another account or cluster needs its own reviewed launcher.
 See `Delta job accounting <https://docs.ncsa.illinois.edu/systems/delta/en/latest/user_guide/job_accounting.html>`_.
 
-The launcher rejects larger CPU, memory or wall-time requests. Completion of
-the selected cases or a configured stop on failure releases the allocation
-early. A one-hour allocation does not guarantee that every selected case
-reaches its prescribed simulation time.
+The launcher verifies the live billing configuration before submission. For
+these resources the expected rate is at most 1 SU per allocated hour. It
+reserves five minutes of the allowance for scheduler termination and accounting
+headroom. Completion or a configured stop on failure releases the allocation
+early; requesting time does not charge for time after the job ends.
 
-The worker's 3,300-second budget leaves a shutdown margin; Slurm also sends an
-advance USR1 signal. Shorter jobs may set ``VPML_SHUTDOWN_MARGIN_SECONDS`` between
-60 and 180 seconds; the worker budget must leave at least this margin before
-the requested wall limit. The default is 180 seconds. There is no automatic
-requeue, retry or resubmission. Each submission has its own budget; the launcher
-does not enforce a shared allowance across separate jobs.
-Compilation or slow I/O can still reach the hard limit, so recovery does not
-depend solely on graceful shutdown.
+The default worker budget is 93,000 seconds (25 hours 50 minutes). It is also
+bounded by the actual allocation end time, leaving the configured shutdown
+margin after setup and validation. Slurm sends an advance USR1 signal and
+enforces the outer wall-time limit even if the client disconnects. There is no
+automatic requeue, retry or resubmission. A time allowance is not a guarantee
+that every selected trajectory reaches its prescribed simulation time.
+
+The first submission under this controller creates ``$VPML_DATA_ROOT/budget.json``.
+The allowance applies to jobs recorded there; historical jobs from before its
+creation are not retroactively charged against this new allowance. Each later
+submission reconciles recorded job IDs with Slurm accounting, including failed
+and cancelled jobs, and reduces the available wall time accordingly. It does
+not grant a fresh allowance on restart or infer spending from changes in a
+shared project balance. Preserve this record alongside the dataset.
+
+Only one submission can update the budget at a time. An active job, missing
+accounting or an ambiguous submission result blocks another submission. If the
+connection fails during submission, inspect the recorded intent and Slurm queue
+before resolving the uncertainty; do not delete the record and submit again.
+Compilation, slow I/O or a crash can still interrupt checkpoint publication,
+so recovery does not depend solely on graceful shutdown.
 
 Monitoring and continuation
 ---------------------------
@@ -116,10 +135,21 @@ are written under ``$VPML_DATA_ROOT/logs``; worker data are under
 ``$VPML_DATA_ROOT/reference``. Closing the SSH connection does not stop an
 already submitted batch job.
 
+The ``status`` action reports completed and partial cases and their committed
+steps; the ``budget`` action reports job states, charges and the remaining
+allowance. A partial checkpoint can retain a ``running`` label after its job
+ends: Slurm, rather than that label, determines whether computation is active.
+Use committed steps to include partial trajectories in progress estimates.
+
 To request a checkpointed stop, send USR1 to that job's steps. ``scancel JOBID``
 cancels the specific job immediately; recovery then uses the last committed
 checkpoint. Confirm that the previous job has ended before submitting again.
-The same manifest and output directory continue the same dataset.
+The same manifest and output directory continue the same dataset. Completed
+cases are verified and skipped; partial cases resume from the last committed
+checkpoint. An abrupt stop can lose the current uncommitted block, but not the
+preceding published checkpoint. A crash may leave a case lock: confirm that its
+owning job and process have ended before removing it. Preserve and investigate
+any failure record before explicitly retrying the affected case.
 
 .. code-block:: bash
 
