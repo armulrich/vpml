@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 usage() {
-    printf 'Usage: bash %s {prepare|validate|status|test-submit|submit}\n' "$0" >&2
+    printf 'Usage: bash %s {prepare|validate|status|budget|test-submit|submit}\n' "$0" >&2
     printf 'Required: VPML_DATA_ROOT and VPML_PYTHON, both absolute paths.\n' >&2
     printf 'Optional: VPML_RUN_PARAMS selects an absolute parameter file; the adjacent gaussian_amplitudes.params.sh is the default.\n' >&2
 }
@@ -14,7 +14,7 @@ if [[ $# -ne 1 ]]; then
 fi
 action=$1
 case $action in
-    prepare|validate|status|test-submit|submit) ;;
+    prepare|validate|status|budget|test-submit|submit) ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
 esac
@@ -42,7 +42,8 @@ fi
 VPML_CASE_IDS=()
 VPML_STOP_ON_FAILURE=0
 VPML_SLURM_JOB_NAME=vpml-gaussian
-VPML_SHUTDOWN_MARGIN_SECONDS=180
+VPML_SHUTDOWN_MARGIN_SECONDS=300
+VPML_BUDGET_SU=26
 # shellcheck source=/dev/null
 source "$run_parameters"
 if [[ ${VPML_PARAMETERS_FILE:-} != /* || ! -r $VPML_PARAMETERS_FILE ]]; then
@@ -58,7 +59,7 @@ if [[ ${VPML_SLURM_PARTITION:-} != gpuA100x4 || ${VPML_SLURM_MEMORY:-} != 60G \
     exit 2
 fi
 wall_seconds=$((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
-if [[ ! ${VPML_MAX_SECONDS:-} =~ ^[0-9]{1,4}$ \
+if [[ ! ${VPML_MAX_SECONDS:-} =~ ^[0-9]{1,5}$ \
         || ! $VPML_SHUTDOWN_MARGIN_SECONDS =~ ^[0-9]{2,3}$ \
         || ! $VPML_STOP_ON_FAILURE =~ ^[01]$ \
         || ! $VPML_SLURM_JOB_NAME =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -67,10 +68,10 @@ if [[ ! ${VPML_MAX_SECONDS:-} =~ ^[0-9]{1,4}$ \
 fi
 worker_seconds=$((10#$VPML_MAX_SECONDS))
 shutdown_margin=$((10#$VPML_SHUTDOWN_MARGIN_SECONDS))
-if (( shutdown_margin < 60 || shutdown_margin > 180 || wall_seconds <= shutdown_margin \
-        || wall_seconds > 3600 || worker_seconds <= 0 || worker_seconds > 3300 \
+if (( shutdown_margin < 60 || shutdown_margin > 300 || wall_seconds <= shutdown_margin \
+        || wall_seconds > 93300 || worker_seconds <= 0 || worker_seconds > 93000 \
         || worker_seconds > wall_seconds - shutdown_margin )); then
-    printf 'Require wall time <=3600s, worker time <=3300s and a shutdown margin between 60s and 180s.\n' >&2
+    printf 'Require wall time <=93300s, worker time <=93000s and a shutdown margin between 60s and 300s.\n' >&2
     exit 2
 fi
 selection=()
@@ -99,6 +100,9 @@ case $action in
         exec "$VPML_PYTHON" "${cli[@]}" validate --manifest "$manifest" --parameters "$VPML_PARAMETERS_FILE" \
             ${validation_options[@]+"${validation_options[@]}"}
         ;;
+    budget)
+        exec "$VPML_PYTHON" "$script_directory/budget.py" status "$VPML_DATA_ROOT" "$VPML_BUDGET_SU" "$VPML_SLURM_ACCOUNT"
+        ;;
     status)
         exec "$VPML_PYTHON" "${cli[@]}" status --out "$output" --manifest "$manifest"
         ;;
@@ -115,6 +119,7 @@ done
 arguments=(
     --parsable
     "--account=$VPML_SLURM_ACCOUNT"
+    "--qos=$VPML_SLURM_ACCOUNT"
     "--partition=$VPML_SLURM_PARTITION"
     --nodes=1 --ntasks=1 "--cpus-per-task=$VPML_SLURM_CPUS" --gpus-per-node=1
     "--mem=$VPML_SLURM_MEMORY" "--time=$VPML_SLURM_TIME"
@@ -125,16 +130,7 @@ arguments=(
     "--output=$VPML_DATA_ROOT/logs/slurm-%j.out"
     "--error=$VPML_DATA_ROOT/logs/slurm-%j.err"
 )
-if [[ $action == test-submit ]]; then
-    arguments+=(--test-only)
-else
-    mkdir -p -- "$VPML_DATA_ROOT/logs"
-    intent=$("$VPML_PYTHON" "$script_directory/record_submission.py" \
-        "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" \
-        "$run_parameters" "$worker_seconds" "$wall_seconds" "$shutdown_margin" "${arguments[@]}" -- \
-        ${run_options[@]+"${run_options[@]}"})
-    printf 'Submission intent (not scheduler acceptance): %s\n' "$intent" >&2
-fi
-exec sbatch "${arguments[@]}" "$script_directory/gaussian_amplitudes.batch.sh" \
-    "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" "$worker_seconds" \
-    ${run_options[@]+"${run_options[@]}"}
+exec "$VPML_PYTHON" "$script_directory/budget.py" "$action" \
+    "$VPML_CODE_ROOT" "$VPML_DATA_ROOT" "$VPML_PYTHON" "$VPML_PARAMETERS_FILE" \
+    "$run_parameters" "$worker_seconds" "$wall_seconds" "$shutdown_margin" "$VPML_BUDGET_SU" \
+    "${arguments[@]}" -- ${run_options[@]+"${run_options[@]}"}

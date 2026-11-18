@@ -15,6 +15,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -37,7 +38,7 @@ class DeltaLauncherTests(unittest.TestCase):
         self.python = self.bin / "mock python"
         self.python.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 from pathlib import Path
-if Path(sys.argv[1]).name == "record_submission.py":
+if Path(sys.argv[1]).name in {"record_submission.py", "budget.py"}:
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
     handle.write(json.dumps({"program": "python", "args": sys.argv[1:],
@@ -54,10 +55,54 @@ with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
     handle.write(json.dumps({"program": "sbatch", "args": sys.argv[1:],
                              "sbatch_env": [name for name in os.environ if name.startswith("SBATCH_")],
                              "submission_intents": sorted(str(path) for path in
-                                 (Path(os.environ["VPML_DATA_ROOT"]) / "submissions").glob("*.json"))}) + "\\n")
-print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
+                                 (Path(os.environ["VPML_DATA_ROOT"]) / "submissions").glob("*.json")
+                                 if not path.name.startswith("job-"))}) + "\\n")
+if "--test-only" in sys.argv:
+    print("hypothetical")
+else:
+    counter = Path(os.environ["MOCK_CALL_LOG"]).with_suffix(".job-counter")
+    job = int(counter.read_text()) + 1 if counter.exists() else 1001
+    counter.write_text(str(job))
+    print(os.environ.get("MOCK_SBATCH_REPLY", str(job)))
 ''')
         scheduler.chmod(0o700)
+        cluster = f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+if name == "scontrol":
+    if "partition" in sys.argv:
+        print("PartitionName=gpuA100x4 QoS=gpua100x4qos State=UP MaxTime=2-00:00:00 "
+              "TRESBillingWeights=CPU=62.5,Mem=16G,GRES/gpu=1000 OverTimeLimit=NONE")
+    elif "config" in sys.argv:
+        print("PriorityFlags = MAX_TRES\\nKillWait = 30 sec\\nOverTimeLimit = 0 min")
+    elif "job" in sys.argv:
+        print("JobId=1001 JobState=RUNNING EndTime=2099-01-01T00:00:00")
+    else:
+        raise SystemExit("Unexpected scontrol query")
+elif name == "sacctmgr":
+    print("gpua100x4qos|1.000000\\nbhvw-delta-gpu|1.000000")
+elif name == "squeue":
+    print(os.environ.get("MOCK_SQUEUE", ""), end="")
+elif name == "sacct":
+    fields = next((v.split("=", 1)[1] for v in sys.argv if v.lower().startswith("--format=")), None)
+    if fields is None:
+        index = next(i for i, v in enumerate(sys.argv) if v in {"--format", "-o"})
+        fields = sys.argv[index + 1]
+    index = next(i for i, v in enumerate(sys.argv) if v in {"-j", "--jobs"})
+    for job in sys.argv[index + 1].split(","):
+        values = {"JobIDRaw": job, "JobID": job,
+                  "Account": "bhvw-delta-gpu", "Partition": "gpuA100x4",
+                  "State": os.environ.get("MOCK_SACCT_STATE", "COMPLETED"),
+                  "ElapsedRaw": os.environ.get("MOCK_ELAPSED", "100"),
+                  "AllocTRES": "billing=1000,cpu=16,gres/gpu=1,mem=60G,node=1",
+                  "Start": "2026-11-18T12:00:00", "End": "2026-11-18T12:01:40",
+                  "ExitCode": "0:0", "User": os.environ.get("USER", "armin")}
+        print("|".join(values[field.split("%", 1)[0]] for field in fields.split(",")))
+'''
+        for name in ("scontrol", "sacctmgr", "squeue", "sacct"):
+            executable = self.bin / name
+            executable.write_text(cluster)
+            executable.chmod(0o700)
         self.environment = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
                                 VPML_CODE_ROOT=str(ROOT), VPML_DATA_ROOT=str(self.data),
                                 VPML_PYTHON=str(self.python), MOCK_CALL_LOG=str(self.log),
@@ -65,6 +110,14 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
                                 SBATCH_EXCLUSIVE="1")
         self.environment.pop("VPML_RUN_PARAMS", None)
         self.environment.pop("VPML_SOURCE_COMMIT", None)
+
+    def make_manifest(self):
+        self.data.mkdir(mode=0o700, exist_ok=True)
+        path = self.data / "manifest.json"
+        path.write_text(json.dumps({"cases": [{"case_id": case_id} for case_id in MANIFEST_IDS]}))
+
+    def assert_only_manifest_exists(self):
+        self.assertEqual(sorted(path.name for path in self.data.iterdir()), ["manifest.json"])
 
     def run_action(self, *args, environment=None):
         return subprocess.run(["/bin/bash", str(LAUNCHER), *args],
@@ -104,6 +157,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
                                                "--manifest", str(self.data / "manifest.json")])
 
     def test_test_submit_is_only_scheduler_test_and_quoted_paths_survive(self):
+        self.make_manifest()
         result = self.run_action("test-submit")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
@@ -113,17 +167,19 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(calls[1]["sbatch_env"], [])
         for argument in ("--test-only", "--account=bhvw-delta-gpu", "--partition=gpuA100x4",
                          "--nodes=1", "--ntasks=1", "--cpus-per-task=16", "--gpus-per-node=1",
-                         "--mem=60G", "--time=01:00:00", "--signal=USR1@180", "--no-requeue",
+                         "--mem=60G", "--time=25:55:00", "--signal=USR1@300", "--no-requeue",
                          "--constraint=work", "--export=NIL", "--job-name=vpml-gaussian"):
             self.assertIn(argument, arguments)
         self.assertIn(str(self.data), arguments)
         self.assertIn(str(self.python), arguments)
-        self.assertEqual(arguments[-6:], [str(ROOT), str(self.data), str(self.python),
-                                         str(PARAMETERS), "3300", "--stop-on-failure"])
+        self.assertEqual(arguments[-8:], [str(ROOT), str(self.data), str(self.python),
+                                         str(PARAMETERS), "93000", "--shutdown-margin", "300",
+                                         "--stop-on-failure"])
         self.assertNotIn("--case-id", arguments)
-        self.assertFalse(self.data.exists())
+        self.assert_only_manifest_exists()
 
     def test_canonical_scientific_parameters_and_explicit_default_match(self):
+        self.make_manifest()
         parameters = json.loads(PARAMETERS.read_text())
         self.assertEqual(parameters["numerics"], {
             "nx": 512, "nv": 4096, "dt": 0.0125, "final_time": 120.0,
@@ -137,10 +193,16 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         result = self.run_action("test-submit", environment=dict(
             self.environment, VPML_RUN_PARAMS=str(RUN_PARAMETERS)))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), expected)
-        self.assertFalse(self.data.exists())
+        # Each dry run gets a unique reconciliation comment, while its request is identical.
+        actual = self.calls()
+        for calls in (expected, actual):
+            for call in calls:
+                call["args"] = [arg for arg in call["args"] if not arg.startswith("--comment=")]
+        self.assertEqual(actual, expected)
+        self.assert_only_manifest_exists()
 
     def test_explicit_selection_is_validated_and_forwarded_exactly(self):
+        self.make_manifest()
         selected = ["case_" + f"{index:024x}" for index in range(5)]
         environment = self.parameter_environment(
             "VPML_CASE_IDS=(" + " ".join(shlex.quote(value) for value in selected) + ")\n"
@@ -155,7 +217,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         batch_arguments = calls[1]["args"]
         self.assertEqual(batch_arguments[-len(expected)-1:], [*expected, "--stop-on-failure"])
         self.assertIn("--job-name=vpml-gaussian-selected", batch_arguments)
-        self.assertFalse(self.data.exists())
+        self.assert_only_manifest_exists()
 
     def test_selected_case_validation_failure_never_calls_scheduler(self):
         environment = self.parameter_environment("VPML_CASE_IDS=(unknown unknown)\nVPML_STOP_ON_FAILURE=1")
@@ -171,11 +233,11 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
             with self.subTest(path=value):
                 result = self.run_action("submit", environment=dict(self.environment, VPML_RUN_PARAMS=value))
                 self.assertEqual(result.returncode, 2, result.stderr)
-        for setting in ("VPML_SLURM_TIME=02:00:00", "VPML_SLURM_TIME=00:60:00",
-                        "VPML_MAX_SECONDS=3600", "VPML_MAX_SECONDS=0",
+        for setting in ("VPML_SLURM_TIME=26:00:01", "VPML_SLURM_TIME=00:60:00",
+                        "VPML_MAX_SECONDS=93601", "VPML_MAX_SECONDS=0",
                         "VPML_SLURM_TIME=00:30:00", "VPML_SLURM_CPUS=32",
                         "VPML_SLURM_MEMORY=120G", "VPML_SLURM_PARTITION=gpuA40x4",
-                        "VPML_SHUTDOWN_MARGIN_SECONDS=59", "VPML_SHUTDOWN_MARGIN_SECONDS=181",
+                        "VPML_SHUTDOWN_MARGIN_SECONDS=59", "VPML_SHUTDOWN_MARGIN_SECONDS=301",
                         "VPML_SHUTDOWN_MARGIN_SECONDS=invalid",
                         "VPML_SLURM_TIME=00:05:00\nVPML_MAX_SECONDS=241\nVPML_SHUTDOWN_MARGIN_SECONDS=60",
                         "VPML_SLURM_TIME=00:01:00\nVPML_MAX_SECONDS=1\nVPML_SHUTDOWN_MARGIN_SECONDS=60",
@@ -187,6 +249,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertFalse(self.data.exists())
 
     def test_bounded_comparison_jobs_fit_within_fifteen_minutes(self):
+        self.make_manifest()
         wall_seconds = 0
         for wall, worker in (("00:05:00", 240), ("00:10:00", 540)):
             with self.subTest(wall=wall):
@@ -198,11 +261,11 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
                 scheduler = self.calls()[-1]
                 self.assertIn(f"--time={wall}", scheduler["args"])
                 self.assertIn("--signal=USR1@60", scheduler["args"])
-                self.assertEqual(scheduler["args"][-2], str(worker))
+                self.assertEqual(scheduler["args"][-4], str(worker))
                 self.assertEqual(scheduler["args"][-1], "--stop-on-failure")
                 wall_seconds += int(wall[3:5]) * 60
         self.assertEqual(wall_seconds, 900)
-        self.assertFalse(self.data.exists())
+        self.assert_only_manifest_exists()
 
     def test_explicit_submit_is_the_only_action_without_test_only(self):
         self.data.mkdir(mode=0o700)
@@ -227,9 +290,9 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         self.assertEqual(record["scientific_parameters"]["text"], PARAMETERS.read_text())
         self.assertEqual(record["launcher_parameters"]["text"], RUN_PARAMETERS.read_text())
         self.assertEqual(record["selected_case_ids"], MANIFEST_IDS)
-        self.assertEqual(record["scheduler"]["wall_seconds"], 3600)
-        self.assertEqual(record["scheduler"]["shutdown_margin_seconds"], 180)
-        self.assertEqual(record["worker"]["max_seconds"], 3300)
+        self.assertEqual(record["scheduler"]["wall_seconds"], 93300)
+        self.assertEqual(record["scheduler"]["shutdown_margin_seconds"], 300)
+        self.assertEqual(record["worker"]["max_seconds"], 93000)
         self.assertTrue(record["worker"]["stop_on_failure"])
         self.assertEqual(record["worker"]["arguments"], ["--stop-on-failure"])
         self.assertIn("--gpus-per-node=1", record["scheduler"]["arguments"])
@@ -242,7 +305,8 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         # A later submit records its own intent without overwriting earlier evidence.
         result = self.run_action("submit")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(list(path.parent.glob("*.json"))), 2)
+        self.assertEqual(len([p for p in path.parent.glob("*.json") if not p.name.startswith("job-")]), 2)
+        self.assertEqual(len(list(path.parent.glob("job-*.json"))), 2)
         self.assertEqual(path.read_bytes(), payload)
 
     def test_explicit_parameter_snapshots_survive_later_edits(self):
@@ -259,7 +323,7 @@ print("hypothetical" if "--test-only" in sys.argv else "mock-submitted")
         scientific_snapshot = scientific.read_text()
         result = self.run_action("submit", environment=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
-        path = next((self.data / "submissions").glob("*.json"))
+        path = next(p for p in (self.data / "submissions").glob("*.json") if not p.name.startswith("job-"))
         before = path.read_bytes()
         scientific.write_text("{}")
         Path(environment["VPML_RUN_PARAMS"]).write_text("# changed later\n")
@@ -387,7 +451,8 @@ with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
         command = ["/bin/bash", str(batch), str(ROOT), str(self.data), str(self.python),
                    str(ROOT / "scripts/delta/gaussian_amplitudes.json"), "3300"]
         environment = dict(self.environment, SLURM_JOB_ID="fake-job", SLURM_CPUS_PER_TASK="16",
-                           CUDA_VISIBLE_DEVICES="allocated-device")
+                           CUDA_VISIBLE_DEVICES="allocated-device",
+                           SLURM_JOB_END_TIME=str(int(time.time()) + 7200))
         return command, environment
 
     def test_batch_forwards_only_selected_cases_and_failure_policy(self):
@@ -420,7 +485,7 @@ with open(os.environ["MOCK_CALL_LOG"], "a") as handle:
                 result = subprocess.run([*command, *options], env=environment, text=True,
                                         capture_output=True, check=False)
                 self.assertEqual(result.returncode, 2, result.stderr)
-        result = subprocess.run([*command[:-1], "3301"], env=environment, text=True,
+        result = subprocess.run([*command[:-1], "93601"], env=environment, text=True,
                                 capture_output=True, check=False)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.calls(), [])

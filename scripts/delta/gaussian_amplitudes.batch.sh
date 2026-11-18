@@ -16,8 +16,17 @@ shift 5
 selection=()
 run_options=()
 stop_on_failure=0
+shutdown_margin=300
 while (( $# )); do
     case $1 in
+        --shutdown-margin)
+            if [[ $# -lt 2 || ! $2 =~ ^[0-9]{2,3}$ ]] || (( 10#$2 < 60 || 10#$2 > 300 )); then
+                printf 'Shutdown margin must be between 60 and 300 seconds.\n' >&2
+                exit 2
+            fi
+            shutdown_margin=$((10#$2))
+            shift 2
+            ;;
         --case-id)
             if [[ $# -lt 2 || -z $2 ]]; then
                 printf 'Each --case-id requires a value.\n' >&2
@@ -45,14 +54,14 @@ done
 cpus=${SLURM_CPUS_PER_TASK:-}
 if [[ $code != /* || $data != /* || $data == / || $python != /* || $parameters != /* \
         || ! -x $python || ! -r $code/src/vpml/cli/gaussian_dataset.py || ! -r $parameters \
-        || ! $max_seconds =~ ^[0-9]{1,4}$ \
+        || ! $max_seconds =~ ^[0-9]{1,5}$ \
     || ! $cpus =~ ^([1-9]|1[0-6])$ ]]; then
     printf 'Invalid batch paths or runtime limit.\n' >&2
     exit 2
 fi
 max_seconds=$((10#$max_seconds))
-if (( max_seconds <= 0 || max_seconds > 3300 )); then
-    printf 'Worker runtime must be between 1 and 3300 seconds.\n' >&2
+if (( max_seconds <= 0 || max_seconds > 93000 )); then
+    printf 'Worker runtime must be between 1 and 93000 seconds.\n' >&2
     exit 2
 fi
 
@@ -66,6 +75,9 @@ cd -- "$code"
 "$python" -m vpml.cli.gaussian_dataset --code-root "$code" validate \
     --manifest "$data/manifest.json" --parameters "$parameters" --out "$data/reference" \
     ${selection[@]+"${selection[@]}"}
+# Bound the worker by the allocation's actual end, including time spent in
+# environment/metadata validation before the numerical worker starts.
+max_seconds=$("$python" "$code/scripts/delta/budget.py" worker-seconds "$max_seconds" "$shutdown_margin")
 exec /usr/bin/srun --ntasks=1 "--cpus-per-task=$cpus" --gpus-per-task=1 --export=ALL \
     --kill-on-bad-exit=1 "$python" -m vpml.cli.gaussian_dataset --code-root "$code" run \
     --manifest "$data/manifest.json" --out "$data/reference" --backend gpu \

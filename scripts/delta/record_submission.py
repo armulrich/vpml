@@ -90,7 +90,7 @@ def main() -> int:
     launcher_sources = {
         name: snapshot(launcher_directory / name)["sha256"]
         for name in ("run_gaussian_amplitudes.sh", "gaussian_amplitudes.batch.sh",
-                     "record_submission.py")
+                     "record_submission.py", "budget.py")
     }
     record = {
         "schema_version": 1,
