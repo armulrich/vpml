@@ -461,6 +461,8 @@ elif name == "sacct":
         self.assertEqual(record["manifest"]["path"], str((self.data / "manifest.json").resolve()))
         self.assertEqual(record["normalization"]["sha256"], hashlib.sha256(normalization.read_bytes()).hexdigest())
         self.assertEqual(record["worker"]["arguments"][-2:], ["--max-updates", "5920"])
+        worker_args = record["worker"]["arguments"]
+        self.assertEqual(worker_args[worker_args.index("--microbatch-size") + 1], "12")
         self.assertEqual(record["worker"]["max_seconds"], 3000)
         scheduler = self.calls()[-1]
         self.assertEqual(scheduler["program"], "sbatch")
@@ -480,6 +482,14 @@ elif name == "sacct":
         report = invoke("budget", MOCK_ELAPSED="3300")
         self.assertEqual(report.returncode, 0, report.stderr)
         self.assertEqual(json.loads(report.stdout)["remaining_su"], "1.08")
+        (run_root / "training-protocol.json").write_text('{"microbatch_size": 6}')
+        before_calls = self.calls()
+        self.assertEqual(invoke("submit", "--microbatch-size", "12").returncode, 2)
+        self.assertEqual(self.calls(), before_calls)
+        resumed = invoke("test-submit", MOCK_ELAPSED="3300")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        resumed_args = self.calls()[-1]["args"]
+        self.assertEqual(resumed_args[resumed_args.index("--microbatch-size") + 1], "6")
         same_root = invoke("submit", VPML_RUN_ROOT=str(self.data))
         self.assertEqual(same_root.returncode, 2)
 

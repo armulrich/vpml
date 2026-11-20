@@ -19,6 +19,7 @@ ACCOUNT = "bhvw-delta-gpu"
 INITIAL_ALLOWANCE = Decimal("1.0")
 SHUTDOWN_SECONDS = 300
 sys.path.insert(0, str(CODE_ROOT / "src"))
+from vpml.cli.gaussian_training import resolve_microbatch_size
 from vpml.datasets.provenance import source_record
 from vpml.io.serialization import file_digest
 
@@ -55,6 +56,7 @@ def current_allowance(root: Path) -> Decimal:
 
 
 def configure_job(args) -> None:
+    microbatch_size = resolve_microbatch_size(args.data_root, args.microbatch_size)
     args.parameters = absolute_path("VPML_NORMALIZATION")
     if not args.parameters.is_file():
         raise ValueError("VPML_NORMALIZATION must name the E10 normalization artifact")
@@ -70,7 +72,7 @@ def configure_job(args) -> None:
         "--no-requeue", "--constraint=work", "--export=NIL", "--job-name=vpml-closure",
         f"--chdir={CODE_ROOT}", f"--output={args.data_root}/logs/slurm-%j.out",
         f"--error={args.data_root}/logs/slurm-%j.err", "--",
-        "--dataset", str(args.dataset), "--microbatch-size", str(args.microbatch_size),
+        "--dataset", str(args.dataset), "--microbatch-size", str(microbatch_size),
     ]
     if args.cache:
         cache = args.cache.resolve()
@@ -94,7 +96,8 @@ def main(argv=None) -> int:
     extend.add_argument("total_su", type=Decimal, help="new cumulative total, including charges already incurred")
     for name in ("test-submit", "submit"):
         action = actions.add_parser(name)
-        action.add_argument("--microbatch-size", type=int, choices=[n for n in range(1, 49) if 48 % n == 0], default=4)
+        action.add_argument("--microbatch-size", type=int,
+                            help="windows per gradient microbatch (saved run value, or 12 for a new run)")
         action.add_argument("--cache", type=Path, help="optional shared trajectory cache")
         action.add_argument("--wall-minutes", type=int, default=60)
         action.add_argument("--max-epochs", type=int, help="absolute completed-epoch target")

@@ -40,6 +40,8 @@ entry point before preparing training inputs:
      - ``python -m vpml.training.interface_train --help``
    * - History or persistent-memory low-moment FNO
      - ``python -m vpml.training.low_moment_train --help``
+   * - Persistent-memory low-moment FNO on Gaussian moment trajectories
+     - ``python -m vpml.cli.gaussian_training --help``
 
 For the interface closure, the maintained workflow script configures the solver,
 reference cache, training and evaluation:
@@ -53,6 +55,32 @@ model with ``--latent-memory-dim 0`` or persistent memory with
 ``--latent-memory-dim 6``. Its expected inputs are defined by the trainer;
 the Gaussian ``gaussian-moments`` and historical ``gaussian-fields-v1`` outputs
 are not interchangeable with an older ``states.npy`` array.
+
+Training on Gaussian trajectories
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Gaussian trainer reads the manifest from a completed reference directory.
+The train, validation and test split is assigned by initial field shape and is
+shared by all five strengths. Each 48-window training batch draws from shuffled
+trajectory and start-time pairs. Every five batches give each strength equal
+exposure. A cache stores each trajectory's conserved moments once on disk.
+
+The model initializes its six latent channels from the reference moments at
+the start of each window and an equilibrium-padded history. It predicts 600
+steps at a spacing of 0.025. The loss averages the per-window relative L2
+error in density, velocity, pressure and electric field over the whole
+15-unit interval. Validation uses a fixed set of windows paired across
+strengths. The test split is reserved for final evaluation.
+
+Use the original E10 normalization archive with fresh model weights. A
+continuation uses the same run directory, dataset and normalization. Each
+checkpoint records the parameters, optimizer state and next batch. Time
+limits and cumulative update or epoch targets control how long the worker
+runs. Extending the target preserves the learning-rate schedule in optimizer
+updates. For submission and accounting on Delta, see :doc:`delta`.
+
+Historical Modal runs
+~~~~~~~~~~~~~~~~~~~~~
 
 The retained Modal launchers reproduce their own fixed configurations. They
 require the referenced cache and Modal authentication before use. Staging

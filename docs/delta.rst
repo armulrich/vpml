@@ -247,7 +247,10 @@ The job writes progress in ``logs/slurm-JOBID.out`` and errors in
 those files to follow the same job.
 
 On a new allocation, the worker opens the same run directory and resumes
-its last published optimizer update and sampling position. The
+its last published optimizer update and sampling position. New runs use
+12 windows per gradient microbatch by default, with one optimizer step
+per 48 windows. A resumed run uses the microbatch size in its saved
+training protocol. The launcher checks an explicit override before submission. The
 ``--max-updates`` and ``--max-epochs`` options set absolute targets across
 allocations. An explicit increase to the cumulative SU allowance preserves
 all previous charges. For example, after approval for a total of 3 SU:

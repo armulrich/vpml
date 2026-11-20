@@ -6,6 +6,23 @@ from pathlib import Path
 import time
 
 
+def resolve_microbatch_size(run: Path, requested: int | None) -> int:
+    """Recover the accumulation layout before submitting or opening a run."""
+    from vpml.io.serialization import read_json
+
+    protocol = run / "training-protocol.json"
+    if protocol.is_file():
+        saved = read_json(protocol)["microbatch_size"]
+        if requested is not None and requested != saved:
+            raise ValueError(f"The existing run uses microbatch size {saved}")
+        size = saved
+    else:
+        size = 12 if requested is None else requested
+    if type(size) is not int or not 1 <= size <= 48:
+        raise ValueError("Microbatch size must be between 1 and 48")
+    return size
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -14,7 +31,8 @@ def main(argv=None):
                         help="Frozen E10 normalization.npz")
     parser.add_argument("--cache", type=Path, help="Reusable conservative moment arrays")
     parser.add_argument("--worker-seconds", type=int, help="Wall time including setup and compilation")
-    parser.add_argument("--microbatch-size", type=int, default=4)
+    parser.add_argument("--microbatch-size", type=int,
+                        help="Windows processed together (default 12, or the saved run setting)")
     parser.add_argument("--max-updates", type=int, help="Cumulative optimizer update target")
     parser.add_argument("--max-epochs", type=int, help="Cumulative epoch target")
     parser.add_argument("--require-gpu", action="store_true")
@@ -50,9 +68,10 @@ def main(argv=None):
         cache = (args.cache or run / "cache").resolve()
         if run == root or cache == root or root in run.parents or root in cache.parents:
             raise ValueError("Training and cache directories must be outside the reference dataset")
+        microbatch = resolve_microbatch_size(run, args.microbatch_size)
         data = GaussianTrainingData(root, cache, E10_MODEL)
         train(data, E10_MODEL, stats, run, normalization_sha256=digest,
-              deadline=deadline, signal_received=signal_received, microbatch_size=args.microbatch_size,
+              deadline=deadline, signal_received=signal_received, microbatch_size=microbatch,
               max_updates=args.max_updates, max_epochs=args.max_epochs,
               validate=make_validation_report(data, E10_MODEL, stats))
 
