@@ -218,3 +218,47 @@ settings. Timing a solver kernel alone does not estimate all data-generation
 costs. Worker results separate advancement and observation, host transfer,
 checkpoint writing and finalization times. Advancement
 timing waits for device completion and includes compilation on the first block.
+
+Training the Gaussian low moment closure
+---------------------------------------
+
+Stage the reviewed source revision and use the Delta environment's Python
+interpreter. Give training a new durable run directory and point the input
+at the completed reference directory. The batch step imports the staged
+source and reads the existing reference trajectories in place.
+
+.. code-block:: bash
+
+   export VPML_REFERENCE_ROOT=/absolute/path/to/completed/reference
+   export VPML_RUN_ROOT=/absolute/path/to/training/run
+   export VPML_NORMALIZATION=/absolute/path/to/E10/normalization.npz
+   launcher="$VPML_CODE_ROOT/scripts/delta/run_gaussian_training.py"
+   "$VPML_PYTHON" "$launcher" test-submit
+   "$VPML_PYTHON" "$launcher" submit
+   "$VPML_PYTHON" "$launcher" budget
+
+The default training allowance is 1 GPU SU. At 1 SU per allocated hour,
+the first job requests at most 55 minutes with up to 50 minutes of worker
+time. Slurm enforces the allocation deadline even if SSH disconnects. Each
+submission starts one A100 step and writes its billing record, source
+revision, input hashes and Slurm job ID under the training run directory.
+The job writes progress in ``logs/slurm-JOBID.out`` and errors in
+``logs/slurm-JOBID.err``. Reconnect, check ``squeue -j JOBID``, and read
+those files to follow the same job.
+
+On a new allocation, the worker opens the same run directory and resumes
+its last published optimizer update and sampling position. The
+``--max-updates`` and ``--max-epochs`` options set absolute targets across
+allocations. An explicit increase to the cumulative SU allowance preserves
+all previous charges. For example, after approval for a total of 3 SU:
+
+.. code-block:: bash
+
+   "$VPML_PYTHON" "$launcher" extend-budget 3
+   "$VPML_PYTHON" "$launcher" submit --wall-minutes 90 --max-epochs 2
+
+The allowance change alone does not submit a job. Read completed-step counts
+and validation from the training output; query ``budget`` for the separate
+Slurm charges. Reuse the same data, normalization and training configuration
+when continuing. The ``--cache`` option can select a reusable trajectory
+cache on shared storage.

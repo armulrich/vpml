@@ -433,6 +433,56 @@ elif name == "sacct":
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.calls(), [])
 
+    def test_training_hour_charges_one_separate_ledger_and_extends_the_same_run(self):
+        self.make_manifest()
+        run_root = self.directory / "closure training"
+        normalization = self.directory / "normalization.npz"
+        normalization.write_bytes(b"normalization-fixture")
+        environment = dict(self.environment, VPML_REFERENCE_ROOT=str(self.data), VPML_RUN_ROOT=str(run_root),
+                           VPML_NORMALIZATION=str(normalization), VPML_DATA_ROOT=str(run_root))
+        launcher = ROOT / "scripts/delta/run_gaussian_training.py"
+
+        def invoke(*args, **overrides):
+            return subprocess.run([sys.executable, str(launcher), *args], env=dict(environment, **overrides),
+                                  capture_output=True, text=True, check=False)
+
+        dry_run = invoke("test-submit")
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+        self.assertFalse(run_root.exists())
+        submitted = invoke("submit", "--max-updates", "5920")
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        job = json.loads(submitted.stdout)
+        self.assertEqual((job["wall_seconds"], job["worker_seconds"]), (3300, 3000))
+        ledger_path = run_root / "budget.json"
+        ledger = json.loads(ledger_path.read_bytes())
+        self.assertEqual(ledger["allowance_su"], "1.0")
+        original_jobs = ledger["jobs"]
+        record = json.loads(Path(job["intent"]).read_bytes())
+        self.assertEqual(record["manifest"]["path"], str((self.data / "manifest.json").resolve()))
+        self.assertEqual(record["normalization"]["sha256"], hashlib.sha256(normalization.read_bytes()).hexdigest())
+        self.assertEqual(record["worker"]["arguments"][-2:], ["--max-updates", "5920"])
+        self.assertEqual(record["worker"]["max_seconds"], 3000)
+        scheduler = self.calls()[-1]
+        self.assertEqual(scheduler["program"], "sbatch")
+        self.assertIn(str(ROOT / "scripts/delta/gaussian_training.batch.sh"), scheduler["args"])
+        self.assertIn("--time=00:55:00", scheduler["args"])
+        self.assertIn("--signal=USR1@300", scheduler["args"])
+        self.assertIn("--no-requeue", scheduler["args"])
+        self.assertEqual(sorted(p.name for p in self.data.iterdir()), ["manifest.json"])
+        self.assertEqual(invoke("submit", MOCK_ELAPSED="3300").returncode, 2)
+        self.assertEqual(invoke("extend-budget", "2", MOCK_SACCT_STATE="RUNNING").returncode, 2)
+        extended = invoke("extend-budget", "2", MOCK_ELAPSED="3300")
+        self.assertEqual(extended.returncode, 0, extended.stderr)
+        updated = json.loads(ledger_path.read_bytes())
+        self.assertEqual(updated["allowance_su"], "2")
+        self.assertEqual(updated["budget_id"], ledger["budget_id"])
+        self.assertEqual(updated["jobs"], original_jobs)
+        report = invoke("budget", MOCK_ELAPSED="3300")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(json.loads(report.stdout)["remaining_su"], "1.08")
+        same_root = invoke("submit", VPML_RUN_ROOT=str(self.data))
+        self.assertEqual(same_root.returncode, 2)
+
     def batch_command(self):
         scheduler = self.bin / "fake srun"
         scheduler.write_text(f"#!{sys.executable}\n" + '''import json, os, sys

@@ -98,10 +98,13 @@ def submission_lock(data: Path):
         yield
 
 
-def load_budget(data: Path, allowance: Decimal, account: str) -> dict:
-    if not allowance.is_finite() or not 0 < allowance <= MAX_BUDGET_SU:
-        raise ValueError("Budget must be positive and at most 26 additional SU")
-    manifest_hash = hashlib.sha256((data / "manifest.json").read_bytes()).hexdigest()
+def load_budget(data: Path, allowance: Decimal, account: str, *, manifest: Path | None = None) -> dict:
+    if not allowance.is_finite() or allowance <= 0:
+        raise ValueError("Budget must be finite and positive")
+    if manifest is None and allowance > MAX_BUDGET_SU:
+        raise ValueError("Dataset budget must be at most 26 additional SU")
+    manifest_path = manifest if manifest is not None else data / "manifest.json"
+    manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     path = data / "budget.json"
     if path.exists():
         ledger = json.loads(path.read_text())
@@ -185,7 +188,13 @@ def remaining_worker_seconds(requested: int, margin: int) -> int:
     return remaining
 
 
-def submit(args) -> None:
+def dataset_submission_record(args, scheduler, worker, runtime, wall):
+    return command([str(args.python), str(Path(__file__).with_name("record_submission.py")),
+                    str(args.code_root), str(args.data_root), str(args.python), str(args.parameters), str(args.run_parameters),
+                    str(runtime), str(wall), str(args.shutdown_margin_seconds), *scheduler, "--", *worker])
+
+
+def submit(args, *, manifest=None, batch_file="gaussian_amplitudes.batch.sh", record_intent=dataset_submission_record) -> None:
     data = args.data_root
     allowance = Decimal(args.budget_su)
     split = args.arguments.index("--")
@@ -217,7 +226,7 @@ def submit(args) -> None:
     # writers and overlapping charges even before a first job ID is recorded.
     if command(["squeue", "--noheader", "--user", getpass.getuser(), "--account", account, "--format=%i"]):
         raise ValueError("Another job for this user and account is queued or running")
-    ledger = load_budget(data, allowance, account)
+    ledger = load_budget(data, allowance, account, manifest=manifest)
     report = accounting(ledger)
     if report["active_job_ids"]:
         raise ValueError("A previous budget job is still active; reconnect to it instead of resubmitting")
@@ -229,7 +238,7 @@ def submit(args) -> None:
     scheduler = [f"--time={wall_time(wall)}" if item.startswith("--time=") else item for item in scheduler]
     token = f"vpml-{ledger['budget_id']}-{uuid.uuid4().hex[:12]}"
     scheduler.append(f"--comment={token}")
-    script = Path(__file__).with_name("gaussian_amplitudes.batch.sh")
+    script = Path(__file__).with_name(batch_file)
     batch = [str(script), str(args.code_root), str(data), str(args.python), str(args.parameters), str(runtime),
              "--shutdown-margin", str(args.shutdown_margin_seconds), *worker]
     for name in list(os.environ):
@@ -239,9 +248,7 @@ def submit(args) -> None:
         print(command(["sbatch", *scheduler, "--test-only", *batch]))
         return
     (data / "logs").mkdir(exist_ok=True, mode=0o700)
-    intent = command([str(args.python), str(Path(__file__).with_name("record_submission.py")),
-                      str(args.code_root), str(data), str(args.python), str(args.parameters), str(args.run_parameters),
-                      str(runtime), str(wall), str(args.shutdown_margin_seconds), *scheduler, "--", *worker])
+    intent = str(record_intent(args, scheduler, worker, runtime, wall))
     entry = {"job_id": None, "comment": token, "intent": intent, "wall_seconds": wall,
              "billing_rate_su_per_hour": str(rate), "billing_headroom_seconds": HEADROOM_SECONDS}
     ledger["jobs"].append(entry)

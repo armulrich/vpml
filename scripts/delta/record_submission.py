@@ -47,6 +47,23 @@ def snapshot(path: Path) -> dict:
             "text": payload.decode("utf-8")}
 
 
+def publish_intent(data_root: Path, record: dict) -> Path:
+    from vpml.io.atomic import atomic_write
+    from vpml.io.serialization import canonical_json_bytes
+
+    payload = canonical_json_bytes(record, newline=True)
+    directory = data_root / "submissions"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = directory / f"{hashlib.sha256(payload).hexdigest()}.json"
+
+    def write_record(handle):
+        handle.write(payload)
+        os.fchmod(handle.fileno(), 0o400)
+
+    atomic_write(destination, write_record, replace=False)
+    return destination
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("code_root", type=Path)
@@ -78,8 +95,6 @@ def main() -> int:
     # Explicitly inspect this checkout; these utilities import no JAX modules.
     sys.path.insert(0, str(args.code_root / "src"))
     from vpml.datasets.provenance import source_record
-    from vpml.io.atomic import atomic_write
-    from vpml.io.serialization import canonical_json_bytes
 
     manifest_path = args.data_root / "manifest.json"
     manifest_bytes = manifest_path.read_bytes()
@@ -109,18 +124,7 @@ def main() -> int:
         "worker": {"python": str(args.python), "arguments": worker_arguments,
                    "max_seconds": args.worker_seconds, "stop_on_failure": stop_on_failure},
     }
-    payload = canonical_json_bytes(record, newline=True)
-    directory = args.data_root / "submissions"
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    destination = directory / f"{hashlib.sha256(payload).hexdigest()}.json"
-    def write_record(handle):
-        handle.write(payload)
-        os.fchmod(handle.fileno(), 0o400)
-
-    # Publish only the fully flushed read-only record, sync its directory and
-    # refuse to replace an earlier submission's evidence.
-    atomic_write(destination, write_record, replace=False)
-    print(destination)
+    print(publish_intent(args.data_root, record))
     return 0
 
 
