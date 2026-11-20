@@ -1,7 +1,7 @@
 """Indexed windows of conserved moment histories for the Gaussian dataset."""
 
 from collections import Counter
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 import re
 
@@ -46,6 +46,7 @@ class GaussianTrainingData:
         self.cache = Path(cache_root) / "conserved_moments" / self.manifest_sha256
         self.cache.mkdir(parents=True, exist_ok=True)
         self._verified_paths = {}
+        self._source_digests = {}
         # Bound the number of open mappings on both laptops and compute nodes.
         self._mapped = lru_cache(maxsize=64)(lambda path: np.load(path, mmap_mode="r", allow_pickle=False))
 
@@ -71,7 +72,7 @@ class GaussianTrainingData:
             rows[slot::len(self.strengths), 1] = anchors
         return rows
 
-    def _cache_case(self, case_index):
+    def _read_output_digest(self, case_index):
         case = self.cases[case_index]
         directory = self.reference_root / "cases" / case["case_id"]
         progress = read_json(directory / "progress.json")
@@ -80,6 +81,23 @@ class GaussianTrainingData:
         digest = progress["outputs"]["sha256"]
         if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
             raise ValueError("Invalid reference output digest")
+        return digest
+
+    def _output_digest(self, case_index):
+        if case_index not in self._source_digests:
+            self._source_digests[case_index] = self._read_output_digest(case_index)
+        return self._source_digests[case_index]
+
+    @cached_property
+    def training_outputs_sha256(self):
+        """Pin the actual train and validation outputs across restarts and machines."""
+        return json_digest([[case["case_id"], self._output_digest(i)]
+                            for i, case in enumerate(self.cases)
+                            if case["split"] in ("train", "validation")])
+
+    def _cache_case(self, case_index):
+        case = self.cases[case_index]
+        digest = self._output_digest(case_index)
         path = self.cache / f"{case['case_id']}-{digest}.npy"
         receipt = path.with_suffix(".sha256")
         if path.is_file() and receipt.is_file() and file_digest(path) == receipt.read_text().strip():
@@ -87,6 +105,8 @@ class GaussianTrainingData:
         # This reader verifies the trajectory's checksum, time coordinates,
         # shape and protocol before deriving a cache from its full raw moments.
         arrays = _read_current_case(self.reference_root, self.manifest, case)
+        if self._read_output_digest(case_index) != digest:
+            raise ValueError(f"Reference output changed during training: {case['case_id']}")
         states = np.array(arrays["raw_moments"], dtype=np.float64, copy=True, order="C")
         states[:, 0] -= 1
         states[:, 2] -= 1

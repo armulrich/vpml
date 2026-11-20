@@ -1,5 +1,7 @@
 """Gaussian windows preserve the kinetic moment convention and split by shape."""
+import json
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -29,6 +31,31 @@ def manifest(draws, splits, strengths, final_time):
 
 
 class GaussianTrainingDataTests(unittest.TestCase):
+    def test_training_output_identity_includes_both_splits_and_survives_a_copy(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source"
+            definition = manifest(3, (1, 1, 1), (.7,), .25)
+            write_manifest(source / "manifest.json", definition)
+            for case in definition["cases"]:
+                if case["split"] == "test":
+                    continue
+                path = source / "cases" / case["case_id"] / "progress.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"status": "complete", "outputs": {"sha256": "a" * 64}}))
+            identity = GaussianTrainingData(source, base / "cache", settings()).training_outputs_sha256
+            for split in ("train", "validation"):
+                copy = base / f"copy-{split}"
+                shutil.copytree(source, copy)
+                data = GaussianTrainingData(copy, base / "cache", settings())
+                self.assertEqual(data.training_outputs_sha256, identity)
+                case = next(case for case in definition["cases"] if case["split"] == split)
+                path = copy / "cases" / case["case_id"] / "progress.json"
+                path.write_text(json.dumps({"status": "complete", "outputs": {"sha256": "b" * 64}}))
+                restarted = GaussianTrainingData(copy, base / "cache", settings())
+                self.assertEqual(data.manifest_sha256, restarted.manifest_sha256)
+                self.assertNotEqual(restarted.training_outputs_sha256, identity)
+
     def test_epoch_covers_each_split_and_balances_strength_even_during_first_hour(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
