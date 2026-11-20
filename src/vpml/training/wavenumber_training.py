@@ -18,6 +18,7 @@ from vpml.training.optimization import adam_init, _adam_step, _cosine_learning_r
 from vpml.datasets.interface_flux import sha256_json, sha256_file
 from vpml.datasets.wavenumber import REGIMES, epoch_batches
 from vpml.models.moment_parameters import init_burles_latent_fno_params
+from vpml.io.atomic import atomic_write
 import jax
 import jax.numpy as jnp
 
@@ -146,8 +147,8 @@ def tree_hash(tree):
     return h.hexdigest()
 
 
-def save_snapshot(path,params,optimizer,record,loss_rows):
-    """Create immutable snapshot with optimizer, exposure cursor and loss prefix."""
+def save_snapshot(path,params,optimizer,record,loss_rows, *, replace=False):
+    """Publish a complete snapshot, preserving immutable historical snapshots by default."""
     payload={f'param_{k}':np.asarray(v) for k,v in params.items()}
     for part in ('m','v'):
         payload.update({f'optimizer_{part}_{k}':np.asarray(v) for k,v in optimizer[part].items()})
@@ -155,8 +156,7 @@ def save_snapshot(path,params,optimizer,record,loss_rows):
     payload['record']=np.asarray(json.dumps(record,sort_keys=True))
     payload['loss_rows']=np.asarray(loss_rows,dtype=np.float64).reshape(-1,5)
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
-    # Write-exclusive: a duplicate snapshot is an error, never an overwrite.
-    with path.open('xb') as f: np.savez(f,**payload)
+    atomic_write(path, lambda handle: np.savez(handle, **payload), replace=replace)
     return sha256_file(path)
 
 
@@ -171,11 +171,40 @@ def load_snapshot(path, expected_protocol):
     return params,optimizer,record,rows
 
 
-def update_factory(config,stats):
-    loss=loss_factory(config,stats)
+def update_factory(config, stats, *, microbatch_size=None):
+    """Differentiate the mean window loss at fixed parameters before one AdamW update."""
+    if microbatch_size is not None and microbatch_size < 1:
+        raise ValueError("microbatch_size must be positive")
+    differentiate = jax.value_and_grad(loss_factory(config, stats))
+
+    def mean_gradient(params, batch):
+        count = batch['initial'].shape[0]
+        if microbatch_size is None or microbatch_size >= count:
+            return differentiate(params, batch)
+
+        # Every microbatch uses the same parameters. Weight by window count,
+        # including the final short group, before applying AdamW exactly once.
+        groups, tail = divmod(count, microbatch_size)
+        stop = groups * microbatch_size
+        blocks = jax.tree_util.tree_map(
+            lambda x: x[:stop].reshape((groups, microbatch_size, *x.shape[1:])), batch)
+        zero = (jnp.zeros((), batch['initial'].dtype),
+                jax.tree_util.tree_map(jnp.zeros_like, params))
+
+        def accumulate(total, block):
+            loss_and_grad = differentiate(params, block)
+            weight = block['initial'].shape[0] / count
+            return jax.tree_util.tree_map(
+                lambda old, new: old + weight * new, total, loss_and_grad), None
+
+        result, _ = jax.lax.scan(accumulate, zero, blocks)
+        if tail:
+            result, _ = accumulate(result, jax.tree_util.tree_map(lambda x: x[stop:], batch))
+        return result
+
     @jax.jit
     def update(params,opt,batch,rate):
-        value,grad=jax.value_and_grad(loss)(params,batch)
+        value,grad=mean_gradient(params,batch)
         p,o,gn,un,_=_adam_step(params,grad,opt,jnp.asarray(rate,getattr(jnp,config.compute_dtype)),0.,config.weight_decay,0.)
         p=jax.tree_util.tree_map(lambda new,old:new.astype(old.dtype),p,params)
         for part in ("m","v"):
