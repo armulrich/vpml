@@ -104,7 +104,10 @@ def open_training_index(root, cache):
                 _publish_index(root, directory, source)
     metadata = read_json(header)
     table = directory / "cases.npy"
-    if metadata["source_file_sha256"] != source or file_digest(table) != metadata["cases_sha256"]:
+    if (metadata.get("source_file_sha256") != source
+            or not all(re.fullmatch("[0-9a-f]{64}", str(metadata.get(key)))
+                       for key in ("manifest_sha256", "training_outputs_sha256"))
+            or file_digest(table) != metadata.get("cases_sha256")):
         raise ValueError("Training catalog checksum disagrees with its published index")
     records = np.load(table, mmap_mode="r", allow_pickle=False)
     if records.ndim != 1 or records.dtype != _CASE_DTYPE:
