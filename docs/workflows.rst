@@ -79,6 +79,25 @@ limits and cumulative update or epoch targets control how long the worker
 runs. Extending the target preserves the learning-rate schedule in optimizer
 updates. For submission and accounting on Delta, see :doc:`delta`.
 
+Autonomous Gaussian rollouts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Evaluate a saved checkpoint on one held-out field shape at selected strengths.
+The diagnostic gives the seeded and trained models the same initial moments.
+Each forecast carries its own state and memory through the recorded time
+interval. The kinetic trajectory supplies the comparison energy.
+
+.. code-block:: bash
+
+   python -m vpml.diagnostics.gaussian_rollout \
+       --dataset "$reference" --run "$training_run" --normalization "$normalization" \
+       --checkpoint "$checkpoint" --checkpoint-sha256 "$checkpoint_sha256" \
+       --shape-id "$shape_id" --strengths 0.1 0.3 0.5 0.7 1.0 --output "$results"
+   python -m vpml.diagnostics.gaussian_rollout_plot "$results"
+
+Use a fresh results directory for each checkpoint. The energy curves and
+report can be copied and plotted on a machine without the training dataset.
+
 Historical Modal runs
 ~~~~~~~~~~~~~~~~~~~~~
 
