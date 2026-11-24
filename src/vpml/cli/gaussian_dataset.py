@@ -39,6 +39,11 @@ def main(argv=None) -> int:
     status = commands.add_parser("status", help="Summarize existing progress without loading JAX devices")
     status.add_argument("--out", type=Path, required=True)
     status.add_argument("--manifest", type=Path)
+    pack = commands.add_parser("pack-training", help="Pack completed training and validation moments for indexed CPU reads")
+    pack.add_argument("--reference", type=Path, required=True)
+    pack.add_argument("--cache", type=Path, required=True)
+    pack.add_argument("--shard-mib", type=int, default=256,
+                      help="Target MiB per shard. Each trajectory is stored contiguously.")
     run = commands.add_parser("run", help="Execute on resources already allocated by the caller")
     run.add_argument("--manifest", type=Path, required=True)
     run.add_argument("--out", type=Path, required=True)
@@ -91,6 +96,16 @@ def main(argv=None) -> int:
                           "existing_case_protocols_checked": checked_protocols,
                           "case_ids": [case["case_id"] for case in selected] if args.case_ids is not None else None,
                           "numerics": manifest["numerics"], "evolution_started": False}))
+    elif args.command == "pack-training":
+        from vpml.datasets.gaussian_training import pack_training_cache
+
+        reference, cache = args.reference.resolve(), args.cache.resolve()
+        if cache == reference or reference in cache.parents or cache in reference.parents:
+            parser.error("--cache must be separate from the solver reference")
+        if args.shard_mib < 1:
+            parser.error("--shard-mib must be positive")
+        location = pack_training_cache(reference, cache, target_bytes=args.shard_mib * 1024**2)
+        print(json.dumps({"packed_training_moments": str(location)}))
     elif args.command == "status":
         from vpml.datasets.runner import dataset_status
         print(json.dumps(dataset_status(args.out, args.manifest), indent=2))

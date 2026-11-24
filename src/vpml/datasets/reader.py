@@ -31,11 +31,20 @@ def read_case(root: str | Path, case_id: str) -> dict:
     return _read_current_case(root, manifest, cases[case_id])
 
 
-def _read_current_case(root: Path, manifest: dict, case: dict) -> dict:
+def _read_current_case(root: Path, manifest: dict, case: dict, *,
+                       manifest_sha256: str | None = None, case_sha256: str | None = None) -> dict:
     directory = root / "cases" / case["case_id"]
     protocol = read_json(directory / "protocol.json")
     output_schema = manifest["output_schema"]
-    if (protocol.get("manifest_sha256") != json_digest(manifest)
+    manifest_sha256 = manifest_sha256 or json_digest(manifest)
+    if case_sha256 is not None:
+        # The compact training catalog pins the complete case, including the
+        # Fourier coefficients. Read those only when decoding this one output.
+        source_case = protocol.get("case")
+        if not isinstance(source_case, dict) or json_digest(source_case) != case_sha256:
+            raise ValueError("Case protocol disagrees with the published training index")
+        case = source_case
+    if (protocol.get("manifest_sha256") != manifest_sha256
             or protocol.get("case") != case
             or protocol.get("numerics") != manifest["numerics"]
             or protocol.get("output_schema") != output_schema
@@ -43,7 +52,8 @@ def _read_current_case(root: Path, manifest: dict, case: dict) -> dict:
             or protocol.get("observations") != observation_schema(output_schema)):
         raise ValueError("Case protocol disagrees with the dataset manifest")
     if output_schema == OUTPUT_SCHEMA:
-        expected = build_protocol(manifest, case, protocol.get("runtime"), protocol["linearized"])
+        expected = build_protocol(manifest, case, protocol.get("runtime"), protocol["linearized"],
+                                  manifest_sha256=manifest_sha256)
         resume_protocol(expected, protocol)
     store = CheckpointStore(directory, protocol, read_only=True)
     progress = store.read_progress()

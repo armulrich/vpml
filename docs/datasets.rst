@@ -254,3 +254,22 @@ A passing comparison establishes agreement at the chosen tolerance, not the
 accuracy of either reference. Historical diagnostic failures are reported
 separately. The comparison is an analysis tool, not a dataset-generation gate;
 its tolerance should reflect the quantities and use being assessed.
+
+Index and pack training moments
+-------------------------------
+
+The Gaussian trainer builds a durable case index in its cache directory the
+first time a completed reference dataset is opened. A restart verifies the
+index and looks up the selected trajectories without opening every case's
+progress file. Existing validated per-trajectory moment caches remain usable.
+
+To store multiple trajectories in each file, prepare an optional packed cache
+once on CPU compute with access to the reference and cache directories::
+
+   vpml-dataset pack-training --reference /path/to/reference --cache /path/to/cache
+
+The default target per shard is 256 MiB. Each case occupies a contiguous span
+of one shard. The trainer reads the same time slices and verifies accessed
+trajectories against the published receipts. Rerunning an interrupted pack
+checks and reuses completed shards. Pass the same cache directory to training;
+the solver outputs remain the authoritative source.

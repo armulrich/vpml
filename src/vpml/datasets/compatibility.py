@@ -97,9 +97,10 @@ def normalize_protocol(protocol: dict) -> dict:
     return normalized
 
 
-def build_protocol(manifest: dict, case: dict, runtime: dict, linearized: bool = False) -> dict:
+def build_protocol(manifest: dict, case: dict, runtime: dict, linearized: bool = False, *,
+                   manifest_sha256: str | None = None) -> dict:
     """Build the current explicit solver/storage contract for one case."""
-    protocol = {**_CONTRACT, "manifest_sha256": json_digest(manifest), "case": case,
+    protocol = {**_CONTRACT, "manifest_sha256": manifest_sha256 or json_digest(manifest), "case": case,
                 "numerics": manifest["numerics"], "runtime": runtime,
                 "linearized": linearized, "output_schema": manifest["output_schema"],
                 "observations": observation_schema(manifest["output_schema"])}

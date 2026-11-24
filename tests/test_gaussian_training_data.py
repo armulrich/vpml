@@ -130,3 +130,95 @@ class GaussianTrainingDataTests(unittest.TestCase):
             config.dt = .05
             with self.assertRaisesRegex(ValueError, "must match"):
                 GaussianTrainingData(root, root / "cache", config)
+
+    def test_sampled_rounds_replay_are_balanced_and_use_only_bounded_draws(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = manifest(5, (3, 1, 1), (.1, .3, .5, .7, 1.), 25.)
+            write_manifest(root / "manifest.json", definition)
+            data = GaussianTrainingData(root, root / "cache", settings())
+            draw = lambda step: data.sample_rows(step, 1729, 48)
+            first = np.concatenate([draw(step) for step in range(25)])
+            self.assertEqual(len(set(map(tuple, first))), 1200)
+            self.assertEqual(data.round_updates(48), 25)
+            strengths = np.asarray([case["strength"] for case in data.cases])
+            self.assertTrue(all(data.cases[i]["split"] == "train" for i in first[:, 0]))
+            strength_counts = np.unique(strengths[first[:, 0]], return_counts=True)[1]
+            np.testing.assert_array_equal(strength_counts, np.full(5, 240))
+            for i in range(25):
+                counts = np.unique(strengths[draw(i)[:, 0]], return_counts=True)[1]
+                self.assertEqual(sorted(counts), [9, 9, 10, 10, 10])
+            next_round = np.concatenate([draw(step) for step in range(25, 50)])
+            self.assertTrue(set(map(tuple, first)) & set(map(tuple, next_round)))
+            np.testing.assert_array_equal(draw(0), first[:48])
+            # Simulate an enormous eligible window space without constructing it.
+            data.anchors_per_case = 100_000_000
+            far_future = draw(1_000_000)
+            self.assertEqual(far_future.shape, (48, 2))
+            self.assertTrue((far_future[:, 1] < data.anchors_per_case).all())
+
+    def test_small_corpus_uses_short_final_batch_before_reshuffling(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_manifest(root / "manifest.json", manifest(1, (1, 0, 0), (.3, .5), .25))
+            data = GaussianTrainingData(root, root / "cache", settings())
+            self.assertEqual(data.round_updates(3), 2)
+            first = data.sample_rows(0, 8, 3)
+            tail = data.sample_rows(1, 8, 3)
+            self.assertEqual(len(tail), 1)
+            self.assertEqual(len(set(map(tuple, np.vstack((first, tail))))), 4)
+            self.assertEqual(len(data.sample_rows(2, 8, 3)), 3)
+
+    def test_training_index_opens_without_case_metadata_scan_and_pins_source(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "reference"
+            cache = Path(directory) / "cache"
+            definition = manifest(3, (1, 1, 1), (.3, 1.), .25)
+            write_manifest(root / "manifest.json", definition)
+            for case in definition["cases"]:
+                if case["split"] != "test":
+                    path = root / "cases" / case["case_id"] / "progress.json"
+                    path.parent.mkdir(parents=True)
+                    path.write_text(json.dumps({"status": "complete", "outputs": {"sha256": "a"*64}}))
+            unindexed = GaussianTrainingData(root, cache, settings())
+            indexed = GaussianTrainingData.open_indexed(root, cache, settings())
+            self.assertEqual(indexed.training_outputs_sha256, unindexed.training_outputs_sha256)
+            for i, plain in enumerate(definition["cases"]):
+                self.assertEqual(indexed.cases[i], {k: plain[k] for k in indexed.cases[i]})
+            with patch("vpml.datasets.training_index.read_manifest", side_effect=AssertionError), \
+                 patch("vpml.datasets.training_index.read_completed_digest", side_effect=AssertionError):
+                resumed = GaussianTrainingData.open_indexed(root, cache, settings())
+                self.assertEqual(indexed.training_outputs_sha256, resumed.training_outputs_sha256)
+            path = root / "cases" / indexed.cases[0]["case_id"] / "progress.json"
+            path.write_text(json.dumps({"status": "complete", "outputs": {"sha256": "b"*64}}))
+            with self.assertRaisesRegex(ValueError, "published training index"):
+                resumed.state(0)
+
+    def test_packed_moments_match_source_and_detect_selected_case_corruption(self):
+        from vpml.datasets.gaussian_training import pack_training_cache
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root, cache = base / "reference", base / "packed-cache"
+            definition = manifest(2, (1, 1, 0), (.3, .5), .25)
+            run_dataset(definition, root, backend="cpu", max_seconds=60)
+            direct = GaussianTrainingData(root, base / "comparison-cache", settings())
+            reference = direct.batch([[2, 0], [0, 1], [1, 0]])
+            target_bytes = 11 * 3 * 8 * 8 * 2
+            packed_path = pack_training_cache(root, cache, target_bytes=target_bytes)
+            self.assertEqual(len(list(packed_path.glob("*.f64"))), 2)
+            self.assertFalse(list(cache.rglob("case_*.npy")))
+            with patch("vpml.datasets.gaussian_training._read_current_case", side_effect=AssertionError):
+                self.assertEqual(pack_training_cache(root, cache), packed_path)
+                indexed = GaussianTrainingData.open_indexed(root, cache, settings())
+                batch = indexed.batch([[2, 0], [0, 1], [1, 0]])
+                for name in reference:
+                    np.testing.assert_array_equal(reference[name], batch[name])
+                self.assertFalse(indexed.state(0).flags.writeable)
+            with (packed_path / "00000000.f64").open("r+b") as handle:
+                first = handle.read(1)[0]
+                handle.seek(0)
+                handle.write(bytes([first ^ 1]))
+            reopened = GaussianTrainingData.open_indexed(root, cache, settings())
+            with self.assertRaisesRegex(ValueError, "Packed moment checksum mismatch"):
+                reopened.state(0)
