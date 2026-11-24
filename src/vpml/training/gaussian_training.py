@@ -1,22 +1,23 @@
-"""Train the latent moment closure on Gaussian reference trajectories."""
+"""Train the latent moment closure on deterministic sampled Gaussian windows."""
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import fcntl
 import json
+import math
 from pathlib import Path
 import time
 
 import jax
 import numpy as np
 
-from vpml.io.atomic import atomic_write
+from vpml.datasets.gaussian_training import SAMPLED_ROUND_UPDATES
 from vpml.io.serialization import canonical_json_bytes, json_digest, read_json
+from vpml.training.gaussian_checkpoints import TrainingCheckpoints, write_json
 from vpml.training.optimization import _cosine_learning_rate, adam_init
-from vpml.training.wavenumber_training import (
-    Configuration, initialize, load_snapshot, save_snapshot, update_factory,
-)
+from vpml.training.wavenumber_training import Configuration, initialize, update_factory
 
 # The historical decay was specified as 1,000 epochs of 592 optimizer updates.
 E10_DECAY_UPDATES = 592_000
@@ -24,174 +25,290 @@ E10_NORMALIZATION_SHA256 = "fd00f37899503377ae23028e73a7cddb25109d5a5dbbc175997d
 E10_MODEL = Configuration(preparation_steps=0, horizon=600, relative_loss_norm="l2",
                           learning_rate=1e-4, compute_dtype="float64")
 
+VALIDATION_START = 50
+VALIDATION_INTERVAL = 25
+PLATEAU_RELATIVE_GAIN = 0.01
+PLATEAU_PATIENCE = 3
+CHECKPOINT_SECONDS = 300
 
-def training_protocol(data, config, normalization_sha256, batch_size, microbatch_size):
-    """Describe the update sequence independently of any particular allocation."""
+
+def training_protocol(data, config, normalization_sha256, batch_size, microbatch_size,
+                      panel_sha256=None):
+    """Describe the update and model-selection sequence across allocations."""
     model = asdict(config)
-    del model["planned_epochs"]  # The Gaussian schedule is measured in optimizer updates.
+    del model["planned_epochs"]
     return dict(model=model, dataset_sha256=data.manifest_sha256,
                 training_outputs_sha256=data.training_outputs_sha256,
                 normalization_sha256=normalization_sha256,
-                sampler="strength_interleaved_shuffled_windows", batch_size=batch_size,
-                microbatch_size=microbatch_size, decay_updates=E10_DECAY_UPDATES)
+                sampler="strength_balanced_sampled_rounds", updates_per_round=SAMPLED_ROUND_UPDATES,
+                batch_size=batch_size, microbatch_size=microbatch_size,
+                decay_updates=E10_DECAY_UPDATES, validation_panel_sha256=panel_sha256,
+                validation=dict(first_steps=[1, 28], start=VALIDATION_START,
+                                interval=VALIDATION_INTERVAL, patience=PLATEAU_PATIENCE,
+                                relative_gain=PLATEAU_RELATIVE_GAIN))
 
 
 def log_event(event, **values):
     print(json.dumps(dict(event=event, **values), allow_nan=False), flush=True)
 
 
-def write_json(path, value, *, replace=True):
-    atomic_write(path, lambda f: f.write(canonical_json_bytes(value, newline=True)),
-                 replace=replace)
+def scheduled_check(step):
+    return step >= VALIDATION_START and (step - VALIDATION_START) % VALIDATION_INTERVAL == 0
+
+
+def record_validation(state, report):
+    """Track the true best across checks; count patience only on scheduled checks."""
+    step = report["step"]
+    value = report["mean_relative_l2"]
+    state["last"] = report
+    if value is None or not math.isfinite(value):
+        state["invalid_step"] = step
+        return
+    if state["best_score"] is None or value < state["best_score"]:
+        state.update(best_score=value, best_step=step)
+    if not scheduled_check(step):
+        return
+    reference = state["significant_best"]
+    if reference is None or (value < reference and value <= (1 - PLATEAU_RELATIVE_GAIN) * reference):
+        state.update(significant_best=value, checks_without_gain=0)
+    else:
+        state["checks_without_gain"] += 1
+
+
+class PrefetchedBatches:
+    """One host producer, at most one batch ahead of the committed optimizer."""
+    def __init__(self, data, seed, batch_size, executor):
+        self.data = data
+        self.seed = seed
+        self.size = batch_size
+        self.executor = executor
+        self.future = None
+        self.step = None
+
+    def _read(self, step):
+        started = time.monotonic()
+        rows = self.data.sample_rows(step, self.seed, self.size)
+        batch = self.data.batch(rows)
+        cases = self.data.manifest["cases"]
+        counts = Counter(str(cases[int(case)]["strength"]) for case, _ in rows)
+        return batch, counts, time.monotonic() - started
+
+    def prepare(self, step):
+        if self.future is None:
+            self.future = self.executor.submit(self._read, step)
+            self.step = step
+        elif self.step != step:
+            raise RuntimeError("Prefetch and optimizer positions disagree")
+
+    def take(self, step):
+        self.prepare(step)
+        result = self.future.result()
+        self.future = None
+        return result
+
+    def drain(self):
+        # Validation reads through the same corpus cache on the main thread.
+        if self.future is not None:
+            self.future.result()
+
+
+def _new_record(digest, strengths):
+    return dict(protocol_sha256=digest, accepted_updates=0, windows=0,
+                windows_by_strength={str(s): 0 for s in strengths},
+                loss_history_bytes=0, pending_validation=False, stop_reason=None,
+                validation=dict(last=None, best_score=None, best_step=None, invalid_step=None,
+                                significant_best=None, checks_without_gain=0))
+
+
+def _publish_validation(run, report):
+    if report is None:
+        return
+    directory = run / "validation"
+    directory.mkdir(exist_ok=True)
+    write_json(directory / f"step-{report['step']:08d}.json", report)
+    write_json(run / "latest-validation.json", report)
 
 
 def train(data, config, stats, run, *, normalization_sha256, batch_size=48,
-          microbatch_size=4, max_updates=None, max_epochs=None, deadline=None,
-          signal_received=lambda: False, validate=None):
-    """Continue one training directory through its requested time or exposure limit.
-
-    Epochs are one-based. max_updates and max_epochs are cumulative targets.
-    Only the latest complete optimizer step is published to checkpoint.npz.
-    """
+          microbatch_size=4, max_updates=None, max_rounds=None, deadline=None,
+          signal_received=lambda: False, validate=None, resume_after_plateau=False):
+    """Continue up to a cumulative step/round cap or an allocation deadline."""
     if not 1 <= microbatch_size <= batch_size:
         raise ValueError("Microbatch size must be between one and the effective batch size")
-    if any(target is not None and target <= 0 for target in (max_updates, max_epochs)):
+    if any(target is not None and target <= 0 for target in (max_updates, max_rounds)):
         raise ValueError("Training targets must be positive")
-    if deadline is None and max_epochs is None and max_updates is None:
-        raise ValueError("Specify a deadline, an epoch target or an update target")
+    if deadline is None and max_rounds is None and max_updates is None:
+        raise ValueError("Specify a deadline, a round target or an update target")
     if not jax.config.x64_enabled:
         raise RuntimeError("Enable JAX float64 before starting Gaussian closure training")
+    limit = min(max_updates or math.inf, (max_rounds or math.inf) * data.round_updates(batch_size))
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
-    protocol = training_protocol(data, config, normalization_sha256, batch_size, microbatch_size)
+    protocol = training_protocol(data, config, normalization_sha256, batch_size, microbatch_size,
+                                 getattr(validate, "panel_sha256", None))
     digest = json_digest(protocol)
     with (run / ".training.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         protocol_path = run / "training-protocol.json"
         if protocol_path.exists():
             if read_json(protocol_path) != protocol:
-                raise ValueError("Training protocol has changed; use the original configuration to resume")
+                raise ValueError("Training protocol mismatch: resume with the original code and "
+                                 "configuration or start a fresh run directory for the new sampler")
         else:
             write_json(protocol_path, protocol, replace=False)
-
-        checkpoint = run / "checkpoint.npz"
-        if checkpoint.exists():
-            params, optimizer, record, rows = load_snapshot(checkpoint, digest)
-            if (int(optimizer["step"]) != record["accepted_updates"]
-                    or len(rows) != record["accepted_updates"]):
-                raise ValueError("Checkpoint optimizer or loss history disagrees with training cursor")
-            last_saved = record["accepted_updates"]
-        else:
+        checkpoints = TrainingCheckpoints(run, digest)
+        restored = checkpoints.restore()
+        if restored is None:
             params = initialize(config)
             optimizer = adam_init(params)
-            record = dict(protocol_sha256=digest, epoch=1, next_batch=0, accepted_updates=0,
-                          windows=0, windows_by_strength={str(s): 0 for s in data.strengths})
-            rows = []
-            last_saved = -1
+            record = _new_record(digest, data.strengths)
+        else:
+            params, optimizer, record = restored
+        state = record["validation"]
+        if state["invalid_step"] is not None:
+            raise ValueError(f"Validation was nonfinite at update {state['invalid_step']}; inspect the checkpoint")
+        if state["checks_without_gain"] >= PLATEAU_PATIENCE:
+            if not resume_after_plateau:
+                raise ValueError("Training paused at a validation plateau; use --resume-after-plateau "
+                                 "to grant another observation period")
+            state["checks_without_gain"] = 0
+        _publish_validation(run, state["last"])
+        with checkpoints.open_history(record) as history, ThreadPoolExecutor(max_workers=1) as reader:
+            return _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadline,
+                                signal_received, validate, params, optimizer, record,
+                                checkpoints, history, reader)
 
-        def checkpoint_now():
-            nonlocal last_saved
-            if record["accepted_updates"] != last_saved:
-                checksum = save_snapshot(checkpoint, params, optimizer, record, rows, replace=True)
-                last_saved = record["accepted_updates"]
-                log_event("checkpoint", step=last_saved, sha256=checksum, path=str(checkpoint))
 
-        def stopping():
-            return signal_received() or (deadline is not None and time.monotonic() >= deadline)
+def _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadline,
+                 signal_received, validate, params, optimizer, record, checkpoints, history, reader):
+    batches = PrefetchedBatches(data, config.seed, batch_size, reader)
+    make_update = update_factory(config, stats, microbatch_size=microbatch_size)
+    compiled = {}
+    steps_per_round = data.round_updates(batch_size)
+    state = record["validation"]
+    last_save = time.monotonic()
+    last_report = state["last"]
+    panel_seconds = 180 if last_report is None else last_report["seconds"]
+    step_seconds = 30
+    record["stop_reason"] = None
+    step = record["accepted_updates"]
 
-        checkpoint_now()
-        log_event("training_start", **record)
-        update = update_factory(config, stats, microbatch_size=microbatch_size)
-        compiled = {}
-        active_epoch = None
-        last_checkpoint_time = time.monotonic()
-        last_validation_time = last_checkpoint_time
-        validation_seconds = None
-        try:
-            while (not stopping()
-                   and (max_updates is None or record["accepted_updates"] < max_updates)
-                   and (max_epochs is None or record["epoch"] <= max_epochs)):
-                if active_epoch != record["epoch"]:
-                    active_epoch = record["epoch"]
-                    epoch_rows = data.epoch_rows(active_epoch, config.seed)
-                    if len(epoch_rows) == 0:
-                        raise ValueError("Training split has no eligible windows")
-                start = record["next_batch"] * batch_size
-                selected = epoch_rows[start:start + batch_size]
-                if not len(selected):
-                    raise ValueError("Checkpoint batch lies outside the deterministic epoch")
+    def remaining():
+        return math.inf if deadline is None else deadline - time.monotonic()
+
+    def persist():
+        nonlocal last_save
+        checkpoints.save(params, optimizer, record, history)
+        last_save = time.monotonic()
+
+    def evaluate():
+        nonlocal panel_seconds
+        batches.drain()
+        if signal_received() or remaining() <= 1.3 * panel_seconds + 5:
+            return False
+        began = time.monotonic()
+        report = dict(step=step, **validate(params))
+        panel_seconds = report["seconds"] = time.monotonic() - began
+        record_validation(state, report)
+        record["pending_validation"] = False
+        persist()
+        _publish_validation(checkpoints.run, report)
+        log_event("validation", **report)
+        return True
+
+    if checkpoints.saved_step is None:
+        persist()
+    log_event("training_start", accepted_updates=step, windows=record["windows"],
+              windows_by_strength=record["windows_by_strength"])
+    reason = "update_limit"
+    finish_after_validation = False
+    try:
+        while True:
+            if signal_received() or remaining() <= 0:
+                reason = "signal" if signal_received() else "deadline"
+                break
+            if record["pending_validation"]:
+                if validate is None:
+                    raise ValueError("Resume requires the validation evaluator for the pending check")
+                if not evaluate():
+                    reason = "signal" if signal_received() else "deadline"
+                    break
+                if state["invalid_step"] is not None:
+                    reason = "nonfinite_validation"
+                    break
+                if state["checks_without_gain"] >= PLATEAU_PATIENCE:
+                    reason = "validation_plateau"
+                    break
+                if finish_after_validation:
+                    reason = "deadline"
+                    break
+            if step >= limit:
+                break
+            if remaining() <= step_seconds + 5:
+                reason = "deadline"
+                break
+            wait_at = time.monotonic()
+            batch, counts, preparation = batches.take(step)
+            wait = time.monotonic() - wait_at
+            if signal_received() or remaining() <= step_seconds + 5:
+                reason = "signal" if signal_received() else "deadline"
+                break
+            count = len(batch["initial"])
+            if count not in compiled:
                 began = time.monotonic()
-                batch = data.batch(selected)
-                loaded = time.monotonic()
-                if stopping():
-                    break
-                step = record["accepted_updates"]
-                rate = np.asarray(_cosine_learning_rate(
-                    step, E10_DECAY_UPDATES, config.learning_rate, config.final_learning_rate),
-                    dtype=config.compute_dtype)
-                if len(selected) not in compiled:
-                    log_event("compiling", step=step, batch_size=len(selected),
-                              microbatch_size=microbatch_size)
-                    executable = update.lower(params, optimizer, batch, rate).compile()
-                    compiled[len(selected)] = executable
-                    analysis = executable.memory_analysis()
-                    log_event("compiled", seconds=time.monotonic()-loaded,
-                              temporary_bytes=analysis.temp_size_in_bytes if analysis else None)
-                if stopping():
-                    break
-                update_start = time.monotonic()
-                p, opt, loss, grad, change, init_grad, finite = compiled[len(selected)](
-                    params, optimizer, batch, rate)
-                if not bool(finite):  # Synchronizes the device before committing the cursor.
-                    raise FloatingPointError(f"Nonfinite candidate at optimizer update {step + 1}")
-                update_seconds = time.monotonic() - update_start
-                params, optimizer = p, opt
-                record["accepted_updates"] = step + 1
-                record["next_batch"] += 1
-                record["windows"] += len(selected)
-                cases = data.manifest["cases"]
-                counts = Counter(str(cases[int(ci)]["strength"]) for ci, _ in selected)
-                for strength, count in counts.items():
-                    record["windows_by_strength"][strength] += count
-                rows.append([step + 1, float(loss), float(grad), float(change), float(init_grad)])
-                end_of_epoch = start + len(selected) == len(epoch_rows)
-                if end_of_epoch:
-                    record["epoch"] += 1
-                    record["next_batch"] = 0
-                metrics = dict(step=step+1, epoch=active_epoch, loss=float(loss),
-                               learning_rate=float(rate), update_seconds=update_seconds,
-                               load_seconds=loaded-began, windows=record["windows"],
-                               windows_by_strength=record["windows_by_strength"])
-                memory = jax.devices()[0].memory_stats() or {}
-                if "peak_bytes_in_use" in memory:
-                    metrics["peak_device_bytes"] = int(memory["peak_bytes_in_use"])
-                log_event("update", **metrics)
-                now = time.monotonic()
-                remaining = float("inf") if deadline is None else deadline - now
-                # The first panel includes its own compilation. Reserve enough
-                # time for another panel plus a durable checkpoint near the limit.
-                panel_budget = 60 if validation_seconds is None else 1.3 * validation_seconds + 5
-                nearing_deadline = remaining <= panel_budget + max(update_seconds, 15) + 10
-                hit_target = (max_updates == step + 1
-                              or (max_epochs is not None and record["epoch"] > max_epochs))
-                validation_due = (validate is not None and remaining > panel_budget
-                                  and (step == 0 or (step + 1) % 100 == 0 or hit_target
-                                       or nearing_deadline or now - last_validation_time >= 600))
-                if (validation_due or end_of_epoch or step == 0
-                        or now - last_checkpoint_time >= 120):
-                    checkpoint_now()
-                    last_checkpoint_time = time.monotonic()
-                if validation_due and not stopping():
-                    validation_start = time.monotonic()
-                    result = dict(step=step + 1, **validate(params))
-                    last_validation_time = time.monotonic()
-                    validation_seconds = last_validation_time - validation_start
-                    result["seconds"] = validation_seconds
-                    write_json(run / "latest-validation.json", result)
-                    log_event("validation", **result)
-                    if nearing_deadline:
-                        break
-        finally:
-            checkpoint_now()
+                log_event("compiling", step=step, batch_size=count, microbatch_size=microbatch_size)
+                rate = np.asarray(config.learning_rate, dtype=config.compute_dtype)
+                executable = make_update.lower(params, optimizer, batch, rate).compile()
+                compiled[count] = executable
+                analysis = executable.memory_analysis()
+                log_event("compiled", seconds=time.monotonic()-began,
+                          temporary_bytes=analysis.temp_size_in_bytes if analysis else None)
+            if signal_received() or remaining() <= step_seconds + 5:
+                reason = "signal" if signal_received() else "deadline"
+                break
+            next_step = step + 1
+            periodic = next_step in (1, 28) or scheduled_check(next_step)
+            if next_step < limit and not (periodic and validate is not None):
+                batches.prepare(next_step)
+            rate = np.asarray(_cosine_learning_rate(step, E10_DECAY_UPDATES, config.learning_rate,
+                                                   config.final_learning_rate), dtype=config.compute_dtype)
+            began = time.monotonic()
+            p, opt, loss, grad, change, init_grad, finite = compiled[count](params, optimizer, batch, rate)
+            if not bool(finite):
+                raise FloatingPointError(f"Nonfinite candidate at optimizer update {next_step}")
+            step_seconds = time.monotonic() - began
+            # Convert device values before advancing any part of the committed state.
+            row = [next_step, float(loss), float(grad), float(change), float(init_grad)]
+            history.write(canonical_json_bytes(row, newline=True))
+            params, optimizer, step = p, opt, next_step
+            record["accepted_updates"] = step
+            record["windows"] += count
+            for strength, strength_count in counts.items():
+                record["windows_by_strength"][strength] += strength_count
+            metrics = dict(step=step, sampled_round=1 + (step-1)//steps_per_round,
+                           loss=row[1], learning_rate=float(rate), update_seconds=step_seconds,
+                           load_seconds=preparation, input_wait_seconds=wait, windows=record["windows"],
+                           windows_by_strength=record["windows_by_strength"])
+            memory = jax.devices()[0].memory_stats() or {}
+            if "peak_bytes_in_use" in memory:
+                metrics["peak_device_bytes"] = int(memory["peak_bytes_in_use"])
+            log_event("update", **metrics)
+            panel_budget = 1.3 * panel_seconds + 5
+            near_deadline = remaining() <= panel_budget + max(step_seconds, 15) + wait + 15
+            if validate is not None and (periodic or step >= limit or near_deadline):
+                # A pending check is durable before it consumes time. A resumed job
+                # can finish it using the identical weights before another update.
+                record["pending_validation"] = periodic or remaining() > panel_budget
+                if record["pending_validation"]:
+                    finish_after_validation = near_deadline
+                    persist()
+            if time.monotonic() - last_save >= CHECKPOINT_SECONDS:
+                persist()
+    except BaseException:
+        reason = "error"
+        raise
+    finally:
+        record["stop_reason"] = reason
+        persist()
         log_event("training_stop", **record)
-        return record
+    return record
