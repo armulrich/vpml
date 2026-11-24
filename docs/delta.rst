@@ -247,18 +247,37 @@ The job writes progress in ``logs/slurm-JOBID.out`` and errors in
 those files to follow the same job.
 
 On a new allocation, the worker opens the same run directory and resumes
-its last published optimizer update and sampling position. New runs use
-12 windows per gradient microbatch by default, with one optimizer step
-per 48 windows. A resumed run uses the microbatch size in its saved
-training protocol. The launcher checks an explicit override before submission. The
-``--max-updates`` and ``--max-epochs`` options set absolute targets across
-allocations. An explicit increase to the cumulative SU allowance preserves
-all previous charges. For example, after approval for a total of 3 SU:
+its last published optimizer update and sampling position. Each sampling
+round consists of 25 updates of 48 windows. The sampler balances the five
+strengths and draws distinct trajectory and start-time pairs within each
+round. The next round can draw a previously sampled window. The loader
+prepares one batch ahead. A batch buffered when the worker stops is drawn
+again if its optimizer update was not committed.
+
+New runs process 12 windows per gradient microbatch by default. A resumed
+run uses the saved microbatch size. The launcher checks an explicit override
+before submission. The ``--max-updates`` and ``--max-rounds`` options set
+cumulative targets across allocations. Runs created with the earlier
+full-epoch sampler resume with the revision recorded in their submission.
+Use a separate run directory to start from the original E10 initialization
+with the sampled-round protocol.
+
+Validation uses the same 60 paired windows at updates 1 and 28 and every
+25 updates starting at update 50. The update-50 result starts the plateau
+monitor. A cumulative 1% reduction in the mean relative loss resets its
+counter. Three consecutive scheduled checks without this improvement flag
+a plateau. A shutdown evaluation, when time permits, does not advance that
+counter. A deliberate continuation after a plateau uses
+``--resume-after-plateau``. The checkpoint preserves the optimizer step
+and the learning-rate schedule across allocations.
+
+An explicit increase to the cumulative SU allowance preserves previous
+charges. For example, after approval for a total of 3 SU:
 
 .. code-block:: bash
 
    "$VPML_PYTHON" "$launcher" extend-budget 3
-   "$VPML_PYTHON" "$launcher" submit --wall-minutes 90 --max-epochs 2
+   "$VPML_PYTHON" "$launcher" submit --wall-minutes 90 --max-updates 150
 
 The allowance change alone does not submit a job. Read completed-step counts
 and validation from the training output; query ``budget`` for the separate

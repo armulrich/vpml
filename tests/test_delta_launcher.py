@@ -486,10 +486,18 @@ elif name == "sacct":
         before_calls = self.calls()
         self.assertEqual(invoke("submit", "--microbatch-size", "12").returncode, 2)
         self.assertEqual(self.calls(), before_calls)
-        resumed = invoke("test-submit", MOCK_ELAPSED="3300")
+        resumed = invoke("test-submit", "--max-rounds", "6", "--resume-after-plateau", MOCK_ELAPSED="3300")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         resumed_args = self.calls()[-1]["args"]
         self.assertEqual(resumed_args[resumed_args.index("--microbatch-size") + 1], "6")
+        self.assertEqual(resumed_args[resumed_args.index("--max-rounds") + 1], "6")
+        self.assertIn("--resume-after-plateau", resumed_args)
+        (run_root / "training-protocol.json").write_text(
+            '{"microbatch_size": 12, "sampler": "strength_interleaved_shuffled_windows"}')
+        before_calls = self.calls()
+        legacy = invoke("test-submit")
+        self.assertIn("original source revision", legacy.stderr)
+        self.assertEqual(self.calls(), before_calls)
         same_root = invoke("submit", VPML_RUN_ROOT=str(self.data))
         self.assertEqual(same_root.returncode, 2)
 

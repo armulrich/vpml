@@ -80,7 +80,9 @@ def configure_job(args) -> None:
             if cache == source or cache.is_relative_to(source) or source.is_relative_to(cache):
                 raise ValueError("The writable cache must be separate from the dataset and source")
         args.arguments.extend(("--cache", str(cache)))
-    for option in ("max_epochs", "max_updates"):
+    if args.resume_after_plateau:
+        args.arguments.append("--resume-after-plateau")
+    for option in ("max_rounds", "max_updates"):
         value = getattr(args, option)
         if value is not None:
             if value < 1:
@@ -100,8 +102,10 @@ def main(argv=None) -> int:
                             help="windows per gradient microbatch (saved run value, or 12 for a new run)")
         action.add_argument("--cache", type=Path, help="optional shared trajectory cache")
         action.add_argument("--wall-minutes", type=int, default=60)
-        action.add_argument("--max-epochs", type=int, help="absolute completed-epoch target")
+        action.add_argument("--max-rounds", type=int, help="absolute limit in 25-update sampling rounds")
         action.add_argument("--max-updates", type=int, help="absolute optimizer update target")
+        action.add_argument("--resume-after-plateau", action="store_true",
+                            help="explicitly extend a run that stopped on a validation plateau")
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:

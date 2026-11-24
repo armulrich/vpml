@@ -12,7 +12,11 @@ def resolve_microbatch_size(run: Path, requested: int | None) -> int:
 
     protocol = run / "training-protocol.json"
     if protocol.is_file():
-        saved = read_json(protocol)["microbatch_size"]
+        saved_protocol = read_json(protocol)
+        if saved_protocol.get("sampler") == "strength_interleaved_shuffled_windows":
+            raise ValueError("This full-epoch run requires its original source revision to resume. "
+                             "Choose a new run directory for sampled rounds.")
+        saved = saved_protocol["microbatch_size"]
         if requested is not None and requested != saved:
             raise ValueError(f"The existing run uses microbatch size {saved}")
         size = saved
@@ -34,7 +38,9 @@ def main(argv=None):
     parser.add_argument("--microbatch-size", type=int,
                         help="Windows processed together (default 12, or the saved run setting)")
     parser.add_argument("--max-updates", type=int, help="Cumulative optimizer update target")
-    parser.add_argument("--max-epochs", type=int, help="Cumulative epoch target")
+    parser.add_argument("--max-rounds", type=int, help="Cumulative limit in 25-update sampling rounds")
+    parser.add_argument("--resume-after-plateau", action="store_true",
+                        help="Continue a stopped run with a new validation observation period")
     parser.add_argument("--require-gpu", action="store_true")
     args = parser.parse_args(argv)
     if args.worker_seconds is not None and args.worker_seconds <= 0:
@@ -69,11 +75,12 @@ def main(argv=None):
         if run == root or cache == root or root in run.parents or root in cache.parents:
             raise ValueError("Training and cache directories must be outside the reference dataset")
         microbatch = resolve_microbatch_size(run, args.microbatch_size)
-        data = GaussianTrainingData(root, cache, E10_MODEL)
+        data = GaussianTrainingData.open_indexed(root, cache, E10_MODEL)
         train(data, E10_MODEL, stats, run, normalization_sha256=digest,
               deadline=deadline, signal_received=signal_received, microbatch_size=microbatch,
-              max_updates=args.max_updates, max_epochs=args.max_epochs,
-              validate=make_validation_report(data, E10_MODEL, stats))
+              max_updates=args.max_updates, max_rounds=args.max_rounds,
+              resume_after_plateau=args.resume_after_plateau,
+              validate=make_validation_report(data, E10_MODEL, stats, batch_size=microbatch))
 
 
 if __name__ == "__main__":
