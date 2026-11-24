@@ -60,7 +60,8 @@ def initialize(config):
     return params
 
 
-def loss_factory(config, stats):
+def window_loss_factory(config, stats):
+    """Score each batch window independently on its trajectory's spatial grid."""
     one_loss = make_loss_function(k_arr=np.arange(config.nx//2+1,dtype=np.float32),
         width=config.width, horizon=config.horizon, dt=config.dt,
         input_scale=stats['input_scale'], regime_scales=stats['regime_scales'],
@@ -79,9 +80,15 @@ def loss_factory(config, stats):
         # The core solver sees one geometry and a batch dimension of one.
         b={key:(value if key=='k_arr' else value[None]) for key,value in row.items()}
         return one_loss(params,b)[0]
-    def loss(params,batch):
-        values=jax.vmap(sample,in_axes=(None,0))(params,batch)
-        return jnp.mean(values)
+    return jax.vmap(sample, in_axes=(None, 0))
+
+
+def loss_factory(config, stats):
+    window_losses = window_loss_factory(config, stats)
+
+    def loss(params, batch):
+        return jnp.mean(window_losses(params, batch))
+
     return loss
 
 
