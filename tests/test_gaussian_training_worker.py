@@ -1,17 +1,18 @@
 """Regression checks for accumulation and exact partial-round continuation."""
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
 
-from vpml.io.serialization import json_digest
+from vpml.io.serialization import file_digest, json_digest, read_json
 from vpml.training import gaussian_training
 from vpml.training.gaussian_training import E10_MODEL, train, training_protocol, record_validation
 from vpml.training.gaussian_checkpoints import TrainingCheckpoints
 from vpml.training.optimization import adam_init
-from vpml.training.wavenumber_training import initialize, load_snapshot, update_factory
+from vpml.training.wavenumber_training import initialize, load_snapshot, read_checkpoint_parameters, update_factory
 
 
 class TinyWindows:
@@ -185,3 +186,118 @@ def test_interrupted_validation_and_plateau_survive_restarts(tmp_path, monkeypat
     result = train(data, config, stats, tmp_path, max_updates=150, resume_after_plateau=True, **args)
     assert result["accepted_updates"] == 150 and result["stop_reason"] == "update_limit"
     assert result["validation"]["checks_without_gain"] == 1
+
+
+def test_validation_phase_replays_next_training_update_exactly(tmp_path):
+    config, stats = fixture()
+    parent, child, direct = [tmp_path / name for name in ("parent", "child", "direct")]
+    args = dict(batch_size=3, microbatch_size=2, normalization_sha256="fixture")
+    parent_score = lambda params: {"mean_relative_l2": 0.1}
+    train(TinyWindows(config), config, stats, parent, max_updates=2, validate=parent_score, **args)
+    train(TinyWindows(config), config, stats, direct, max_updates=3, validate=parent_score, **args)
+    parent_ckpt = parent / "checkpoint.npz"
+    original_sha = file_digest(parent_ckpt)
+    parent_history = (parent / "training-loss.jsonl").read_bytes()
+
+    def validate(params):
+        return {"mean_relative_l2": 0.4, "panel_sha256": validate.panel_sha256}
+
+    validate.panel_sha256 = json_digest(["new validation windows"])
+    phase = dict(phase_checkpoint=parent_ckpt, phase_checkpoint_sha256=original_sha,
+                 validation_interval=50, validate=validate, baseline_loss=0.4)
+    with pytest.raises(ValueError):
+        train(TinyWindows(config), config, stats, tmp_path / "wrong-digest", max_updates=3,
+              **args, **{**phase, "phase_checkpoint_sha256": "0" * 64})
+    with pytest.raises(ValueError):
+        train(TinyWindows(config), config, stats, tmp_path / "changed-optimizer", max_updates=3,
+              **{**args, "microbatch_size": 1}, **phase)
+    wrong_baseline = TinyWindows(config)
+    with pytest.raises(ValueError):
+        train(wrong_baseline, config, stats, tmp_path / "wrong-baseline", max_updates=3,
+              **args, **{**phase, "baseline_loss": 0.5})
+    assert wrong_baseline.starts == []
+
+    record = train(TinyWindows(config), config, stats, child, max_updates=3, **args, **phase)
+    assert record["accepted_updates"] == 3
+    assert (child / "training-loss.jsonl").read_bytes() == (direct / "training-loss.jsonl").read_bytes()
+    assert (parent / "training-loss.jsonl").read_bytes() == parent_history
+    assert file_digest(parent_ckpt) == original_sha
+    child_protocol = json_digest(read_json(child / "training-protocol.json"))
+    direct_protocol = json_digest(read_json(direct / "training-protocol.json"))
+    assert child_protocol != direct_protocol
+    child_state = load_snapshot(child / "checkpoint.npz", child_protocol)
+    direct_state = load_snapshot(direct / "checkpoint.npz", direct_protocol)
+    for got, expected in zip(jax.tree_util.tree_leaves(child_state[:2]),
+                             jax.tree_util.tree_leaves(direct_state[:2]), strict=True):
+        np.testing.assert_array_equal(got, expected)
+    assert record["windows_by_strength"] == direct_state[2]["windows_by_strength"]
+    assert record["validation"]["best_step"] == 2 and record["validation"]["best_score"] == 0.4
+    validate.panel_sha256 = json_digest(["a different panel"])
+    with pytest.raises(ValueError):
+        train(TinyWindows(config), config, stats, child, max_updates=4, **args, **phase)
+
+
+def test_phase_retains_every_validation_weights_including_nonbest_across_restart(tmp_path, monkeypatch):
+    config, stats = fixture()
+    data = TinyWindows(config)
+    parent, phase_root = tmp_path / "parent", tmp_path / "phase"
+    monkeypatch.setattr(gaussian_training, "initialize", lambda _: {"a": np.float64(0)})
+    def make_update(*args, **kwargs):
+        def update(params, opt, batch, rate):
+            return {"a": params["a"] + 1}, dict(opt, step=opt["step"] + 1), 1., 0., 0., 0., True
+        return jax.jit(update)
+    monkeypatch.setattr(gaussian_training, "update_factory", make_update)
+    args = dict(batch_size=3, microbatch_size=2, normalization_sha256="fixture")
+    train(data, config, stats, parent, max_updates=50,
+          validate=lambda params: {"mean_relative_l2": 0.01}, **args)
+    assert not (parent / "snapshots").exists()
+    observed = []
+    def validate(params):
+        step = int(params["a"])
+        observed.append(step)
+        if step == 100 and observed.count(100) == 1:
+            raise RuntimeError("interrupted mid-validation")
+        return {"mean_relative_l2": step / 1000, "panel_sha256": validate.panel_sha256}
+    validate.panel_sha256 = json_digest(["matched windows"])
+    parent_ckpt = parent / "checkpoint.npz"
+    phase = dict(phase_checkpoint=parent_ckpt, phase_checkpoint_sha256=file_digest(parent_ckpt),
+                 validation_interval=50, baseline_loss=0.05, validate=validate)
+    with pytest.raises(RuntimeError, match="interrupted mid-validation"):
+        train(data, config, stats, phase_root, max_updates=250, **args, **phase)
+    baseline = phase_root / "snapshots" / "step-00000050" / "checkpoint.npz"
+    baseline_sha = file_digest(baseline)
+    result = train(data, config, stats, phase_root, max_updates=250, **args, **phase)
+    assert observed == [50, 100, 100, 150, 200, 250]
+    assert result["accepted_updates"] == 250 and result["stop_reason"] == "update_limit"
+    assert result["validation"]["best_step"] == 50
+    assert file_digest(baseline) == baseline_sha
+    digest = json_digest(read_json(phase_root / "training-protocol.json"))
+    # Interrupt between the durable validation and publication of its snapshot.
+    rename = Path.rename
+    def interrupt_publication(source, target):
+        if target.name == "step-00000300":
+            raise OSError("snapshot publication interrupted")
+        return rename(source, target)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rename", interrupt_publication)
+        with pytest.raises(OSError, match="snapshot publication interrupted"):
+            train(data, config, stats, phase_root, max_updates=300, **args, **phase)
+    assert not (phase_root / "snapshots" / "step-00000300").exists()
+    resumed = train(data, config, stats, phase_root, max_updates=300, **args, **phase)
+    assert resumed["accepted_updates"] == 300 and observed.count(300) == 1
+    corrupt = phase_root / "corrupt.npz"
+    corrupt.write_bytes(b"bad rolling generation")
+    corrupt.replace(phase_root / "checkpoint.npz")
+    (phase_root / ".best-at-50.npz").unlink()
+    (phase_root / "best-checkpoint.npz").unlink()
+    recovered = train(data, config, stats, phase_root, max_updates=300, **args, **phase)
+    assert recovered["accepted_updates"] == 300 and observed.count(300) == 1
+    assert file_digest(phase_root / "best-checkpoint.npz") == baseline_sha
+    for step in (50, 100, 150, 200, 250, 300):
+        directory = phase_root / "snapshots" / f"step-{step:08d}"
+        receipt = read_json(directory / "receipt.json")
+        assert receipt["step"] == step and receipt["panel_sha256"] == validate.panel_sha256
+        # Exercise the same decoder used for offline rollout evaluation.
+        loaded, actual_step = read_checkpoint_parameters(directory / "checkpoint.npz", receipt["sha256"],
+                                                         digest, {"a": np.array(0.)})
+        assert actual_step == step and float(loaded["a"]) == step

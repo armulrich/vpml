@@ -33,11 +33,12 @@ CHECKPOINT_SECONDS = 300
 
 
 def training_protocol(data, config, normalization_sha256, batch_size, microbatch_size,
-                      panel_sha256=None):
+                      panel_sha256=None, *, phase_checkpoint_sha256=None,
+                      validation_interval=None, baseline_loss=None):
     """Describe the update and model-selection sequence across allocations."""
     model = asdict(config)
     del model["planned_epochs"]
-    return dict(model=model, dataset_sha256=data.manifest_sha256,
+    protocol = dict(model=model, dataset_sha256=data.manifest_sha256,
                 training_outputs_sha256=data.training_outputs_sha256,
                 normalization_sha256=normalization_sha256,
                 sampler="strength_balanced_sampled_rounds", updates_per_round=SAMPLED_ROUND_UPDATES,
@@ -46,17 +47,29 @@ def training_protocol(data, config, normalization_sha256, batch_size, microbatch
                 validation=dict(first_steps=[1, 28], start=VALIDATION_START,
                                 interval=VALIDATION_INTERVAL, patience=PLATEAU_PATIENCE,
                                 relative_gain=PLATEAU_RELATIVE_GAIN))
+    if phase_checkpoint_sha256 is not None:
+        interval = 50 if validation_interval is None else validation_interval
+        if type(interval) is not int or interval < 1 or not panel_sha256:
+            raise ValueError("A validation phase requires a fixed panel and positive check interval")
+        if baseline_loss is not None and (not math.isfinite(baseline_loss) or baseline_loss < 0):
+            raise ValueError("Expected finite nonnegative baseline loss")
+        protocol.update(phase_parent_sha256=phase_checkpoint_sha256,
+                        validation=dict(first_steps=[], start=0, interval=interval, patience=None,
+                                        baseline_loss=baseline_loss, archive_checks=True))
+    elif validation_interval is not None or baseline_loss is not None:
+        raise ValueError("Specify the parent checkpoint to change the validation policy")
+    return protocol
 
 
 def log_event(event, **values):
     print(json.dumps(dict(event=event, **values), allow_nan=False), flush=True)
 
 
-def scheduled_check(step):
-    return step >= VALIDATION_START and (step - VALIDATION_START) % VALIDATION_INTERVAL == 0
+def scheduled_check(step, start=VALIDATION_START, interval=VALIDATION_INTERVAL):
+    return step >= start and (step - start) % interval == 0
 
 
-def record_validation(state, report):
+def record_validation(state, report, *, track_plateau=True):
     """Track the true best across checks; count patience only on scheduled checks."""
     step = report["step"]
     value = report["mean_relative_l2"]
@@ -66,7 +79,7 @@ def record_validation(state, report):
         return
     if state["best_score"] is None or value < state["best_score"]:
         state.update(best_score=value, best_step=step)
-    if not scheduled_check(step):
+    if not track_plateau or not scheduled_check(step):
         return
     reference = state["significant_best"]
     if reference is None or (value < reference and value <= (1 - PLATEAU_RELATIVE_GAIN) * reference):
@@ -131,7 +144,9 @@ def _publish_validation(run, report):
 
 def train(data, config, stats, run, *, normalization_sha256, batch_size=48,
           microbatch_size=4, max_updates=None, max_rounds=None, deadline=None,
-          signal_received=lambda: False, validate=None, resume_after_plateau=False):
+          signal_received=lambda: False, validate=None, resume_after_plateau=False,
+          phase_checkpoint=None, phase_checkpoint_sha256=None, validation_interval=None,
+          baseline_loss=None):
     """Continue up to a cumulative step/round cap or an allocation deadline."""
     if not 1 <= microbatch_size <= batch_size:
         raise ValueError("Microbatch size must be between one and the effective batch size")
@@ -144,9 +159,14 @@ def train(data, config, stats, run, *, normalization_sha256, batch_size=48,
     limit = min(max_updates or math.inf, (max_rounds or math.inf) * data.round_updates(batch_size))
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
+    if (phase_checkpoint is None) != (phase_checkpoint_sha256 is None):
+        raise ValueError("Specify both a phase checkpoint and its SHA256")
     protocol = training_protocol(data, config, normalization_sha256, batch_size, microbatch_size,
-                                 getattr(validate, "panel_sha256", None))
+                                 getattr(validate, "panel_sha256", None),
+                                 phase_checkpoint_sha256=phase_checkpoint_sha256,
+                                 validation_interval=validation_interval, baseline_loss=baseline_loss)
     digest = json_digest(protocol)
+    policy = protocol["validation"]
     with (run / ".training.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         protocol_path = run / "training-protocol.json"
@@ -156,8 +176,18 @@ def train(data, config, stats, run, *, normalization_sha256, batch_size=48,
                                  "configuration or start a fresh run directory for the new sampler")
         else:
             write_json(protocol_path, protocol, replace=False)
-        checkpoints = TrainingCheckpoints(run, digest)
-        restored = checkpoints.restore()
+        checkpoints = TrainingCheckpoints(run, digest, archive_validations=policy.get("archive_checks", False))
+        if (phase_checkpoint is not None and not checkpoints.latest.exists()
+                and not checkpoints.previous.exists() and not checkpoints.snapshots.exists()):
+            # Retrying an interrupted initial import can leave just the committed history prefix.
+            params, optimizer, record = checkpoints.import_phase(phase_checkpoint, phase_checkpoint_sha256,
+                                                                protocol, data.strengths)
+            baseline = _new_record(digest, data.strengths)["validation"]
+            record.update(protocol_sha256=digest, validation=baseline, pending_validation=True,
+                          phase_start_update=record["accepted_updates"], stop_reason=None)
+            restored = params, optimizer, record
+        else:
+            restored = checkpoints.restore()
         if restored is None:
             params = initialize(config)
             optimizer = adam_init(params)
@@ -165,9 +195,11 @@ def train(data, config, stats, run, *, normalization_sha256, batch_size=48,
         else:
             params, optimizer, record = restored
         state = record["validation"]
+        if state.get("baseline_mismatch"):
+            raise ValueError("Validation phase baseline disagrees with the expected loss")
         if state["invalid_step"] is not None:
             raise ValueError(f"Validation was nonfinite at update {state['invalid_step']}; inspect the checkpoint")
-        if state["checks_without_gain"] >= PLATEAU_PATIENCE:
+        if policy["patience"] is not None and state["checks_without_gain"] >= policy["patience"]:
             if not resume_after_plateau:
                 raise ValueError("Training paused at a validation plateau; use --resume-after-plateau "
                                  "to grant another observation period")
@@ -176,11 +208,11 @@ def train(data, config, stats, run, *, normalization_sha256, batch_size=48,
         with checkpoints.open_history(record) as history, ThreadPoolExecutor(max_workers=1) as reader:
             return _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadline,
                                 signal_received, validate, params, optimizer, record,
-                                checkpoints, history, reader)
+                                checkpoints, history, reader, policy)
 
 
 def _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadline,
-                 signal_received, validate, params, optimizer, record, checkpoints, history, reader):
+                 signal_received, validate, params, optimizer, record, checkpoints, history, reader, policy):
     batches = PrefetchedBatches(data, config.seed, batch_size, reader)
     make_update = update_factory(config, stats, microbatch_size=microbatch_size)
     compiled = {}
@@ -209,11 +241,21 @@ def _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadli
         began = time.monotonic()
         report = dict(step=step, **validate(params))
         panel_seconds = report["seconds"] = time.monotonic() - began
-        record_validation(state, report)
+        if checkpoints.archive_validations:
+            panel_digest = validate.panel_sha256
+            if report.setdefault("panel_sha256", panel_digest) != panel_digest:
+                raise ValueError("Validation reported a different panel than the training protocol")
+        record_validation(state, report, track_plateau=policy["patience"] is not None)
+        expected = policy.get("baseline_loss")
+        if step == record.get("phase_start_update") and expected is not None and state["invalid_step"] is None:
+            if not math.isclose(report["mean_relative_l2"], expected, rel_tol=1e-5, abs_tol=1e-10):
+                state["baseline_mismatch"] = True
         record["pending_validation"] = False
         persist()
         _publish_validation(checkpoints.run, report)
         log_event("validation", **report)
+        if state.get("baseline_mismatch"):
+            raise ValueError(f"Baseline validation loss {report['mean_relative_l2']} differs from {expected}")
         return True
 
     if checkpoints.saved_step is None:
@@ -236,7 +278,7 @@ def _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadli
                 if state["invalid_step"] is not None:
                     reason = "nonfinite_validation"
                     break
-                if state["checks_without_gain"] >= PLATEAU_PATIENCE:
+                if policy["patience"] is not None and state["checks_without_gain"] >= policy["patience"]:
                     reason = "validation_plateau"
                     break
                 if finish_after_validation:
@@ -267,7 +309,8 @@ def _run_updates(data, config, stats, batch_size, microbatch_size, limit, deadli
                 reason = "signal" if signal_received() else "deadline"
                 break
             next_step = step + 1
-            periodic = next_step in (1, 28) or scheduled_check(next_step)
+            periodic = (next_step in policy["first_steps"]
+                        or scheduled_check(next_step, policy["start"], policy["interval"]))
             if next_step < limit and not (periodic and validate is not None):
                 batches.prepare(next_step)
             rate = np.asarray(_cosine_learning_rate(step, E10_DECAY_UPDATES, config.learning_rate,
