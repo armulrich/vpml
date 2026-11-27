@@ -79,6 +79,26 @@ limits and cumulative update or epoch targets control how long the worker
 runs. Extending the target preserves the learning-rate schedule in optimizer
 updates. For submission and accounting on Delta, see :doc:`delta`.
 
+Comparing archived validation checkpoints
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In a validation phase, each check saves its own model and optimizer state in
+``snapshots/step-NNNNNNNN/checkpoint.npz`` alongside its checksum receipt.
+The latest and best checkpoints have separate names. To compare archived models
+on a different selection of held-out windows, supply the same panel to all steps:
+
+.. code-block:: bash
+
+   python -m vpml.cli.gaussian_validation \
+       --dataset "$reference" --run "$training_run" --normalization "$normalization" \
+       --steps 400 450 500 --panel "$panel" --output "$new_results"
+
+The panel JSON has a ``rows`` list. Each row identifies a validation trajectory
+by manifest ``case_id`` and ``case_index``, and its window by ``anchor_index``.
+Each report records the checkpoint identity, panel identity and per-window losses.
+On Delta, ``--cache`` can reuse the indexed training cache. Locally, the evaluator
+can read the completed reference files and use a temporary cache.
+
 Autonomous Gaussian rollouts
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

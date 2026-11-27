@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -17,7 +16,7 @@ from vpml.datasets.training_index import read_completed_digest
 from vpml.io.atomic import atomic_write
 from vpml.io.serialization import canonical_json_bytes, file_digest, json_digest, read_json
 from vpml.training.wavenumber_evaluation import rollout_factory
-from vpml.training.wavenumber_training import Configuration, initialize
+from vpml.training.wavenumber_training import Configuration, initialize, read_checkpoint_parameters as _read_parameters
 
 
 def select_cases(manifest, shape_id, strengths):
@@ -78,30 +77,6 @@ def forecast_energy(params, initial, k0, config, rollout, *, steps, chunk_steps)
             return np.concatenate(energies), start + first + 1
         energies.append(energy)
     return np.concatenate(energies), None
-
-
-def _read_parameters(checkpoint, expected_sha, protocol_sha, template):
-    # Hash and read the same open inode, even if training publishes a newer one.
-    with checkpoint.open("rb") as handle:
-        digest = hashlib.sha256()
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-        if digest.hexdigest() != expected_sha:
-            raise ValueError("Checkpoint checksum mismatch")
-        handle.seek(0)
-        with np.load(handle, allow_pickle=False) as archive:
-            record = json.loads(str(archive["record"]))
-            step = record["accepted_updates"]
-            if record["protocol_sha256"] != protocol_sha or int(archive["optimizer_step"]) != step:
-                raise ValueError("Checkpoint disagrees with training protocol or optimizer step")
-            params = {name[6:]: archive[name] for name in archive.files if name.startswith("param_")}
-    if params.keys() != template.keys():
-        raise ValueError("Checkpoint parameter names disagree with model")
-    for name, value in params.items():
-        if (value.shape != template[name].shape or value.dtype != template[name].dtype
-                or not np.isfinite(value).all()):
-            raise ValueError(f"Invalid checkpoint parameter: {name}")
-    return jax.device_put(params), step
 
 
 def _status(failed):

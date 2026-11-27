@@ -22,6 +22,7 @@ test = ["pytest>=8", "modal>=1.0"]
 [project.scripts]
 vpml-dataset = "vpml.cli.gaussian_dataset:main"
 vpml-gaussian-train = "vpml.cli.gaussian_training:main"
+vpml-gaussian-validate = "vpml.cli.gaussian_validation:main"
 vpml-low-moment-train = "vpml.training.low_moment_train:main"
 vpml-gaussian-analyze = "vpml.diagnostics.gaussian_dataset:main"
 vpml-linear-landau-compare = "vpml.diagnostics.linear_landau_comparison:main"

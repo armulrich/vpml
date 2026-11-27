@@ -4,6 +4,7 @@ The architecture and objective live in the common modules. This module supplies
 per-example physical geometry, complete exposure, and immutable resume snapshots.
 """
 from __future__ import annotations
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -176,6 +177,30 @@ def load_snapshot(path, expected_protocol):
         optimizer['step']=jnp.asarray(z['optimizer_step'])
         rows=z['loss_rows'].tolist()
     return params,optimizer,record,rows
+
+
+def read_checkpoint_parameters(checkpoint, expected_sha, protocol_sha, template):
+    """Verify and read only the model weights from one checkpoint inode."""
+    with checkpoint.open("rb") as handle:
+        digest = hashlib.sha256()
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+        if digest.hexdigest() != expected_sha:
+            raise ValueError("Checkpoint checksum mismatch")
+        handle.seek(0)
+        with np.load(handle, allow_pickle=False) as archive:
+            record = json.loads(str(archive["record"]))
+            step = record["accepted_updates"]
+            if record["protocol_sha256"] != protocol_sha or int(archive["optimizer_step"]) != step:
+                raise ValueError("Checkpoint disagrees with training protocol or optimizer step")
+            params = {name[6:]: archive[name] for name in archive.files if name.startswith("param_")}
+    if params.keys() != template.keys():
+        raise ValueError("Checkpoint parameter names disagree with model")
+    for name, value in params.items():
+        if (value.shape != template[name].shape or value.dtype != template[name].dtype
+                or not np.isfinite(value).all()):
+            raise ValueError(f"Invalid checkpoint parameter: {name}")
+    return jax.device_put(params), step
 
 
 def update_factory(config, stats, *, microbatch_size=None):
