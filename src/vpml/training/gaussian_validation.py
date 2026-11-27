@@ -35,11 +35,47 @@ def validation_windows(manifest, anchors_per_case):
     return rows
 
 
-def make_validation_report(data, config, stats, *, batch_size=12):
+def _external_rows(data, config, panel):
+    """Resolve a frozen list of held-out windows against the active case catalog."""
+    rows = []
+    seen = set()
+    cases = data.manifest["cases"]
+    for row in panel["rows"]:
+        index, anchor = row["case_index"], row["anchor_index"]
+        if (type(index) is not int or not 0 <= index < len(cases)
+                or type(anchor) is not int or not 0 <= anchor < data.anchors_per_case):
+            raise ValueError("Validation panel case index or anchor is outside the dataset")
+        case = cases[index]
+        if case["split"] != "validation" or row["case_id"] != case["case_id"]:
+            raise ValueError("Validation panel requires matching held-out case IDs")
+        for field in ("strength", "shape_id", "k0", "mode_count", "decay"):
+            if field in row and row[field] != case[field]:
+                raise ValueError(f"Validation panel disagrees with case {field}")
+        if ("start_time" in row and not np.isclose(row["start_time"], anchor * data.anchor_stride * config.dt,
+                                                   rtol=0, atol=1e-9)):
+            raise ValueError("Validation window start time disagrees with anchor")
+        if "time_band" in row and "strata" in panel:
+            lo, hi = panel["strata"][row["time_band"]]
+            if not lo <= anchor <= hi:
+                raise ValueError("Validation anchor is outside its stated time band")
+        if ("source_output_sha256" in row
+                and row["source_output_sha256"] != data._output_digest(index)):
+            raise ValueError(f"Validation reference output changed at {case['case_id']}")
+        if (index, anchor) in seen:
+            raise ValueError("Duplicate validation window")
+        seen.add((index, anchor))
+        rows.append((case["strength"], index, anchor))
+    if not rows:
+        raise ValueError("Validation panel is empty")
+    return rows
+
+
+def make_validation_report(data, config, stats, *, batch_size=12, panel=None):
     """Score the fixed panel with a bounded number of forecast windows in memory."""
     if batch_size < 1:
         raise ValueError("Validation batch size must be positive")
-    rows = validation_windows(data.manifest, data.anchors_per_case)
+    rows = (validation_windows(data.manifest, data.anchors_per_case) if panel is None
+            else _external_rows(data, config, panel))
     panel_sha256 = json_digest([
         [data.manifest["cases"][case]["case_id"], anchor] for _, case, anchor in rows
     ])
@@ -47,14 +83,17 @@ def make_validation_report(data, config, stats, *, batch_size=12):
 
     def report(params):
         values = defaultdict(list)
+        window_values = []
         for start in range(0, len(rows), batch_size):
             selected = rows[start:start + batch_size]
             batch = data.batch([(case, anchor) for _, case, anchor in selected])
             losses = np.asarray(score_windows(params, batch))
             for (strength, _, _), loss in zip(selected, losses, strict=True):
-                values[strength].append(float(loss) if np.isfinite(loss) else None)
+                value = float(loss) if np.isfinite(loss) else None
+                values[strength].append(value)
+                window_values.append(value)
         all_losses = [loss for losses in values.values() for loss in losses]
-        return {
+        result = {
             "panel_sha256": panel_sha256,
             "validation_windows": len(rows),
             "mean_relative_l2": float(np.mean(all_losses)) if None not in all_losses else None,
@@ -68,6 +107,10 @@ def make_validation_report(data, config, stats, *, batch_size=12):
                 for strength, losses in sorted(values.items())
             },
         }
+        if panel is not None:
+            # Aligned to the frozen input rows, including per-shape and time-band metadata.
+            result["window_relative_l2"] = window_values
+        return result
 
     report.panel_sha256 = panel_sha256
     return report
