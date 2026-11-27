@@ -5,27 +5,23 @@ from unittest import mock
 
 import numpy as np
 
-from model.diagnostics.landau_resolution_report import (
+from vpml.diagnostics.landau_resolution_report import (
     _first_projection_grid_passing_all_cases,
     build_report,
 )
-from model.diagnostics.physical_velocity_grid_convergence import (
+from vpml.diagnostics.physical_velocity_grid_convergence import (
     _distribution_successive_change,
     _energy_block_changes,
     _save_teacher_artifact,
 )
-from model.diagnostics.physical_spatial_grid_convergence import (
-    _distribution_successive_x_change,
-)
-from model.diagnostics.physical_grid_2d_convergence import (
+from vpml.diagnostics.physical_spatial_grid_convergence import _distribution_successive_x_change
+from vpml.diagnostics.physical_grid_2d_convergence import (
     _parse_case_names,
     _projected_change,
     _run_case_segmented,
 )
-from model.diagnostics.projection_quadrature_convergence import (
-    _load_teacher_snapshot_artifact,
-)
-from vpml.physical_grid import (
+from vpml.diagnostics.projection_quadrature_convergence import _load_teacher_snapshot_artifact
+from vpml.solvers.physical_grid import (
     PhysicalGridVlasovPoissonConfig,
     gaussian_pdf,
     normalize_density_on_grid,
@@ -116,7 +112,7 @@ class LandauResolutionDiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             cases_dir = Path(temporary_directory)
             with mock.patch(
-                "model.diagnostics.physical_grid_2d_convergence."
+                "vpml.diagnostics.physical_grid_2d_convergence."
                 "run_semilagrangian_vlasov_poisson",
                 side_effect=interrupt_second_segment,
             ):

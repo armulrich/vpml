@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from vpml import (
+from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,
     EarlyGrowthConfig,
     FieldErrorConfig,

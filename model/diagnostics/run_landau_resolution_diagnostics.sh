@@ -50,7 +50,7 @@ if [[ -n "${COARSE_TEACHER_SNAPSHOTS}" ]]; then
 fi
 
 echo "[landau-resolution] [1/3] Semi-Lagrangian velocity-grid self-convergence"
-"${PYTHON_BIN}" -m model.diagnostics.physical_velocity_grid_convergence \
+"${PYTHON_BIN}" -m vpml.diagnostics.physical_velocity_grid_convergence \
   --outdir "${PHYSICAL_OUTDIR}" \
   --teacher-Nx "${TEACHER_NX}" \
   --physical-Nv-list "${PHYSICAL_NV_LIST}" \
@@ -71,7 +71,7 @@ echo "[landau-resolution] [1/3] Semi-Lagrangian velocity-grid self-convergence"
   "${PHYSICAL_REUSE_ARGS[@]}"
 
 echo "[landau-resolution] [2/3] Spline-to-Hermite projection-quadrature self-convergence"
-"${PYTHON_BIN}" -m model.diagnostics.projection_quadrature_convergence \
+"${PYTHON_BIN}" -m vpml.diagnostics.projection_quadrature_convergence \
   --outdir "${PROJECTION_OUTDIR}" \
   --teacher-snapshots "${TEACHER_SNAPSHOTS}" \
   --snapshot-times "${SNAPSHOT_TIMES}" \
@@ -81,7 +81,7 @@ echo "[landau-resolution] [2/3] Spline-to-Hermite projection-quadrature self-con
   --cutoffs "${CUTOFFS}"
 
 echo "[landau-resolution] [3/3] Combined parameter recommendation"
-"${PYTHON_BIN}" -m model.diagnostics.landau_resolution_report \
+"${PYTHON_BIN}" -m vpml.diagnostics.landau_resolution_report \
   --physical-json "${PHYSICAL_OUTDIR}/physical_velocity_grid_convergence.json" \
   --projection-json "${PROJECTION_OUTDIR}/projection_quadrature_convergence.json" \
   --outdir "${OUTDIR}"

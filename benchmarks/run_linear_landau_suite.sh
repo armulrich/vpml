@@ -15,11 +15,11 @@ export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
 cd "${REPO_ROOT}"
 
 for method in truncation hyper filter nonlocal; do
-  "${PYTHON_BIN}" -m benchmarks.fh_benchmarks_2412_07073_jax linear_landau --method "${method}" --outdir "${OUTDIR}"
+  "${PYTHON_BIN}" -m vpml.benchmarks.fh_benchmarks_2412_07073_jax linear_landau --method "${method}" --outdir "${OUTDIR}"
 done
 
 if [[ -n "${LEARNED_CHECKPOINT:-}" ]]; then
-  "${PYTHON_BIN}" -m benchmarks.fh_benchmarks_2412_07073_jax \
+  "${PYTHON_BIN}" -m vpml.benchmarks.fh_benchmarks_2412_07073_jax \
     linear_landau \
     --method learned \
     --learned-checkpoint "${LEARNED_CHECKPOINT}" \

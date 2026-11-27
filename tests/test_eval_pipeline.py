@@ -8,12 +8,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from model.eval import main as eval_main
-from vpml.core import (
-    LearnedInterfaceClosure,
-    e_hat_history_from_a_hat_history,
-    save_learned_interface_closure_npz,
-)
+from vpml.evaluation.interface_flux import main as eval_main
+from vpml.models.interface_closure import LearnedInterfaceClosure
+from vpml.solvers.hermite import e_hat_history_from_a_hat_history
+from vpml.models.interface_checkpoint import save_learned_interface_closure_npz
 from vpml.metrics import (
     EarlyElectricFieldGrowthMetric,
     EarlyGrowthConfig,

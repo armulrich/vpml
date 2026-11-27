@@ -30,14 +30,9 @@ REPO_ROOT = Path("/root/vpml")
 
 
 def _source_tree_sha256(root: Path) -> str:
-    digest = hashlib.sha256()
-    for package in ("model", "vpml"):
-        for path in sorted((root / package).rglob("*.py")):
-            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(path.read_bytes())
-            digest.update(b"\0")
-    return digest.hexdigest()
+    from vpml.io.serialization import source_tree_digest
+
+    return source_tree_digest(root)
 
 
 app = modal.App(APP_NAME)
@@ -50,7 +45,7 @@ image = (
         "matplotlib==3.10.9",
         "scipy",
     )
-    .add_local_dir("vpml", str(REPO_ROOT / "vpml"), copy=True)
+    .add_local_dir("src/vpml", str(REPO_ROOT / "vpml"), copy=True)
     .add_local_dir("model", str(REPO_ROOT / "model"), copy=True)
 )
 
@@ -61,7 +56,7 @@ def history_train_arguments(stop_epoch: int) -> list[str]:
     arguments = [
         sys.executable,
         "-m",
-        "model.train.low_moment_closure",
+        "vpml.training.low_moment_train",
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",
@@ -140,7 +135,7 @@ def evaluation_arguments(epoch: int) -> list[str]:
     return [
         sys.executable,
         "-m",
-        "model.train.low_moment_closure",
+        "vpml.training.low_moment_train",
         "--reference-cache",
         str(REFERENCE_CACHE),
         "--outdir",

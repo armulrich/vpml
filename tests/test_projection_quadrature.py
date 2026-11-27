@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vpml.physical_grid import (
+from vpml.solvers.physical_grid import (
     build_cubic_spline_hermite_projection_matrix,
     cubic_bspline_velocity_resampling_matrix,
     project_distribution_snapshot_to_fourier_hermite,
