@@ -284,3 +284,36 @@ and validation from the training output; query ``budget`` for the separate
 Slurm charges. Reuse the same data, normalization and training configuration
 when continuing. The ``--cache`` option can select a reusable trajectory
 cache on shared storage.
+
+A new validation phase
+~~~~~~~~~~~~~~~~~~~~~~
+
+To compare later checkpoints on a different fixed validation panel, choose a
+new run directory and retain the parent checkpoint, training history and
+protocol. Supply the parent checkpoint digest and its measured mean loss on
+the new panel. The worker checks that baseline before taking the next
+optimizer step. The new phase inherits the optimizer, learning-rate schedule
+and sampling position. Validation runs every 50 updates. Each check retains
+its own checkpoint in ``snapshots/step-XXXXXXXX/checkpoint.npz``, alongside the
+rolling latest and best checkpoints. Ordinary plateaus in this phase are
+recorded while training continues to the update or wall-time limit.
+
+The example below gives the phase an independent 5 SU allowance and an
+absolute limit of 1,100 optimizer updates. The parent run keeps its allocation
+records. The launcher reserves its usual billing and shutdown margins.
+
+.. code-block:: bash
+
+   export VPML_RUN_ROOT=/absolute/project/path/to/new-phase
+   phase=(--phase-from "$parent" --parent-checkpoint-sha256 "$parent_sha256"
+          --validation-panel "$panel_json" --baseline-loss "$measured_loss"
+          --max-updates 1100 --wall-minutes 300)
+   "$VPML_PYTHON" "$launcher" init-budget 5.00
+   "$VPML_PYTHON" "$launcher" test-submit "${phase[@]}"
+   "$VPML_PYTHON" "$launcher" submit "${phase[@]}"
+
+The launcher records the selected panel and pins its canonical JSON digest
+for the worker. An optional ``--validation-panel-sha256`` checks the same
+digest before submission. To resume after an interruption, use the same run
+directory, panel and phase options. Its budget counts all jobs submitted in
+that directory.

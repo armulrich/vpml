@@ -19,7 +19,7 @@ ACCOUNT = "bhvw-delta-gpu"
 INITIAL_ALLOWANCE = Decimal("1.0")
 SHUTDOWN_SECONDS = 300
 sys.path.insert(0, str(CODE_ROOT / "src"))
-from vpml.cli.gaussian_training import resolve_microbatch_size
+from vpml.cli.gaussian_training import add_phase_arguments, resolve_microbatch_size, validation_phase
 from vpml.datasets.provenance import source_record
 from vpml.io.serialization import file_digest
 
@@ -34,7 +34,7 @@ def absolute_path(name: str) -> Path:
 def training_record(args, scheduler, worker, runtime, wall) -> Path:
     manifest = args.dataset / "manifest.json"
     sources = ("run_gaussian_training.py", "gaussian_training.batch.sh", "record_submission.py", "budget.py")
-    return publish_intent(args.data_root, {
+    record = {
         "schema_version": 1, "record_type": "training_submission_intent",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "manifest": {"path": str(manifest), "sha256": file_digest(manifest)},
@@ -45,7 +45,11 @@ def training_record(args, scheduler, worker, runtime, wall) -> Path:
         "scheduler": {"arguments": scheduler, "wall_seconds": wall, "shutdown_margin_seconds": SHUTDOWN_SECONDS},
         "worker": {"python": str(args.python), "arguments": worker, "max_seconds": runtime,
                    "run_root": str(args.data_root)},
-    })
+    }
+    if args.phase is not None:
+        record["validation_panel"] = {"path": str(args.phase.panel_path), "sha256": args.phase.panel_sha256,
+                                      "contents": args.phase.panel}
+    return publish_intent(args.data_root, record)
 
 
 def current_allowance(root: Path) -> Decimal:
@@ -56,7 +60,9 @@ def current_allowance(root: Path) -> Decimal:
 
 
 def configure_job(args) -> None:
-    microbatch_size = resolve_microbatch_size(args.data_root, args.microbatch_size)
+    phase = args.phase = validation_phase(args, args.data_root)
+    microbatch_size = resolve_microbatch_size(args.data_root, args.microbatch_size,
+                                             parent=phase.parent if phase else None)
     args.parameters = absolute_path("VPML_NORMALIZATION")
     if not args.parameters.is_file():
         raise ValueError("VPML_NORMALIZATION must name the E10 normalization artifact")
@@ -82,6 +88,12 @@ def configure_job(args) -> None:
         args.arguments.extend(("--cache", str(cache)))
     if args.resume_after_plateau:
         args.arguments.append("--resume-after-plateau")
+    if phase is not None:
+        args.arguments.extend(("--phase-from", str(phase.parent),
+                               "--parent-checkpoint-sha256", phase.checkpoint_sha256,
+                               "--validation-panel", str(phase.panel_path),
+                               "--validation-panel-sha256", phase.panel_sha256,
+                               "--baseline-loss", str(phase.baseline_loss)))
     for option in ("max_rounds", "max_updates"):
         value = getattr(args, option)
         if value is not None:
@@ -94,6 +106,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("budget", help="report recorded jobs, charges and remaining allowance")
+    initialize = actions.add_parser("init-budget", help="set the initial cumulative allowance without submitting")
+    initialize.add_argument("total_su", type=Decimal)
     extend = actions.add_parser("extend-budget", help="set a higher cumulative allowance for this same run")
     extend.add_argument("total_su", type=Decimal, help="new cumulative total, including charges already incurred")
     for name in ("test-submit", "submit"):
@@ -106,6 +120,7 @@ def main(argv=None) -> int:
         action.add_argument("--max-updates", type=int, help="absolute optimizer update target")
         action.add_argument("--resume-after-plateau", action="store_true",
                             help="explicitly extend a run that stopped on a validation plateau")
+        add_phase_arguments(action)
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -122,6 +137,17 @@ def main(argv=None) -> int:
         if args.action == "budget":
             ledger = budget.load_budget(args.data_root, current_allowance(args.data_root), ACCOUNT, manifest=manifest)
             print(json.dumps(budget.accounting(ledger), indent=2))
+            return 0
+        if args.action == "init-budget":
+            if not args.total_su.is_finite() or args.total_su <= 0:
+                raise ValueError("Initial allowance must be finite and positive")
+            args.data_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with budget.submission_lock(args.data_root):
+                ledger = budget.load_budget(args.data_root, args.total_su, ACCOUNT, manifest=manifest)
+                path = args.data_root / "budget.json"
+                if not path.exists():
+                    budget.atomic_json(path, ledger, replace=False)
+                print(f"Cumulative training allowance: {ledger['allowance_su']} SU")
             return 0
         if args.action == "extend-budget":
             with budget.submission_lock(args.data_root):

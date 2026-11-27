@@ -433,9 +433,7 @@ elif name == "sacct":
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.calls(), [])
 
-    def test_training_hour_charges_one_separate_ledger_and_extends_the_same_run(self):
-        self.make_manifest()
-        run_root = self.directory / "closure training"
+    def training_launcher(self, run_root):
         normalization = self.directory / "normalization.npz"
         normalization.write_bytes(b"normalization-fixture")
         environment = dict(self.environment, VPML_REFERENCE_ROOT=str(self.data), VPML_RUN_ROOT=str(run_root),
@@ -446,6 +444,12 @@ elif name == "sacct":
             return subprocess.run([sys.executable, str(launcher), *args], env=dict(environment, **overrides),
                                   capture_output=True, text=True, check=False)
 
+        return invoke, normalization
+
+    def test_training_hour_charges_one_separate_ledger_and_extends_the_same_run(self):
+        self.make_manifest()
+        run_root = self.directory / "closure training"
+        invoke, normalization = self.training_launcher(run_root)
         dry_run = invoke("test-submit")
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
         self.assertFalse(run_root.exists())
@@ -500,6 +504,52 @@ elif name == "sacct":
         self.assertEqual(self.calls(), before_calls)
         same_root = invoke("submit", VPML_RUN_ROOT=str(self.data))
         self.assertEqual(same_root.returncode, 2)
+
+    def test_validation_phase_submission_pins_inputs_and_enforces_five_incremental_su(self):
+        self.make_manifest()
+        phase = self.directory / "monthly validation phase"
+        parent = self.directory / "parent run"
+        parent.mkdir()
+        (parent / "training-protocol.json").write_text('{"microbatch_size": 6}')
+        checkpoint = parent / "checkpoint.npz"
+        checkpoint.write_bytes(b"frozen weights")
+        parent_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        panel = self.directory / "fixed panel.json"
+        panel.write_text(json.dumps({"rows": [{"case_index": 0, "anchor_index": 10, "case_id": "held-out"}]},
+                                    indent=2))
+        panel_sha = hashlib.sha256(json.dumps(json.loads(panel.read_bytes()),
+                                              sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        invoke, _ = self.training_launcher(phase)
+        args = ["--phase-from", str(parent), "--parent-checkpoint-sha256", parent_sha,
+                "--validation-panel", str(panel), "--baseline-loss", "0.23057658807323808",
+                "--max-updates", "1100", "--wall-minutes", "300"]
+        created = invoke("init-budget", "5.00")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        ledger = phase / "budget.json"
+        initial = ledger.read_bytes()
+        initialized_again = invoke("init-budget", "5.00")
+        self.assertEqual(initialized_again.returncode, 0, initialized_again.stderr)
+        self.assertEqual(invoke("init-budget", "10.00").returncode, 2)
+        self.assertEqual(ledger.read_bytes(), initial)
+        self.assertEqual(invoke("submit", *args, "--resume-after-plateau").returncode, 2)
+        self.assertEqual(invoke("submit", *args, "--validation-panel-sha256", "0" * 64).returncode, 2)
+        self.assertFalse(any(call["program"] == "sbatch" for call in self.calls()))
+
+        submitted = invoke("submit", *args)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        job = json.loads(submitted.stdout)
+        self.assertEqual(job["wall_seconds"], 295 * 60)
+        record = json.loads(Path(job["intent"]).read_bytes())
+        worker = record["worker"]["arguments"]
+        for option, value in (("--validation-panel-sha256", panel_sha),
+                              ("--parent-checkpoint-sha256", parent_sha),
+                              ("--microbatch-size", "6"), ("--max-updates", "1100")):
+            self.assertEqual(worker[worker.index(option) + 1], value)
+        scheduler = self.calls()[-1]["args"]
+        self.assertIn("--no-requeue", scheduler)
+        self.assertIn("--time=04:55:00", scheduler)
+        self.assertIn("--gpus-per-node=1", scheduler)
+        self.assertFalse((parent / "budget.json").exists())
 
     def batch_command(self):
         scheduler = self.bin / "fake srun"

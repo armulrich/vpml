@@ -2,15 +2,69 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import math
 from pathlib import Path
+import re
 import time
 
+from vpml.io.serialization import file_digest, json_digest, read_json
 
-def resolve_microbatch_size(run: Path, requested: int | None) -> int:
+
+@dataclass(frozen=True)
+class ValidationPhase:
+    parent: Path
+    checkpoint_sha256: str
+    panel_path: Path
+    panel: dict
+    panel_sha256: str
+    baseline_loss: float
+
+
+def add_phase_arguments(parser):
+    group = parser.add_argument_group("continuation with a new validation panel")
+    group.add_argument("--phase-from", type=Path, help="Parent training run with the source checkpoint")
+    group.add_argument("--parent-checkpoint-sha256", help="Expected SHA-256 of the parent's checkpoint.npz")
+    group.add_argument("--validation-panel", type=Path, help="JSON manifest of the fixed held-out windows")
+    group.add_argument("--validation-panel-sha256", help="Optional SHA-256 of the canonical panel JSON")
+    group.add_argument("--baseline-loss", type=float, help="Reference mean loss of the parent on this panel")
+
+
+def validation_phase(args, run: Path) -> ValidationPhase | None:
+    required = (args.phase_from, args.parent_checkpoint_sha256, args.validation_panel, args.baseline_loss)
+    if all(value is None for value in required) and args.validation_panel_sha256 is None:
+        return None
+    if any(value is None for value in required):
+        raise ValueError("A validation phase requires --phase-from, --parent-checkpoint-sha256, "
+                         "--validation-panel and --baseline-loss")
+    if args.resume_after_plateau:
+        raise ValueError("--resume-after-plateau applies to the original validation protocol")
+    parent = args.phase_from.resolve()
+    if run.resolve() == parent:
+        raise ValueError("Select a separate run directory for the new validation phase")
+    digest = args.parent_checkpoint_sha256.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Invalid parent checkpoint SHA-256")
+    if not math.isfinite(args.baseline_loss) or args.baseline_loss < 0:
+        raise ValueError("--baseline-loss must be finite and nonnegative")
+    if not (run / "checkpoint.npz").is_file():
+        if file_digest(parent / "checkpoint.npz") != digest:
+            raise ValueError("Parent checkpoint SHA-256 mismatch")
+    panel_path = args.validation_panel.resolve()
+    panel = read_json(panel_path)
+    panel_sha256 = json_digest(panel)
+    if args.validation_panel_sha256 is not None and args.validation_panel_sha256.lower() != panel_sha256:
+        raise ValueError("Validation panel SHA-256 mismatch")
+    return ValidationPhase(parent, digest, panel_path, panel, panel_sha256, args.baseline_loss)
+
+
+def resolve_microbatch_size(run: Path, requested: int | None, *, parent: Path | None = None) -> int:
     """Recover the accumulation layout before submitting or opening a run."""
-    from vpml.io.serialization import read_json
-
     protocol = run / "training-protocol.json"
+    if parent is not None and not protocol.is_file():
+        protocol = parent / "training-protocol.json"
+        if not protocol.is_file():
+            raise ValueError("Parent training protocol is missing")
     if protocol.is_file():
         saved_protocol = read_json(protocol)
         if saved_protocol.get("sampler") == "strength_interleaved_shuffled_windows":
@@ -42,6 +96,7 @@ def main(argv=None):
     parser.add_argument("--resume-after-plateau", action="store_true",
                         help="Continue a stopped run with a new validation observation period")
     parser.add_argument("--require-gpu", action="store_true")
+    add_phase_arguments(parser)
     args = parser.parse_args(argv)
     if args.worker_seconds is not None and args.worker_seconds <= 0:
         parser.error("--worker-seconds must be positive")
@@ -53,7 +108,6 @@ def main(argv=None):
         import numpy as np
         from vpml.datasets.gaussian_training import GaussianTrainingData
         from vpml.datasets.provenance import runtime_record, source_record
-        from vpml.io.serialization import file_digest
         from vpml.training.gaussian_training import (
             E10_MODEL, E10_NORMALIZATION_SHA256, log_event, train,
         )
@@ -74,13 +128,20 @@ def main(argv=None):
         cache = (args.cache or run / "cache").resolve()
         if run == root or cache == root or root in run.parents or root in cache.parents:
             raise ValueError("Training and cache directories must be outside the reference dataset")
-        microbatch = resolve_microbatch_size(run, args.microbatch_size)
+        phase = validation_phase(args, run)
+        microbatch = resolve_microbatch_size(run, args.microbatch_size, parent=phase.parent if phase else None)
         data = GaussianTrainingData.open_indexed(root, cache, E10_MODEL)
+        validation = make_validation_report(data, E10_MODEL, stats, batch_size=microbatch,
+                                            panel=phase.panel if phase else None)
+        continuation = (dict(phase_checkpoint=phase.parent / "checkpoint.npz",
+                             phase_checkpoint_sha256=phase.checkpoint_sha256,
+                             validation_interval=50, baseline_loss=phase.baseline_loss)
+                        if phase else {})
         train(data, E10_MODEL, stats, run, normalization_sha256=digest,
               deadline=deadline, signal_received=signal_received, microbatch_size=microbatch,
               max_updates=args.max_updates, max_rounds=args.max_rounds,
               resume_after_plateau=args.resume_after_plateau,
-              validate=make_validation_report(data, E10_MODEL, stats, batch_size=microbatch))
+              validate=validation, **continuation)
 
 
 if __name__ == "__main__":
